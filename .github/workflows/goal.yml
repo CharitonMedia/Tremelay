@@ -27,14 +27,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           token: ${{ github.token }}
-      - name: Require the goal GitHub token
-        env:
-          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
-        run: bash scripts/require_goal_github_token.sh
-      - name: Ensure goal and goal-ready labels
+      - name: Ensure goal labels
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          github-token: ${{ github.token }}
           script: |
             const { owner, repo } = context.repo
             async function ensureLabel(name, color, description) {
@@ -54,6 +50,11 @@ jobs:
               "goal-ready",
               "0E8A16",
               "Codex approved this goal pull request.",
+            )
+            await ensureLabel(
+              "human-review-required",
+              "B60205",
+              "Automation stopped after the three-cycle remediation limit.",
             )
 
   implement:
@@ -300,16 +301,17 @@ jobs:
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
             marker="<!-- tremelay-three-cycle-stop head:${head} -->"
-            existing=$(python - <<'PY'
+            existing=$(MARKER="$marker" python - <<'PY'
           import json, os
           pages=json.load(open("cycle_comments.json", encoding="utf-8"))
           comments=[c for page in pages for c in page]
-          marker=os.environ.get("MARKER","")
+          marker=os.environ["MARKER"]
           print("yes" if any(marker in (c.get("body") or "") for c in comments) else "no")
           PY
             )
             if [ "$existing" != "yes" ]; then
-              MARKER="$marker" gh pr comment "$PR_NUMBER" --body "Automation stopped after three implementation/remediation cycles for this pull-request lineage. Human review is required before another Cursor run. Latest head: \`${head}\`. Review the unresolved Codex/CI findings and explicitly resume only after deciding the next approach.\n\n${marker}"
+              gh pr edit "$PR_NUMBER" --add-label "human-review-required"
+              gh pr comment "$PR_NUMBER" --body "Automation stopped after three implementation/remediation cycles for this pull-request lineage. Human review is required before another Cursor run. Latest head: \`${head}\`. Review the unresolved Codex/CI findings and explicitly resume only after deciding the next approach.\n\n${marker}"
             fi
           else
             echo "allowed=true" >> "$GITHUB_OUTPUT"
@@ -319,6 +321,7 @@ jobs:
         run: sleep 20
       - name: Build Cloud Agent request
         id: build
+        if: steps.cycle.outputs.allowed == 'true'
         run: |
           if python scripts/goal_agent_request.py build --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --out payload.json; then
             echo "launch=true" >> "$GITHUB_OUTPUT"
