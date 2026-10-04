@@ -117,7 +117,14 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REASON: ${{ steps.plan.outputs.reason }}
         run: |
-          gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped: ${REASON}"
+          set -euo pipefail
+          if [[ "$REASON" == *"circuit breaker reached 3 rounds"* ]]; then
+            gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped after the three-cycle remediation limit." --force
+            gh pr edit "$PR_NUMBER" --add-label human-review-required
+            gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped after three remediation cycles. Human review is required before another agent run. Reason: ${REASON}"
+          else
+            gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped: ${REASON}"
+          fi
 
       - name: Require Cursor and owner GitHub credentials
         if: steps.plan.outputs.action == 'launch'
