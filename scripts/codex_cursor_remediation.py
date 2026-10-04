@@ -22,8 +22,8 @@ MARKER_RE = re.compile(
     r"<!-- codex-cursor-remediation review:(?P<review_id>[0-9]+) "
     r"head:(?P<head>[0-9a-fA-F]{40}) -->"
 )
-DEFAULT_MAX_ROUNDS = 8
-DEFAULT_REPO_URL = "https://github.com/CharitonMedia/agent-converter-v2"
+DEFAULT_MAX_ROUNDS = 3
+DEFAULT_REPO_URL = "https://github.com/CharitonMedia/Tremelay"
 DEFAULT_TRUSTED_MARKER_LOGIN = "pattalkslaw-del"
 
 
@@ -198,7 +198,7 @@ def _prompt(
         "widen permissions, capabilities, conversion semantics, or release scope merely to make a test pass.\n\n"
         f"{numbered}\n\n"
         "Work on this pull request's existing branch. Do not create another branch or pull request. "
-        "Run python3 -m pytest tests/unit tests/integration and fix failures caused by your changes. "
+        "Run `go test ./...` and `go vet ./...`; fix failures caused by your changes. "
         "Commit and push the remediation.\n\n"
         "Do not merge. Do not package or publish a release. Do not request Codex and do not mention @codex. "
         "The workflow will request the next independent review only after exact-head Linux and Windows CI pass. "
