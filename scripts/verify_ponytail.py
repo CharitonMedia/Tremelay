@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+from hashlib import sha256
+from pathlib import Path
+import sys
+
+path = Path(".cursor/rules/ponytail.mdc")
+expected = "e5b63124834c65e73208e8349e6cfd90b56757646c576a393932a01adc63940f"
+
+if not path.is_file():
+    raise SystemExit("Required Ponytail Cursor rule is missing: .cursor/rules/ponytail.mdc")
+
+actual = sha256(path.read_bytes()).hexdigest()
+if actual != expected:
+    raise SystemExit(
+        "Required Ponytail Cursor rule changed unexpectedly. "
+        "Review the upstream/license/security implications and update the pinned hash intentionally."
+    )
+
+print("Ponytail Cursor rule present and pinned.")
