@@ -38,6 +38,12 @@ The three-cycle limit is a hard guardrail against runaway agent churn.
 - The stop rule applies even if more automated remediation appears possible.
 - Security incidents or evidence of architectural drift may stop automation earlier than three cycles.
 
+## Required Cursor rule
+
+Cursor implementation agents MUST operate with the repository-pinned Ponytail rule at `.cursor/rules/ponytail.mdc`. The rule is always-on for Cursor and is verified by CI.
+
+Ponytail's minimalism applies only after Tremelay's security invariants, threat model, milestone acceptance criteria, auditability, and required tests are satisfied. Security controls, validation, adversarial testing, and required error handling are not optional simplifications.
+
 ## Development method
 
 For each milestone:
