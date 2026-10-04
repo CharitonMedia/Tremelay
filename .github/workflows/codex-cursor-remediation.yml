@@ -97,7 +97,7 @@ jobs:
       - name: Build exact-head remediation plan
         id: plan
         env:
-          MAX_REMEDIATION_ROUNDS: "8"
+          MAX_REMEDIATION_ROUNDS: "3"
         run: |
           set -euo pipefail
           python scripts/codex_cursor_remediation.py build --event normalized_event.json --pull pull.json --review-comments review_comments.json --issue-comments issue_comments.json --out plan.json --max-rounds "$MAX_REMEDIATION_ROUNDS" --repo-url "https://github.com/${GITHUB_REPOSITORY}" --trusted-marker-login "${{ steps.marker_identity.outputs.login }}"
