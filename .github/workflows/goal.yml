@@ -1,0 +1,368 @@
+name: goal
+
+on:
+  push:
+    branches:
+      - main
+      - "goal/issue-*"
+  issues:
+    types: [labeled]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  ensure-label:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+      - name: Require the goal GitHub token
+        env:
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: bash scripts/require_goal_github_token.sh
+      - name: Ensure goal and goal-ready labels
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo
+            async function ensureLabel(name, color, description) {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name })
+              } catch (error) {
+                if (error.status !== 404) throw error
+                await github.rest.issues.createLabel({ owner, repo, name, color, description })
+              }
+            }
+            await ensureLabel(
+              "goal",
+              "1D76DB",
+              "Implement this issue with a Cursor cloud agent. The agent opens a pull request and does not merge.",
+            )
+            await ensureLabel(
+              "goal-ready",
+              "0E8A16",
+              "Codex approved this goal pull request.",
+            )
+
+  implement:
+    if: github.event_name == 'issues' && github.event.label.name == 'goal' && !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: List open pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr list --state open --limit 100 --json number,url,body,labels,headRefName,baseRefName > open_prs.json
+      - name: Build Cloud Agent request
+        id: build
+        run: |
+          if python scripts/goal_agent_request.py build --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --open-prs open_prs.json --out payload.json; then
+            echo "launch=true" >> "$GITHUB_OUTPUT"
+          else
+            code=$?
+            if [ "$code" -eq 2 ]; then
+              echo "launch=false" >> "$GITHUB_OUTPUT"
+            else
+              exit "$code"
+            fi
+          fi
+      - name: Ensure goal branch
+        id: ensure
+        if: steps.build.outputs.launch == 'true'
+        run: |
+          set -euo pipefail
+          base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
+          branch=$(python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.branch_to_ensure(json.load(open("payload.json"))) or "")')
+          if [ -z "$branch" ]; then
+            exit 0
+          fi
+          git fetch origin "$base"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "branch exists"
+          else
+            git push origin "refs/remotes/origin/${base}:refs/heads/${branch}"
+          fi
+      - name: Launch Cloud Agent
+        id: launch
+        if: steps.build.outputs.launch == 'true' && steps.ensure.outcome == 'success'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash scripts/require_goal_github_token.sh
+          number="${{ github.event.issue.number }}"
+          if [ -z "${CURSOR_API_KEY}" ]; then
+            gh issue comment "$number" --body "The \`goal\` label was applied, but this repository has no \`CURSOR_API_KEY\` secret. Create a key at Cursor Dashboard → API Keys, add it as a repository secret named \`CURSOR_API_KEY\`, and apply the label again."
+            exit 1
+          fi
+          pr_url=$(python -c 'import json; print(json.load(open("payload.json"))["repos"][0].get("prUrl", ""))')
+          if [ -n "$pr_url" ]; then
+            pr_number=${pr_url##*/}
+            before=$(gh pr view "$pr_number" --json headRefOid --jq .headRefOid)
+            printf '%s\n' "$pr_number" > pr_number.txt
+          else
+            rm -f pr_number.txt
+            base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
+            git fetch origin "$base"
+            before=$(git rev-parse "origin/${base}")
+          fi
+          printf '%s\n' "$before" > before_sha.txt
+          curl --fail-with-body -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json https://api.cursor.com/v1/agents > response.json
+          url=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["url"])')
+          gh issue comment "$number" --body "A cloud agent is implementing this issue: ${url}. The workflow opens the pull request, with the Goal-Issue line and the goal label, after the branch has commits. The agent does not open one."
+          python -c 'import json; print(json.load(open("response.json"))["agent"]["id"])' > agent_id.txt
+          python -c 'import json; print(json.load(open("response.json"))["run"]["id"])' > run_id.txt
+      - name: Open the pull request after the agent finishes
+        if: steps.build.outputs.launch == 'true' && steps.launch.outcome == 'success'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash scripts/require_goal_github_token.sh
+          status=$(bash scripts/wait_for_agent_run.sh "$(cat agent_id.txt)" "$(cat run_id.txt)")
+          echo "agent run status: ${status}"
+          before=$(tr -d '\n' < before_sha.txt)
+          base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
+          issue="${{ github.event.issue.number }}"
+          title=$(gh issue view "$issue" --json title --jq .title)
+          if [ -f pr_number.txt ]; then
+            pr_number=$(tr -d '\n' < pr_number.txt)
+            gh pr view "$pr_number" --json number,url,body,labels,headRefName,baseRefName > existing.json
+            python scripts/goal_agent_request.py apply-sync --issue-number "$issue" --title "$title" --existing existing.json --pr-number "$pr_number" --ahead
+            after=$(gh pr view "$pr_number" --json headRefOid --jq .headRefOid)
+            comment_target=$pr_number
+          else
+            branch=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.goal_branch(int(sys.argv[1])))' "$issue")
+            git fetch origin "$base" "$branch"
+            ahead=$(git rev-list --count "origin/${base}..origin/${branch}")
+            gh pr list --head "$branch" --state open --json number,url,body,labels,headRefName,baseRefName > existing.json
+            if [ "$ahead" -eq 0 ]; then
+              python scripts/goal_agent_request.py apply-sync --issue-number "$issue" --title "$title" --existing existing.json --no-ahead
+              after=$before
+              comment_target=
+            else
+              comment_target=$(python scripts/goal_agent_request.py apply-sync --issue-number "$issue" --title "$title" --existing existing.json --ahead)
+              if [ -z "$comment_target" ]; then
+                comment_target=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')
+              fi
+              after=$(git rev-parse "origin/${branch}")
+            fi
+          fi
+          if [ -n "$comment_target" ] && comment=$(python scripts/goal_agent_request.py codex-rereview --status "$status" --before "$before" --after "$after"); then
+            gh pr comment "$comment_target" --body "$comment"
+          fi
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/goal/issue-')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: goal-publish-${{ github.ref_name }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Wait for the rest of this push burst
+        run: sleep 20
+      - name: Sync pull request metadata
+        env:
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="${{ github.ref_name }}"
+          if ! issue=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; number = g.parse_goal_branch(sys.argv[1]); sys.exit(2) if number is None else print(number)' "$branch"); then
+            echo "branch is not goal/issue-<number>"
+            exit 0
+          fi
+          bash scripts/require_goal_github_token.sh
+          base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
+          git fetch origin "$base" "$branch"
+          ahead=$(git rev-list --count "origin/${base}..origin/${branch}")
+          head=$(git rev-parse "origin/${branch}")
+          title=$(gh issue view "$issue" --json title --jq .title)
+          gh pr list --head "$branch" --state open --json number,url,body,labels,headRefName,baseRefName > existing.json
+          changed="--head-changed"
+          number=$(python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; pulls=json.load(open("existing.json")); pr=g.select_open_pr(pulls, int(sys.argv[1])); print("" if pr is None else pr.get("number") or "")' "$issue")
+          if [ -n "$number" ]; then
+            gh api --paginate --slurp "repos/{owner}/{repo}/pulls/${number}/reviews" > reviews.json
+            gh api --paginate --slurp "repos/{owner}/{repo}/issues/${number}/comments" > comments.json
+            python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("review_state.json", "w"))'
+            if [ "$(python scripts/goal_agent_request.py head-already-reviewed --head "$head" --state review_state.json)" = "yes" ]; then
+              changed="--head-accepted"
+            fi
+          fi
+          if [ "$ahead" -eq 0 ]; then
+            python scripts/goal_agent_request.py apply-sync --issue-number "$issue" --title "$title" --existing existing.json --no-ahead $changed
+          else
+            python scripts/goal_agent_request.py apply-sync --issue-number "$issue" --title "$title" --existing existing.json --ahead $changed
+          fi
+
+  codex-clean-complete:
+    if: github.event_name == 'issue_comment' && (github.event.action == 'created' || github.event.action == 'edited') && github.event.issue.pull_request && github.event.comment.user.login == 'chatgpt-codex-connector[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read current pull request state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr view "${{ github.event.issue.number }}" --json number,body,labels,headRefOid > clean_pr.json
+      - name: Record clean Codex review
+        env:
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if python scripts/complete_codex_clean_review.py --dry-run --event "$GITHUB_EVENT_PATH" --pull clean_pr.json; then
+            bash scripts/require_goal_github_token.sh
+            gh pr view "${{ github.event.issue.number }}" --json number,body,labels,headRefOid > clean_pr.json
+            python scripts/complete_codex_clean_review.py --event "$GITHUB_EVENT_PATH" --pull clean_pr.json
+          else
+            code=$?
+            if [ "$code" -eq 2 ]; then
+              exit 0
+            fi
+            exit "$code"
+          fi
+
+  review-launch:
+    if: "github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment' || (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.login == 'chatgpt-codex-connector[bot]' && !(contains(github.event.comment.body, 'Codex Review: Didn''t find any major issues.') && contains(github.event.comment.body, '**Reviewed commit:**')))"
+    runs-on: ubuntu-latest
+    concurrency:
+      group: goal-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    outputs:
+      launch: ${{ steps.build.outputs.launch }}
+      agent_id: ${{ steps.launch.outputs.agent_id }}
+      run_id: ${{ steps.launch.outputs.run_id }}
+      before_sha: ${{ steps.launch.outputs.before_sha }}
+      pr_number: ${{ steps.launch.outputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Wait for the rest of this review
+        run: sleep 20
+      - name: Build Cloud Agent request
+        id: build
+        run: |
+          if python scripts/goal_agent_request.py build --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --out payload.json; then
+            echo "launch=true" >> "$GITHUB_OUTPUT"
+          else
+            code=$?
+            if [ "$code" -eq 2 ]; then
+              echo "launch=false" >> "$GITHUB_OUTPUT"
+            else
+              exit "$code"
+            fi
+          fi
+      - name: Record Codex approval
+        if: steps.build.outputs.launch != 'true'
+        env:
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if python scripts/goal_agent_request.py complete --dry-run --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME"; then
+            bash scripts/require_goal_github_token.sh
+            python scripts/goal_agent_request.py complete --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" && exit 0
+            code=$?
+            if [ "$code" -eq 2 ]; then
+              exit 0
+            fi
+            exit "$code"
+          else
+            code=$?
+            if [ "$code" -eq 2 ]; then
+              exit 0
+            fi
+            exit "$code"
+          fi
+      - name: Launch Cloud Agent
+        id: launch
+        if: steps.build.outputs.launch == 'true'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash scripts/require_goal_github_token.sh
+          number="${{ github.event.pull_request.number || github.event.issue.number }}"
+          if [ -z "${CURSOR_API_KEY}" ]; then
+            gh pr comment "$number" --body "Review findings were not sent to a cloud agent because \`CURSOR_API_KEY\` is not set on this repository."
+            exit 1
+          fi
+          before=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
+          curl --fail-with-body -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json https://api.cursor.com/v1/agents > response.json
+          url=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["url"])')
+          agent_id=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["id"])')
+          run_id=$(python -c 'import json; print(json.load(open("response.json"))["run"]["id"])')
+          gh pr comment "$number" --body "A cloud agent is working through the review findings: ${url}"
+          echo "agent_id=${agent_id}" >> "$GITHUB_OUTPUT"
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "before_sha=${before}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${number}" >> "$GITHUB_OUTPUT"
+
+  request-codex:
+    needs: review-launch
+    if: needs.review-launch.result == 'success' && needs.review-launch.outputs.launch == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ github.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Request a fresh Codex review after new commits
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash scripts/require_goal_github_token.sh
+          number="${{ needs.review-launch.outputs.pr_number }}"
+          status=$(bash scripts/wait_for_agent_run.sh "${{ needs.review-launch.outputs.agent_id }}" "${{ needs.review-launch.outputs.run_id }}")
+          after=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
+          gh pr view "$number" --json reviews > reviews.json
+          if comment=$(python scripts/goal_agent_request.py codex-rereview --status "$status" --before "${{ needs.review-launch.outputs.before_sha }}" --after "$after" --reviews reviews.json); then
+            gh pr comment "$number" --body "$comment"
+          else
+            echo "no fresh Codex review requested (status ${status})"
+          fi
