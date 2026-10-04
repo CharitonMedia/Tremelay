@@ -19,7 +19,7 @@ from pathlib import Path
 from complete_codex_clean_review import is_terminal_clean_review, reviewed_commit
 
 DEFAULT_BASE_REF = "main"
-DEFAULT_REPO_URL = "https://github.com/CharitonMedia/agent-converter-v2"
+DEFAULT_REPO_URL = "https://github.com/CharitonMedia/Tremelay"
 GOAL_LABEL = "goal"
 GOAL_READY_LABEL = "goal-ready"
 GOAL_READY_COLOR = "0E8A16"
@@ -208,10 +208,10 @@ def _implement_prompt(
         f"Title: {title}\n\n"
         f"{body.strip()}\n\n"
         f"{where}"
-        "Implement the whole issue. Run `pytest -q` and fix failures. Commit and push.\n"
+        "Implement the whole issue. Run `go test ./...` and `go vet ./...`; fix failures. Commit and push.\n"
         f"Do not remove the line `{marker}` from the pull request body.\n\n"
         "Do not merge. Do not ask routine implementation questions. Do not request a review. "
-        "Continue until the issue is implemented and `pytest -q` passes. Stop only for missing "
+        "Continue until the issue is implemented and the required Go checks pass. Stop only for missing "
         "credentials, missing authority, or a product or architecture contradiction with AGENTS.md.\n"
     )
 
@@ -227,7 +227,7 @@ def _review_prompt(*, number: int, url: str, event_text: str) -> str:
         "Fix legitimate findings. A finding is legitimate when it identifies a bug, a missing test, "
         "a broken invariant in AGENTS.md, or behavior the issue asked for. Do not chase style nits "
         "that do not change behavior. Do not expand scope.\n\n"
-        "Run `pytest -q` and fix failures caused by your changes. Commit and push to this pull "
+        "Run `go test ./...` and `go vet ./...`; fix failures caused by your changes. Commit and push to this pull "
         "request's branch.\n\n"
         "Do not merge. Do not open a pull request. Do not submit a review. Do not leave inline "
         "review comments. Do not request a Codex review and do not mention @codex. The workflow "
