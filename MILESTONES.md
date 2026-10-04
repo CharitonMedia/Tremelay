@@ -1,0 +1,72 @@
+# Tremelay Milestones
+
+Milestones define outcomes and acceptance criteria, not detailed implementation prescriptions.
+
+## M0 — Repository, specification, and executable skeleton
+
+**Goal:** Establish the public project, security contract, contribution rules, and CI before substantive credential code exists.
+
+Acceptance:
+- vision, architecture, threat model, security invariants, contribution/security policies present
+- minimal executable builds
+- CI builds/tests on Linux, Windows, and macOS
+- race/static/vulnerability checks established where applicable
+- no production credential-handling code yet
+
+## M1 — Encrypted single-user vault
+
+**Goal:** A human can create/unlock a local vault and securely store/retrieve a credential through the human-authorized interface.
+
+Acceptance includes authenticated encryption using mature libraries, ADR-documented unlock design, corruption/wrong-key tests, no plaintext persistence, redaction tests, and credential lifecycle metadata.
+
+## M2 — Agent identity and capability grants
+
+**Goal:** Create an agent principal and issue a revocable, expiring, scoped capability without granting raw-secret read access.
+
+Acceptance includes distinct agent identity, grant creation/revocation/expiry, deny-by-default authorization, capability enumeration without secrets, and audit events.
+
+## M3 — Generic HTTP credential broker
+
+**Goal:** An agent can call a test HTTP service using a stored credential without receiving the credential.
+
+Acceptance includes broker-only credential insertion, constrained destination, secret-free agent surfaces, success/denial audit events, working integration test, and adversarial extraction tests.
+
+## M4 — Policy enforcement and network hardening
+
+**Goal:** Limit credential-backed requests by service, host, method, resource/path, lifecycle, and context.
+
+Acceptance includes redirect defense, SSRF/private-address defense, destination/origin validation, method/path/action policy tests, abuse-control hooks, and suspicious-denial classification.
+
+## M5 — Audit, detection, and notification
+
+**Goal:** Produce complete tamper-evident credential-use history and promptly surface risky behavior.
+
+Acceptance includes every allowed/denied attempt logged, append-oriented integrity verification, no secrets in audit payloads, credential and agent audit views, risk classification, notification interfaces, full-record references in alerts, and optional containment hooks.
+
+## M6 — Credential health and lifecycle
+
+**Goal:** Evaluate credentials at entry/change and continuously track health and rotation state.
+
+Acceptance includes password strength assessment, compromised-password checking without plaintext disclosure, internal reuse detection, credential health states, configurable rotation schedules/reminders, and health-change audit events.
+
+## M7 — GitHub reference integration
+
+**Goal:** Demonstrate a real-world capability model for GitHub without exposing the underlying credential.
+
+## M8 — SSH/signing broker
+
+**Goal:** Allow authorized signing operations while keeping private key material inside Tremelay.
+
+## M9 — Multi-user and shared vaults
+
+**Goal:** Support organizations, ownership, shared vaults, recovery, role separation, and approvals without weakening earlier invariants.
+
+## M10 — Agent SDK / MCP integration
+
+**Goal:** Give agents a first-class interface to discover and invoke capabilities, never generic secret retrieval.
+
+Representative operations: `list_capabilities`, `describe_capability`, `invoke_capability`, and `request_capability`.
+
+## M11 — Hardened v1
+
+**Goal:** Produce a documented, reproducible, security-reviewed v1 suitable for serious self-hosting, including threat-model review, dependency audit, SBOM, signed releases, backup/recovery documentation, migration tests, hardened defaults, and independent security review where practical.
