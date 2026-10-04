@@ -73,6 +73,7 @@ jobs:
         run: gh pr list --state open --limit 100 --json number,url,body,labels,headRefName,baseRefName > open_prs.json
       - name: Build Cloud Agent request
         id: build
+        if: steps.cycle.outputs.allowed == 'true'
         run: |
           if python scripts/goal_agent_request.py build --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --open-prs open_prs.json --out payload.json; then
             echo "launch=true" >> "$GITHUB_OUTPUT"
@@ -102,7 +103,7 @@ jobs:
           fi
       - name: Launch Cloud Agent
         id: launch
-        if: steps.build.outputs.launch == 'true' && steps.ensure.outcome == 'success'
+        if: steps.cycle.outputs.allowed == 'true' && steps.build.outputs.launch == 'true' && steps.ensure.outcome == 'success'
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
@@ -275,7 +276,46 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Enforce three-cycle human-review breaker
+        id: cycle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > cycle_comments.json
+          count=$(python - <<'PY'
+          import json
+          pages=json.load(open("cycle_comments.json", encoding="utf-8"))
+          comments=[c for page in pages for c in page]
+          markers=(
+              "A cloud agent is working through the review findings:",
+              "Cursor remediation round ",
+          )
+          print(sum(any(m in (c.get("body") or "") for m in markers) for c in comments))
+          PY
+          )
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          if [ "$count" -ge 3 ]; then
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
+            marker="<!-- tremelay-three-cycle-stop head:${head} -->"
+            existing=$(python - <<'PY'
+          import json, os
+          pages=json.load(open("cycle_comments.json", encoding="utf-8"))
+          comments=[c for page in pages for c in page]
+          marker=os.environ.get("MARKER","")
+          print("yes" if any(marker in (c.get("body") or "") for c in comments) else "no")
+          PY
+            )
+            if [ "$existing" != "yes" ]; then
+              MARKER="$marker" gh pr comment "$PR_NUMBER" --body "Automation stopped after three implementation/remediation cycles for this pull-request lineage. Human review is required before another Cursor run. Latest head: \`${head}\`. Review the unresolved Codex/CI findings and explicitly resume only after deciding the next approach.\n\n${marker}"
+            fi
+          else
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Wait for the rest of this review
+        if: steps.cycle.outputs.allowed == 'true'
         run: sleep 20
       - name: Build Cloud Agent request
         id: build
@@ -291,7 +331,7 @@ jobs:
             fi
           fi
       - name: Record Codex approval
-        if: steps.build.outputs.launch != 'true'
+        if: steps.cycle.outputs.allowed == 'true' && steps.build.outputs.launch != 'true'
         env:
           GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
