@@ -1,20 +1,39 @@
-# ADR 0003: Hash-chained audit log for human custody operations
+# ADR 0003: Transactional SQLite audit and custody persistence
 
 Status: Accepted
 
 ## Context
 
-Security invariants require every attempted credential operation to be auditable, audit records to exclude secrets, and the audit design to be append-oriented and tamper-evident, with a path to external checkpointing. The initial implementation should hash-chain events. The chain format itself needs an ADR.
+M1 requires encrypted local credential custody plus a tamper-evident audit history for every credential operation. The first implementation attempted to coordinate three related states across two independently bounded files: an encrypted vault document containing a sealed audit suffix, plaintext header fields binding the authenticated audit head, and a separate append-only `.audit` sidecar containing the full chain.
 
-M5 still owns detection, notification, review views, and containment. M1 only records human custody operations that this milestone actually performs: vault creation, unlock success and failure, credential store, credential retrieval, and credential list.
+Three remediation cycles exposed repeated failure windows around sidecar append errors, suffix overlap, file-size ceilings, crash recovery, and reserving space for future unlock events. The implementation was converging on a custom two-file transactional protocol. That complexity is not justified for M1 security infrastructure.
 
 ## Decision
 
-Each vault has an append-only sidecar, `VAULT_PATH.audit`, of JSON lines. A copy of the same chain is stored inside the encrypted vault document. The authenticated tip of that chain is also stored in the plaintext header as `audit_head` and `audit_seq`, and those values are bound into the AES-256-GCM additional data of the credential document (ADR 0002). Changing the header tip makes an honest unlock fail authentication.
+Use a single local SQLite database as Tremelay's M1 persistence boundary.
 
-Hash function: SHA-256 from the Go standard library. No custom hash.
+SQLite is the transactional storage engine, not the cryptographic trust boundary. Credential material remains encrypted with the existing envelope-encryption design from ADR 0002.
 
-The version-1 preimage for event hash `H_n` is:
+The database contains, conceptually:
+
+- vault metadata and KDF parameters;
+- wrapped DEK and encrypted credential document;
+- authenticated audit head and sequence;
+- an append-oriented audit table containing the full hash chain.
+
+The audit chain keeps the existing SHA-256 version-1 preimage and event schema unless a later ADR changes it.
+
+For any credential-state mutation, the encrypted-state update and corresponding audit row MUST commit in one SQLite transaction. Either both become durable or neither does.
+
+A credential read that is required to be audited MUST append its allowed audit event transactionally before returning the secret. If the audit transaction fails, the secret is not returned.
+
+Locked-state authentication denials are the one intentional asymmetry: the process does not possess the DEK after a rejected passphrase, so it may append a `vault_unlock / denied` audit row without updating encrypted credential state. On the next valid unlock, Tremelay MUST verify that every row after the authenticated audit head is a valid hash-linked locked-state denial suffix, then advance the authenticated audit head in the same transaction as the successful unlock event and updated encrypted state.
+
+## Audit hash
+
+Hash function: SHA-256 from the Go standard library.
+
+The version-1 preimage remains:
 
 ```
 H_n = SHA-256(
@@ -29,51 +48,87 @@ H_n = SHA-256(
 )
 ```
 
-`H_0` is 32 zero bytes. Each length prefix is a uint32 big-endian byte count of the UTF-8 field that follows. `seq` starts at 1. `time` is `time.RFC3339Nano` in UTC. The stored record keeps `prev` and `hash` as hex, plus `v` = 1. The hash does not cover JSON punctuation, so encoding whitespace cannot change it.
+`H_0` is 32 zero bytes. Sequence starts at 1. Records contain `prev`, `hash`, and `v = 1`. Audit records MUST NOT contain credential secrets, passphrases, decrypted payloads, authorization headers, or equivalent material.
 
-Actions: `vault_create`, `vault_unlock`, `credential_put`, `credential_get`, `credential_list`. Results: `allowed` or `denied`. The first event must be `vault_create` / `allowed`. Records may contain the credential's stable id and type. They do not contain the secret, the passphrase, or the free-form label. A retrieval probe that is not a 32-character hex id is not copied into the log.
+## SQLite schema direction
 
-While the vault is locked, a failed unwrap appends `vault_unlock` / `denied` to the sidecar only. The next successful unlock accepts a sidecar suffix made only of those denial events, seals that suffix into the encrypted document, and advances the authenticated head. Any other sidecar divergence (broken hash, forged allow, mismatched prefix) fails the unlock closed. If the sidecar is missing, or is a strict prefix of the sealed chain, unlock restores the missing suffix from the encrypted copy. That restore is crash recovery, not a routine rewrite.
+The exact schema may evolve, but M1 needs at least:
 
-`tremelay audit verify` checks that the sidecar is a valid chain, that it contains the header's authenticated head, and that any newer suffix is only unlock denials. It prints the sidecar tip. That tip is the external checkpoint value. Offline verify does not have the passphrase, so an attacker who rewrites both the header tip and the sidecar can fool offline verify; unlock still fails GCM because the tip is inside the additional data.
+```
+vault
+  id
+  format_version
+  kdf metadata
+  wrapped_dek
+  encrypted_document
+  data_nonce
+  audit_head
+  audit_seq
 
-Every accepted save must leave room for the next `vault_unlock` event inside `maxVaultFile` (32 MiB, the same cap `readLimited` enforces). The check is the encoded size of the credential document plus two maximum-width unlock events, so the unlock that consumes one event still leaves room for the unlock after it. The sidecar uses the same cap. A save is refused when the new sidecar bytes would not leave room for one maximum-width `vault_unlock` line, and that unlock line itself is refused when it would pass the cap. Failed unlocks are held to the same reserve so a burst of denials cannot fill the last line. When the full sealed chain would exceed the vault-file room, the encrypted document stores a hash-linked suffix and omits a prefix that the sidecar already has. The header head remains the chain tip. The sidecar is not trimmed. If that sidecar is later missing, unlock fails closed instead of restoring a chain that no longer starts at `vault_create`. A sidecar that still overlaps the sealed suffix is stitched back together on unlock.
+audit
+  seq
+  time
+  action
+  vault_id
+  credential_id
+  credential_type
+  result
+  prev_hash
+  hash
+```
 
-Each sidecar append replaces the file with a complete prefix plus the new line. A crash during that replacement leaves the previous file, or its `.bak` if the process dies between the two renames. A trailing partial line, which an older in-place append can leave, is not part of the chain and is omitted on the next successful append. A complete line that does not decode or hash is not dropped.
+SQLite should use durable transactional settings appropriate for a local security store. Schema details and driver choice must use a mature, actively maintained implementation and must not weaken portability tests.
 
-Ceiling: denial events that are not yet sealed can be removed by someone who can edit the sidecar before the next successful unlock. Modification of sealed history cannot. The upgrade path is an off-host checkpoint of the tip printed by `audit verify`, which M5 can automate. Single-writer, same as the vault file.
+## Verification semantics
 
-A credential read that cannot append its audit event returns an error and does not return the secret.
+`tremelay audit verify` iterates the authoritative audit rows in sequence, validates the version-1 hash chain, and confirms that the authenticated vault head exists in the chain. Rows after that head are accepted only when they are valid locked-state denial events permitted by this ADR.
 
-## Alternatives considered
+The audit tip remains suitable for later external checkpointing.
 
-- **Defer all audit to M5.** Conflicts with the invariant that the operations introduced here are auditable and tamper-evident.
-- **HMAC the chain with a key stored in the vault file.** A key sitting next to the log can forge events. The GCM-bound head is the authenticator we already have.
-- **Hash the JSON line.** Fragile under encoding changes. The length-prefixed preimage is the canonical form.
+## Removed design
+
+M1 no longer uses:
+
+- a separate `VAULT_PATH.audit` sidecar;
+- duplication of the audit chain or a suffix inside the encrypted document;
+- sealed-prefix dropping;
+- overlap reconciliation between sidecar and encrypted suffix;
+- file-size reservation for one or two future unlock events;
+- custom recovery for partial sidecar writes.
+
+These mechanisms should be deleted rather than preserved as dormant compatibility code because M1 has not shipped a stable storage format.
 
 ## Security implications
 
-- Audit files are mode `0600` on systems that honor it, same as the vault.
-- Failed unlocks of a healthy vault produce a denial event. The event has no passphrase material.
-- Sealed history is tamper-evident against an editor who does not know the passphrase.
-- Unsealed denial suffixes are tamper-evident only against editors who cannot rewrite the sidecar. Operators who need that detection checkpoint the printed tip outside the host.
-- Audit failure on an otherwise authorized read denies the secret.
+- SQLite transactions provide the atomic durability boundary for credential-state mutations plus their audit events.
+- SQLite does not replace encryption. Credential plaintext remains protected by the existing DEK/KEK design.
+- The authenticated audit head remains bound into encrypted-state authentication so unauthorized history rewrites are detected on unlock.
+- Locked-state denial suffixes remain distinguishable from authenticated state changes and are incorporated only after verification.
+- M5 may add off-host checkpoints, SIEM export, signed checkpoints, retention, or archival without changing the M1 transaction invariant.
+
+## Alternatives considered
+
+- **Continue hardening the two-file protocol.** Rejected after three remediation cycles showed recurring consistency and capacity edge cases. This would amount to building a custom transactional storage layer.
+- **Defer audit to M5.** Rejected because current security invariants require credential operations to be auditable now.
+- **Store plaintext credentials in SQLite.** Rejected. SQLite is persistence, not secrecy.
+- **Keep the sidecar only for audit while putting credentials in SQLite.** Rejected because it recreates the atomicity problem between authoritative credential state and audit state.
 
 ## Consequences
 
-- M5 may add event types only by extending this format under a new ADR. Version-1 preimages stay verifiable.
-- The encrypted document grows with the chain until it must reserve room for the next unlock. After that it keeps a suffix. The sidecar stays a full genesis chain until it reaches the same read cap. A later store can split the log without changing the preimage. Losing the sidecar after a suffix drop cannot be repaired from the encrypted copy.
-- `audit verify` is safe to run without the passphrase because the sidecar contains no secrets.
+- M1 storage format changes before release; no migration compatibility is required yet.
+- Existing M1 code for crypto, credential models, redaction, audit hashing, CLI behavior, and most tests should be retained where sensible.
+- Dual-file synchronization and suffix-recovery code should be removed, reducing bespoke failure-handling logic.
+- Future clustering or remote storage remains outside M1.
 
-## Tests
+## Required tests
 
-- Known SHA-256 vector for the version-1 preimage.
-- Bit flip in the sidecar fails verification.
-- A forged allowed event after the sealed head fails unlock and does not return a secret.
-- A locked-vault denial is present after the next successful unlock and is then covered by the sealed head.
-- A missing sidecar is restored from the sealed chain when that chain still starts at `vault_create`.
-- A sealed suffix matches the sidecar, a sidecar that ends inside that suffix is restored, and a gap or a missing sidecar after a drop fails closed.
-- A vault held at the read limit still records the next unlock, and a put that would consume that reserve does not replace the file.
-- A sidecar append that would pass the read cap is refused, the previous sidecar stays readable, and the reserved unlock still fits.
-- A trailing partial sidecar line is ignored and replaced on the next append. A complete bad line is not stripped.
-- Secret and passphrase bytes are absent from the sidecar.
+- credential mutation and audit event commit atomically;
+- induced transaction failure leaves neither mutation nor allowed audit event durable;
+- audited credential read does not return a secret when its audit transaction fails;
+- wrong passphrase appends a secret-free denial event;
+- valid unlock verifies and incorporates an outstanding denial suffix;
+- forged or non-denial rows after the authenticated head fail unlock;
+- hash-chain tampering fails verification;
+- secret and passphrase bytes are absent from audit rows and ordinary error/log output;
+- database corruption produces a safe failure;
+- Windows and Linux CI remain green.
