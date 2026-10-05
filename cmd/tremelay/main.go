@@ -135,8 +135,8 @@ func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(stdout, cred.ID)
-		return nil
+		_, err = fmt.Fprintln(stdout, cred.ID)
+		return err
 	})
 }
 

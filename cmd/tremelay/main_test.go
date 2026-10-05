@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,6 +126,52 @@ func TestCLIRejectsAgentAndPassphraseArguments(t *testing.T) {
 		t.Fatal("stderr echoed secret argument")
 	}
 }
+
+func TestCLIPutReportsStdoutWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	secret := randBytes(t, 32)
+	secretPath := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"TREMELAY_PASSPHRASE": pass}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"vault", "create", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("create %d %s", code, stderr.String())
+	}
+
+	writeErr := errors.New("stdout write failed")
+	stderr.Reset()
+	if code := run([]string{"credential", "put", "--path", path, "--label", "ci", "--type", "api_key", "--secret-file", secretPath}, envGet(env), strings.NewReader(""), errWriter{writeErr}, &stderr); code == 0 {
+		t.Fatal("put returned success after stdout write failure")
+	}
+	if !strings.Contains(stderr.String(), writeErr.Error()) {
+		t.Fatalf("stderr missing write failure: %s", stderr.String())
+	}
+	assertNoSecret(t, &stderr, secret, pass)
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "list", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("list %d %s", code, stderr.String())
+	}
+	var listed map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed["label"] != "ci" || listed["id"] == "" {
+		t.Fatalf("committed credential missing after stdout write failure: %#v", listed)
+	}
+	assertNoSecret(t, &stdout, secret, pass)
+	assertNoSecret(t, &stderr, secret, pass)
+}
+
+type errWriter struct{ err error }
+
+func (w errWriter) Write([]byte) (int, error) { return 0, w.err }
 
 func envGet(m map[string]string) func(string) string {
 	return func(k string) string {
