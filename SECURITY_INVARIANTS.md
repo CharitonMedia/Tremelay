@@ -28,6 +28,12 @@ Audit records may identify credentials by stable internal identifier and human-r
 
 The audit design MUST be append-oriented and tamper-evident. The initial implementation SHOULD hash-chain events. Designs MUST permit external or independent checkpointing.
 
+## 6A. Transactional audit/state durability
+
+Any credential-state mutation and its corresponding audit event MUST become durable atomically. A crash or storage error may leave the operation entirely unapplied, but MUST NOT leave credential state and the authoritative audit history disagreeing about whether the operation occurred.
+
+Locked-state authentication denials that cannot update encrypted credential state MAY append independently, but the next successful unlock MUST validate and incorporate that suffix before advancing the authenticated audit head.
+
 ## 7. Detection and notification
 
 Tremelay MUST distinguish ordinary denials from suspicious behavior. High-risk events MUST be capable of notifying the responsible owner promptly and referencing the complete audit record. Automated containment must be configurable.
