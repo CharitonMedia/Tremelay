@@ -288,11 +288,16 @@ jobs:
           import json
           pages=json.load(open("cycle_comments.json", encoding="utf-8"))
           comments=[c for page in pages for c in page]
+          resume="<!-- tremelay-human-resume -->"
+          start=0
+          for i,c in enumerate(comments):
+              if (c.get("user") or {}).get("login","").casefold()=="pattalkslaw-del" and resume in (c.get("body") or ""):
+                  start=i+1
           markers=(
               "A cloud agent is working through the review findings:",
               "Cursor remediation round ",
           )
-          print(sum(any(m in (c.get("body") or "") for m in markers) for c in comments))
+          print(sum(any(m in (c.get("body") or "") for m in markers) for c in comments[start:]))
           PY
           )
           echo "count=${count}" >> "$GITHUB_OUTPUT"
