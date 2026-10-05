@@ -378,12 +378,22 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 		},
 	}
 	next := append(append([]credential{}, s.creds...), rec)
-	s.redactor.Add(secret)
 	ev, err := nextEvent(s.audit, actionPut, s.id, id, typ, resultAllowed)
 	if err != nil {
 		wipe(rec.Secret)
 		return Credential{}, err
 	}
+	// Exact equality with a plaintext audit field would persist the secret.
+	// Credential ids already in the chain, and credential types the chain can
+	// emit, are included. ponytail: a denial still writes fixed tokens
+	// (action, result, vault id); a secret equal to one of those is not copied
+	// into credential fields, but the token remains. Upgrade path: encrypt
+	// audit metadata.
+	if secretDisclosedByAudit(secret, s.audit, ev) {
+		wipe(rec.Secret)
+		return s.denyPut(ErrInvalid)
+	}
+	s.redactor.Add(secret)
 	if err := s.commit(ev, next); err != nil {
 		wipe(rec.Secret)
 		return Credential{}, err
@@ -640,6 +650,37 @@ func validateSecret(s []byte) error {
 		return ErrInvalid
 	}
 	return nil
+}
+
+// secretDisclosedByAudit reports whether secret is exactly a plaintext audit
+// value already stored, about to be stored, or reserved for credential_type.
+func secretDisclosedByAudit(secret []byte, prior []auditEvent, pending auditEvent) bool {
+	if len(secret) == 0 {
+		return false
+	}
+	for _, typ := range CredentialTypes {
+		if bytes.Equal(secret, []byte(typ)) {
+			return true
+		}
+	}
+	if eventDiscloses(pending, secret) {
+		return true
+	}
+	for i := range prior {
+		if eventDiscloses(prior[i], secret) {
+			return true
+		}
+	}
+	return false
+}
+
+func eventDiscloses(ev auditEvent, secret []byte) bool {
+	for _, field := range []string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Time, ev.Prev, ev.Hash} {
+		if field != "" && bytes.Equal(secret, []byte(field)) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateLabel(label string) error {
