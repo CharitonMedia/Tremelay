@@ -18,6 +18,7 @@ from typing import Any
 CODEX_LOGINS = frozenset({"codex", "chatgpt-codex-connector[bot]"})
 LOOP_LABEL = "codex-cursor-loop"
 MARKER_PREFIX = "<!-- codex-cursor-remediation "
+HUMAN_RESUME_MARKER = "<!-- tremelay-human-resume -->"
 MARKER_RE = re.compile(
     r"<!-- codex-cursor-remediation review:(?P<review_id>[0-9]+) "
     r"head:(?P<head>[0-9a-fA-F]{40}) -->"
@@ -112,9 +113,16 @@ def _round_markers(
     trusted_login: str,
 ) -> list[str]:
     trusted = trusted_login.casefold()
+    start = 0
+    for i, comment in enumerate(issue_comments):
+        if _actor_login(comment).casefold() != trusted:
+            continue
+        body = comment.get("body")
+        if isinstance(body, str) and HUMAN_RESUME_MARKER in body:
+            start = i + 1
     found: list[str] = []
     seen: set[str] = set()
-    for comment in issue_comments:
+    for comment in issue_comments[start:]:
         if _actor_login(comment).casefold() != trusted:
             continue
         body = comment.get("body")
