@@ -86,7 +86,10 @@ func cmdVault(args []string, getenv func(string) string, stdin io.Reader, stdout
 		return 1
 	}
 	defer session.Lock()
-	fmt.Fprintln(stdout, "vault created")
+	if _, err := fmt.Fprintln(stdout, "vault created"); err != nil {
+		fmt.Fprintln(stderr, red.Redact(err.Error()))
+		return 1
+	}
 	return 0
 }
 

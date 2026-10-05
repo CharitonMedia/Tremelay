@@ -127,6 +127,37 @@ func TestCLIRejectsAgentAndPassphraseArguments(t *testing.T) {
 	}
 }
 
+func TestCLICreateReportsStdoutWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	env := map[string]string{"TREMELAY_PASSPHRASE": pass}
+
+	writeErr := errors.New("stdout write failed")
+	var stderr bytes.Buffer
+	if code := run([]string{"vault", "create", "--path", path}, envGet(env), strings.NewReader(""), errWriter{writeErr}, &stderr); code == 0 {
+		t.Fatal("create returned success after stdout write failure")
+	}
+	if !strings.Contains(stderr.String(), writeErr.Error()) {
+		t.Fatalf("stderr missing write failure: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), pass) {
+		t.Fatal("stderr echoed passphrase")
+	}
+
+	var stdout bytes.Buffer
+	stderr.Reset()
+	if code := run([]string{"audit", "verify", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("verify %d %s", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) == "" {
+		t.Fatal("vault missing after a failed create confirmation")
+	}
+	if strings.Contains(stderr.String(), pass) {
+		t.Fatal("stderr echoed passphrase")
+	}
+}
+
 func TestCLIPutReportsStdoutWriteFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vault.db")
