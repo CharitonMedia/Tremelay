@@ -18,7 +18,7 @@ tremelay credential list --path vault.db
 tremelay audit verify --path vault.db
 ```
 
-The path is one local SQLite database. Credential bytes are encrypted; the file does not store plaintext secrets. The passphrase comes from `TREMELAY_PASSPHRASE` or a no-echo terminal prompt. It is not a command-line argument. `credential get` writes the raw secret to stdout.
+The path is one local SQLite database. Credential bytes are encrypted; the file does not store plaintext secrets. The passphrase comes from `TREMELAY_PASSPHRASE` or a no-echo terminal prompt. It is not a command-line argument. `audit verify` uses that passphrase to authenticate the sealed audit head. `credential get` writes the raw secret to stdout.
 
 ## Core goals
 

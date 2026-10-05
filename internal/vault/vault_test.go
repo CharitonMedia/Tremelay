@@ -91,8 +91,11 @@ func TestRoundTripLifecycleAndNoPlaintext(t *testing.T) {
 		t.Fatal(err)
 	}
 	dek := append([]byte(nil), opened.dek...)
-	head, err := VerifyAudit(path)
-	if err != nil || head == "" {
+	head, err := VerifyAudit(path, pass)
+	if err != nil || head == "" || head != opened.header.AuditHead {
+		t.Fatal(err)
+	}
+	if _, err := VerifyAudit(path, []byte("wrong-passphrase")); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatal(err)
 	}
 	opened.Lock()
@@ -458,7 +461,7 @@ func TestForgedAuditBlocksUnlock(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if _, err := VerifyAudit(path); !errors.Is(err, ErrAudit) {
+	if _, err := VerifyAudit(path, pass); !errors.Is(err, ErrAudit) {
 		t.Fatal(err)
 	}
 	_, err = Unlock(path, pass, nil)
@@ -482,7 +485,7 @@ func TestTamperedAuditHashFailsVerify(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if _, err := VerifyAudit(path); !errors.Is(err, ErrAudit) {
+	if _, err := VerifyAudit(path, pass); !errors.Is(err, ErrAudit) {
 		t.Fatal(err)
 	}
 	_, err := Unlock(path, pass, nil)
@@ -492,6 +495,89 @@ func TestTamperedAuditHashFailsVerify(t *testing.T) {
 	if bytes.Contains([]byte(err.Error()), secret) || strings.Contains(err.Error(), string(pass)) {
 		t.Fatal("tamper error contains secret material")
 	}
+}
+
+func TestRewrittenAuditHeadFailsVerify(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 24)
+	if _, err := session.Put("label", "generic", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	mutateDB(t, path, func(db *sql.DB) {
+		events, err := readAuditRows(db)
+		if err != nil || len(events) < 2 {
+			t.Fatal(err)
+		}
+		kept := events[len(events)-2]
+		if _, err := db.Exec(`DELETE FROM audit WHERE seq=?`, int64(events[len(events)-1].Seq)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE vault SET audit_head=?, audit_seq=?`, kept.Hash, int64(kept.Seq)); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if _, err := VerifyAudit(path, pass); !errors.Is(err, ErrAudit) {
+		t.Fatal(err)
+	}
+	_, err := Unlock(path, pass, nil)
+	if err == nil {
+		t.Fatal("rewritten head unlocked")
+	}
+	if bytes.Contains([]byte(err.Error()), secret) || strings.Contains(err.Error(), string(pass)) {
+		t.Fatal("error contains secret material")
+	}
+}
+
+func TestNoncanonicalDenialSuffixRejected(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 24)
+	if _, err := session.Put("label", "generic", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	head := session.header.AuditHead
+	seq := session.header.AuditSeq
+	session.Lock()
+	mutateDB(t, path, func(db *sql.DB) {
+		events, err := readAuditRows(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		forged, err := nextEvent(events, actionUnlock, events[0].VaultID, strings.Repeat("ab", 16), "api_key", resultDenied)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := insertAudit(tx, forged); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if _, err := VerifyAudit(path, pass); !errors.Is(err, ErrAudit) {
+		t.Fatal(err)
+	}
+	_, err := Unlock(path, pass, nil)
+	if !errors.Is(err, ErrAudit) {
+		t.Fatal(err)
+	}
+	if bytes.Contains([]byte(err.Error()), secret) || strings.Contains(err.Error(), string(pass)) {
+		t.Fatal("error contains secret material")
+	}
+	mutateDB(t, path, func(db *sql.DB) {
+		h, err := readVaultRow(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.AuditHead != head || h.AuditSeq != seq {
+			t.Fatalf("head advanced to %s seq %d", h.AuditHead, h.AuditSeq)
+		}
+	})
 }
 
 func TestCorruptDatabase(t *testing.T) {
@@ -678,6 +764,9 @@ func TestOutOfRangePassphraseUnlockIsAudited(t *testing.T) {
 	}
 	if denied != 2 {
 		t.Fatalf("denied unlocks %d", denied)
+	}
+	if _, err := VerifyAudit(path, pass); err != nil {
+		t.Fatal(err)
 	}
 	opened, err := Unlock(path, pass, logger)
 	if err != nil {

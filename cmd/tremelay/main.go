@@ -33,7 +33,7 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 	case "credential":
 		return cmdCredential(args[1:], getenv, stdin, stdout, stderr)
 	case "audit":
-		return cmdAudit(args[1:], stdout, stderr)
+		return cmdAudit(args[1:], getenv, stdin, stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, "unknown command")
 		return 2
@@ -214,7 +214,7 @@ type listEntry struct {
 	RotationDueAt *time.Time `json:"rotation_due_at,omitempty"`
 }
 
-func cmdAudit(args []string, stdout, stderr io.Writer) int {
+func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] != "verify" {
 		usage(stderr)
 		return 2
@@ -229,9 +229,17 @@ func cmdAudit(args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
-	head, err := vault.VerifyAudit(*path)
+	red := &vault.Redactor{}
+	pass, err := readPassphrase(getenv, stdin, stderr)
 	if err != nil {
-		fmt.Fprintln(stderr, err.Error())
+		fmt.Fprintln(stderr, red.Redact(err.Error()))
+		return 1
+	}
+	defer vault.Wipe(pass)
+	red.Add(pass)
+	head, err := vault.VerifyAudit(*path, pass)
+	if err != nil {
+		fmt.Fprintln(stderr, red.Redact(err.Error()))
 		return 1
 	}
 	fmt.Fprintln(stdout, head)

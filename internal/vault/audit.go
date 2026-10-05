@@ -34,15 +34,34 @@ type auditEvent struct {
 	Hash     string `json:"hash"`
 }
 
-// VerifyAudit checks the hash chain and the authenticated head.
-// Rows after the head are accepted only when they are locked-state unlock denials.
-// The returned hash is the chain tip, for a later external checkpoint.
-func VerifyAudit(vaultPath string) (string, error) {
-	db, _, events, err := loadVault(vaultPath)
+// VerifyAudit checks the hash chain, then authenticates the encrypted
+// document under the plaintext audit head. That head is associated data
+// on the credential ciphertext, so rewriting it to match a truncated chain
+// fails here. The passphrase unwraps the DEK for that check and is not
+// retained. Rows after the head are accepted only when they are canonical
+// locked-state unlock denials. The returned hash is the chain tip, for a
+// later external checkpoint. This read does not append an audit event.
+func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
+	db, header, events, err := loadVault(vaultPath)
 	if err != nil {
 		return "", err
 	}
 	defer db.Close()
+	if err := validatePassphrase(passphrase); err != nil {
+		return "", err
+	}
+	kek := deriveKEK(passphrase, header.KDF)
+	defer wipe(kek)
+	dek, err := openAEAD(kek, header.WrapNonce, header.WrappedDEK, dekAAD(header.ID))
+	if err != nil {
+		return "", ErrUnauthenticated
+	}
+	defer wipe(dek)
+	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
+	if err != nil {
+		return "", ErrAudit
+	}
+	wipe(plain)
 	return events[len(events)-1].Hash, nil
 }
 
@@ -162,7 +181,9 @@ func suffixAllows(events []auditEvent, header fileHeader) error {
 		return ErrAudit
 	}
 	for _, ev := range events[idx+1:] {
-		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != header.ID {
+		// appendDenial leaves credential fields empty. A hash-linked row
+		// with any other metadata is a forged suffix and must not be incorporated.
+		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != header.ID || ev.CredID != "" || ev.CredType != "" {
 			return ErrAudit
 		}
 	}

@@ -70,6 +70,17 @@ func TestCLICreatePutGetListAndRedaction(t *testing.T) {
 	if strings.TrimSpace(stdout.String()) == "" {
 		t.Fatal("missing audit head")
 	}
+	wrongVerify := map[string]string{"TREMELAY_PASSPHRASE": randHex(t, 16)}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"audit", "verify", "--path", path}, envGet(wrongVerify), strings.NewReader(""), &stdout, &stderr); code == 0 {
+		t.Fatal("verify accepted a wrong passphrase")
+	}
+	if stdout.Len() != 0 {
+		t.Fatal("failed verify wrote a head")
+	}
+	assertNoSecret(t, &stderr, secret, pass)
+	assertNoSecret(t, &stderr, []byte(wrongVerify["TREMELAY_PASSPHRASE"]), pass)
 	wrong := map[string]string{"TREMELAY_PASSPHRASE": randHex(t, 16)}
 	stdout.Reset()
 	stderr.Reset()

@@ -59,6 +59,20 @@ func TestSuffixAllowsDenialOnly(t *testing.T) {
 	if err := suffixAllows([]auditEvent{create, forged}, header); !errors.Is(err, ErrAudit) {
 		t.Fatalf("forged allow: %v", err)
 	}
+	tagged, err := nextEvent([]auditEvent{create}, actionUnlock, id, strings.Repeat("cd", 16), "bearer_token", resultDenied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := suffixAllows([]auditEvent{create, tagged}, header); !errors.Is(err, ErrAudit) {
+		t.Fatalf("tagged denial: %v", err)
+	}
+	idOnly, err := nextEvent([]auditEvent{create}, actionUnlock, id, strings.Repeat("ef", 16), "", resultDenied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := suffixAllows([]auditEvent{create, idOnly}, header); !errors.Is(err, ErrAudit) {
+		t.Fatalf("id-only denial: %v", err)
+	}
 }
 
 func TestRedactorHidesSecretAndPassphrase(t *testing.T) {
