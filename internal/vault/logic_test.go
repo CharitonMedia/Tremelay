@@ -144,6 +144,47 @@ func TestShortPassphraseRejected(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsPassphraseInAuditPlaintext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vault.db")
+	for _, pass := range []string{"vault_create", "vault_unlock", "password", "credential"} {
+		_, err := Create(path, []byte(pass), nil)
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s: %v", pass, err)
+		}
+		if strings.Contains(err.Error(), pass) {
+			t.Fatalf("%s echoed passphrase", pass)
+		}
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("%s left a vault file", pass)
+		}
+	}
+}
+
+func TestAuditPlaintextContainment(t *testing.T) {
+	ev := auditEvent{
+		Action:  actionCreate,
+		Result:  resultAllowed,
+		VaultID: "0123456789abcdef0123456789abcdef",
+		Time:    "2026-10-05T18:22:10Z",
+		Hash:    strings.Repeat("ab", 32),
+	}
+	for _, secret := range []string{"allow", "api", "01234567", "2026-10-", "vault_create"} {
+		if !secretDisclosedByAudit([]byte(secret), nil, ev) {
+			t.Fatalf("accepted %q", secret)
+		}
+	}
+	prior := auditEvent{CredID: "abcdef0123456789abcdef0123456789", CredType: "generic", Action: actionPut, Result: resultAllowed}
+	if !secretDisclosedByAudit([]byte("abcdef01"), []auditEvent{prior}, ev) {
+		t.Fatal("accepted prior id prefix")
+	}
+	if secretDisclosedByAudit(nil, nil, ev) {
+		t.Fatal("empty secret")
+	}
+	if secretDisclosedByAudit([]byte("qqqqqqqq"), nil, ev) {
+		t.Fatal("rejected unrelated secret")
+	}
+}
+
 func TestTruncatedVaultRejected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vault.db")
 	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {

@@ -176,6 +176,11 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	if err := validatePassphrase(passphrase); err != nil {
 		return nil, err
 	}
+	// Fixed audit tokens are written in the clear. Reject before KDF or file
+	// creation so the passphrase is never persisted as one of them.
+	if auditTokenContains(passphrase) {
+		return nil, ErrInvalid
+	}
 	if path == "" {
 		return nil, ErrInvalid
 	}
@@ -383,12 +388,11 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 		wipe(rec.Secret)
 		return Credential{}, err
 	}
-	// Exact equality with a plaintext audit field would persist the secret.
-	// Credential ids already in the chain, and credential types the chain can
-	// emit, are included. ponytail: a denial still writes fixed tokens
-	// (action, result, vault id); a secret equal to one of those is not copied
-	// into credential fields, but the token remains. Upgrade path: encrypt
-	// audit metadata.
+	// A secret contained in a plaintext audit field is the raw secret.
+	// Fixed action, result, and type tokens count even when this event does
+	// not use them. ponytail: the denial still writes those tokens, so the
+	// bytes remain; the secret is refused instead of copied into credential
+	// fields. Upgrade path: encrypt audit metadata.
 	if secretDisclosedByAudit(secret, s.audit, ev) {
 		wipe(rec.Secret)
 		return s.denyPut(ErrInvalid)
@@ -495,6 +499,11 @@ func (s *Session) persistEvent(action, credID, credType, result string) error {
 func (s *Session) commit(ev auditEvent, creds []credential) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
+	}
+	// Passphrases and secrets already accepted must not show up in a later
+	// row (credential id, timestamp, hash). Fail before the write.
+	if s.knownSecretInEvent(ev) {
+		return ErrInvalid
 	}
 	plain, err := json.Marshal(document{Credentials: creds})
 	if err != nil {
@@ -652,18 +661,14 @@ func validateSecret(s []byte) error {
 	return nil
 }
 
-// secretDisclosedByAudit reports whether secret is exactly a plaintext audit
-// value already stored, about to be stored, or reserved for credential_type.
+// secretDisclosedByAudit reports whether secret is contained in a plaintext
+// audit value already stored, about to be stored, or reserved as an action,
+// result, or credential type.
 func secretDisclosedByAudit(secret []byte, prior []auditEvent, pending auditEvent) bool {
 	if len(secret) == 0 {
 		return false
 	}
-	for _, typ := range CredentialTypes {
-		if bytes.Equal(secret, []byte(typ)) {
-			return true
-		}
-	}
-	if eventDiscloses(pending, secret) {
+	if auditTokenContains(secret) || eventDiscloses(pending, secret) {
 		return true
 	}
 	for i := range prior {
@@ -674,9 +679,45 @@ func secretDisclosedByAudit(secret []byte, prior []auditEvent, pending auditEven
 	return false
 }
 
+func auditTokenContains(secret []byte) bool {
+	if len(secret) == 0 {
+		return false
+	}
+	tokens := [...]string{
+		actionCreate, actionUnlock, actionPut, actionGet, actionList,
+		resultAllowed, resultDenied,
+	}
+	for _, tok := range tokens {
+		if bytes.Contains([]byte(tok), secret) {
+			return true
+		}
+	}
+	for _, typ := range CredentialTypes {
+		if bytes.Contains([]byte(typ), secret) {
+			return true
+		}
+	}
+	return false
+}
+
 func eventDiscloses(ev auditEvent, secret []byte) bool {
+	if len(secret) == 0 {
+		return false
+	}
 	for _, field := range []string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Time, ev.Prev, ev.Hash} {
-		if field != "" && bytes.Equal(secret, []byte(field)) {
+		if field != "" && bytes.Contains([]byte(field), secret) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Session) knownSecretInEvent(ev auditEvent) bool {
+	if s == nil || s.redactor == nil {
+		return false
+	}
+	for _, secret := range s.redactor.secrets {
+		if eventDiscloses(ev, secret) {
 			return true
 		}
 	}

@@ -676,7 +676,11 @@ func TestPutRejectsSecretEqualToAuditPlaintext(t *testing.T) {
 		secret     []byte
 	}{
 		{label: "id-secret", typ: "generic", secret: []byte(stored.ID)},
+		{label: "id-prefix", typ: "generic", secret: []byte(stored.ID[:8])},
 		{label: "type-secret", typ: "api_key", secret: []byte("api_key")},
+		{label: "api-substring", typ: "api_key", secret: []byte("api")},
+		{label: "api-generic", typ: "generic", secret: []byte("api")},
+		{label: "allow-substring", typ: "generic", secret: []byte("allow")},
 		{label: "vault-secret", typ: "generic", secret: []byte(session.id)},
 	}
 	for _, bad := range collisions {
@@ -694,7 +698,10 @@ func TestPutRejectsSecretEqualToAuditPlaintext(t *testing.T) {
 	if denied != len(collisions) {
 		t.Fatalf("denied puts %d", denied)
 	}
-	if len(session.creds) != 1 {
+	if _, err := session.Put("ok-short", "generic", []byte("qqqqqqqq"), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(session.creds) != 2 {
 		t.Fatalf("stored %d credentials", len(session.creds))
 	}
 	if bytes.Contains(logs.Bytes(), []byte("api_key")) {
@@ -704,10 +711,14 @@ func TestPutRejectsSecretEqualToAuditPlaintext(t *testing.T) {
 	raw := readAll(t, path)
 	assertAbsent(t, raw, secret)
 	assertAbsent(t, raw, []byte(pass))
+	assertAbsent(t, raw, []byte("qqqqqqqq"))
 	events := mustAudit(t, path)
 	for _, ev := range events {
 		if ev.CredType == "api_key" || ev.CredID == "api_key" {
 			t.Fatal("audit stored the rejected type secret")
+		}
+		if strings.Contains(ev.CredID, "api") || strings.Contains(ev.CredType, "api") || strings.Contains(ev.Action, "api") {
+			t.Fatal("audit field contains rejected substring secret")
 		}
 	}
 	opened, err := Unlock(path, pass, nil)
@@ -715,7 +726,7 @@ func TestPutRejectsSecretEqualToAuditPlaintext(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer opened.Lock()
-	if len(opened.creds) != 1 {
+	if len(opened.creds) != 2 {
 		t.Fatalf("durable credentials %d", len(opened.creds))
 	}
 	got, err := opened.Get(stored.ID)
@@ -736,6 +747,10 @@ func TestPutRejectsSecretEqualToAuditPlaintext(t *testing.T) {
 	}
 	if sealed != len(collisions) {
 		t.Fatalf("durable denials %d", sealed)
+	}
+	opened.redactor.Add([]byte(opened.id))
+	if _, err := opened.List(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("list persisted a known secret: %v", err)
 	}
 }
 
