@@ -74,7 +74,6 @@ jobs:
         run: gh pr list --state open --limit 100 --json number,url,body,labels,headRefName,baseRefName > open_prs.json
       - name: Build Cloud Agent request
         id: build
-        if: steps.cycle.outputs.allowed == 'true'
         run: |
           if python scripts/goal_agent_request.py build --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --open-prs open_prs.json --out payload.json; then
             echo "launch=true" >> "$GITHUB_OUTPUT"
@@ -104,7 +103,7 @@ jobs:
           fi
       - name: Launch Cloud Agent
         id: launch
-        if: steps.cycle.outputs.allowed == 'true' && steps.build.outputs.launch == 'true' && steps.ensure.outcome == 'success'
+        if: steps.build.outputs.launch == 'true' && steps.ensure.outcome == 'success'
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
