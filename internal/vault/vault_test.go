@@ -298,6 +298,205 @@ func TestLogRedactsLabelContainingSecret(t *testing.T) {
 	}
 }
 
+func TestPutRejectsGrowthPastReadLimit(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	before := readAll(t, path)
+	old := maxVaultFile
+	defer func() { maxVaultFile = old }()
+	maxVaultFile = int64(len(before))
+
+	secret := randBytesT(t, 64)
+	if _, err := session.Put("label", "generic", secret, PutOptions{}); !errors.Is(err, ErrInvalid) {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readAll(t, path), before) {
+		t.Fatal("rejected put replaced the vault file")
+	}
+	assertAbsent(t, before, secret)
+
+	maxVaultFile = old
+	session.Lock()
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	listed, err := opened.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("count %d", len(listed))
+	}
+}
+
+func TestSidecarGapRepairedBeforeNextAppend(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	if _, err := session.Put("a", "generic", randBytesT(t, 16), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	side, exists, err := readAudit(auditPath(path))
+	if err != nil || !exists || len(side) < 2 {
+		t.Fatalf("sidecar exists=%v len=%d err=%v", exists, len(side), err)
+	}
+	if err := writeAuditFile(auditPath(path), side[:1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Put("b", "password", randBytesT(t, 16), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyAudit(path); err != nil {
+		t.Fatal(err)
+	}
+	repaired, _, err := readAudit(auditPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, ev := range repaired {
+		if ev.Seq != uint64(i+1) {
+			t.Fatalf("seq %d at %d", ev.Seq, i)
+		}
+	}
+	if len(repaired) != len(session.audit) {
+		t.Fatalf("sidecar %d session %d", len(repaired), len(session.audit))
+	}
+	session.Lock()
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	listed, err := opened.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("count %d", len(listed))
+	}
+}
+
+func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
+	var logs bytes.Buffer
+	path, pass, session := mustCreate(t, log.New(&logs, "", 0))
+	secret := randBytesT(t, 24)
+	badLabel := "bad-\n" + hex.EncodeToString(secret)
+	badType := "not-a-type-" + hex.EncodeToString(secret[:4])
+	zero := time.Time{}
+	attempts := []struct {
+		label, typ string
+		secret     []byte
+		opt        PutOptions
+	}{
+		{label: "", typ: "generic", secret: secret},
+		{label: badLabel, typ: "generic", secret: secret},
+		{label: "ok", typ: badType, secret: secret},
+		{label: "ok", typ: "generic", secret: nil},
+		{label: "ok", typ: "generic", secret: secret, opt: PutOptions{ExpiresAt: &zero}},
+	}
+	for _, attempt := range attempts {
+		if _, err := session.Put(attempt.label, attempt.typ, attempt.secret, attempt.opt); !errors.Is(err, ErrInvalid) {
+			t.Fatal(err)
+		}
+	}
+	audit := readAll(t, auditPath(path))
+	assertAbsent(t, audit, secret)
+	assertAbsent(t, logs.Bytes(), secret)
+	if bytes.Contains(audit, []byte(badLabel)) || bytes.Contains(audit, []byte(badType)) || bytes.Contains(logs.Bytes(), []byte(badLabel)) {
+		t.Fatal("denial recorded free-form metadata")
+	}
+	var denied int
+	for _, ev := range session.audit {
+		if ev.Action == actionPut && ev.Result == resultDenied {
+			denied++
+			if ev.CredID != "" || ev.CredType != "" {
+				t.Fatalf("denial carried metadata id=%q type=%q", ev.CredID, ev.CredType)
+			}
+		}
+	}
+	if denied != len(attempts) {
+		t.Fatalf("denied puts %d", denied)
+	}
+	stored, err := session.Put("ok", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	got, err := opened.Get(stored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Secret, secret) {
+		t.Fatal("secret mismatch after denied puts")
+	}
+	sealed := 0
+	for _, ev := range opened.audit {
+		if ev.Action == actionPut && ev.Result == resultDenied {
+			sealed++
+		}
+	}
+	if sealed != len(attempts) {
+		t.Fatalf("sealed denials %d", sealed)
+	}
+}
+
+func TestOutOfRangePassphraseUnlockIsAudited(t *testing.T) {
+	var logs bytes.Buffer
+	path, pass, session := mustCreate(t, nil)
+	session.Lock()
+	logger := log.New(&logs, "", 0)
+	short := []byte("s3cret!")
+	long := bytes.Repeat([]byte("Z"), maxPassphrase+1)
+	for _, phrase := range [][]byte{short, long} {
+		_, err := Unlock(path, phrase, logger)
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatal(err)
+		}
+		if strings.Contains(err.Error(), string(phrase)) {
+			t.Fatal("unlock error contains passphrase")
+		}
+	}
+	audit := readAll(t, auditPath(path))
+	assertAbsent(t, audit, short)
+	assertAbsent(t, audit, long)
+	assertAbsent(t, logs.Bytes(), short)
+	assertAbsent(t, logs.Bytes(), long)
+	side, _, err := readAudit(auditPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var denied int
+	for _, ev := range side {
+		if ev.Action == actionUnlock && ev.Result == resultDenied {
+			denied++
+			if ev.CredID != "" || ev.CredType != "" {
+				t.Fatal("unlock denial carried credential metadata")
+			}
+		}
+	}
+	if denied != 2 {
+		t.Fatalf("denied unlocks %d", denied)
+	}
+	opened, err := Unlock(path, pass, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	sealed := 0
+	for _, ev := range opened.audit {
+		if ev.Action == actionUnlock && ev.Result == resultDenied {
+			sealed++
+		}
+	}
+	if sealed != 2 {
+		t.Fatalf("sealed denials %d", sealed)
+	}
+}
+
 func mustCreate(t *testing.T, logger *log.Logger) (string, []byte, *Session) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "vault.json")

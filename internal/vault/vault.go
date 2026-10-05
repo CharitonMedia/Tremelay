@@ -49,11 +49,13 @@ const (
 	maxKDFTime    = 10
 	maxKDFThreads = 8
 
-	maxVaultFile = 32 << 20
-
 	// StateActive is the lifecycle state of a newly stored credential.
 	StateActive = "active"
 )
+
+// maxVaultFile is the largest vault or audit file readLimited will load.
+// Tests shrink it; production stays 32 MiB so a written vault stays readable.
+var maxVaultFile int64 = 32 << 20
 
 // CredentialTypes is the allowlist stored with each credential.
 var CredentialTypes = []string{
@@ -229,26 +231,21 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	return s, nil
 }
 
-// Unlock opens path with passphrase. A wrong passphrase appends an unlock denial
-// when the audit sidecar can accept one.
+// Unlock opens path with passphrase. A rejected passphrase appends an unlock denial
+// when the audit sidecar can accept one. The denial has no passphrase bytes.
 func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error) {
-	if err := validatePassphrase(passphrase); err != nil {
-		return nil, err
-	}
 	header, err := readHeader(path)
 	if err != nil {
 		return nil, err
+	}
+	if err := validatePassphrase(passphrase); err != nil {
+		return nil, unlockDenied(path, header, logger, err)
 	}
 	kek := deriveKEK(passphrase, header.KDF)
 	defer wipe(kek)
 	dek, err := openAEAD(kek, header.WrapNonce, header.WrappedDEK, dekAAD(header.ID))
 	if err != nil {
-		if aerr := appendUnlockDenial(path, header.ID, header.AuditHead, header.AuditSeq); aerr != nil && !errors.Is(aerr, errNoSidecar) {
-			logLine(logger, "vault_unlock result=denied")
-			return nil, ErrAudit
-		}
-		logLine(logger, "vault_unlock result=denied")
-		return nil, ErrUnauthenticated
+		return nil, unlockDenied(path, header, logger, ErrUnauthenticated)
 	}
 	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
 	if err != nil {
@@ -341,30 +338,31 @@ func (s *Session) Lock() {
 }
 
 // Put stores a new credential and returns its metadata. The secret is not echoed.
+// Invalid input is denied and audited with no secret and no free-form metadata.
 func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credential, error) {
 	if err := s.live(); err != nil {
 		return Credential{}, err
 	}
 	if err := validateLabel(label); err != nil {
-		return Credential{}, err
+		return s.denyPut(err)
 	}
 	if err := validateType(typ); err != nil {
-		return Credential{}, err
+		return s.denyPut(err)
 	}
 	if err := validateSecret(secret); err != nil {
-		return Credential{}, err
+		return s.denyPut(err)
 	}
 	expires, err := optionalTime(opt.ExpiresAt)
 	if err != nil {
-		return Credential{}, err
+		return s.denyPut(err)
 	}
 	review, err := optionalTime(opt.ReviewDueAt)
 	if err != nil {
-		return Credential{}, err
+		return s.denyPut(err)
 	}
 	rotation, err := optionalTime(opt.RotationDueAt)
 	if err != nil {
-		return Credential{}, err
+		return s.denyPut(err)
 	}
 	id, err := newID()
 	if err != nil {
@@ -479,6 +477,26 @@ func (s *Session) live() error {
 	return nil
 }
 
+func (s *Session) denyPut(cause error) (Credential, error) {
+	if err := s.persistEvent(actionPut, "", "", resultDenied); err != nil {
+		if errors.Is(err, errSidecar) {
+			return Credential{}, ErrAudit
+		}
+		return Credential{}, err
+	}
+	s.logf("credential_put result=denied")
+	return Credential{}, cause
+}
+
+func unlockDenied(path string, header fileHeader, logger *log.Logger, cause error) error {
+	if aerr := appendUnlockDenial(path, header.ID, header.AuditHead, header.AuditSeq); aerr != nil && !errors.Is(aerr, errNoSidecar) {
+		logLine(logger, "vault_unlock result=denied")
+		return ErrAudit
+	}
+	logLine(logger, "vault_unlock result=denied")
+	return cause
+}
+
 func (s *Session) persistEvent(action, credID, credType, result string) error {
 	ev, err := nextEvent(s.audit, action, s.id, credID, credType, result)
 	if err != nil {
@@ -489,7 +507,9 @@ func (s *Session) persistEvent(action, credID, credType, result string) error {
 		s.audit = s.audit[:len(s.audit)-1]
 		return err
 	}
-	if err := appendAudit(auditPath(s.path), ev); err != nil {
+	// A previous append may have failed after save. Write the missing sealed
+	// prefix before the new tip so the sidecar cannot skip a sequence number.
+	if err := syncSidecar(auditPath(s.path), s.audit); err != nil {
 		return errSidecar
 	}
 	return nil
@@ -520,6 +540,9 @@ func (s *Session) save() error {
 	raw, err := json.Marshal(s.header)
 	if err != nil {
 		return ErrIO
+	}
+	if int64(len(raw)) > maxVaultFile {
+		return ErrInvalid
 	}
 	if err := writeAtomic(s.path, raw); err != nil {
 		s.logf("io error=%v", err)
