@@ -271,8 +271,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
 	if err != nil {
 		wipe(dek)
-		logLine(logger, "vault_unlock result=denied")
-		return nil, ErrCorrupt
+		return nil, deny(ErrCorrupt)
 	}
 	defer wipe(plain)
 	var doc document
@@ -412,8 +411,11 @@ func (s *Session) Get(id string) (Credential, error) {
 		out.Secret = append([]byte(nil), c.Secret...)
 		return out, nil
 	}
+	// A caller-supplied id is not a stored identifier. Drop it when it
+	// contains a known secret or passphrase; exact equality is not enough,
+	// because a 32-character hex id can embed a shorter secret.
 	auditedID := safeID(id)
-	if s.redactor.Contains([]byte(auditedID)) {
+	if s.redactor.Redact(auditedID) != auditedID {
 		auditedID = ""
 	}
 	if err := s.persistEvent(actionGet, auditedID, "", resultDenied); err != nil {

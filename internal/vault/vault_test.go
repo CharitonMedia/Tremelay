@@ -362,6 +362,26 @@ func TestTamperAndSwap(t *testing.T) {
 	if bytes.Contains([]byte(err.Error()), secretA) || strings.Contains(err.Error(), string(passA)) {
 		t.Fatal("tamper error contains secret material")
 	}
+	db, header, events, err := loadVault(dataCopy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	var denials int
+	for _, ev := range events {
+		if ev.Action == actionUnlock && ev.Result == resultDenied {
+			denials++
+			if ev.CredID != "" || ev.CredType != "" {
+				t.Fatal("corrupt unlock denial carried metadata")
+			}
+		}
+	}
+	if denials != 1 || events[len(events)-1].Hash == header.AuditHead {
+		t.Fatalf("denials %d head %s", denials, header.AuditHead)
+	}
+	if err := suffixAllows(events, header); err != nil {
+		t.Fatal(err)
+	}
 	mutateDB(t, wrapCopy, func(db *sql.DB) {
 		var wrapped []byte
 		if err := db.QueryRow(`SELECT wrapped_dek FROM vault`).Scan(&wrapped); err != nil {
@@ -507,6 +527,53 @@ func TestLogRedactsLabelContainingSecret(t *testing.T) {
 	if !bytes.Contains(logs.Bytes(), []byte(redacted)) {
 		t.Fatal("expected redaction marker in logs")
 	}
+}
+
+func TestDeniedGetOmitsEmbeddedSecret(t *testing.T) {
+	var logs bytes.Buffer
+	path := filepath.Join(t.TempDir(), "vault.db")
+	pass := []byte(randHex(t, 4))
+	secret := []byte(randHex(t, 4))
+	session, err := Create(path, pass, log.New(&logs, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Lock()
+	if _, err := session.Put("label", "generic", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	embeddedSecret := strings.Repeat("0", 24) + string(secret)
+	embeddedPass := strings.Repeat("1", 24) + string(pass)
+	clean := strings.Repeat("ab", 16)
+	for _, id := range []string{embeddedSecret, embeddedPass, clean} {
+		if _, err := hex.DecodeString(id); err != nil || len(id) != 32 {
+			t.Fatal(id)
+		}
+		if _, err := session.Get(id); !errors.Is(err, ErrNotFound) {
+			t.Fatal(err)
+		}
+	}
+	var sawClean bool
+	for _, ev := range session.audit {
+		if ev.Action != actionGet || ev.Result != resultDenied {
+			continue
+		}
+		if strings.Contains(ev.CredID, string(secret)) || strings.Contains(ev.CredID, string(pass)) {
+			t.Fatal("denial id contains secret material")
+		}
+		if ev.CredID == clean {
+			sawClean = true
+		}
+	}
+	if !sawClean {
+		t.Fatal("safe miss id was dropped")
+	}
+	session.Lock()
+	raw := readAll(t, path)
+	assertAbsent(t, raw, secret)
+	assertAbsent(t, raw, pass)
+	assertAbsent(t, logs.Bytes(), secret)
+	assertAbsent(t, logs.Bytes(), pass)
 }
 
 func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
