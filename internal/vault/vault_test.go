@@ -682,6 +682,9 @@ func TestPutRejectsSecretEqualToAuditPlaintext(t *testing.T) {
 		{label: "api-generic", typ: "generic", secret: []byte("api")},
 		{label: "allow-substring", typ: "generic", secret: []byte("allow")},
 		{label: "vault-secret", typ: "generic", secret: []byte(session.id)},
+		{label: "root-secret", typ: "generic", secret: []byte(rootPassphrase)},
+		{label: "kdf-secret", typ: "generic", secret: []byte(algoArgon2id)},
+		{label: "kdf-substring", typ: "generic", secret: []byte("argon")},
 	}
 	for _, bad := range collisions {
 		if _, err := session.Put(bad.label, bad.typ, bad.secret, PutOptions{}); !errors.Is(err, ErrInvalid) {

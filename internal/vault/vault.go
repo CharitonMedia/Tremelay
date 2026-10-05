@@ -176,8 +176,9 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	if err := validatePassphrase(passphrase); err != nil {
 		return nil, err
 	}
-	// Fixed audit tokens are written in the clear. Reject before KDF or file
-	// creation so the passphrase is never persisted as one of them.
+	// Fixed audit tokens and vault-header labels are written in the clear.
+	// Reject before KDF or file creation so the passphrase is never persisted
+	// as one of them.
 	if auditTokenContains(passphrase) {
 		return nil, ErrInvalid
 	}
@@ -388,11 +389,12 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 		wipe(rec.Secret)
 		return Credential{}, err
 	}
-	// A secret contained in a plaintext audit field is the raw secret.
-	// Fixed action, result, and type tokens count even when this event does
-	// not use them. ponytail: the denial still writes those tokens, so the
-	// bytes remain; the secret is refused instead of copied into credential
-	// fields. Upgrade path: encrypt audit metadata.
+	// A secret contained in a plaintext audit field or fixed vault column
+	// is the raw secret. Action, result, type, root, and KDF tokens count
+	// even when this event does not use them. ponytail: those columns still
+	// store the literal tokens, so the bytes remain; the secret is refused
+	// instead of being copied into a credential. Upgrade path: encrypt audit
+	// metadata and store the root and KDF labels as non-secret codes.
 	if secretDisclosedByAudit(secret, s.audit, ev) {
 		wipe(rec.Secret)
 		return s.denyPut(ErrInvalid)
@@ -663,7 +665,7 @@ func validateSecret(s []byte) error {
 
 // secretDisclosedByAudit reports whether secret is contained in a plaintext
 // audit value already stored, about to be stored, or reserved as an action,
-// result, or credential type.
+// result, credential type, vault root label, or KDF algorithm name.
 func secretDisclosedByAudit(secret []byte, prior []auditEvent, pending auditEvent) bool {
 	if len(secret) == 0 {
 		return false
@@ -679,6 +681,9 @@ func secretDisclosedByAudit(secret []byte, prior []auditEvent, pending auditEven
 	return false
 }
 
+// auditTokenContains reports whether secret is contained in a fixed string
+// stored in the clear: audit actions and results, credential types, the
+// vault root label, or the KDF algorithm name.
 func auditTokenContains(secret []byte) bool {
 	if len(secret) == 0 {
 		return false
@@ -686,6 +691,7 @@ func auditTokenContains(secret []byte) bool {
 	tokens := [...]string{
 		actionCreate, actionUnlock, actionPut, actionGet, actionList,
 		resultAllowed, resultDenied,
+		rootPassphrase, algoArgon2id,
 	}
 	for _, tok := range tokens {
 		if bytes.Contains([]byte(tok), secret) {

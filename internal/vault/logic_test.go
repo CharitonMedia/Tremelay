@@ -146,7 +146,7 @@ func TestShortPassphraseRejected(t *testing.T) {
 
 func TestCreateRejectsPassphraseInAuditPlaintext(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vault.db")
-	for _, pass := range []string{"vault_create", "vault_unlock", "password", "credential"} {
+	for _, pass := range []string{"vault_create", "vault_unlock", "password", "credential", "passphrase", "argon2id", "passphra"} {
 		_, err := Create(path, []byte(pass), nil)
 		if !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%s: %v", pass, err)
@@ -168,7 +168,7 @@ func TestAuditPlaintextContainment(t *testing.T) {
 		Time:    "2026-10-05T18:22:10Z",
 		Hash:    strings.Repeat("ab", 32),
 	}
-	for _, secret := range []string{"allow", "api", "01234567", "2026-10-", "vault_create"} {
+	for _, secret := range []string{"allow", "api", "01234567", "2026-10-", "vault_create", "passphrase", "argon2id", "argon", "pass"} {
 		if !secretDisclosedByAudit([]byte(secret), nil, ev) {
 			t.Fatalf("accepted %q", secret)
 		}
