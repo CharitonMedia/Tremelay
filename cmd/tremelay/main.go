@@ -242,7 +242,10 @@ func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout
 		fmt.Fprintln(stderr, red.Redact(err.Error()))
 		return 1
 	}
-	fmt.Fprintln(stdout, head)
+	if _, err := fmt.Fprintln(stdout, head); err != nil {
+		fmt.Fprintln(stderr, red.Redact(err.Error()))
+		return 1
+	}
 	return 0
 }
 

@@ -169,6 +169,42 @@ func TestCLIPutReportsStdoutWriteFailure(t *testing.T) {
 	assertNoSecret(t, &stderr, secret, pass)
 }
 
+func TestCLIAuditVerifyReportsStdoutWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	env := map[string]string{"TREMELAY_PASSPHRASE": pass}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"vault", "create", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("create %d %s", code, stderr.String())
+	}
+
+	writeErr := errors.New("stdout write failed")
+	stderr.Reset()
+	if code := run([]string{"audit", "verify", "--path", path}, envGet(env), strings.NewReader(""), errWriter{writeErr}, &stderr); code == 0 {
+		t.Fatal("verify returned success after stdout write failure")
+	}
+	if !strings.Contains(stderr.String(), writeErr.Error()) {
+		t.Fatalf("stderr missing write failure: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), pass) {
+		t.Fatal("stderr echoed passphrase")
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"audit", "verify", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("verify %d %s", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) == "" {
+		t.Fatal("missing audit head after a failed write")
+	}
+	if strings.Contains(stderr.String(), pass) {
+		t.Fatal("stderr echoed passphrase")
+	}
+}
+
 type errWriter struct{ err error }
 
 func (w errWriter) Write([]byte) (int, error) { return 0, w.err }
