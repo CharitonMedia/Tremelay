@@ -599,19 +599,27 @@ func TestCorruptDatabase(t *testing.T) {
 	}
 }
 
-func TestLogRedactsLabelContainingSecret(t *testing.T) {
+func TestLogOmitsFreeFormLabel(t *testing.T) {
 	var logs bytes.Buffer
 	_, _, session := mustCreate(t, log.New(&logs, "", 0))
 	secret := []byte(randHex(t, 16))
-	label := "pre-" + string(secret) + "-post"
-	if _, err := session.Put(label, "generic", secret, PutOptions{}); err != nil {
+	// A label may carry a secret this session has never stored. Redaction
+	// does not know it, so the log line must not include the label at all.
+	foreign := randHex(t, 16)
+	label := "pre-" + foreign + "-post"
+	stored, err := session.Put(label, "generic", secret, PutOptions{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(logs.Bytes(), secret) {
-		t.Fatal("log contains secret")
+	if bytes.Contains(logs.Bytes(), []byte(foreign)) || bytes.Contains(logs.Bytes(), secret) {
+		t.Fatal("put log contains label or secret")
 	}
-	if !bytes.Contains(logs.Bytes(), []byte(redacted)) {
-		t.Fatal("expected redaction marker in logs")
+	logs.Reset()
+	if _, err := session.Get(stored.ID); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(logs.Bytes(), []byte(foreign)) || bytes.Contains(logs.Bytes(), secret) {
+		t.Fatal("get log contains label or secret")
 	}
 }
 

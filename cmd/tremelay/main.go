@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -162,8 +163,12 @@ func cmdGet(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 			return err
 		}
 		defer vault.Wipe(cred.Secret)
-		_, err = stdout.Write(cred.Secret)
-		return err
+		// A writer error can echo the bytes it was given. Do not return that
+		// error: it is a direct path for the retrieved secret into stderr.
+		if _, err := stdout.Write(cred.Secret); err != nil {
+			return errors.New("stdout write failed")
+		}
+		return nil
 	})
 }
 

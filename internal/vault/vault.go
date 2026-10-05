@@ -389,7 +389,9 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 		wipe(rec.Secret)
 		return Credential{}, err
 	}
-	s.logf("credential_put id=%s type=%s label=%s result=allowed", id, typ, label)
+	// Labels are caller-controlled and may carry a secret this session has
+	// not seen, so redaction cannot cover them. Keep them out of process logs.
+	s.logf("credential_put id=%s type=%s result=allowed", id, typ)
 	return rec.public(), nil
 }
 
@@ -407,7 +409,7 @@ func (s *Session) Get(id string) (Credential, error) {
 		if err := s.persistEvent(actionGet, c.ID, c.Type, resultAllowed); err != nil {
 			return Credential{}, err
 		}
-		s.logf("credential_get id=%s type=%s label=%s result=allowed", c.ID, c.Type, c.Label)
+		s.logf("credential_get id=%s type=%s result=allowed", c.ID, c.Type)
 		out := c.public()
 		out.Secret = append([]byte(nil), c.Secret...)
 		return out, nil
