@@ -38,7 +38,7 @@ Go's garbage collector can retain copies of key and secret bytes. `Lock` zeroes 
 
 ## Security implications
 
-- Raw credentials are not written to the vault file. Tests compare file bytes with the secret and the passphrase.
+- Raw credentials are not written to the vault file. Tests compare file bytes with a unique secret and passphrase. A secret that merely equals a fixed literal (action name, result, credential type, KDF id, root label) is not treated as disclosure.
 - Errors returned by the vault are fixed sentences. Callers redact log lines with the passphrase and any secret the session has seen.
 - An attacker who can edit the file can deny availability. They cannot produce a document that decrypts under the honest DEK without breaking GCM.
 - Parameters in the file are untrusted input. Bounds are enforced before Argon2id runs so a hostile file cannot request an unbounded allocation.
@@ -61,6 +61,6 @@ Go's garbage collector can retain copies of key and secret bytes. `Lock` zeroes 
 - Tampered DEK wrap fails authentication.
 - Ciphertext from one vault does not decrypt under another vault's key.
 - Hostile KDF memory parameters are rejected without running the KDF.
-- Vault and audit bytes do not contain the secret or the passphrase.
+- A unique secret and passphrase do not appear in vault or audit bytes. Equality with a fixed non-secret literal is not disclosure.
 - Log lines and error strings are redacted.
 - No `GetSecret` method exists on the session.

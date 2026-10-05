@@ -133,6 +133,6 @@ These mechanisms should be deleted rather than preserved as dormant compatibilit
 - a hash-linked unlock denial that carries a credential id or type fails unlock and is not incorporated;
 - rewriting the plaintext audit head onto a truncated chain fails verify;
 - hash-chain tampering fails verification;
-- secret and passphrase bytes are absent from audit rows and ordinary error/log output;
+- a unique sentinel secret and passphrase are absent from audit rows and ordinary error/log output; equality with a fixed literal is not disclosure;
 - database corruption produces a safe failure;
 - Windows and Linux CI remain green.

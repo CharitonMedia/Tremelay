@@ -662,66 +662,56 @@ func TestDeniedGetOmitsEmbeddedSecret(t *testing.T) {
 	assertAbsent(t, logs.Bytes(), pass)
 }
 
-func TestPutRejectsSecretEqualToAuditPlaintext(t *testing.T) {
+func TestSentinelSecretDoesNotFlowIntoPlaintext(t *testing.T) {
 	var logs bytes.Buffer
 	path, pass, session := mustCreate(t, log.New(&logs, "", 0))
-	secret := randBytesT(t, 24)
-	stored, err := session.Put("a", "generic", secret, PutOptions{})
+	sentinel := []byte(randHex(t, 16))
+	label := "pre-" + string(sentinel) + "-post"
+	stored, err := session.Put(label, "generic", sentinel, PutOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := len(session.audit)
-	collisions := []struct {
+	// These values already exist as identifiers or fixed literals. Storing
+	// them as secrets must succeed; the audit row is not a copy of the secret.
+	incidental := []struct {
 		label, typ string
 		secret     []byte
 	}{
 		{label: "id-secret", typ: "generic", secret: []byte(stored.ID)},
 		{label: "id-prefix", typ: "generic", secret: []byte(stored.ID[:8])},
-		{label: "type-secret", typ: "api_key", secret: []byte("api_key")},
-		{label: "api-substring", typ: "api_key", secret: []byte("api")},
-		{label: "api-generic", typ: "generic", secret: []byte("api")},
-		{label: "allow-substring", typ: "generic", secret: []byte("allow")},
-		{label: "vault-secret", typ: "generic", secret: []byte(session.id)},
-		{label: "root-secret", typ: "generic", secret: []byte(rootPassphrase)},
-		{label: "kdf-secret", typ: "generic", secret: []byte(algoArgon2id)},
+		{label: "type-name", typ: "generic", secret: []byte("api_key")},
+		{label: "type-substring", typ: "generic", secret: []byte("api")},
+		{label: "result-substring", typ: "generic", secret: []byte("allow")},
+		{label: "vault-id", typ: "generic", secret: []byte(session.id)},
+		{label: "root-label", typ: "generic", secret: []byte(rootPassphrase)},
+		{label: "kdf-id", typ: "generic", secret: []byte(algoArgon2id)},
 		{label: "kdf-substring", typ: "generic", secret: []byte("argon")},
 	}
-	for _, bad := range collisions {
-		if _, err := session.Put(bad.label, bad.typ, bad.secret, PutOptions{}); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("accepted secret equal to audit plaintext %q: %v", bad.secret, err)
+	for _, item := range incidental {
+		cred, err := session.Put(item.label, item.typ, item.secret, PutOptions{})
+		if err != nil {
+			t.Fatalf("label %s: %v", item.label, err)
+		}
+		if cred.Type != item.typ || len(cred.Secret) != 0 {
+			t.Fatalf("label %s echoed secret metadata", item.label)
 		}
 	}
-	denied := 0
-	for _, ev := range session.audit[before:] {
-		if ev.Action != actionPut || ev.Result != resultDenied || ev.CredID != "" || ev.CredType != "" {
-			t.Fatalf("denial shape %+v", ev)
-		}
-		denied++
-	}
-	if denied != len(collisions) {
-		t.Fatalf("denied puts %d", denied)
-	}
-	if _, err := session.Put("ok-short", "generic", []byte("qqqqqqqq"), PutOptions{}); err != nil {
+	if _, err := session.List(); err != nil {
 		t.Fatal(err)
-	}
-	if len(session.creds) != 2 {
-		t.Fatalf("stored %d credentials", len(session.creds))
-	}
-	if bytes.Contains(logs.Bytes(), []byte("api_key")) {
-		t.Fatal("log contains rejected type secret")
 	}
 	session.Lock()
 	raw := readAll(t, path)
-	assertAbsent(t, raw, secret)
-	assertAbsent(t, raw, []byte(pass))
-	assertAbsent(t, raw, []byte("qqqqqqqq"))
-	events := mustAudit(t, path)
-	for _, ev := range events {
-		if ev.CredType == "api_key" || ev.CredID == "api_key" {
-			t.Fatal("audit stored the rejected type secret")
+	assertAbsent(t, raw, sentinel)
+	assertAbsent(t, raw, pass)
+	assertAbsent(t, logs.Bytes(), sentinel)
+	assertAbsent(t, logs.Bytes(), pass)
+	for _, ev := range mustAudit(t, path) {
+		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Time, ev.Prev, ev.Hash}, "\n")
+		if strings.Contains(fields, string(sentinel)) || strings.Contains(fields, string(pass)) {
+			t.Fatal("sentinel flowed into an audit field")
 		}
-		if strings.Contains(ev.CredID, "api") || strings.Contains(ev.CredType, "api") || strings.Contains(ev.Action, "api") {
-			t.Fatal("audit field contains rejected substring secret")
+		if strings.Contains(fields, "api_key") {
+			t.Fatal("type-name secret flowed into an audit field")
 		}
 	}
 	opened, err := Unlock(path, pass, nil)
@@ -729,31 +719,15 @@ func TestPutRejectsSecretEqualToAuditPlaintext(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer opened.Lock()
-	if len(opened.creds) != 2 {
-		t.Fatalf("durable credentials %d", len(opened.creds))
-	}
 	got, err := opened.Get(stored.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got.Secret, secret) {
-		t.Fatal("original secret mismatch")
+	if !bytes.Equal(got.Secret, sentinel) || got.Label != label {
+		t.Fatal("sentinel round-trip mismatch")
 	}
-	sealed := 0
-	for _, ev := range opened.audit {
-		if ev.Action == actionPut && ev.Result == resultDenied {
-			if ev.CredID != "" || ev.CredType != "" {
-				t.Fatal("durable denial carried metadata")
-			}
-			sealed++
-		}
-	}
-	if sealed != len(collisions) {
-		t.Fatalf("durable denials %d", sealed)
-	}
-	opened.redactor.Add([]byte(opened.id))
-	if _, err := opened.List(); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("list persisted a known secret: %v", err)
+	if bytes.Contains(raw, []byte(label)) {
+		t.Fatal("label containing the sentinel was stored in plaintext")
 	}
 }
 

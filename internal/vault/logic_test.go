@@ -144,45 +144,27 @@ func TestShortPassphraseRejected(t *testing.T) {
 	}
 }
 
-func TestCreateRejectsPassphraseInAuditPlaintext(t *testing.T) {
+func TestLiteralPassphraseIsNotRejected(t *testing.T) {
+	// The KDF identifier is stored as a constant. A passphrase that happens
+	// to equal it is not a copy of that passphrase into the vault header.
 	path := filepath.Join(t.TempDir(), "vault.db")
-	for _, pass := range []string{"vault_create", "vault_unlock", "password", "credential", "passphrase", "argon2id", "passphra"} {
-		_, err := Create(path, []byte(pass), nil)
-		if !errors.Is(err, ErrInvalid) {
-			t.Fatalf("%s: %v", pass, err)
-		}
-		if strings.Contains(err.Error(), pass) {
-			t.Fatalf("%s echoed passphrase", pass)
-		}
-		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
-			t.Fatalf("%s left a vault file", pass)
-		}
+	pass := []byte(algoArgon2id)
+	session, err := Create(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestAuditPlaintextContainment(t *testing.T) {
-	ev := auditEvent{
-		Action:  actionCreate,
-		Result:  resultAllowed,
-		VaultID: "0123456789abcdef0123456789abcdef",
-		Time:    "2026-10-05T18:22:10Z",
-		Hash:    strings.Repeat("ab", 32),
+	sentinel := randBytesT(t, 32)
+	if _, err := session.Put("label", "generic", sentinel, PutOptions{}); err != nil {
+		session.Lock()
+		t.Fatal(err)
 	}
-	for _, secret := range []string{"allow", "api", "01234567", "2026-10-", "vault_create", "passphrase", "argon2id", "argon", "pass"} {
-		if !secretDisclosedByAudit([]byte(secret), nil, ev) {
-			t.Fatalf("accepted %q", secret)
-		}
+	session.Lock()
+	assertAbsent(t, readAll(t, path), sentinel)
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	prior := auditEvent{CredID: "abcdef0123456789abcdef0123456789", CredType: "generic", Action: actionPut, Result: resultAllowed}
-	if !secretDisclosedByAudit([]byte("abcdef01"), []auditEvent{prior}, ev) {
-		t.Fatal("accepted prior id prefix")
-	}
-	if secretDisclosedByAudit(nil, nil, ev) {
-		t.Fatal("empty secret")
-	}
-	if secretDisclosedByAudit([]byte("qqqqqqqq"), nil, ev) {
-		t.Fatal("rejected unrelated secret")
-	}
+	opened.Lock()
 }
 
 func TestTruncatedVaultRejected(t *testing.T) {
