@@ -24,6 +24,14 @@ Every attempted credential operation—allowed or denied—MUST produce an audit
 
 Audit records may identify credentials by stable internal identifier and human-readable label, but MUST NOT record raw secrets, decrypted payloads, authorization headers, private keys, passwords, or equivalent material.
 
+## 5A. Secret disclosure is about dataflow, not incidental equality
+
+A secret-bearing input MUST NOT be written, logged, emitted, indexed, or otherwise persisted in plaintext through a path derived from that secret.
+
+Incidental equality between secret bytes and independently existing non-secret constants or metadata—such as schema names, SQL text, field names, algorithm identifiers, action names, result labels, or other fixed literals—does NOT by itself constitute secret disclosure.
+
+Tests for plaintext leakage SHOULD use unique high-entropy sentinel values and demonstrate an actual secret-bearing dataflow into plaintext storage or output.
+
 ## 6. Audit integrity
 
 The audit design MUST be append-oriented and tamper-evident. The initial implementation SHOULD hash-chain events. Designs MUST permit external or independent checkpointing.
