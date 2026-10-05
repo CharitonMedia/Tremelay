@@ -1,0 +1,385 @@
+package vault
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"log"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestRoundTripLifecycleAndNoPlaintext(t *testing.T) {
+	var logs bytes.Buffer
+	logger := log.New(&logs, "", 0)
+	path, pass, session := mustCreate(t, logger)
+	secret := randBytesT(t, 32)
+	other := randBytesT(t, 24)
+	label := "ci-label-" + hex.EncodeToString(randBytesT(t, 8))
+	exp := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	review := time.Date(2029, 6, 1, 0, 0, 0, 0, time.UTC)
+	rotation := time.Date(2028, 5, 4, 0, 0, 0, 0, time.UTC)
+	stored, err := session.Put(label, "api_key", secret, PutOptions{
+		ExpiresAt:     &exp,
+		ReviewDueAt:   &review,
+		RotationDueAt: &rotation,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Type != "api_key" || stored.Lifecycle.State != StateActive || len(stored.Secret) != 0 {
+		t.Fatalf("put metadata id=%s type=%s state=%s secretLen=%d", stored.ID, stored.Type, stored.Lifecycle.State, len(stored.Secret))
+	}
+	if !stored.Lifecycle.ExpiresAt.Equal(exp) || !stored.Lifecycle.ReviewDueAt.Equal(review) || !stored.Lifecycle.RotationDueAt.Equal(rotation) {
+		t.Fatal("lifecycle fields were not stored")
+	}
+	second, err := session.Put("other", "password", other, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Put("x", "not-a-type", secret, PutOptions{}); !errors.Is(err, ErrInvalid) {
+		t.Fatal(err)
+	}
+	if _, err := session.Put("x", "generic", nil, PutOptions{}); !errors.Is(err, ErrInvalid) {
+		t.Fatal(err)
+	}
+	listed, err := session.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 {
+		t.Fatal(len(listed))
+	}
+	for _, item := range listed {
+		if len(item.Secret) != 0 {
+			t.Fatal("list returned a secret")
+		}
+	}
+	session.Lock()
+	if _, err := session.Get(stored.ID); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatal(err)
+	}
+
+	opened, err := Unlock(path, pass, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	got, err := opened.Get(stored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Secret, secret) || got.Type != "api_key" || got.Lifecycle.State != StateActive {
+		t.Fatal("retrieved credential metadata or secret mismatch")
+	}
+	if got.Lifecycle.CreatedAt.IsZero() || got.Lifecycle.UpdatedAt.IsZero() {
+		t.Fatal("missing lifecycle timestamps")
+	}
+	gotOther, err := opened.Get(second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotOther.Secret, other) {
+		t.Fatal("second credential mismatch")
+	}
+	if _, err := opened.Get(string(secret)); !errors.Is(err, ErrNotFound) {
+		t.Fatal(err)
+	}
+
+	raw := readAll(t, path)
+	audit := readAll(t, auditPath(path))
+	assertAbsent(t, raw, secret)
+	assertAbsent(t, raw, other)
+	assertAbsent(t, raw, pass)
+	assertAbsent(t, raw, []byte(label))
+	assertAbsent(t, audit, secret)
+	assertAbsent(t, audit, other)
+	assertAbsent(t, audit, pass)
+	assertAbsent(t, logs.Bytes(), secret)
+	assertAbsent(t, logs.Bytes(), pass)
+	if bytes.Contains(raw, opened.dek) {
+		t.Fatal("master key persisted")
+	}
+	head, err := VerifyAudit(path)
+	if err != nil || head == "" {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		for _, p := range []string{path, auditPath(path)} {
+			fi, err := os.Stat(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fi.Mode().Perm()&0o077 != 0 {
+				t.Fatalf("%s mode %v", p, fi.Mode().Perm())
+			}
+		}
+	}
+}
+
+func TestWrongPassphrase(t *testing.T) {
+	var logs bytes.Buffer
+	path, pass, session := mustCreate(t, log.New(&logs, "", 0))
+	secret := randBytesT(t, 32)
+	if _, err := session.Put("label", "generic", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	wrong := []byte(randHex(t, 16))
+	_, err := Unlock(path, wrong, log.New(&logs, "", 0))
+	if !errors.Is(err, ErrUnauthenticated) {
+		t.Fatal(err)
+	}
+	if strings.Contains(err.Error(), string(wrong)) || strings.Contains(err.Error(), string(pass)) || bytes.Contains([]byte(err.Error()), secret) {
+		t.Fatal("unlock error contains secret material")
+	}
+	audit := readAll(t, auditPath(path))
+	assertAbsent(t, audit, secret)
+	assertAbsent(t, audit, wrong)
+	assertAbsent(t, logs.Bytes(), secret)
+	assertAbsent(t, logs.Bytes(), wrong)
+	if !bytes.Contains(audit, []byte(resultDenied)) {
+		t.Fatal("denied unlock was not audited")
+	}
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	got, err := opened.Get(mustOne(t, opened).ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Secret, secret) {
+		t.Fatal("secret unreadable after denied unlock")
+	}
+	var sawDenial bool
+	for _, ev := range opened.audit {
+		if ev.Action == actionUnlock && ev.Result == resultDenied {
+			sawDenial = true
+		}
+	}
+	if !sawDenial {
+		t.Fatal("denial was not sealed")
+	}
+}
+
+func TestTamperAndSwap(t *testing.T) {
+	pathA, passA, sessionA := mustCreate(t, nil)
+	secretA := randBytesT(t, 32)
+	if _, err := sessionA.Put("a", "generic", secretA, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	sessionA.Lock()
+	pathB, passB, sessionB := mustCreate(t, nil)
+	secretB := randBytesT(t, 32)
+	if _, err := sessionB.Put("b", "generic", secretB, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	sessionB.Lock()
+
+	dataCopy := filepath.Join(t.TempDir(), "data.json")
+	wrapCopy := filepath.Join(t.TempDir(), "wrap.json")
+	copyFile(t, pathA, dataCopy)
+	copyFile(t, pathA, wrapCopy)
+	mutateHeader(t, dataCopy, func(h *fileHeader) {
+		h.Data[len(h.Data)-1] ^= 0xff
+	})
+	_, err := Unlock(dataCopy, passA, nil)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatal(err)
+	}
+	if bytes.Contains([]byte(err.Error()), secretA) || strings.Contains(err.Error(), string(passA)) {
+		t.Fatal("tamper error contains secret material")
+	}
+	mutateHeader(t, wrapCopy, func(h *fileHeader) {
+		h.WrappedDEK[len(h.WrappedDEK)-1] ^= 0xff
+	})
+	_, err = Unlock(wrapCopy, passA, nil)
+	if !errors.Is(err, ErrUnauthenticated) {
+		t.Fatal(err)
+	}
+
+	mutateHeader(t, pathA, func(h *fileHeader) {
+		other, readErr := readHeader(pathB)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		h.Data = other.Data
+		h.DataNonce = other.DataNonce
+	})
+	_, err = Unlock(pathA, passA, nil)
+	if err == nil {
+		t.Fatal("swapped ciphertext decrypted")
+	}
+	if bytes.Contains([]byte(err.Error()), secretA) || bytes.Contains([]byte(err.Error()), secretB) {
+		t.Fatal("swap error contains secret material")
+	}
+	opened, err := Unlock(pathB, passB, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	got, err := opened.Get(mustOne(t, opened).ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Secret, secretB) {
+		t.Fatal("untampered vault secret changed")
+	}
+}
+
+func TestForgedAuditBlocksUnlock(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 32)
+	stored, err := session.Put("label", "bearer_token", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	side, _, err := readAudit(auditPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged, err := nextEvent(side, actionGet, side[0].VaultID, stored.ID, "bearer_token", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := appendAudit(auditPath(path), forged); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyAudit(path); !errors.Is(err, ErrAudit) {
+		t.Fatal(err)
+	}
+	_, err = Unlock(path, pass, nil)
+	if !errors.Is(err, ErrAudit) {
+		t.Fatal(err)
+	}
+	if bytes.Contains([]byte(err.Error()), secret) {
+		t.Fatal("audit error contains secret")
+	}
+}
+
+func TestMissingSidecarRestored(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	session.Lock()
+	if err := os.Remove(auditPath(path)); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened.Lock()
+	if _, err := VerifyAudit(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLogRedactsLabelContainingSecret(t *testing.T) {
+	var logs bytes.Buffer
+	_, _, session := mustCreate(t, log.New(&logs, "", 0))
+	secret := []byte(randHex(t, 16))
+	label := "pre-" + string(secret) + "-post"
+	if _, err := session.Put(label, "generic", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(logs.Bytes(), secret) {
+		t.Fatal("log contains secret")
+	}
+	if !bytes.Contains(logs.Bytes(), []byte(redacted)) {
+		t.Fatalf("expected redaction marker in logs")
+	}
+}
+
+func mustCreate(t *testing.T, logger *log.Logger) (string, []byte, *Session) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "vault.json")
+	pass := []byte(randHex(t, 16))
+	session, err := Create(path, pass, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { session.Lock() })
+	return path, pass, session
+}
+
+func mustOne(t *testing.T, s *Session) Credential {
+	t.Helper()
+	listed, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("count %d", len(listed))
+	}
+	return listed[0]
+}
+
+func randHex(t *testing.T, n int) string {
+	t.Helper()
+	return hex.EncodeToString(randBytesT(t, n))
+}
+
+func randBytesT(t *testing.T, n int) []byte {
+	t.Helper()
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func assertAbsent(t *testing.T, blob, secret []byte) {
+	t.Helper()
+	if len(secret) == 0 {
+		t.Fatal("empty secret")
+	}
+	if bytes.Contains(blob, secret) {
+		t.Fatalf("found %d secret bytes in persisted output", len(secret))
+	}
+}
+
+func readAll(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func copyFile(t *testing.T, src, dst string) {
+	t.Helper()
+	b := readAll(t, src)
+	if err := os.WriteFile(dst, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mutateHeader(t *testing.T, path string, fn func(*fileHeader)) {
+	t.Helper()
+	b := readAll(t, path)
+	var header fileHeader
+	if err := unmarshalStrict(b, &header); err != nil {
+		t.Fatal(err)
+	}
+	fn(&header)
+	raw, err := json.Marshal(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func jsonMarshal(v any) ([]byte, error) {
+	return json.Marshal(v)
+}
