@@ -10,15 +10,15 @@ M1 does not issue agent capabilities and does not expose a broker. Agent identit
 
 ## Decision
 
-The vault is a single file. The human unlock secret is a passphrase. Knowledge of that passphrase is the only authorization to create, unlock, list, store, or retrieve credentials in this milestone. The CLI is the human control plane. It is not an agent interface: there is no agent subcommand, no HTTP API, and no exported `GetSecret` operation.
+The vault is a single SQLite database file. ADR 0003 defines that persistence boundary. The human unlock secret is a passphrase. Knowledge of that passphrase is the only authorization to create, unlock, list, store, or retrieve credentials in this milestone. The CLI is the human control plane. It is not an agent interface: there is no agent subcommand, no HTTP API, and no exported `GetSecret` operation.
 
 Key hierarchy:
 
 1. **Unlock secret.** The passphrase. It is never written to the vault, the audit log, or an error. Minimum length is 8 bytes. The CLI reads it from `TREMELAY_PASSPHRASE` or from a terminal prompt without echo (`golang.org/x/term` v0.34.0). It is not accepted as a command-line argument.
-2. **Key-encryption key (KEK).** Argon2id (RFC 9106) via `golang.org/x/crypto/argon2` v0.41.0, the newest release that still supports the repository's Go 1.23 toolchain. Production parameters are the RFC 9106 second recommended set: 64 MiB memory, 3 iterations, parallelism 4, 16-byte random salt, 32-byte output. Parameters are stored with the vault so later defaults can change without stranding existing files. Untrusted files are rejected before the KDF runs if the parameters fall outside a fixed bound (memory 8 MiB–1 GiB, time 1–10, threads 1–8, key length 32).
+2. **Key-encryption key (KEK).** Argon2id (RFC 9106) via `golang.org/x/crypto/argon2` v0.41.0. Production parameters are the RFC 9106 second recommended set: 64 MiB memory, 3 iterations, parallelism 4, 16-byte random salt, 32-byte output. Parameters are stored with the vault so later defaults can change without stranding existing files. Untrusted files are rejected before the KDF runs if the parameters fall outside a fixed bound (memory 8 MiB–1 GiB, time 1–10, threads 1–8, key length 32).
 3. **Master key (DEK).** A random 32-byte data key generated at vault creation from `crypto/rand`. The passphrase does not encrypt credential bytes directly.
 4. **Wrapping.** AES-256-GCM from the Go standard library encrypts the DEK under the KEK. The associated data is the domain separator `tremelay/v1/dek` plus the vault id. A wrong passphrase and a tampered wrap both fail GCM authentication. They are not distinguished.
-5. **Data encryption.** AES-256-GCM under the DEK encrypts one document containing every credential record and the sealed copy of the audit chain. Associated data binds the vault id and the audit head. Each seal uses a fresh random 12-byte nonce.
+5. **Data encryption.** AES-256-GCM under the DEK encrypts one document containing every credential record. The audit chain is not copied into that document. Associated data binds the vault id and the authenticated audit head. Each seal uses a fresh random 12-byte nonce.
 
 Credential records inside the document include a type from a fixed allowlist and lifecycle metadata: state, created time, updated time, and optional expiry, review, and rotation times. The secret itself exists in plaintext only in process memory after a successful unlock.
 
@@ -49,9 +49,9 @@ Go's garbage collector can retain copies of key and secret bytes. `Lock` zeroes 
 
 - Vault creation is intentionally slow (Argon2id, 64 MiB). Tests use the production parameters rather than a weaker test KDF.
 - Passphrase change is rewrap-of-DEK work and is not implemented.
-- The file format is version 1. Readers reject any other version.
-- Single-writer. Concurrent processes can lose updates. A later store can add a lock or SQLite without changing the hierarchy.
-- Crash recovery keeps the previous file at `PATH.bak` only across the rename window, and readers fall back to it when `PATH` is missing.
+- The vault format version is 1. Readers reject any other version.
+- Single-writer. SQLite serializes transactions. Concurrent processes are not an M1 workflow.
+- Credential-state changes and their audit events commit in one SQLite transaction. A locked unlock denial is appended without the DEK and incorporated on the next valid unlock (ADR 0003).
 
 ## Tests
 

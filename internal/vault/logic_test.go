@@ -3,8 +3,9 @@ package vault
 import (
 	"bytes"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -34,65 +35,29 @@ func TestVerifyChainRejectsTamper(t *testing.T) {
 	}
 }
 
-func TestReconcileDenialAndForgery(t *testing.T) {
-	create, err := nextEvent(nil, actionCreate, "vault", "", "", resultAllowed)
+func TestSuffixAllowsDenialOnly(t *testing.T) {
+	id := strings.Repeat("ab", 16)
+	create, err := nextEvent(nil, actionCreate, id, "", "", resultAllowed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sealed := []auditEvent{create}
-	denial, err := nextEvent(sealed, actionUnlock, "vault", "", "", resultDenied)
+	denial, err := nextEvent([]auditEvent{create}, actionUnlock, id, "", "", resultDenied)
 	if err != nil {
 		t.Fatal(err)
 	}
-	withDenial := []auditEvent{create, denial}
-	merged, err := reconcile(sealed, withDenial, true)
+	header := fileHeader{ID: id, AuditHead: create.Hash, AuditSeq: create.Seq}
+	if err := suffixAllows([]auditEvent{create, denial}, header); err != nil {
+		t.Fatal(err)
+	}
+	forged, err := nextEvent([]auditEvent{create}, actionGet, id, "id", "api_key", resultAllowed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(merged) != 2 || merged[1].Result != resultDenied {
-		t.Fatalf("denial suffix not kept")
-	}
-	forged, err := nextEvent(sealed, actionGet, "vault", "id", "api_key", resultAllowed)
-	if err != nil {
+	if err := verifyChain([]auditEvent{create, forged}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reconcile(sealed, []auditEvent{create, forged}, true); !errors.Is(err, ErrAudit) {
+	if err := suffixAllows([]auditEvent{create, forged}, header); !errors.Is(err, ErrAudit) {
 		t.Fatalf("forged allow: %v", err)
-	}
-	restored, err := reconcile(sealed, nil, false)
-	if err != nil || len(restored) != 1 {
-		t.Fatalf("missing sidecar: %v len %d", err, len(restored))
-	}
-}
-
-func TestReconcileSealedSuffix(t *testing.T) {
-	create, err := nextEvent(nil, actionCreate, "vault", "", "", resultAllowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := nextEvent([]auditEvent{create}, actionList, "vault", "", "", resultAllowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	third, err := nextEvent([]auditEvent{create, second}, actionUnlock, "vault", "", "", resultAllowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	full := []auditEvent{create, second, third}
-	suffix := full[1:]
-	merged, err := reconcile(suffix, full, true)
-	if err != nil || len(merged) != len(full) || merged[2].Hash != third.Hash {
-		t.Fatalf("suffix merge: %v len %d", err, len(merged))
-	}
-	partial, err := reconcile(suffix, full[:2], true)
-	if err != nil || len(partial) != len(full) || partial[2].Hash != third.Hash {
-		t.Fatalf("overlap restore: %v", err)
-	}
-	if _, err := reconcile(suffix, nil, false); !errors.Is(err, ErrAudit) {
-		t.Fatalf("missing sidecar after drop: %v", err)
-	}
-	if _, err := reconcile(full[2:], full[:1], true); !errors.Is(err, ErrAudit) {
-		t.Fatal("sealed gap was accepted")
 	}
 }
 
@@ -115,54 +80,6 @@ func TestRedactorHidesSecretAndPassphrase(t *testing.T) {
 	}
 	if bytes.Contains(buf.Bytes(), secret) {
 		t.Fatal("writer left secret material in place")
-	}
-}
-
-func TestUnlockProbeCoversRealEvent(t *testing.T) {
-	id := strings.Repeat("ab", 16)
-	create, err := nextEvent(nil, actionCreate, id, "", "", resultAllowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	unlock, err := nextEvent([]auditEvent{create}, actionUnlock, id, "", "", resultAllowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	probe := unlockProbe([]auditEvent{create}, id)
-	got, err := json.Marshal(unlock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want, err := json.Marshal(probe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) > len(want) {
-		t.Fatalf("probe %d bytes is smaller than a real unlock %d: %s", len(want), len(got), got)
-	}
-}
-
-func TestSplitAuditDropsTornTailOnly(t *testing.T) {
-	ev, err := nextEvent(nil, actionCreate, "vault", "", "", resultAllowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(ev); err != nil {
-		t.Fatal(err)
-	}
-	good := append([]byte(nil), buf.Bytes()...)
-	events, keep, torn, err := splitAudit(append(append([]byte(nil), good...), []byte(`{"v":1,"seq":`)...))
-	if err != nil || !torn || keep != len(good) || len(events) != 1 || events[0].Hash != ev.Hash {
-		t.Fatalf("torn tail events=%d keep=%d torn=%v err=%v", len(events), keep, torn, err)
-	}
-	bad := append(append([]byte(nil), good...), []byte("{\"v\":1,\"extra\":true}\n")...)
-	if _, _, _, err := splitAudit(bad); !errors.Is(err, ErrAudit) {
-		t.Fatalf("complete bad line: %v", err)
-	}
-	events, keep, torn, err = splitAudit(good)
-	if err != nil || torn || keep != len(good) || len(events) != 1 {
-		t.Fatalf("clean file keep=%d torn=%v err=%v", keep, torn, err)
 	}
 }
 
@@ -204,15 +121,18 @@ func TestNoGetSecretMethod(t *testing.T) {
 }
 
 func TestShortPassphraseRejected(t *testing.T) {
-	path := t.TempDir() + "/vault.json"
+	path := filepath.Join(t.TempDir(), "vault.db")
 	if _, err := Create(path, []byte("short"), nil); !errors.Is(err, ErrInvalid) {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal(err)
 	}
 }
 
 func TestTruncatedVaultRejected(t *testing.T) {
-	path := t.TempDir() + "/vault.json"
-	if err := writeAtomic(path, []byte("{")); err != nil {
+	path := filepath.Join(t.TempDir(), "vault.db")
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	pass := randBytesT(t, 16)
@@ -226,28 +146,71 @@ func TestTruncatedVaultRejected(t *testing.T) {
 }
 
 func TestHostileKDFRejectedWithoutDerivation(t *testing.T) {
-	path := t.TempDir() + "/vault.json"
-	header := fileHeader{
-		Version:    formatVersion,
-		ID:         strings.Repeat("ab", 16),
-		Root:       rootPassphrase,
-		KDF:        kdfParams{Algorithm: algoArgon2id, Salt: bytes.Repeat([]byte{7}, 16), Time: 3, Memory: 1 << 31, Threads: 4, KeyLen: keyLen},
-		WrapNonce:  bytes.Repeat([]byte{1}, nonceLen),
-		WrappedDEK: bytes.Repeat([]byte{2}, keyLen+16),
-		DataNonce:  bytes.Repeat([]byte{3}, nonceLen),
-		Data:       bytes.Repeat([]byte{4}, 32),
-		AuditHead:  strings.Repeat("cd", 32),
-		AuditSeq:   1,
-	}
-	raw, err := jsonMarshal(header)
+	path := filepath.Join(t.TempDir(), "vault.db")
+	db, err := createDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeAtomic(path, raw); err != nil {
+	_, err = db.Exec(`INSERT INTO vault (
+		id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len,
+		wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		strings.Repeat("ab", 16), formatVersion, rootPassphrase, algoArgon2id, bytes.Repeat([]byte{7}, 16),
+		3, int64(1)<<31, 4, keyLen,
+		bytes.Repeat([]byte{1}, nonceLen), bytes.Repeat([]byte{2}, keyLen+16),
+		bytes.Repeat([]byte{3}, nonceLen), bytes.Repeat([]byte{4}, 32),
+		strings.Repeat("cd", 32), 1,
+	)
+	if err != nil {
+		db.Close()
 		t.Fatal(err)
 	}
-	_, err = Unlock(path, randBytesT(t, 16), nil)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pass := randBytesT(t, 16)
+	_, err = Unlock(path, pass, nil)
 	if !errors.Is(err, ErrCorrupt) {
 		t.Fatal(err)
+	}
+	if bytes.Contains([]byte(err.Error()), pass) {
+		t.Fatal("error contains passphrase")
+	}
+}
+
+func TestDatabasePragmasAndExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vault.db")
+	db, err := createDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dsn, err := sqliteDSN(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(dsn, "mode=rw") || strings.Contains(dsn, "mode=rwc") {
+		t.Fatal(dsn)
+	}
+	opened, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := assertDurable(opened); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	opened.Close()
+	if _, err := createDB(path); !errors.Is(err, ErrInvalid) {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing.db")
+	if _, err := Unlock(missing, randBytesT(t, 16), nil); !errors.Is(err, ErrInvalid) {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("unlock created a database")
 	}
 }

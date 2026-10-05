@@ -9,6 +9,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -17,7 +18,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -53,13 +53,6 @@ const (
 	StateActive = "active"
 )
 
-// maxVaultFile is the largest vault or audit file readLimited will load.
-// Tests shrink it. Every accepted save leaves room for the next vault_unlock
-// in the vault file and in the sidecar, and neither file is written past this cap.
-var maxVaultFile int64 = 32 << 20
-
-const gcmTagLen = 16
-
 // CredentialTypes is the allowlist stored with each credential.
 var CredentialTypes = []string{
 	"password",
@@ -89,10 +82,6 @@ var (
 	// ErrPassphrase means the CLI has no passphrase source.
 	ErrPassphrase = errors.New("passphrase required")
 )
-
-// errSidecar means the sealed chain is durable but the append-only mirror write failed.
-// Callers must not roll back state that save already committed.
-var errSidecar = errors.New("audit sidecar append failed")
 
 // Lifecycle is non-secret metadata stored with a credential.
 type Lifecycle struct {
@@ -139,30 +128,31 @@ type credential struct {
 }
 
 type kdfParams struct {
-	Algorithm string `json:"algorithm"`
-	Salt      []byte `json:"salt"`
-	Time      uint32 `json:"time"`
-	Memory    uint32 `json:"memory"`
-	Threads   uint8  `json:"threads"`
-	KeyLen    uint32 `json:"key_len"`
+	Algorithm string
+	Salt      []byte
+	Time      uint32
+	Memory    uint32
+	Threads   uint8
+	KeyLen    uint32
 }
 
 type fileHeader struct {
-	Version    int       `json:"version"`
-	ID         string    `json:"id"`
-	Root       string    `json:"root"`
-	KDF        kdfParams `json:"kdf"`
-	WrapNonce  []byte    `json:"wrap_nonce"`
-	WrappedDEK []byte    `json:"wrapped_dek"`
-	DataNonce  []byte    `json:"data_nonce"`
-	Data       []byte    `json:"data"`
-	AuditHead  string    `json:"audit_head"`
-	AuditSeq   uint64    `json:"audit_seq"`
+	Version    int
+	ID         string
+	Root       string
+	KDF        kdfParams
+	WrapNonce  []byte
+	WrappedDEK []byte
+	DataNonce  []byte
+	Data       []byte
+	AuditHead  string
+	AuditSeq   uint64
 }
 
+// document is the plaintext inside the encrypted blob. Audit history lives
+// in the SQLite audit table, not in this document.
 type document struct {
 	Credentials []credential `json:"credentials"`
-	Audit       []auditEvent `json:"audit"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -175,6 +165,10 @@ type Session struct {
 	audit    []auditEvent
 	redactor *Redactor
 	logger   *log.Logger
+	db       *sql.DB
+	// commitFault, when set, fails a credential-state transaction before commit.
+	// Tests use it to prove rollback. Production leaves it nil.
+	commitFault func() error
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -182,8 +176,13 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	if err := validatePassphrase(passphrase); err != nil {
 		return nil, err
 	}
-	if err := refuseExisting(path); err != nil {
-		return nil, err
+	if path == "" {
+		return nil, ErrInvalid
+	}
+	if _, err := os.Stat(path); err == nil {
+		return nil, ErrInvalid
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, ErrIO
 	}
 	id, err := newID()
 	if err != nil {
@@ -200,6 +199,11 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		return nil, err
 	}
 	wrapNonce, wrapped, err := seal(kek, dek, dekAAD(id))
+	if err != nil {
+		wipe(dek)
+		return nil, err
+	}
+	db, err := createDB(path)
 	if err != nil {
 		wipe(dek)
 		return nil, err
@@ -221,39 +225,52 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		creds:    []credential{},
 		redactor: red,
 		logger:   logger,
+		db:       db,
 	}
 	if err := s.persistEvent(actionCreate, "", "", resultAllowed); err != nil {
 		s.Lock()
-		removeVaultFiles(path)
-		if errors.Is(err, errSidecar) {
-			return nil, ErrAudit
-		}
+		os.Remove(path)
 		return nil, err
 	}
 	s.logf("vault_create id=%s result=allowed", id)
 	return s, nil
 }
 
-// Unlock opens path with passphrase. A rejected passphrase appends an unlock denial
-// when the audit sidecar can accept one. The denial has no passphrase bytes.
+// Unlock opens path with passphrase. A rejected passphrase appends an unlock
+// denial and does not update encrypted credential state. The denial has no
+// passphrase bytes. A later valid unlock checks that denial suffix and links
+// its own event after it.
 func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error) {
-	header, err := readHeader(path)
+	db, header, events, err := loadVault(path)
 	if err != nil {
 		return nil, err
 	}
+	closeDB := true
+	defer func() {
+		if closeDB {
+			db.Close()
+		}
+	}()
+	deny := func(cause error) error {
+		if aerr := appendDenial(db, events, header.ID); aerr != nil {
+			logLine(logger, "vault_unlock result=denied")
+			return ErrAudit
+		}
+		logLine(logger, "vault_unlock result=denied")
+		return cause
+	}
 	if err := validatePassphrase(passphrase); err != nil {
-		return nil, unlockDenied(path, header, logger, err)
+		return nil, deny(err)
 	}
 	kek := deriveKEK(passphrase, header.KDF)
 	defer wipe(kek)
 	dek, err := openAEAD(kek, header.WrapNonce, header.WrappedDEK, dekAAD(header.ID))
 	if err != nil {
-		return nil, unlockDenied(path, header, logger, ErrUnauthenticated)
+		return nil, deny(ErrUnauthenticated)
 	}
 	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
 	if err != nil {
 		wipe(dek)
-		_ = appendUnlockDenial(path, header.ID, header.AuditHead, header.AuditSeq)
 		logLine(logger, "vault_unlock result=denied")
 		return nil, ErrCorrupt
 	}
@@ -264,25 +281,6 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		return nil, ErrCorrupt
 	}
 	if err := validateStored(doc.Credentials); err != nil {
-		wipe(dek)
-		return nil, err
-	}
-	if len(doc.Audit) == 0 || !sealedAuditOK(doc.Audit) {
-		wipe(dek)
-		return nil, ErrAudit
-	}
-	tip := doc.Audit[len(doc.Audit)-1]
-	if tip.Hash != header.AuditHead || tip.Seq != header.AuditSeq || tip.VaultID != header.ID {
-		wipe(dek)
-		return nil, ErrAudit
-	}
-	side, exists, err := readAudit(auditPath(path))
-	if err != nil {
-		wipe(dek)
-		return nil, err
-	}
-	merged, err := reconcile(doc.Audit, side, exists)
-	if err != nil {
 		wipe(dek)
 		return nil, err
 	}
@@ -297,32 +295,17 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		dek:      dek,
 		header:   header,
 		creds:    doc.Credentials,
-		audit:    merged,
+		audit:    events,
 		redactor: red,
 		logger:   logger,
-	}
-	// Restoring a missing suffix must leave the line the unlock below will write.
-	if err := sidecarFits(auditPath(path), merged, true); err != nil {
-		s.Lock()
-		return nil, err
-	}
-	if err := syncSidecar(auditPath(path), merged); err != nil {
-		s.Lock()
-		return nil, err
-	}
-	if len(merged) != len(doc.Audit) {
-		if err := s.save(); err != nil {
-			s.Lock()
-			return nil, err
-		}
+		db:       db,
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
-		if errors.Is(err, errSidecar) {
-			return nil, ErrAudit
-		}
+		closeDB = false
 		return nil, err
 	}
+	closeDB = false
 	s.logf("vault_unlock id=%s result=allowed", s.id)
 	return s, nil
 }
@@ -342,6 +325,10 @@ func (s *Session) Lock() {
 	s.audit = nil
 	if s.redactor != nil {
 		s.redactor.Wipe()
+	}
+	if s.db != nil {
+		s.db.Close()
+		s.db = nil
 	}
 }
 
@@ -391,24 +378,23 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 			RotationDueAt: rotation,
 		},
 	}
-	s.creds = append(s.creds, rec)
+	next := append(append([]credential{}, s.creds...), rec)
 	s.redactor.Add(secret)
-	if err := s.persistEvent(actionPut, id, typ, resultAllowed); err != nil {
-		if !errors.Is(err, errSidecar) {
-			wipe(s.creds[len(s.creds)-1].Secret)
-			s.creds = s.creds[:len(s.creds)-1]
-		}
-		if errors.Is(err, errSidecar) {
-			return Credential{}, ErrAudit
-		}
+	ev, err := nextEvent(s.audit, actionPut, s.id, id, typ, resultAllowed)
+	if err != nil {
+		wipe(rec.Secret)
+		return Credential{}, err
+	}
+	if err := s.commit(ev, next); err != nil {
+		wipe(rec.Secret)
 		return Credential{}, err
 	}
 	s.logf("credential_put id=%s type=%s label=%s result=allowed", id, typ, label)
 	return rec.public(), nil
 }
 
-// Get returns one credential, including its secret, after writing an audit event.
-// A failed audit does not return the secret.
+// Get returns one credential, including its secret, after committing an audit event.
+// A failed audit transaction does not return the secret.
 func (s *Session) Get(id string) (Credential, error) {
 	if err := s.live(); err != nil {
 		return Credential{}, err
@@ -419,9 +405,6 @@ func (s *Session) Get(id string) (Credential, error) {
 			continue
 		}
 		if err := s.persistEvent(actionGet, c.ID, c.Type, resultAllowed); err != nil {
-			if errors.Is(err, errSidecar) {
-				return Credential{}, ErrAudit
-			}
 			return Credential{}, err
 		}
 		s.logf("credential_get id=%s type=%s label=%s result=allowed", c.ID, c.Type, c.Label)
@@ -434,9 +417,6 @@ func (s *Session) Get(id string) (Credential, error) {
 		auditedID = ""
 	}
 	if err := s.persistEvent(actionGet, auditedID, "", resultDenied); err != nil {
-		if errors.Is(err, errSidecar) {
-			return Credential{}, ErrAudit
-		}
 		return Credential{}, err
 	}
 	s.logf("credential_get id=%s result=denied", auditedID)
@@ -449,9 +429,6 @@ func (s *Session) List() ([]Credential, error) {
 		return nil, err
 	}
 	if err := s.persistEvent(actionList, "", "", resultAllowed); err != nil {
-		if errors.Is(err, errSidecar) {
-			return nil, ErrAudit
-		}
 		return nil, err
 	}
 	s.logf("credential_list count=%d result=allowed", len(s.creds))
@@ -479,7 +456,7 @@ func (c credential) public() Credential {
 }
 
 func (s *Session) live() error {
-	if s == nil || len(s.dek) != keyLen {
+	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
 	return nil
@@ -487,22 +464,10 @@ func (s *Session) live() error {
 
 func (s *Session) denyPut(cause error) (Credential, error) {
 	if err := s.persistEvent(actionPut, "", "", resultDenied); err != nil {
-		if errors.Is(err, errSidecar) {
-			return Credential{}, ErrAudit
-		}
 		return Credential{}, err
 	}
 	s.logf("credential_put result=denied")
 	return Credential{}, cause
-}
-
-func unlockDenied(path string, header fileHeader, logger *log.Logger, cause error) error {
-	if aerr := appendUnlockDenial(path, header.ID, header.AuditHead, header.AuditSeq); aerr != nil && !errors.Is(aerr, errNoSidecar) {
-		logLine(logger, "vault_unlock result=denied")
-		return ErrAudit
-	}
-	logLine(logger, "vault_unlock result=denied")
-	return cause
 }
 
 func (s *Session) persistEvent(action, credID, credType, result string) error {
@@ -510,204 +475,42 @@ func (s *Session) persistEvent(action, credID, credType, result string) error {
 	if err != nil {
 		return err
 	}
-	s.audit = append(s.audit, ev)
-	// The successful unlock may use the reserved line. Every other event must
-	// leave that line free so locking the session cannot strand the vault.
-	reserve := action != actionUnlock || result != resultAllowed
-	if err := sidecarFits(auditPath(s.path), s.audit, reserve); err != nil {
-		s.audit = s.audit[:len(s.audit)-1]
-		return err
-	}
-	if err := s.save(); err != nil {
-		s.audit = s.audit[:len(s.audit)-1]
-		return err
-	}
-	// A previous append may have failed after save. Write the missing sealed
-	// prefix before the new tip so the sidecar cannot skip a sequence number.
-	if err := syncSidecar(auditPath(s.path), s.audit); err != nil {
-		return errSidecar
-	}
-	return nil
+	return s.commit(ev, s.creds)
 }
 
-func (s *Session) save() error {
-	if len(s.audit) == 0 || len(s.dek) != keyLen {
-		return ErrAudit
+// commit encrypts credential state under the new audit head and writes that
+// ciphertext plus the audit row in one transaction.
+func (s *Session) commit(ev auditEvent, creds []credential) error {
+	if s == nil || s.db == nil || len(s.dek) != keyLen {
+		return ErrUnauthenticated
 	}
-	sealed, err := s.sealedAudit()
-	if err != nil {
-		return err
-	}
-	last := s.audit[len(s.audit)-1]
-	if sealed[len(sealed)-1].Hash != last.Hash || sealed[len(sealed)-1].Seq != last.Seq {
-		return ErrAudit
-	}
-	s.header.Version = formatVersion
-	s.header.ID = s.id
-	s.header.Root = rootPassphrase
-	s.header.AuditHead = last.Hash
-	s.header.AuditSeq = last.Seq
-	doc := document{Credentials: s.creds, Audit: sealed}
-	plain, err := json.Marshal(doc)
+	plain, err := json.Marshal(document{Credentials: creds})
 	if err != nil {
 		return ErrIO
 	}
 	defer wipe(plain)
-	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, s.header.AuditHead, s.header.AuditSeq))
+	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, ev.Hash, ev.Seq))
 	if err != nil {
 		return err
 	}
-	s.header.DataNonce = nonce
-	s.header.Data = ct
-	raw, err := json.Marshal(s.header)
-	if err != nil {
-		return ErrIO
+	h := s.header
+	h.Version = formatVersion
+	h.ID = s.id
+	h.Root = rootPassphrase
+	h.DataNonce = nonce
+	h.Data = ct
+	h.AuditHead = ev.Hash
+	h.AuditSeq = ev.Seq
+	if err := writeTx(s.db, h, ev, len(s.audit) == 0, s.commitFault); err != nil {
+		if errors.Is(err, ErrIO) {
+			s.logf("vault_write result=error")
+		}
+		return err
 	}
-	if int64(len(raw)) > maxVaultFile {
-		return ErrInvalid
-	}
-	if err := writeAtomic(s.path, raw); err != nil {
-		s.logf("io error=%v", err)
-		return ErrIO
-	}
+	s.header = h
+	s.audit = append(s.audit, ev)
+	s.creds = creds
 	return nil
-}
-
-// sealedAudit keeps the longest suffix that still leaves room for the next
-// vault_unlock. A prefix is omitted only after the sidecar has that prefix.
-// ponytail: the sidecar is not rotated. Ceiling: losing the sidecar after a
-// drop fails unlock closed. The sidecar is capped separately in sidecarFits.
-// Upgrade path: store the chain outside the credential document (ADR 0003).
-func (s *Session) sealedAudit() ([]auditEvent, error) {
-	chain := s.audit
-	keep, err := s.keptTail()
-	if err != nil {
-		return nil, err
-	}
-	if keep < 1 || keep > len(chain) {
-		return nil, ErrAudit
-	}
-	if s.commitFits(chain) {
-		return chain, nil
-	}
-	maxDrop := len(chain) - keep
-	best := -1
-	lo, hi := 1, maxDrop
-	for lo <= hi {
-		mid := lo + (hi-lo)/2
-		if s.commitFits(chain[mid:]) {
-			best = mid
-			hi = mid - 1
-		} else {
-			lo = mid + 1
-		}
-	}
-	if best < 0 {
-		return nil, ErrInvalid
-	}
-	return chain[best:], nil
-}
-
-// keptTail is the number of trailing events that must stay inside the
-// encrypted document. The sidecar already has the rest.
-func (s *Session) keptTail() (int, error) {
-	side, exists, err := readAudit(auditPath(s.path))
-	if err != nil {
-		return 0, err
-	}
-	if !exists || len(side) > len(s.audit) || !hashesEqual(side, s.audit[:len(side)]) {
-		return len(s.audit), nil
-	}
-	pending := len(s.audit) - len(side)
-	if pending < 1 {
-		return 1, nil
-	}
-	return pending, nil
-}
-
-// commitFits reports whether events can be sealed and a later unlock can still
-// persist after older sealed events are dropped.
-func (s *Session) commitFits(events []auditEvent) bool {
-	if len(events) == 0 || !s.roomFor(withProbe(events, s.id)) {
-		return false
-	}
-	return s.roomFor(twoUnlocks(events, s.id))
-}
-
-func (s *Session) roomFor(events []auditEvent) bool {
-	n, err := encodedSize(s.header, s.creds, events)
-	return err == nil && int64(n) <= maxVaultFile
-}
-
-func withProbe(events []auditEvent, vaultID string) []auditEvent {
-	out := make([]auditEvent, len(events)+1)
-	copy(out, events)
-	out[len(events)] = unlockProbe(events, vaultID)
-	return out
-}
-
-// twoUnlocks is the credential floor: two max-width unlock events and no
-// older history. An accepted save must leave at least this much room.
-func twoUnlocks(events []auditEvent, vaultID string) []auditEvent {
-	first := unlockProbe(events, vaultID)
-	second := unlockProbe([]auditEvent{first}, vaultID)
-	return []auditEvent{first, second}
-}
-
-// unlockProbe is a max-width vault_unlock used only to measure file growth.
-// It is not hashed or stored.
-func unlockProbe(chain []auditEvent, vaultID string) auditEvent {
-	seq := uint64(1)
-	prev := strings.Repeat("0", 64)
-	if n := len(chain); n > 0 {
-		seq = chain[n-1].Seq + 1
-		if len(chain[n-1].Hash) == 64 {
-			prev = chain[n-1].Hash
-		}
-	}
-	if len(vaultID) < 32 {
-		vaultID = strings.Repeat("a", 32)
-	}
-	return auditEvent{
-		V:       auditVersion,
-		Seq:     seq,
-		Time:    "2006-01-02T15:04:05.999999999Z",
-		Action:  actionUnlock,
-		VaultID: vaultID,
-		Result:  resultAllowed,
-		Prev:    prev,
-		Hash:    strings.Repeat("f", 64),
-	}
-}
-
-func encodedSize(h fileHeader, creds []credential, events []auditEvent) (int, error) {
-	if len(events) == 0 {
-		return 0, ErrAudit
-	}
-	last := events[len(events)-1]
-	h.AuditHead = last.Hash
-	h.AuditSeq = last.Seq
-	h.DataNonce = make([]byte, nonceLen)
-	plain, err := json.Marshal(document{Credentials: creds, Audit: events})
-	if err != nil {
-		return 0, ErrIO
-	}
-	h.Data = make([]byte, len(plain)+gcmTagLen)
-	raw, err := json.Marshal(h)
-	if err != nil {
-		return 0, ErrIO
-	}
-	return len(raw), nil
-}
-
-func sealedAuditOK(events []auditEvent) bool {
-	if len(events) == 0 {
-		return false
-	}
-	if events[0].Seq == 1 {
-		return verifyChain(events) == nil
-	}
-	return verifyLinked(events) == nil
 }
 
 func (s *Session) logf(format string, args ...any) {
@@ -929,69 +732,6 @@ func validateHeader(h fileHeader) error {
 	return nil
 }
 
-func refuseExisting(path string) error {
-	if path == "" {
-		return ErrInvalid
-	}
-	if _, err := os.Stat(path); err == nil {
-		return ErrInvalid
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return ErrIO
-	}
-	if _, err := os.Stat(auditPath(path)); err == nil {
-		return ErrInvalid
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return ErrIO
-	}
-	return nil
-}
-
-func readHeader(path string) (fileHeader, error) {
-	b, err := readVaultBytes(path)
-	if err != nil {
-		return fileHeader{}, err
-	}
-	var header fileHeader
-	if err := unmarshalStrict(b, &header); err != nil {
-		return fileHeader{}, ErrCorrupt
-	}
-	if err := validateHeader(header); err != nil {
-		return fileHeader{}, err
-	}
-	return header, nil
-}
-
-func readVaultBytes(path string) ([]byte, error) {
-	b, err := readLimited(path, maxVaultFile)
-	if err == nil {
-		return b, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	bak, bakErr := readLimited(path+".bak", maxVaultFile)
-	if bakErr != nil {
-		return nil, ErrInvalid
-	}
-	return bak, nil
-}
-
-func readLimited(path string, max int64) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, max+1))
-	if err != nil {
-		return nil, ErrIO
-	}
-	if int64(len(b)) > max {
-		return nil, ErrCorrupt
-	}
-	return b, nil
-}
-
 func unmarshalStrict(data []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -1003,64 +743,4 @@ func unmarshalStrict(data []byte, v any) error {
 		return ErrCorrupt
 	}
 	return nil
-}
-
-// writeAtomic replaces path by renaming a synced temp file into place.
-// ponytail: single writer. A crash between moving path aside and renaming the
-// temp file leaves path.bak. Readers fall back to that file when path is missing.
-// Upgrade path: a file lock or SQLite transaction.
-func writeAtomic(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".tremelay-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			os.Remove(tmp)
-		}
-	}()
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	bak := path + ".bak"
-	if _, err := os.Stat(path); err == nil {
-		os.Remove(bak)
-		if err := os.Rename(path, bak); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Rename(bak, path)
-		return err
-	}
-	cleanup = false
-	os.Remove(bak)
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
-	}
-	return nil
-}
-
-func removeVaultFiles(path string) {
-	os.Remove(path)
-	os.Remove(path + ".bak")
-	os.Remove(auditPath(path))
 }

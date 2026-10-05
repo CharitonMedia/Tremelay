@@ -3,8 +3,8 @@ package vault
 import (
 	"bytes"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"log"
 	"os"
@@ -70,7 +70,6 @@ func TestRoundTripLifecycleAndNoPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer opened.Lock()
 	got, err := opened.Get(stored.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -91,35 +90,187 @@ func TestRoundTripLifecycleAndNoPlaintext(t *testing.T) {
 	if _, err := opened.Get(string(secret)); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
 	}
-
-	raw := readAll(t, path)
-	audit := readAll(t, auditPath(path))
-	assertAbsent(t, raw, secret)
-	assertAbsent(t, raw, other)
-	assertAbsent(t, raw, pass)
-	assertAbsent(t, raw, []byte(label))
-	assertAbsent(t, audit, secret)
-	assertAbsent(t, audit, other)
-	assertAbsent(t, audit, pass)
-	assertAbsent(t, logs.Bytes(), secret)
-	assertAbsent(t, logs.Bytes(), pass)
-	if bytes.Contains(raw, opened.dek) {
-		t.Fatal("master key persisted")
-	}
+	dek := append([]byte(nil), opened.dek...)
 	head, err := VerifyAudit(path)
 	if err != nil || head == "" {
 		t.Fatal(err)
 	}
+	opened.Lock()
+	raw := readAll(t, path)
+	assertAbsent(t, raw, secret)
+	assertAbsent(t, raw, other)
+	assertAbsent(t, raw, pass)
+	assertAbsent(t, raw, []byte(label))
+	assertAbsent(t, logs.Bytes(), secret)
+	assertAbsent(t, logs.Bytes(), pass)
+	if bytes.Contains(raw, dek) {
+		t.Fatal("master key persisted")
+	}
+	if _, err := os.Stat(path + ".audit"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
 	if runtime.GOOS != "windows" {
-		for _, p := range []string{path, auditPath(path)} {
-			fi, err := os.Stat(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if fi.Mode().Perm()&0o077 != 0 {
-				t.Fatalf("%s mode %v", p, fi.Mode().Perm())
-			}
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
 		}
+		if fi.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("%s mode %v", path, fi.Mode().Perm())
+		}
+	}
+}
+
+func TestCredentialAndAuditCommitAtomically(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 32)
+	stored, err := session.Put("label", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.header.AuditSeq == 0 || session.header.AuditHead == "" {
+		t.Fatal("missing authenticated head")
+	}
+	db := mustOpen(t, path)
+	var action, head string
+	var seq int64
+	if err := db.QueryRow(`SELECT action FROM audit WHERE seq=?`, session.header.AuditSeq).Scan(&action); err != nil {
+		t.Fatal(err)
+	}
+	if action != actionPut {
+		t.Fatalf("action %s", action)
+	}
+	if err := db.QueryRow(`SELECT audit_head, audit_seq FROM vault`).Scan(&head, &seq); err != nil {
+		t.Fatal(err)
+	}
+	if head != session.header.AuditHead || uint64(seq) != session.header.AuditSeq {
+		t.Fatalf("head %s seq %d", head, seq)
+	}
+	db.Close()
+	session.Lock()
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	got, err := opened.Get(stored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Secret, secret) {
+		t.Fatal("secret mismatch")
+	}
+	if err := verifyChain(opened.audit); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransactionFailureRollsBackCredentialAndAudit(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	beforeLen := len(session.audit)
+	beforeHead := session.header.AuditHead
+	beforeSeq := session.header.AuditSeq
+	secret := randBytesT(t, 32)
+	session.commitFault = func() error { return errors.New("induced") }
+	_, err := session.Put("label", "generic", secret, PutOptions{})
+	if !errors.Is(err, ErrAudit) {
+		t.Fatal(err)
+	}
+	if bytes.Contains([]byte(err.Error()), secret) {
+		t.Fatal("rollback error contains secret")
+	}
+	if len(session.creds) != 0 || len(session.audit) != beforeLen || session.header.AuditHead != beforeHead || session.header.AuditSeq != beforeSeq {
+		t.Fatal("failed put changed the session")
+	}
+	db := mustOpen(t, path)
+	var seq int64
+	var action string
+	if err := db.QueryRow(`SELECT audit_seq FROM vault`).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	if uint64(seq) != beforeSeq {
+		t.Fatalf("durable seq %d", seq)
+	}
+	err = db.QueryRow(`SELECT action FROM audit WHERE action=?`, actionPut).Scan(&action)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("durable put action %q err %v", action, err)
+	}
+	db.Close()
+	session.commitFault = nil
+	stored, err := session.Put("label", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	assertAbsent(t, readAll(t, path), secret)
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	got, err := opened.Get(stored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Secret, secret) {
+		t.Fatal("secret missing after a later commit")
+	}
+	var puts int
+	for _, ev := range opened.audit {
+		if ev.Action == actionPut && ev.Result == resultAllowed {
+			puts++
+		}
+	}
+	if puts != 1 {
+		t.Fatalf("allowed puts %d", puts)
+	}
+}
+
+func TestGetWithholdsSecretWhenAuditCommitFails(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 32)
+	stored, err := session.Put("label", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.commitFault = func() error { return errors.New("induced") }
+	cred, err := session.Get(stored.ID)
+	if !errors.Is(err, ErrAudit) {
+		t.Fatal(err)
+	}
+	if len(cred.Secret) != 0 || bytes.Contains([]byte(err.Error()), secret) {
+		t.Fatal("failed get returned secret material")
+	}
+	for _, ev := range session.audit {
+		if ev.Action == actionGet {
+			t.Fatal("rolled-back get stayed in the session chain")
+		}
+	}
+	db := mustOpen(t, path)
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action=?`, actionGet).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if n != 0 {
+		t.Fatalf("durable get events %d", n)
+	}
+	session.commitFault = nil
+	got, err := session.Get(stored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Secret, secret) {
+		t.Fatal("secret mismatch")
+	}
+	session.Lock()
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	again, err := opened.Get(stored.ID)
+	if err != nil || !bytes.Equal(again.Secret, secret) {
+		t.Fatal(err)
 	}
 }
 
@@ -139,12 +290,12 @@ func TestWrongPassphrase(t *testing.T) {
 	if strings.Contains(err.Error(), string(wrong)) || strings.Contains(err.Error(), string(pass)) || bytes.Contains([]byte(err.Error()), secret) {
 		t.Fatal("unlock error contains secret material")
 	}
-	audit := readAll(t, auditPath(path))
-	assertAbsent(t, audit, secret)
-	assertAbsent(t, audit, wrong)
+	raw := readAll(t, path)
+	assertAbsent(t, raw, secret)
+	assertAbsent(t, raw, wrong)
 	assertAbsent(t, logs.Bytes(), secret)
 	assertAbsent(t, logs.Bytes(), wrong)
-	if !bytes.Contains(audit, []byte(resultDenied)) {
+	if !bytes.Contains(raw, []byte(resultDenied)) {
 		t.Fatal("denied unlock was not audited")
 	}
 	opened, err := Unlock(path, pass, nil)
@@ -159,14 +310,20 @@ func TestWrongPassphrase(t *testing.T) {
 	if !bytes.Equal(got.Secret, secret) {
 		t.Fatal("secret unreadable after denied unlock")
 	}
-	var sawDenial bool
+	var denialSeq uint64
 	for _, ev := range opened.audit {
 		if ev.Action == actionUnlock && ev.Result == resultDenied {
-			sawDenial = true
+			denialSeq = ev.Seq
 		}
 	}
-	if !sawDenial {
-		t.Fatal("denial was not sealed")
+	if denialSeq == 0 || opened.header.AuditSeq <= denialSeq {
+		t.Fatalf("denial seq %d head %d", denialSeq, opened.header.AuditSeq)
+	}
+	if err := verifyChain(opened.audit); err != nil {
+		t.Fatal(err)
+	}
+	if err := suffixAllows(opened.audit, opened.header); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -184,12 +341,19 @@ func TestTamperAndSwap(t *testing.T) {
 	}
 	sessionB.Lock()
 
-	dataCopy := filepath.Join(t.TempDir(), "data.json")
-	wrapCopy := filepath.Join(t.TempDir(), "wrap.json")
+	dataCopy := filepath.Join(t.TempDir(), "data.db")
+	wrapCopy := filepath.Join(t.TempDir(), "wrap.db")
 	copyFile(t, pathA, dataCopy)
 	copyFile(t, pathA, wrapCopy)
-	mutateHeader(t, dataCopy, func(h *fileHeader) {
-		h.Data[len(h.Data)-1] ^= 0xff
+	mutateDB(t, dataCopy, func(db *sql.DB) {
+		var data []byte
+		if err := db.QueryRow(`SELECT encrypted_document FROM vault`).Scan(&data); err != nil {
+			t.Fatal(err)
+		}
+		data[len(data)-1] ^= 0xff
+		if _, err := db.Exec(`UPDATE vault SET encrypted_document=?`, data); err != nil {
+			t.Fatal(err)
+		}
 	})
 	_, err := Unlock(dataCopy, passA, nil)
 	if !errors.Is(err, ErrCorrupt) {
@@ -198,21 +362,31 @@ func TestTamperAndSwap(t *testing.T) {
 	if bytes.Contains([]byte(err.Error()), secretA) || strings.Contains(err.Error(), string(passA)) {
 		t.Fatal("tamper error contains secret material")
 	}
-	mutateHeader(t, wrapCopy, func(h *fileHeader) {
-		h.WrappedDEK[len(h.WrappedDEK)-1] ^= 0xff
+	mutateDB(t, wrapCopy, func(db *sql.DB) {
+		var wrapped []byte
+		if err := db.QueryRow(`SELECT wrapped_dek FROM vault`).Scan(&wrapped); err != nil {
+			t.Fatal(err)
+		}
+		wrapped[len(wrapped)-1] ^= 0xff
+		if _, err := db.Exec(`UPDATE vault SET wrapped_dek=?`, wrapped); err != nil {
+			t.Fatal(err)
+		}
 	})
 	_, err = Unlock(wrapCopy, passA, nil)
 	if !errors.Is(err, ErrUnauthenticated) {
 		t.Fatal(err)
 	}
 
-	mutateHeader(t, pathA, func(h *fileHeader) {
-		other, readErr := readHeader(pathB)
-		if readErr != nil {
-			t.Fatal(readErr)
+	var dataB, nonceB []byte
+	mutateDB(t, pathB, func(db *sql.DB) {
+		if err := db.QueryRow(`SELECT encrypted_document, data_nonce FROM vault`).Scan(&dataB, &nonceB); err != nil {
+			t.Fatal(err)
 		}
-		h.Data = other.Data
-		h.DataNonce = other.DataNonce
+	})
+	mutateDB(t, pathA, func(db *sql.DB) {
+		if _, err := db.Exec(`UPDATE vault SET encrypted_document=?, data_nonce=?`, dataB, nonceB); err != nil {
+			t.Fatal(err)
+		}
 	})
 	_, err = Unlock(pathA, passA, nil)
 	if err == nil {
@@ -243,17 +417,27 @@ func TestForgedAuditBlocksUnlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	session.Lock()
-	side, _, err := readAudit(auditPath(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	forged, err := nextEvent(side, actionGet, side[0].VaultID, stored.ID, "bearer_token", resultAllowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := appendAudit(auditPath(path), forged); err != nil {
-		t.Fatal(err)
-	}
+	mutateDB(t, path, func(db *sql.DB) {
+		events, err := readAuditRows(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		forged, err := nextEvent(events, actionGet, events[0].VaultID, stored.ID, "bearer_token", resultAllowed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := insertAudit(tx, forged); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if _, err := VerifyAudit(path); !errors.Is(err, ErrAudit) {
 		t.Fatal(err)
 	}
@@ -266,19 +450,46 @@ func TestForgedAuditBlocksUnlock(t *testing.T) {
 	}
 }
 
-func TestMissingSidecarRestored(t *testing.T) {
+func TestTamperedAuditHashFailsVerify(t *testing.T) {
 	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 24)
+	if _, err := session.Put("label", "generic", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
 	session.Lock()
-	if err := os.Remove(auditPath(path)); err != nil {
+	mutateDB(t, path, func(db *sql.DB) {
+		if _, err := db.Exec(`UPDATE audit SET result=? WHERE seq=1`, resultDenied); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if _, err := VerifyAudit(path); !errors.Is(err, ErrAudit) {
 		t.Fatal(err)
 	}
-	opened, err := Unlock(path, pass, nil)
-	if err != nil {
+	_, err := Unlock(path, pass, nil)
+	if !errors.Is(err, ErrAudit) {
 		t.Fatal(err)
 	}
-	opened.Lock()
-	if _, err := VerifyAudit(path); err != nil {
+	if bytes.Contains([]byte(err.Error()), secret) || strings.Contains(err.Error(), string(pass)) {
+		t.Fatal("tamper error contains secret material")
+	}
+}
+
+func TestCorruptDatabase(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 24)
+	if _, err := session.Put("label", "generic", secret, PutOptions{}); err != nil {
 		t.Fatal(err)
+	}
+	session.Lock()
+	if err := os.WriteFile(path, []byte("not a database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Unlock(path, pass, nil)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatal(err)
+	}
+	if bytes.Contains([]byte(err.Error()), secret) || strings.Contains(err.Error(), string(pass)) {
+		t.Fatal("corrupt error contains secret material")
 	}
 }
 
@@ -294,320 +505,7 @@ func TestLogRedactsLabelContainingSecret(t *testing.T) {
 		t.Fatal("log contains secret")
 	}
 	if !bytes.Contains(logs.Bytes(), []byte(redacted)) {
-		t.Fatalf("expected redaction marker in logs")
-	}
-}
-
-func TestUnlockRoomSurvivesAuditGrowth(t *testing.T) {
-	path, pass, session := mustCreate(t, nil)
-	secret := randBytesT(t, 32)
-	stored, err := session.Put("a", "generic", secret, PutOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 12; i++ {
-		if _, err := session.List(); err != nil {
-			t.Fatalf("list %d: %v", i, err)
-		}
-	}
-	before := readAll(t, path)
-	floor, err := encodedSize(session.header, session.creds, twoUnlocks(session.audit, session.id))
-	if err != nil {
-		t.Fatal(err)
-	}
-	limit := floor
-	if len(before) > limit {
-		limit = len(before)
-	}
-	old := maxVaultFile
-	t.Cleanup(func() { maxVaultFile = old })
-	maxVaultFile = int64(limit)
-
-	big := randBytesT(t, 4096)
-	if _, err := session.Put("b", "generic", big, PutOptions{}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("put err %v", err)
-	}
-	if !bytes.Equal(readAll(t, path), before) {
-		t.Fatal("rejected put replaced the vault file")
-	}
-	assertAbsent(t, before, big)
-
-	sideBefore, _, err := readAudit(auditPath(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := session.List(); err != nil {
-		t.Fatal(err)
-	}
-	if int64(len(readAll(t, path))) > maxVaultFile {
-		t.Fatalf("list wrote %d bytes over %d", len(readAll(t, path)), maxVaultFile)
-	}
-	session.Lock()
-
-	var opened *Session
-	for i := 0; i < 3; i++ {
-		opened, err = Unlock(path, pass, nil)
-		if err != nil {
-			t.Fatalf("unlock %d: %v", i, err)
-		}
-		if len(opened.creds) != 1 || !bytes.Equal(opened.creds[0].Secret, secret) || opened.creds[0].ID != stored.ID {
-			opened.Lock()
-			t.Fatal("credential missing after unlock")
-		}
-		if int64(len(readAll(t, path))) > maxVaultFile {
-			opened.Lock()
-			t.Fatal("unlock wrote past the read limit")
-		}
-		opened.Lock()
-	}
-	if _, err := VerifyAudit(path); err != nil {
-		t.Fatal(err)
-	}
-	sideAfter, _, err := readAudit(auditPath(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(sideAfter) <= len(sideBefore) {
-		t.Fatalf("sidecar shrank: %d -> %d", len(sideBefore), len(sideAfter))
-	}
-	var unlocks int
-	for _, ev := range sideAfter {
-		if ev.Action == actionUnlock && ev.Result == resultAllowed {
-			unlocks++
-		}
-	}
-	if unlocks < 3 {
-		t.Fatalf("allowed unlocks %d", unlocks)
-	}
-}
-
-func TestPutRejectsGrowthPastReadLimit(t *testing.T) {
-	path, pass, session := mustCreate(t, nil)
-	before := readAll(t, path)
-	old := maxVaultFile
-	defer func() { maxVaultFile = old }()
-	maxVaultFile = int64(len(before))
-
-	secret := randBytesT(t, 64)
-	if _, err := session.Put("label", "generic", secret, PutOptions{}); !errors.Is(err, ErrInvalid) {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(readAll(t, path), before) {
-		t.Fatal("rejected put replaced the vault file")
-	}
-	assertAbsent(t, before, secret)
-
-	maxVaultFile = old
-	session.Lock()
-	opened, err := Unlock(path, pass, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer opened.Lock()
-	listed, err := opened.List()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(listed) != 0 {
-		t.Fatalf("count %d", len(listed))
-	}
-}
-
-func TestAppendAuditRefusesPastCap(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "vault.audit")
-	ev, err := nextEvent(nil, actionCreate, "vault", "", "", resultAllowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	line, err := auditLine(ev)
-	if err != nil {
-		t.Fatal(err)
-	}
-	old := maxVaultFile
-	t.Cleanup(func() { maxVaultFile = old })
-	maxVaultFile = int64(len(line))
-	if err := appendAudit(path, ev); err != nil {
-		t.Fatal(err)
-	}
-	before := readAll(t, path)
-	next, err := nextEvent([]auditEvent{ev}, actionUnlock, "vault", "", "", resultDenied)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := appendAudit(path, next); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("append err %v", err)
-	}
-	if !bytes.Equal(readAll(t, path), before) {
-		t.Fatal("rejected append changed the sidecar")
-	}
-	got, _, err := readAudit(path)
-	if err != nil || len(got) != 1 || got[0].Hash != ev.Hash {
-		t.Fatalf("sidecar after refusal len=%d err=%v", len(got), err)
-	}
-}
-
-func TestTornSidecarTailStillUnlocks(t *testing.T) {
-	path, pass, session := mustCreate(t, nil)
-	secret := randBytesT(t, 16)
-	stored, err := session.Put("a", "generic", secret, PutOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	session.Lock()
-	f, err := os.OpenFile(auditPath(path), os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.Write([]byte(`{"v":1,"seq":`)); err != nil {
-		f.Close()
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-	opened, err := Unlock(path, pass, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer opened.Lock()
-	if bytes.HasSuffix(readAll(t, auditPath(path)), []byte(`{"v":1,"seq":`)) {
-		t.Fatal("torn tail still in sidecar")
-	}
-	if _, err := VerifyAudit(path); err != nil {
-		t.Fatal(err)
-	}
-	got, err := opened.Get(stored.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got.Secret, secret) {
-		t.Fatal("secret missing after torn sidecar")
-	}
-}
-
-func TestCompleteBadSidecarLineIsNotStripped(t *testing.T) {
-	path, pass, session := mustCreate(t, nil)
-	session.Lock()
-	f, err := os.OpenFile(auditPath(path), os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.Write([]byte("{\"v\":1,\"extra\":true}\n")); err != nil {
-		f.Close()
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-	before := readAll(t, auditPath(path))
-	if _, err := Unlock(path, pass, nil); !errors.Is(err, ErrAudit) {
-		t.Fatalf("unlock %v", err)
-	}
-	if !bytes.Equal(readAll(t, auditPath(path)), before) {
-		t.Fatal("tampered sidecar was rewritten")
-	}
-}
-
-func TestSidecarReserveLetsNextUnlockSucceed(t *testing.T) {
-	path, pass, session := mustCreate(t, nil)
-	vaultSize := len(readAll(t, path))
-	old := maxVaultFile
-	t.Cleanup(func() { maxVaultFile = old })
-	maxVaultFile = int64(vaultSize + 8192)
-
-	var lists int
-	for lists < 80 {
-		_, err := session.List()
-		if errors.Is(err, ErrInvalid) {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		lists++
-	}
-	if lists == 0 || lists == 80 {
-		t.Fatalf("lists before refusal: %d", lists)
-	}
-	side := readAll(t, auditPath(path))
-	if int64(len(side)) > maxVaultFile {
-		t.Fatalf("sidecar %d exceeds %d", len(side), maxVaultFile)
-	}
-	ev, err := nextEvent(session.audit, actionList, session.id, "", "", resultAllowed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := sidecarFits(auditPath(path), append(copyEvents(session.audit), ev), true); err == nil {
-		t.Fatal("another list still fits in the sidecar")
-	}
-	if err := sidecarFits(auditPath(path), session.audit, true); err != nil {
-		t.Fatalf("unlock reserve missing: %v", err)
-	}
-	session.Lock()
-	for i := 0; i < 3; i++ {
-		_, err := Unlock(path, []byte("short"), nil)
-		if !errors.Is(err, ErrInvalid) && !errors.Is(err, ErrAudit) {
-			t.Fatalf("denied unlock %v", err)
-		}
-		if int64(len(readAll(t, auditPath(path)))) > maxVaultFile {
-			t.Fatal("denial append passed the read cap")
-		}
-	}
-	opened, err := Unlock(path, pass, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer opened.Lock()
-	if int64(len(readAll(t, auditPath(path)))) > maxVaultFile {
-		t.Fatal("unlock append passed the read cap")
-	}
-	if _, err := VerifyAudit(path); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSidecarGapRepairedBeforeNextAppend(t *testing.T) {
-	path, pass, session := mustCreate(t, nil)
-	if _, err := session.Put("a", "generic", randBytesT(t, 16), PutOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	side, exists, err := readAudit(auditPath(path))
-	if err != nil || !exists || len(side) < 2 {
-		t.Fatalf("sidecar exists=%v len=%d err=%v", exists, len(side), err)
-	}
-	if err := writeAuditFile(auditPath(path), side[:1]); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := session.Put("b", "password", randBytesT(t, 16), PutOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := VerifyAudit(path); err != nil {
-		t.Fatal(err)
-	}
-	repaired, _, err := readAudit(auditPath(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i, ev := range repaired {
-		if ev.Seq != uint64(i+1) {
-			t.Fatalf("seq %d at %d", ev.Seq, i)
-		}
-	}
-	if len(repaired) != len(session.audit) {
-		t.Fatalf("sidecar %d session %d", len(repaired), len(session.audit))
-	}
-	session.Lock()
-	opened, err := Unlock(path, pass, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer opened.Lock()
-	listed, err := opened.List()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(listed) != 2 {
-		t.Fatalf("count %d", len(listed))
+		t.Fatal("expected redaction marker in logs")
 	}
 }
 
@@ -634,12 +532,6 @@ func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	audit := readAll(t, auditPath(path))
-	assertAbsent(t, audit, secret)
-	assertAbsent(t, logs.Bytes(), secret)
-	if bytes.Contains(audit, []byte(badLabel)) || bytes.Contains(audit, []byte(badType)) || bytes.Contains(logs.Bytes(), []byte(badLabel)) {
-		t.Fatal("denial recorded free-form metadata")
-	}
 	var denied int
 	for _, ev := range session.audit {
 		if ev.Action == actionPut && ev.Result == resultDenied {
@@ -657,6 +549,12 @@ func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	session.Lock()
+	raw := readAll(t, path)
+	assertAbsent(t, raw, secret)
+	assertAbsent(t, logs.Bytes(), secret)
+	if bytes.Contains(raw, []byte(badLabel)) || bytes.Contains(raw, []byte(badType)) || bytes.Contains(logs.Bytes(), []byte(badLabel)) {
+		t.Fatal("denial recorded free-form metadata")
+	}
 	opened, err := Unlock(path, pass, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -676,7 +574,7 @@ func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
 		}
 	}
 	if sealed != len(attempts) {
-		t.Fatalf("sealed denials %d", sealed)
+		t.Fatalf("durable denials %d", sealed)
 	}
 }
 
@@ -696,17 +594,14 @@ func TestOutOfRangePassphraseUnlockIsAudited(t *testing.T) {
 			t.Fatal("unlock error contains passphrase")
 		}
 	}
-	audit := readAll(t, auditPath(path))
-	assertAbsent(t, audit, short)
-	assertAbsent(t, audit, long)
+	raw := readAll(t, path)
+	assertAbsent(t, raw, short)
+	assertAbsent(t, raw, long)
 	assertAbsent(t, logs.Bytes(), short)
 	assertAbsent(t, logs.Bytes(), long)
-	side, _, err := readAudit(auditPath(path))
-	if err != nil {
-		t.Fatal(err)
-	}
+	events := mustAudit(t, path)
 	var denied int
-	for _, ev := range side {
+	for _, ev := range events {
 		if ev.Action == actionUnlock && ev.Result == resultDenied {
 			denied++
 			if ev.CredID != "" || ev.CredType != "" {
@@ -729,13 +624,16 @@ func TestOutOfRangePassphraseUnlockIsAudited(t *testing.T) {
 		}
 	}
 	if sealed != 2 {
-		t.Fatalf("sealed denials %d", sealed)
+		t.Fatalf("incorporated denials %d", sealed)
+	}
+	if opened.header.AuditSeq <= uint64(sealed) {
+		t.Fatal("authenticated head did not advance past denials")
 	}
 }
 
 func mustCreate(t *testing.T, logger *log.Logger) (string, []byte, *Session) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "vault.json")
+	path := filepath.Join(t.TempDir(), "vault.db")
 	pass := []byte(randHex(t, 16))
 	session, err := Create(path, pass, logger)
 	if err != nil {
@@ -743,6 +641,26 @@ func mustCreate(t *testing.T, logger *log.Logger) (string, []byte, *Session) {
 	}
 	t.Cleanup(func() { session.Lock() })
 	return path, pass, session
+}
+
+func mustOpen(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func mustAudit(t *testing.T, path string) []auditEvent {
+	t.Helper()
+	db := mustOpen(t, path)
+	events, err := readAuditRows(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
 }
 
 func mustOne(t *testing.T, s *Session) Credential {
@@ -798,23 +716,12 @@ func copyFile(t *testing.T, src, dst string) {
 	}
 }
 
-func mutateHeader(t *testing.T, path string, fn func(*fileHeader)) {
+func mutateDB(t *testing.T, path string, fn func(*sql.DB)) {
 	t.Helper()
-	b := readAll(t, path)
-	var header fileHeader
-	if err := unmarshalStrict(b, &header); err != nil {
-		t.Fatal(err)
-	}
-	fn(&header)
-	raw, err := json.Marshal(header)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func jsonMarshal(v any) ([]byte, error) {
-	return json.Marshal(v)
+	defer db.Close()
+	fn(db)
 }
