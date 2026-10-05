@@ -142,6 +142,30 @@ func TestUnlockProbeCoversRealEvent(t *testing.T) {
 	}
 }
 
+func TestSplitAuditDropsTornTailOnly(t *testing.T) {
+	ev, err := nextEvent(nil, actionCreate, "vault", "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(ev); err != nil {
+		t.Fatal(err)
+	}
+	good := append([]byte(nil), buf.Bytes()...)
+	events, keep, torn, err := splitAudit(append(append([]byte(nil), good...), []byte(`{"v":1,"seq":`)...))
+	if err != nil || !torn || keep != len(good) || len(events) != 1 || events[0].Hash != ev.Hash {
+		t.Fatalf("torn tail events=%d keep=%d torn=%v err=%v", len(events), keep, torn, err)
+	}
+	bad := append(append([]byte(nil), good...), []byte("{\"v\":1,\"extra\":true}\n")...)
+	if _, _, _, err := splitAudit(bad); !errors.Is(err, ErrAudit) {
+		t.Fatalf("complete bad line: %v", err)
+	}
+	events, keep, torn, err = splitAudit(good)
+	if err != nil || torn || keep != len(good) || len(events) != 1 {
+		t.Fatalf("clean file keep=%d torn=%v err=%v", keep, torn, err)
+	}
+}
+
 func TestRedactorMatchesLongerSecretFirst(t *testing.T) {
 	short := []byte("x")
 	long := []byte("xSUPERSECRET")

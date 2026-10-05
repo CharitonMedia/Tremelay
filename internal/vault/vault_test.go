@@ -413,6 +413,159 @@ func TestPutRejectsGrowthPastReadLimit(t *testing.T) {
 	}
 }
 
+func TestAppendAuditRefusesPastCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vault.audit")
+	ev, err := nextEvent(nil, actionCreate, "vault", "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := auditLine(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := maxVaultFile
+	t.Cleanup(func() { maxVaultFile = old })
+	maxVaultFile = int64(len(line))
+	if err := appendAudit(path, ev); err != nil {
+		t.Fatal(err)
+	}
+	before := readAll(t, path)
+	next, err := nextEvent([]auditEvent{ev}, actionUnlock, "vault", "", "", resultDenied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := appendAudit(path, next); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("append err %v", err)
+	}
+	if !bytes.Equal(readAll(t, path), before) {
+		t.Fatal("rejected append changed the sidecar")
+	}
+	got, _, err := readAudit(path)
+	if err != nil || len(got) != 1 || got[0].Hash != ev.Hash {
+		t.Fatalf("sidecar after refusal len=%d err=%v", len(got), err)
+	}
+}
+
+func TestTornSidecarTailStillUnlocks(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 16)
+	stored, err := session.Put("a", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	f, err := os.OpenFile(auditPath(path), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte(`{"v":1,"seq":`)); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	if bytes.HasSuffix(readAll(t, auditPath(path)), []byte(`{"v":1,"seq":`)) {
+		t.Fatal("torn tail still in sidecar")
+	}
+	if _, err := VerifyAudit(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := opened.Get(stored.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Secret, secret) {
+		t.Fatal("secret missing after torn sidecar")
+	}
+}
+
+func TestCompleteBadSidecarLineIsNotStripped(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	session.Lock()
+	f, err := os.OpenFile(auditPath(path), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("{\"v\":1,\"extra\":true}\n")); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := readAll(t, auditPath(path))
+	if _, err := Unlock(path, pass, nil); !errors.Is(err, ErrAudit) {
+		t.Fatalf("unlock %v", err)
+	}
+	if !bytes.Equal(readAll(t, auditPath(path)), before) {
+		t.Fatal("tampered sidecar was rewritten")
+	}
+}
+
+func TestSidecarReserveLetsNextUnlockSucceed(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	vaultSize := len(readAll(t, path))
+	old := maxVaultFile
+	t.Cleanup(func() { maxVaultFile = old })
+	maxVaultFile = int64(vaultSize + 8192)
+
+	var lists int
+	for lists < 80 {
+		_, err := session.List()
+		if errors.Is(err, ErrInvalid) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		lists++
+	}
+	if lists == 0 || lists == 80 {
+		t.Fatalf("lists before refusal: %d", lists)
+	}
+	side := readAll(t, auditPath(path))
+	if int64(len(side)) > maxVaultFile {
+		t.Fatalf("sidecar %d exceeds %d", len(side), maxVaultFile)
+	}
+	ev, err := nextEvent(session.audit, actionList, session.id, "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sidecarFits(auditPath(path), append(copyEvents(session.audit), ev), true); err == nil {
+		t.Fatal("another list still fits in the sidecar")
+	}
+	if err := sidecarFits(auditPath(path), session.audit, true); err != nil {
+		t.Fatalf("unlock reserve missing: %v", err)
+	}
+	session.Lock()
+	for i := 0; i < 3; i++ {
+		_, err := Unlock(path, []byte("short"), nil)
+		if !errors.Is(err, ErrInvalid) && !errors.Is(err, ErrAudit) {
+			t.Fatalf("denied unlock %v", err)
+		}
+		if int64(len(readAll(t, auditPath(path)))) > maxVaultFile {
+			t.Fatal("denial append passed the read cap")
+		}
+	}
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	if int64(len(readAll(t, auditPath(path)))) > maxVaultFile {
+		t.Fatal("unlock append passed the read cap")
+	}
+	if _, err := VerifyAudit(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSidecarGapRepairedBeforeNextAppend(t *testing.T) {
 	path, pass, session := mustCreate(t, nil)
 	if _, err := session.Put("a", "generic", randBytesT(t, 16), PutOptions{}); err != nil {

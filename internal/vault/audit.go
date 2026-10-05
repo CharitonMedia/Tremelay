@@ -267,46 +267,186 @@ func suffixAllows(side []auditEvent, header fileHeader) error {
 }
 
 func readAudit(path string) ([]auditEvent, bool, error) {
-	b, err := readLimited(path, maxVaultFile)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	var events []auditEvent
-	for {
-		var ev auditEvent
-		if err := dec.Decode(&ev); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, true, ErrAudit
-		}
-		events = append(events, ev)
-	}
-	return events, true, nil
+	events, _, exists, err := inspectSidecar(path)
+	return events, exists, err
 }
 
-func appendAudit(path string, ev auditEvent) error {
+// inspectSidecar returns the complete events and how many prefix bytes they
+// occupy. A trailing partial line is not an event: it is the remnant of a
+// crashed append, and the next append drops it. A complete line that does not
+// decode stays an error so tampering is not trimmed away.
+func inspectSidecar(path string) (events []auditEvent, keep int, exists bool, err error) {
+	b, err := readAuditBytes(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, 0, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, err
+	}
+	events, keep, torn, err := splitAudit(b)
+	if err != nil {
+		return nil, 0, true, err
+	}
+	if torn && len(events) == 0 {
+		return nil, 0, false, nil
+	}
+	return events, keep, true, nil
+}
+
+func readAuditBytes(path string) ([]byte, error) {
+	b, err := readLimited(path, maxVaultFile)
+	if err == nil {
+		return b, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	bak, bakErr := readLimited(path+".bak", maxVaultFile)
+	if errors.Is(bakErr, os.ErrNotExist) {
+		return nil, os.ErrNotExist
+	}
+	if bakErr != nil {
+		return nil, bakErr
+	}
+	return bak, nil
+}
+
+// splitAudit parses newline-delimited events. keep is the length of the
+// complete prefix. torn is set when the file ends mid-line.
+func splitAudit(b []byte) (events []auditEvent, keep int, torn bool, err error) {
+	i := 0
+	for i < len(b) {
+		rel := bytes.IndexByte(b[i:], '\n')
+		if rel < 0 {
+			line := b[i:]
+			if len(bytes.TrimSpace(line)) == 0 {
+				return events, i, false, nil
+			}
+			if !json.Valid(line) {
+				return events, i, true, nil
+			}
+			ev, derr := decodeAuditLine(line)
+			if derr != nil {
+				return nil, 0, false, ErrAudit
+			}
+			events = append(events, ev)
+			return events, len(b), false, nil
+		}
+		line := b[i : i+rel]
+		if len(bytes.TrimSpace(line)) == 0 {
+			return nil, 0, false, ErrAudit
+		}
+		ev, derr := decodeAuditLine(line)
+		if derr != nil {
+			return nil, 0, false, ErrAudit
+		}
+		events = append(events, ev)
+		i += rel + 1
+	}
+	return events, i, false, nil
+}
+
+func decodeAuditLine(line []byte) (auditEvent, error) {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.DisallowUnknownFields()
+	var ev auditEvent
+	if err := dec.Decode(&ev); err != nil {
+		return auditEvent{}, err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return auditEvent{}, ErrAudit
+	}
+	return ev, nil
+}
+
+func auditLine(ev auditEvent) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(ev); err != nil {
-		return ErrAudit
+		return nil, ErrAudit
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	return buf.Bytes(), nil
+}
+
+func auditLinesLen(events []auditEvent) (int64, error) {
+	var n int64
+	for _, ev := range events {
+		line, err := auditLine(ev)
+		if err != nil {
+			return 0, err
+		}
+		n += int64(len(line))
+	}
+	return n, nil
+}
+
+// sidecarFits reports whether chain can be mirrored and, when reserve is set,
+// still leave room for one maximum-width vault_unlock line.
+func sidecarFits(path string, chain []auditEvent, reserve bool) error {
+	have, keep, exists, err := inspectSidecar(path)
 	if err != nil {
-		return ErrIO
+		return err
 	}
-	defer f.Close()
-	if _, err := f.Write(buf.Bytes()); err != nil {
-		return ErrIO
+	base := 0
+	if exists {
+		if len(have) > len(chain) || !hashesEqual(have, chain[:len(have)]) {
+			return ErrAudit
+		}
+		base = keep
 	}
-	if err := f.Sync(); err != nil {
-		return ErrIO
+	extra, err := auditLinesLen(chain[len(have):])
+	if err != nil {
+		return err
+	}
+	need := int64(base) + extra
+	if reserve {
+		if len(chain) == 0 {
+			return ErrAudit
+		}
+		probe, err := auditLine(unlockProbe(chain, chain[len(chain)-1].VaultID))
+		if err != nil {
+			return err
+		}
+		need += int64(len(probe))
+	}
+	if need > maxVaultFile {
+		return ErrInvalid
 	}
 	return nil
+}
+
+// appendAudit adds one JSON line without exceeding maxVaultFile.
+// The line replaces the file, so a crash cannot leave a new partial record.
+// A torn tail already present is omitted from the replacement.
+// ponytail: the sidecar is not rotated. Ceiling: once a vault_unlock line
+// would not fit, later unlocks fail closed and the previous file stays
+// readable. Upgrade path: store the chain outside this file (ADR 0003).
+func appendAudit(path string, ev auditEvent) error {
+	line, err := auditLine(ev)
+	if err != nil {
+		return err
+	}
+	b, err := readAuditBytes(path)
+	if errors.Is(err, os.ErrNotExist) {
+		b = nil
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	_, keep, _, err := splitAudit(b)
+	if err != nil {
+		return err
+	}
+	next := make([]byte, 0, keep+len(line))
+	if keep > 0 {
+		next = append(next, b[:keep]...)
+	}
+	next = append(next, line...)
+	if int64(len(next)) > maxVaultFile {
+		return ErrInvalid
+	}
+	return writeAtomic(path, next)
 }
 
 func writeAuditFile(path string, events []auditEvent) error {
@@ -316,6 +456,9 @@ func writeAuditFile(path string, events []auditEvent) error {
 		if err := enc.Encode(ev); err != nil {
 			return ErrAudit
 		}
+	}
+	if int64(buf.Len()) > maxVaultFile {
+		return ErrInvalid
 	}
 	return writeAtomic(path, buf.Bytes())
 }
@@ -358,6 +501,10 @@ func appendUnlockDenial(vaultPath, vaultID, sealedHead string, sealedSeq uint64)
 	}
 	ev, err := nextEvent(side, actionUnlock, vaultID, "", "", resultDenied)
 	if err != nil {
+		return err
+	}
+	// A denial must not consume the line reserved for the next successful unlock.
+	if err := sidecarFits(auditPath(vaultPath), append(copyEvents(side), ev), true); err != nil {
 		return err
 	}
 	return appendAudit(auditPath(vaultPath), ev)

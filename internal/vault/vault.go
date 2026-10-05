@@ -55,7 +55,7 @@ const (
 
 // maxVaultFile is the largest vault or audit file readLimited will load.
 // Tests shrink it. Every accepted save leaves room for the next vault_unlock
-// so audit growth cannot make a readable vault impossible to unlock.
+// in the vault file and in the sidecar, and neither file is written past this cap.
 var maxVaultFile int64 = 32 << 20
 
 const gcmTagLen = 16
@@ -301,6 +301,11 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		redactor: red,
 		logger:   logger,
 	}
+	// Restoring a missing suffix must leave the line the unlock below will write.
+	if err := sidecarFits(auditPath(path), merged, true); err != nil {
+		s.Lock()
+		return nil, err
+	}
 	if err := syncSidecar(auditPath(path), merged); err != nil {
 		s.Lock()
 		return nil, err
@@ -506,6 +511,13 @@ func (s *Session) persistEvent(action, credID, credType, result string) error {
 		return err
 	}
 	s.audit = append(s.audit, ev)
+	// The successful unlock may use the reserved line. Every other event must
+	// leave that line free so locking the session cannot strand the vault.
+	reserve := action != actionUnlock || result != resultAllowed
+	if err := sidecarFits(auditPath(s.path), s.audit, reserve); err != nil {
+		s.audit = s.audit[:len(s.audit)-1]
+		return err
+	}
 	if err := s.save(); err != nil {
 		s.audit = s.audit[:len(s.audit)-1]
 		return err
@@ -564,7 +576,7 @@ func (s *Session) save() error {
 // sealedAudit keeps the longest suffix that still leaves room for the next
 // vault_unlock. A prefix is omitted only after the sidecar has that prefix.
 // ponytail: the sidecar is not rotated. Ceiling: losing the sidecar after a
-// drop fails unlock closed, and the sidecar itself stays capped by maxVaultFile.
+// drop fails unlock closed. The sidecar is capped separately in sidecarFits.
 // Upgrade path: store the chain outside the credential document (ADR 0003).
 func (s *Session) sealedAudit() ([]auditEvent, error) {
 	chain := s.audit
