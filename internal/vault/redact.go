@@ -2,14 +2,17 @@ package vault
 
 import (
 	"io"
+	"sort"
 	"strings"
 )
 
 const redacted = "[redacted]"
 
 // Redactor removes known secret bytes from log and error text.
-// Matching is exact substring replacement. Secrets shorter than one byte
-// are ignored because the vault rejects them.
+// Matching is exact substring replacement, longest secret first, so a
+// shorter value that is a prefix of a longer one cannot leave the tail in
+// a log line. Secrets shorter than one byte are ignored because the vault
+// rejects them.
 type Redactor struct {
 	secrets [][]byte
 }
@@ -42,10 +45,15 @@ func (r *Redactor) Contains(secret []byte) bool {
 
 // Redact returns msg with every added secret replaced.
 func (r *Redactor) Redact(msg string) string {
-	if r == nil {
+	if r == nil || len(r.secrets) == 0 {
 		return msg
 	}
-	for _, secret := range r.secrets {
+	order := make([][]byte, len(r.secrets))
+	copy(order, r.secrets)
+	sort.Slice(order, func(i, j int) bool {
+		return len(order[i]) > len(order[j])
+	})
+	for _, secret := range order {
 		if len(secret) == 0 {
 			continue
 		}

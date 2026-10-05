@@ -37,6 +37,8 @@ While the vault is locked, a failed unwrap appends `vault_unlock` / `denied` to 
 
 `tremelay audit verify` checks that the sidecar is a valid chain, that it contains the header's authenticated head, and that any newer suffix is only unlock denials. It prints the sidecar tip. That tip is the external checkpoint value. Offline verify does not have the passphrase, so an attacker who rewrites both the header tip and the sidecar can fool offline verify; unlock still fails GCM because the tip is inside the additional data.
 
+Every accepted save must leave room for the next `vault_unlock` event inside `maxVaultFile` (32 MiB, the same cap `readLimited` enforces). The check is the encoded size of the credential document plus two maximum-width unlock events, so the unlock that consumes one event still leaves room for the unlock after it. When the full sealed chain would exceed that room, the encrypted document stores a hash-linked suffix and omits a prefix that the sidecar already has. The header head remains the chain tip. The sidecar is not trimmed. If that sidecar is later missing, unlock fails closed instead of restoring a chain that no longer starts at `vault_create`. A sidecar that still overlaps the sealed suffix is stitched back together on unlock.
+
 Ceiling: denial events that are not yet sealed can be removed by someone who can edit the sidecar before the next successful unlock. Modification of sealed history cannot. The upgrade path is an off-host checkpoint of the tip printed by `audit verify`, which M5 can automate. Single-writer, same as the vault file.
 
 A credential read that cannot append its audit event returns an error and does not return the secret.
@@ -58,7 +60,7 @@ A credential read that cannot append its audit event returns an error and does n
 ## Consequences
 
 - M5 may add event types only by extending this format under a new ADR. Version-1 preimages stay verifiable.
-- The encrypted document grows with the chain. That is acceptable for a single-user vault; a later store can split the log without changing the preimage.
+- The encrypted document grows with the chain until it must reserve room for the next unlock. After that it keeps a suffix. The sidecar stays a full genesis chain until it reaches the same read cap. A later store can split the log without changing the preimage. Losing the sidecar after a suffix drop cannot be repaired from the encrypted copy.
 - `audit verify` is safe to run without the passphrase because the sidecar contains no secrets.
 
 ## Tests
@@ -67,5 +69,7 @@ A credential read that cannot append its audit event returns an error and does n
 - Bit flip in the sidecar fails verification.
 - A forged allowed event after the sealed head fails unlock and does not return a secret.
 - A locked-vault denial is present after the next successful unlock and is then covered by the sealed head.
-- A missing sidecar is restored from the sealed chain.
+- A missing sidecar is restored from the sealed chain when that chain still starts at `vault_create`.
+- A sealed suffix matches the sidecar, a sidecar that ends inside that suffix is restored, and a gap or a missing sidecar after a drop fails closed.
+- A vault held at the read limit still records the next unlock, and a put that would consume that reserve does not replace the file.
 - Secret and passphrase bytes are absent from the sidecar.

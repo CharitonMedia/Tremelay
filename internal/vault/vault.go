@@ -54,8 +54,11 @@ const (
 )
 
 // maxVaultFile is the largest vault or audit file readLimited will load.
-// Tests shrink it; production stays 32 MiB so a written vault stays readable.
+// Tests shrink it. Every accepted save leaves room for the next vault_unlock
+// so audit growth cannot make a readable vault impossible to unlock.
 var maxVaultFile int64 = 32 << 20
+
+const gcmTagLen = 16
 
 // CredentialTypes is the allowlist stored with each credential.
 var CredentialTypes = []string{
@@ -264,7 +267,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		wipe(dek)
 		return nil, err
 	}
-	if err := verifyChain(doc.Audit); err != nil || len(doc.Audit) == 0 {
+	if len(doc.Audit) == 0 || !sealedAuditOK(doc.Audit) {
 		wipe(dek)
 		return nil, ErrAudit
 	}
@@ -519,13 +522,20 @@ func (s *Session) save() error {
 	if len(s.audit) == 0 || len(s.dek) != keyLen {
 		return ErrAudit
 	}
+	sealed, err := s.sealedAudit()
+	if err != nil {
+		return err
+	}
 	last := s.audit[len(s.audit)-1]
+	if sealed[len(sealed)-1].Hash != last.Hash || sealed[len(sealed)-1].Seq != last.Seq {
+		return ErrAudit
+	}
 	s.header.Version = formatVersion
 	s.header.ID = s.id
 	s.header.Root = rootPassphrase
 	s.header.AuditHead = last.Hash
 	s.header.AuditSeq = last.Seq
-	doc := document{Credentials: s.creds, Audit: s.audit}
+	doc := document{Credentials: s.creds, Audit: sealed}
 	plain, err := json.Marshal(doc)
 	if err != nil {
 		return ErrIO
@@ -549,6 +559,143 @@ func (s *Session) save() error {
 		return ErrIO
 	}
 	return nil
+}
+
+// sealedAudit keeps the longest suffix that still leaves room for the next
+// vault_unlock. A prefix is omitted only after the sidecar has that prefix.
+// ponytail: the sidecar is not rotated. Ceiling: losing the sidecar after a
+// drop fails unlock closed, and the sidecar itself stays capped by maxVaultFile.
+// Upgrade path: store the chain outside the credential document (ADR 0003).
+func (s *Session) sealedAudit() ([]auditEvent, error) {
+	chain := s.audit
+	keep, err := s.keptTail()
+	if err != nil {
+		return nil, err
+	}
+	if keep < 1 || keep > len(chain) {
+		return nil, ErrAudit
+	}
+	if s.commitFits(chain) {
+		return chain, nil
+	}
+	maxDrop := len(chain) - keep
+	best := -1
+	lo, hi := 1, maxDrop
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if s.commitFits(chain[mid:]) {
+			best = mid
+			hi = mid - 1
+		} else {
+			lo = mid + 1
+		}
+	}
+	if best < 0 {
+		return nil, ErrInvalid
+	}
+	return chain[best:], nil
+}
+
+// keptTail is the number of trailing events that must stay inside the
+// encrypted document. The sidecar already has the rest.
+func (s *Session) keptTail() (int, error) {
+	side, exists, err := readAudit(auditPath(s.path))
+	if err != nil {
+		return 0, err
+	}
+	if !exists || len(side) > len(s.audit) || !hashesEqual(side, s.audit[:len(side)]) {
+		return len(s.audit), nil
+	}
+	pending := len(s.audit) - len(side)
+	if pending < 1 {
+		return 1, nil
+	}
+	return pending, nil
+}
+
+// commitFits reports whether events can be sealed and a later unlock can still
+// persist after older sealed events are dropped.
+func (s *Session) commitFits(events []auditEvent) bool {
+	if len(events) == 0 || !s.roomFor(withProbe(events, s.id)) {
+		return false
+	}
+	return s.roomFor(twoUnlocks(events, s.id))
+}
+
+func (s *Session) roomFor(events []auditEvent) bool {
+	n, err := encodedSize(s.header, s.creds, events)
+	return err == nil && int64(n) <= maxVaultFile
+}
+
+func withProbe(events []auditEvent, vaultID string) []auditEvent {
+	out := make([]auditEvent, len(events)+1)
+	copy(out, events)
+	out[len(events)] = unlockProbe(events, vaultID)
+	return out
+}
+
+// twoUnlocks is the credential floor: two max-width unlock events and no
+// older history. An accepted save must leave at least this much room.
+func twoUnlocks(events []auditEvent, vaultID string) []auditEvent {
+	first := unlockProbe(events, vaultID)
+	second := unlockProbe([]auditEvent{first}, vaultID)
+	return []auditEvent{first, second}
+}
+
+// unlockProbe is a max-width vault_unlock used only to measure file growth.
+// It is not hashed or stored.
+func unlockProbe(chain []auditEvent, vaultID string) auditEvent {
+	seq := uint64(1)
+	prev := strings.Repeat("0", 64)
+	if n := len(chain); n > 0 {
+		seq = chain[n-1].Seq + 1
+		if len(chain[n-1].Hash) == 64 {
+			prev = chain[n-1].Hash
+		}
+	}
+	if len(vaultID) < 32 {
+		vaultID = strings.Repeat("a", 32)
+	}
+	return auditEvent{
+		V:       auditVersion,
+		Seq:     seq,
+		Time:    "2006-01-02T15:04:05.999999999Z",
+		Action:  actionUnlock,
+		VaultID: vaultID,
+		Result:  resultAllowed,
+		Prev:    prev,
+		Hash:    strings.Repeat("f", 64),
+	}
+}
+
+func encodedSize(h fileHeader, creds []credential, events []auditEvent) (int, error) {
+	if len(events) == 0 {
+		return 0, ErrAudit
+	}
+	last := events[len(events)-1]
+	h.AuditHead = last.Hash
+	h.AuditSeq = last.Seq
+	h.DataNonce = make([]byte, nonceLen)
+	plain, err := json.Marshal(document{Credentials: creds, Audit: events})
+	if err != nil {
+		return 0, ErrIO
+	}
+	h.Data = make([]byte, len(plain)+gcmTagLen)
+	raw, err := json.Marshal(h)
+	if err != nil {
+		return 0, ErrIO
+	}
+	return len(raw), nil
+}
+
+func sealedAuditOK(events []auditEvent) bool {
+	if len(events) == 0 {
+		return false
+	}
+	if events[0].Seq == 1 {
+		return verifyChain(events) == nil
+	}
+	return verifyLinked(events) == nil
 }
 
 func (s *Session) logf(format string, args ...any) {

@@ -3,6 +3,7 @@ package vault
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -64,6 +65,37 @@ func TestReconcileDenialAndForgery(t *testing.T) {
 	}
 }
 
+func TestReconcileSealedSuffix(t *testing.T) {
+	create, err := nextEvent(nil, actionCreate, "vault", "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := nextEvent([]auditEvent{create}, actionList, "vault", "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := nextEvent([]auditEvent{create, second}, actionUnlock, "vault", "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := []auditEvent{create, second, third}
+	suffix := full[1:]
+	merged, err := reconcile(suffix, full, true)
+	if err != nil || len(merged) != len(full) || merged[2].Hash != third.Hash {
+		t.Fatalf("suffix merge: %v len %d", err, len(merged))
+	}
+	partial, err := reconcile(suffix, full[:2], true)
+	if err != nil || len(partial) != len(full) || partial[2].Hash != third.Hash {
+		t.Fatalf("overlap restore: %v", err)
+	}
+	if _, err := reconcile(suffix, nil, false); !errors.Is(err, ErrAudit) {
+		t.Fatalf("missing sidecar after drop: %v", err)
+	}
+	if _, err := reconcile(full[2:], full[:1], true); !errors.Is(err, ErrAudit) {
+		t.Fatal("sealed gap was accepted")
+	}
+}
+
 func TestRedactorHidesSecretAndPassphrase(t *testing.T) {
 	secret := randBytesT(t, 24)
 	pass := randBytesT(t, 24)
@@ -83,6 +115,48 @@ func TestRedactorHidesSecretAndPassphrase(t *testing.T) {
 	}
 	if bytes.Contains(buf.Bytes(), secret) {
 		t.Fatal("writer left secret material in place")
+	}
+}
+
+func TestUnlockProbeCoversRealEvent(t *testing.T) {
+	id := strings.Repeat("ab", 16)
+	create, err := nextEvent(nil, actionCreate, id, "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := nextEvent([]auditEvent{create}, actionUnlock, id, "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := unlockProbe([]auditEvent{create}, id)
+	got, err := json.Marshal(unlock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := json.Marshal(probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) > len(want) {
+		t.Fatalf("probe %d bytes is smaller than a real unlock %d: %s", len(want), len(got), got)
+	}
+}
+
+func TestRedactorMatchesLongerSecretFirst(t *testing.T) {
+	short := []byte("x")
+	long := []byte("xSUPERSECRET")
+	for _, order := range [][][]byte{{short, long}, {long, short}} {
+		var r Redactor
+		for _, secret := range order {
+			r.Add(secret)
+		}
+		got := r.Redact("label " + string(long) + " tail")
+		if strings.Contains(got, "SUPERSECRET") || strings.Contains(got, string(long)) {
+			t.Fatalf("order %q leaked: %q", order, got)
+		}
+		if got != "label "+redacted+" tail" {
+			t.Fatalf("order %q got %q", order, got)
+		}
 	}
 }
 

@@ -118,18 +118,40 @@ func verifyChain(events []auditEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
-	prev := make([]byte, 32)
+	if events[0].Seq != 1 {
+		return ErrAudit
+	}
+	if err := verifyLinked(events); err != nil {
+		return err
+	}
+	if events[0].Action != actionCreate || events[0].Result != resultAllowed {
+		return ErrAudit
+	}
+	return nil
+}
+
+// verifyLinked checks a hash-linked run. A sealed suffix may start after seq 1.
+// The sidecar still has to pass verifyChain so dropped history stays visible.
+func verifyLinked(events []auditEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	first := events[0]
+	prev, err := hex.DecodeString(first.Prev)
+	if err != nil || len(prev) != 32 || first.Seq == 0 || first.VaultID == "" {
+		return ErrAudit
+	}
+	if first.Seq == 1 && !bytes.Equal(prev, make([]byte, 32)) {
+		return ErrAudit
+	}
 	for i, ev := range events {
-		if ev.V != auditVersion || ev.Seq != uint64(i+1) {
+		if ev.V != auditVersion || ev.Seq != first.Seq+uint64(i) {
 			return ErrAudit
 		}
-		if ev.VaultID == "" || ev.VaultID != events[0].VaultID {
+		if ev.VaultID != first.VaultID || !knownAction(ev.Action) {
 			return ErrAudit
 		}
-		if !knownAction(ev.Action) || (ev.Result != resultAllowed && ev.Result != resultDenied) {
-			return ErrAudit
-		}
-		if i == 0 && (ev.Action != actionCreate || ev.Result != resultAllowed) {
+		if ev.Result != resultAllowed && ev.Result != resultDenied {
 			return ErrAudit
 		}
 		gotPrev, err := hex.DecodeString(ev.Prev)
@@ -167,36 +189,56 @@ func hashesEqual(a, b []auditEvent) bool {
 }
 
 // reconcile merges a sidecar with the sealed chain.
-// A missing sidecar or a strict prefix is restored from the sealed chain.
-// A suffix of unlock denials is kept. Anything else is ErrAudit.
+// The sealed copy may be a hash-linked suffix once a prefix is already durable
+// in the sidecar. A missing sidecar restores a genesis chain only. A strict
+// overlapping prefix is restored from the sealed copy. A suffix of unlock
+// denials is kept. Anything else is ErrAudit.
 func reconcile(sealed, side []auditEvent, sideExists bool) ([]auditEvent, error) {
 	if len(sealed) == 0 {
 		return nil, ErrAudit
 	}
-	if err := verifyChain(sealed); err != nil {
+	if err := verifyLinked(sealed); err != nil {
 		return nil, err
 	}
 	if !sideExists {
+		if sealed[0].Seq != 1 {
+			return nil, ErrAudit
+		}
 		return copyEvents(sealed), nil
 	}
 	if err := verifyChain(side); err != nil {
 		return nil, err
 	}
-	if len(side) < len(sealed) {
-		if !hashesEqual(side, sealed[:len(side)]) {
-			return nil, ErrAudit
+	idx := -1
+	for i := range side {
+		if side[i].Hash == sealed[0].Hash && side[i].Seq == sealed[0].Seq {
+			idx = i
+			break
 		}
-		return copyEvents(sealed), nil
 	}
-	if !hashesEqual(sealed, side[:len(sealed)]) {
+	if idx < 0 {
 		return nil, ErrAudit
 	}
-	for _, ev := range side[len(sealed):] {
-		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != sealed[0].VaultID {
+	overlap := len(side) - idx
+	if overlap >= len(sealed) {
+		if !hashesEqual(sealed, side[idx:idx+len(sealed)]) {
 			return nil, ErrAudit
 		}
+		for _, ev := range side[idx+len(sealed):] {
+			if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != sealed[0].VaultID {
+				return nil, ErrAudit
+			}
+		}
+		return copyEvents(side), nil
 	}
-	return copyEvents(side), nil
+	if !hashesEqual(side[idx:], sealed[:overlap]) {
+		return nil, ErrAudit
+	}
+	out := append(copyEvents(side), sealed[overlap:]...)
+	if err := verifyChain(out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func copyEvents(in []auditEvent) []auditEvent {

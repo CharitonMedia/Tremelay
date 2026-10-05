@@ -298,6 +298,89 @@ func TestLogRedactsLabelContainingSecret(t *testing.T) {
 	}
 }
 
+func TestUnlockRoomSurvivesAuditGrowth(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 32)
+	stored, err := session.Put("a", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		if _, err := session.List(); err != nil {
+			t.Fatalf("list %d: %v", i, err)
+		}
+	}
+	before := readAll(t, path)
+	floor, err := encodedSize(session.header, session.creds, twoUnlocks(session.audit, session.id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	limit := floor
+	if len(before) > limit {
+		limit = len(before)
+	}
+	old := maxVaultFile
+	t.Cleanup(func() { maxVaultFile = old })
+	maxVaultFile = int64(limit)
+
+	big := randBytesT(t, 4096)
+	if _, err := session.Put("b", "generic", big, PutOptions{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("put err %v", err)
+	}
+	if !bytes.Equal(readAll(t, path), before) {
+		t.Fatal("rejected put replaced the vault file")
+	}
+	assertAbsent(t, before, big)
+
+	sideBefore, _, err := readAudit(auditPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.List(); err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(readAll(t, path))) > maxVaultFile {
+		t.Fatalf("list wrote %d bytes over %d", len(readAll(t, path)), maxVaultFile)
+	}
+	session.Lock()
+
+	var opened *Session
+	for i := 0; i < 3; i++ {
+		opened, err = Unlock(path, pass, nil)
+		if err != nil {
+			t.Fatalf("unlock %d: %v", i, err)
+		}
+		if len(opened.creds) != 1 || !bytes.Equal(opened.creds[0].Secret, secret) || opened.creds[0].ID != stored.ID {
+			opened.Lock()
+			t.Fatal("credential missing after unlock")
+		}
+		if int64(len(readAll(t, path))) > maxVaultFile {
+			opened.Lock()
+			t.Fatal("unlock wrote past the read limit")
+		}
+		opened.Lock()
+	}
+	if _, err := VerifyAudit(path); err != nil {
+		t.Fatal(err)
+	}
+	sideAfter, _, err := readAudit(auditPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sideAfter) <= len(sideBefore) {
+		t.Fatalf("sidecar shrank: %d -> %d", len(sideBefore), len(sideAfter))
+	}
+	var unlocks int
+	for _, ev := range sideAfter {
+		if ev.Action == actionUnlock && ev.Result == resultAllowed {
+			unlocks++
+		}
+	}
+	if unlocks < 3 {
+		t.Fatalf("allowed unlocks %d", unlocks)
+	}
+}
+
 func TestPutRejectsGrowthPastReadLimit(t *testing.T) {
 	path, pass, session := mustCreate(t, nil)
 	before := readAll(t, path)
