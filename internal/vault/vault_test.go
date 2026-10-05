@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log"
 	"os"
@@ -813,6 +814,92 @@ func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
 	if sealed != len(attempts) {
 		t.Fatalf("durable denials %d", sealed)
 	}
+}
+
+func TestAuthenticatedPlaintextRejectionIsAudited(t *testing.T) {
+	var logs bytes.Buffer
+	path, pass, session := mustCreate(t, log.New(&logs, "", 0))
+	secret := randBytesT(t, 32)
+	if _, err := session.Put("label", "generic", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	head := session.header.AuditHead
+	seq := session.header.AuditSeq
+	aad := dataAAD(session.id, head, seq)
+	before := len(session.audit)
+	badNonce, badJSON, err := seal(session.dek, []byte("{"), aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	stored, err := json.Marshal(document{Credentials: []credential{{
+		ID:        strings.Repeat("cd", 16),
+		Label:     "label",
+		Type:      "generic",
+		Secret:    []byte{},
+		Lifecycle: lifecycle{State: StateActive, CreatedAt: now, UpdatedAt: now},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedNonce, badStored, err := seal(session.dek, stored, aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+
+	// Both payloads authenticate under the current audit head. One is not JSON;
+	// the other unmarshals and fails validateStored. Each unlock must still
+	// append a secret-free denial without moving the authenticated head.
+	cases := []struct {
+		name  string
+		nonce []byte
+		data  []byte
+	}{
+		{name: "invalid json", nonce: badNonce, data: badJSON},
+		{name: "invalid stored", nonce: storedNonce, data: badStored},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			copyPath := filepath.Join(t.TempDir(), "vault.db")
+			copyFile(t, path, copyPath)
+			mutateDB(t, copyPath, func(db *sql.DB) {
+				if _, err := db.Exec(`UPDATE vault SET data_nonce=?, encrypted_document=?`, tc.nonce, tc.data); err != nil {
+					t.Fatal(err)
+				}
+			})
+			_, err := Unlock(copyPath, pass, log.New(&logs, "", 0))
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatal(err)
+			}
+			if bytes.Contains([]byte(err.Error()), secret) || strings.Contains(err.Error(), string(pass)) {
+				t.Fatal("rejection error contains secret material")
+			}
+			db, header, events, err := loadVault(copyPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.Close()
+			if header.AuditHead != head || header.AuditSeq != seq {
+				t.Fatalf("head advanced to %s seq %d", header.AuditHead, header.AuditSeq)
+			}
+			if len(events) != before+1 {
+				t.Fatalf("events %d", len(events))
+			}
+			last := events[len(events)-1]
+			if last.Action != actionUnlock || last.Result != resultDenied || last.CredID != "" || last.CredType != "" {
+				t.Fatalf("denial %+v", last)
+			}
+			if err := suffixAllows(events, header); err != nil {
+				t.Fatal(err)
+			}
+			raw := readAll(t, copyPath)
+			assertAbsent(t, raw, secret)
+			assertAbsent(t, raw, pass)
+		})
+	}
+	assertAbsent(t, logs.Bytes(), secret)
+	assertAbsent(t, logs.Bytes(), pass)
 }
 
 func TestOutOfRangePassphraseUnlockIsAudited(t *testing.T) {

@@ -237,10 +237,10 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	return s, nil
 }
 
-// Unlock opens path with passphrase. A rejected passphrase appends an unlock
-// denial and does not update encrypted credential state. The denial has no
-// passphrase bytes. A later valid unlock checks that denial suffix and links
-// its own event after it.
+// Unlock opens path with passphrase. A rejected unlock appends a denial and
+// does not update encrypted credential state. The denial has no passphrase
+// bytes. A later valid unlock checks that denial suffix and links its own
+// event after it.
 func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error) {
 	db, header, events, err := loadVault(path)
 	if err != nil {
@@ -278,11 +278,11 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	var doc document
 	if err := unmarshalStrict(plain, &doc); err != nil {
 		wipe(dek)
-		return nil, ErrCorrupt
+		return nil, deny(ErrCorrupt)
 	}
 	if err := validateStored(doc.Credentials); err != nil {
 		wipe(dek)
-		return nil, err
+		return nil, deny(err)
 	}
 	red := &Redactor{}
 	red.Add(passphrase)
