@@ -20,6 +20,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -643,7 +644,7 @@ func validateSecret(s []byte) error {
 }
 
 func validateLabel(label string) error {
-	if label == "" || len(label) > maxLabel || strings.ContainsAny(label, "\x00\r\n") {
+	if label == "" || len(label) > maxLabel || strings.ContainsAny(label, "\x00\r\n") || !utf8.ValidString(label) {
 		return ErrInvalid
 	}
 	return nil
@@ -666,6 +667,11 @@ func optionalTime(t *time.Time) (*time.Time, error) {
 		return nil, ErrInvalid
 	}
 	u := t.UTC()
+	// encoding/json rejects years outside [0,9999]. That failure happens in
+	// commit, after validation, and returns ErrIO with no audit event.
+	if _, err := u.MarshalJSON(); err != nil {
+		return nil, ErrInvalid
+	}
 	return &u, nil
 }
 

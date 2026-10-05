@@ -736,8 +736,11 @@ func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
 	path, pass, session := mustCreate(t, log.New(&logs, "", 0))
 	secret := randBytesT(t, 24)
 	badLabel := "bad-\n" + hex.EncodeToString(secret)
+	badUTF := "bad-\xff-" + hex.EncodeToString(secret)
 	badType := "not-a-type-" + hex.EncodeToString(secret[:4])
 	zero := time.Time{}
+	beyond := time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	negative := time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC)
 	attempts := []struct {
 		label, typ string
 		secret     []byte
@@ -745,9 +748,12 @@ func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
 	}{
 		{label: "", typ: "generic", secret: secret},
 		{label: badLabel, typ: "generic", secret: secret},
+		{label: badUTF, typ: "generic", secret: secret},
 		{label: "ok", typ: badType, secret: secret},
 		{label: "ok", typ: "generic", secret: nil},
 		{label: "ok", typ: "generic", secret: secret, opt: PutOptions{ExpiresAt: &zero}},
+		{label: "ok", typ: "generic", secret: secret, opt: PutOptions{ExpiresAt: &beyond}},
+		{label: "ok", typ: "generic", secret: secret, opt: PutOptions{RotationDueAt: &negative}},
 	}
 	for _, attempt := range attempts {
 		if _, err := session.Put(attempt.label, attempt.typ, attempt.secret, attempt.opt); !errors.Is(err, ErrInvalid) {
@@ -766,7 +772,8 @@ func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
 	if denied != len(attempts) {
 		t.Fatalf("denied puts %d", denied)
 	}
-	stored, err := session.Put("ok", "generic", secret, PutOptions{})
+	far := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	stored, err := session.Put("café", "generic", secret, PutOptions{ExpiresAt: &far})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -774,7 +781,7 @@ func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
 	raw := readAll(t, path)
 	assertAbsent(t, raw, secret)
 	assertAbsent(t, logs.Bytes(), secret)
-	if bytes.Contains(raw, []byte(badLabel)) || bytes.Contains(raw, []byte(badType)) || bytes.Contains(logs.Bytes(), []byte(badLabel)) {
+	if bytes.Contains(raw, []byte(badLabel)) || bytes.Contains(raw, []byte(badUTF)) || bytes.Contains(raw, []byte(badType)) || bytes.Contains(logs.Bytes(), []byte(badLabel)) || bytes.Contains(logs.Bytes(), []byte(badUTF)) {
 		t.Fatal("denial recorded free-form metadata")
 	}
 	opened, err := Unlock(path, pass, nil)
@@ -786,7 +793,7 @@ func TestRejectedPutIsAuditedWithoutMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got.Secret, secret) {
+	if !bytes.Equal(got.Secret, secret) || got.Label != "café" || got.Lifecycle.ExpiresAt == nil || !got.Lifecycle.ExpiresAt.Equal(far) {
 		t.Fatal("secret mismatch after denied puts")
 	}
 	sealed := 0
