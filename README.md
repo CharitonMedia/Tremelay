@@ -8,7 +8,17 @@ Tremelay is a self-hosted credential vault and capability broker. Humans can sto
 
 ## Project status
 
-Tremelay is at the specification and architecture stage. The initial repository intentionally contains very little product code. Security boundaries, invariants, acceptance criteria, and adversarial tests come before implementation volume.
+M1 is a local single-user vault. A human can create a vault, unlock it with a passphrase, and store and retrieve a credential with the `tremelay` CLI. That CLI is the human control plane: it has no agent interface and no raw-secret retrieval for agents. Later milestones add capabilities, the HTTP broker, audit review, and credential health. See [MILESTONES.md](MILESTONES.md).
+
+```
+tremelay vault create --path vault.db
+tremelay credential put --path vault.db --label ci --type api_key --secret-file ./secret
+tremelay credential get --path vault.db --id CREDENTIAL_ID
+tremelay credential list --path vault.db
+tremelay audit verify --path vault.db
+```
+
+The path is one local SQLite database. Credential bytes are encrypted; the file does not store plaintext secrets. The passphrase comes from `TREMELAY_PASSPHRASE` or a no-echo terminal prompt. It is not a command-line argument. `audit verify` uses that passphrase to authenticate the sealed audit head. `credential get` writes the raw secret to stdout.
 
 ## Core goals
 

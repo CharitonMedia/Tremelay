@@ -1,0 +1,786 @@
+// Package vault is the human control plane for a local encrypted credential store.
+//
+// Retrieval requires an unlocked session, which requires the vault passphrase.
+// This package must not grow an agent-facing raw-secret retrieval API.
+package vault
+
+import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"database/sql"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"golang.org/x/crypto/argon2"
+)
+
+const (
+	formatVersion  = 1
+	rootPassphrase = "passphrase"
+	algoArgon2id   = "argon2id"
+
+	keyLen   = 32
+	saltLen  = 16
+	nonceLen = 12
+
+	// RFC 9106 second recommended Argon2id parameter set.
+	prodTime    = 3
+	prodMemory  = 64 * 1024
+	prodThreads = 4
+
+	minPassphrase = 8
+	maxPassphrase = 1024
+	// MaxSecret is the largest credential payload accepted.
+	MaxSecret = 1 << 20
+	maxLabel  = 256
+
+	minKDFMemory  = 8 * 1024
+	maxKDFMemory  = 1024 * 1024
+	maxKDFTime    = 10
+	maxKDFThreads = 8
+
+	// StateActive is the lifecycle state of a newly stored credential.
+	StateActive = "active"
+)
+
+// credentialTypes is the allowlist stored with each credential.
+// Other packages see only a copy so they cannot widen Put or store a type
+// that validateStored later rejects as corrupt.
+var credentialTypes = []string{
+	"password",
+	"api_key",
+	"bearer_token",
+	"oauth",
+	"ssh_key",
+	"certificate",
+	"database",
+	"totp",
+	"generic",
+}
+
+// CredentialTypes returns a copy of the credential-type allowlist.
+func CredentialTypes() []string {
+	return append([]string(nil), credentialTypes...)
+}
+
+var (
+	// ErrUnauthenticated means the passphrase did not unwrap the master key.
+	ErrUnauthenticated = errors.New("vault unlock failed")
+	// ErrCorrupt means the vault file failed parsing or authentication.
+	ErrCorrupt = errors.New("vault data is corrupt or tampered")
+	// ErrNotFound means the credential id is not in the unlocked vault.
+	ErrNotFound = errors.New("credential not found")
+	// ErrInvalid means caller input was rejected.
+	ErrInvalid = errors.New("invalid vault input")
+	// ErrAudit means the audit chain could not be verified or extended.
+	ErrAudit = errors.New("audit log failed verification")
+	// ErrIO means a vault file could not be read or written.
+	ErrIO = errors.New("vault file operation failed")
+	// ErrPassphrase means the CLI has no passphrase source.
+	ErrPassphrase = errors.New("passphrase required")
+)
+
+// Lifecycle is non-secret metadata stored with a credential.
+type Lifecycle struct {
+	State         string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	ExpiresAt     *time.Time
+	ReviewDueAt   *time.Time
+	RotationDueAt *time.Time
+}
+
+// Credential is a human-visible credential record.
+// Secret is set only by Get on an unlocked session.
+type Credential struct {
+	ID        string
+	Label     string
+	Type      string
+	Secret    []byte
+	Lifecycle Lifecycle
+}
+
+// PutOptions carries optional lifecycle times. Zero values mean unset.
+type PutOptions struct {
+	ExpiresAt     *time.Time
+	ReviewDueAt   *time.Time
+	RotationDueAt *time.Time
+}
+
+type lifecycle struct {
+	State         string     `json:"state"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	ReviewDueAt   *time.Time `json:"review_due_at,omitempty"`
+	RotationDueAt *time.Time `json:"rotation_due_at,omitempty"`
+}
+
+type credential struct {
+	ID        string    `json:"id"`
+	Label     string    `json:"label"`
+	Type      string    `json:"type"`
+	Secret    []byte    `json:"secret"`
+	Lifecycle lifecycle `json:"lifecycle"`
+}
+
+type kdfParams struct {
+	Algorithm string
+	Salt      []byte
+	Time      uint32
+	Memory    uint32
+	Threads   uint8
+	KeyLen    uint32
+}
+
+type fileHeader struct {
+	Version    int
+	ID         string
+	Root       string
+	KDF        kdfParams
+	WrapNonce  []byte
+	WrappedDEK []byte
+	DataNonce  []byte
+	Data       []byte
+	AuditHead  string
+	AuditSeq   uint64
+}
+
+// document is the plaintext inside the encrypted blob. Audit history lives
+// in the SQLite audit table, not in this document.
+type document struct {
+	Credentials []credential `json:"credentials"`
+}
+
+// Session is an unlocked vault. Lock zeroes the master key and cached secrets.
+type Session struct {
+	path     string
+	id       string
+	dek      []byte
+	header   fileHeader
+	creds    []credential
+	audit    []auditEvent
+	redactor *Redactor
+	logger   *log.Logger
+	db       *sql.DB
+	// commitFault, when set, fails a credential-state transaction before commit.
+	// Tests use it to prove rollback. Production leaves it nil.
+	commitFault func() error
+}
+
+// Create makes a new vault at path and returns it unlocked.
+func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error) {
+	if err := validatePassphrase(passphrase); err != nil {
+		return nil, err
+	}
+	if path == "" {
+		return nil, ErrInvalid
+	}
+	if _, err := os.Stat(path); err == nil {
+		return nil, ErrInvalid
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, ErrIO
+	}
+	id, err := newID()
+	if err != nil {
+		return nil, err
+	}
+	kdf, err := newKDF()
+	if err != nil {
+		return nil, err
+	}
+	kek := deriveKEK(passphrase, kdf)
+	defer wipe(kek)
+	dek, err := randBytes(keyLen)
+	if err != nil {
+		return nil, err
+	}
+	wrapNonce, wrapped, err := seal(kek, dek, dekAAD(id))
+	if err != nil {
+		wipe(dek)
+		return nil, err
+	}
+	db, err := createDB(path)
+	if err != nil {
+		wipe(dek)
+		return nil, err
+	}
+	red := &Redactor{}
+	red.Add(passphrase)
+	s := &Session{
+		path: path,
+		id:   id,
+		dek:  dek,
+		header: fileHeader{
+			Version:    formatVersion,
+			ID:         id,
+			Root:       rootPassphrase,
+			KDF:        kdf,
+			WrapNonce:  wrapNonce,
+			WrappedDEK: wrapped,
+		},
+		creds:    []credential{},
+		redactor: red,
+		logger:   logger,
+		db:       db,
+	}
+	if err := s.persistEvent(actionCreate, "", "", resultAllowed); err != nil {
+		s.Lock()
+		os.Remove(path)
+		return nil, err
+	}
+	s.logf("vault_create id=%s result=allowed", id)
+	return s, nil
+}
+
+// Unlock opens path with passphrase. A rejected unlock appends a denial and
+// does not update encrypted credential state. The denial has no passphrase
+// bytes. A later valid unlock checks that denial suffix and links its own
+// event after it.
+func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error) {
+	db, header, events, err := loadVault(path)
+	if err != nil {
+		return nil, err
+	}
+	closeDB := true
+	defer func() {
+		if closeDB {
+			db.Close()
+		}
+	}()
+	deny := func(cause error) error {
+		if aerr := appendDenial(db, header.ID); aerr != nil {
+			logLine(logger, "vault_unlock result=denied")
+			return ErrAudit
+		}
+		logLine(logger, "vault_unlock result=denied")
+		return cause
+	}
+	if err := validatePassphrase(passphrase); err != nil {
+		return nil, deny(err)
+	}
+	kek := deriveKEK(passphrase, header.KDF)
+	defer wipe(kek)
+	dek, err := openAEAD(kek, header.WrapNonce, header.WrappedDEK, dekAAD(header.ID))
+	if err != nil {
+		return nil, deny(ErrUnauthenticated)
+	}
+	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
+	if err != nil {
+		wipe(dek)
+		return nil, deny(ErrCorrupt)
+	}
+	defer wipe(plain)
+	var doc document
+	if err := unmarshalStrict(plain, &doc); err != nil {
+		wipe(dek)
+		return nil, deny(ErrCorrupt)
+	}
+	if err := validateStored(doc.Credentials); err != nil {
+		wipe(dek)
+		return nil, deny(err)
+	}
+	red := &Redactor{}
+	red.Add(passphrase)
+	for i := range doc.Credentials {
+		red.Add(doc.Credentials[i].Secret)
+	}
+	s := &Session{
+		path:     path,
+		id:       header.ID,
+		dek:      dek,
+		header:   header,
+		creds:    doc.Credentials,
+		audit:    events,
+		redactor: red,
+		logger:   logger,
+		db:       db,
+	}
+	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
+		s.Lock()
+		closeDB = false
+		return nil, err
+	}
+	closeDB = false
+	s.logf("vault_unlock id=%s result=allowed", s.id)
+	return s, nil
+}
+
+// Lock zeroes the master key and cached secrets. The session cannot be reused.
+func (s *Session) Lock() {
+	if s == nil {
+		return
+	}
+	wipe(s.dek)
+	s.dek = nil
+	for i := range s.creds {
+		wipe(s.creds[i].Secret)
+		s.creds[i].Secret = nil
+	}
+	s.creds = nil
+	s.audit = nil
+	if s.redactor != nil {
+		s.redactor.Wipe()
+	}
+	if s.db != nil {
+		s.db.Close()
+		s.db = nil
+	}
+}
+
+// Put stores a new credential and returns its metadata. The secret is not echoed.
+// Invalid input is denied and audited with no secret and no free-form metadata.
+func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credential, error) {
+	if err := s.live(); err != nil {
+		return Credential{}, err
+	}
+	if err := validateLabel(label); err != nil {
+		return s.denyPut(err)
+	}
+	if err := validateType(typ); err != nil {
+		return s.denyPut(err)
+	}
+	if err := validateSecret(secret); err != nil {
+		return s.denyPut(err)
+	}
+	expires, err := optionalTime(opt.ExpiresAt)
+	if err != nil {
+		return s.denyPut(err)
+	}
+	review, err := optionalTime(opt.ReviewDueAt)
+	if err != nil {
+		return s.denyPut(err)
+	}
+	rotation, err := optionalTime(opt.RotationDueAt)
+	if err != nil {
+		return s.denyPut(err)
+	}
+	id, err := newID()
+	if err != nil {
+		return Credential{}, err
+	}
+	now := time.Now().UTC()
+	rec := credential{
+		ID:     id,
+		Label:  label,
+		Type:   typ,
+		Secret: append([]byte(nil), secret...),
+		Lifecycle: lifecycle{
+			State:         StateActive,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+			ExpiresAt:     expires,
+			ReviewDueAt:   review,
+			RotationDueAt: rotation,
+		},
+	}
+	next := append(append([]credential{}, s.creds...), rec)
+	ev, err := nextEvent(s.audit, actionPut, s.id, id, typ, resultAllowed)
+	if err != nil {
+		wipe(rec.Secret)
+		return Credential{}, err
+	}
+	s.redactor.Add(secret)
+	if err := s.commit(ev, next); err != nil {
+		wipe(rec.Secret)
+		return Credential{}, err
+	}
+	// Labels are caller-controlled and may carry a secret this session has
+	// not seen, so redaction cannot cover them. Keep them out of process logs.
+	s.logf("credential_put id=%s type=%s result=allowed", id, typ)
+	return rec.public(), nil
+}
+
+// Get returns one credential, including its secret, after committing an audit event.
+// A failed audit transaction does not return the secret.
+func (s *Session) Get(id string) (Credential, error) {
+	if err := s.live(); err != nil {
+		return Credential{}, err
+	}
+	for i := range s.creds {
+		c := &s.creds[i]
+		if c.ID != id {
+			continue
+		}
+		if err := s.persistEvent(actionGet, c.ID, c.Type, resultAllowed); err != nil {
+			return Credential{}, err
+		}
+		s.logf("credential_get id=%s type=%s result=allowed", c.ID, c.Type)
+		out := c.public()
+		out.Secret = append([]byte(nil), c.Secret...)
+		return out, nil
+	}
+	// An unmatched caller-supplied id is not a stored identifier. It may be
+	// a foreign secret in credential-id shape, so the denial records none.
+	if err := s.persistEvent(actionGet, "", "", resultDenied); err != nil {
+		return Credential{}, err
+	}
+	s.logf("credential_get result=denied")
+	return Credential{}, ErrNotFound
+}
+
+// List returns credential metadata. Secrets are omitted.
+func (s *Session) List() ([]Credential, error) {
+	if err := s.live(); err != nil {
+		return nil, err
+	}
+	if err := s.persistEvent(actionList, "", "", resultAllowed); err != nil {
+		return nil, err
+	}
+	s.logf("credential_list count=%d result=allowed", len(s.creds))
+	out := make([]Credential, len(s.creds))
+	for i := range s.creds {
+		out[i] = s.creds[i].public()
+	}
+	return out, nil
+}
+
+func (c credential) public() Credential {
+	return Credential{
+		ID:    c.ID,
+		Label: c.Label,
+		Type:  c.Type,
+		Lifecycle: Lifecycle{
+			State:         c.Lifecycle.State,
+			CreatedAt:     c.Lifecycle.CreatedAt,
+			UpdatedAt:     c.Lifecycle.UpdatedAt,
+			ExpiresAt:     cloneTime(c.Lifecycle.ExpiresAt),
+			ReviewDueAt:   cloneTime(c.Lifecycle.ReviewDueAt),
+			RotationDueAt: cloneTime(c.Lifecycle.RotationDueAt),
+		},
+	}
+}
+
+func (s *Session) live() error {
+	if s == nil || s.db == nil || len(s.dek) != keyLen {
+		return ErrUnauthenticated
+	}
+	return nil
+}
+
+// RejectPut records a secret-free credential_put denial for a write rejected
+// before a secret was accepted, such as a secret file that cannot be read.
+// Caller input is not stored. A durable denial returns cause; a nil cause is
+// treated as ErrInvalid. A failed audit returns that error instead.
+func (s *Session) RejectPut(cause error) error {
+	return s.denyAction(actionPut, cause)
+}
+
+// RejectGet records a metadata-free credential_get denial for a retrieval
+// rejected before lookup, such as a malformed invocation. Caller input is
+// not stored.
+func (s *Session) RejectGet(cause error) error {
+	return s.denyAction(actionGet, cause)
+}
+
+// RejectList records a metadata-free credential_list denial for a listing
+// rejected before it runs. Caller input is not stored.
+func (s *Session) RejectList(cause error) error {
+	return s.denyAction(actionList, cause)
+}
+
+func (s *Session) denyPut(cause error) (Credential, error) {
+	return Credential{}, s.denyAction(actionPut, cause)
+}
+
+func (s *Session) denyAction(action string, cause error) error {
+	if cause == nil {
+		cause = ErrInvalid
+	}
+	if err := s.persistEvent(action, "", "", resultDenied); err != nil {
+		return err
+	}
+	s.logf("%s result=denied", action)
+	return cause
+}
+
+func (s *Session) persistEvent(action, credID, credType, result string) error {
+	ev, err := nextEvent(s.audit, action, s.id, credID, credType, result)
+	if err != nil {
+		return err
+	}
+	return s.commit(ev, s.creds)
+}
+
+// commit encrypts credential state under the new audit head and writes that
+// ciphertext plus the audit row in one transaction.
+func (s *Session) commit(ev auditEvent, creds []credential) error {
+	if s == nil || s.db == nil || len(s.dek) != keyLen {
+		return ErrUnauthenticated
+	}
+	plain, err := json.Marshal(document{Credentials: creds})
+	if err != nil {
+		return ErrIO
+	}
+	defer wipe(plain)
+	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, ev.Hash, ev.Seq))
+	if err != nil {
+		return err
+	}
+	h := s.header
+	h.Version = formatVersion
+	h.ID = s.id
+	h.Root = rootPassphrase
+	h.DataNonce = nonce
+	h.Data = ct
+	h.AuditHead = ev.Hash
+	h.AuditSeq = ev.Seq
+	if err := writeTx(s.db, h, ev, len(s.audit) == 0, s.commitFault); err != nil {
+		if errors.Is(err, ErrIO) {
+			s.logf("vault_write result=error")
+		}
+		return err
+	}
+	s.header = h
+	s.audit = append(s.audit, ev)
+	s.creds = creds
+	return nil
+}
+
+func (s *Session) logf(format string, args ...any) {
+	if s == nil || s.logger == nil {
+		return
+	}
+	msg := s.redactor.Redact(fmt.Sprintf(format, args...))
+	s.logger.Print(msg)
+}
+
+func logLine(logger *log.Logger, msg string) {
+	if logger != nil {
+		logger.Print(msg)
+	}
+}
+
+func newKDF() (kdfParams, error) {
+	salt, err := randBytes(saltLen)
+	if err != nil {
+		return kdfParams{}, err
+	}
+	return kdfParams{
+		Algorithm: algoArgon2id,
+		Salt:      salt,
+		Time:      prodTime,
+		Memory:    prodMemory,
+		Threads:   prodThreads,
+		KeyLen:    keyLen,
+	}, nil
+}
+
+func deriveKEK(passphrase []byte, p kdfParams) []byte {
+	return argon2.IDKey(passphrase, p.Salt, p.Time, p.Memory, p.Threads, p.KeyLen)
+}
+
+func dekAAD(vaultID string) []byte {
+	return []byte("tremelay/v1/dek\x00" + vaultID)
+}
+
+func dataAAD(vaultID, auditHead string, auditSeq uint64) []byte {
+	var seq [8]byte
+	binary.BigEndian.PutUint64(seq[:], auditSeq)
+	return append([]byte("tremelay/v1/data\x00"+vaultID+"\x00"+auditHead+"\x00"), seq[:]...)
+}
+
+// seal encrypts with AES-256-GCM.
+// ponytail: random 96-bit nonces. Upgrade path: a counter nonce before a vault
+// approaches 2^32 seals under one DEK.
+func seal(key, plaintext, aad []byte) (nonce, ciphertext []byte, err error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, nil, ErrInvalid
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, nil, ErrInvalid
+	}
+	nonce = make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, nil, ErrIO
+	}
+	return nonce, gcm.Seal(nil, nonce, plaintext, aad), nil
+}
+
+func openAEAD(key, nonce, ciphertext, aad []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	plain, err := gcm.Open(nil, nonce, ciphertext, aad)
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	return plain, nil
+}
+
+func wipe(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+// Wipe zeroes b. Go may retain other copies.
+func Wipe(b []byte) { wipe(b) }
+
+func randBytes(n int) ([]byte, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return nil, ErrIO
+	}
+	return b, nil
+}
+
+func newID() (string, error) {
+	b, err := randBytes(16)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func safeID(id string) string {
+	if len(id) != 32 {
+		return ""
+	}
+	if _, err := hex.DecodeString(id); err != nil {
+		return ""
+	}
+	return id
+}
+
+func validatePassphrase(p []byte) error {
+	if len(p) < minPassphrase || len(p) > maxPassphrase {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func validateSecret(s []byte) error {
+	if len(s) == 0 || len(s) > MaxSecret {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func validateLabel(label string) error {
+	if label == "" || len(label) > maxLabel || strings.ContainsAny(label, "\x00\r\n") || !utf8.ValidString(label) {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func validateType(typ string) error {
+	for _, allowed := range credentialTypes {
+		if typ == allowed {
+			return nil
+		}
+	}
+	return ErrInvalid
+}
+
+func optionalTime(t *time.Time) (*time.Time, error) {
+	if t == nil {
+		return nil, nil
+	}
+	if t.IsZero() {
+		return nil, ErrInvalid
+	}
+	u := t.UTC()
+	// encoding/json rejects years outside [0,9999]. That failure happens in
+	// commit, after validation, and returns ErrIO with no audit event.
+	if _, err := u.MarshalJSON(); err != nil {
+		return nil, ErrInvalid
+	}
+	return &u, nil
+}
+
+func cloneTime(t *time.Time) *time.Time {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	u := t.UTC()
+	return &u
+}
+
+func validateStored(creds []credential) error {
+	seen := make(map[string]struct{}, len(creds))
+	for _, c := range creds {
+		if validateLabel(c.Label) != nil || validateType(c.Type) != nil || validateSecret(c.Secret) != nil {
+			return ErrCorrupt
+		}
+		if safeID(c.ID) == "" {
+			return ErrCorrupt
+		}
+		if _, ok := seen[c.ID]; ok {
+			return ErrCorrupt
+		}
+		seen[c.ID] = struct{}{}
+		if c.Lifecycle.State != StateActive || c.Lifecycle.CreatedAt.IsZero() || c.Lifecycle.UpdatedAt.IsZero() {
+			return ErrCorrupt
+		}
+	}
+	return nil
+}
+
+func validateHeader(h fileHeader) error {
+	if h.Version != formatVersion || h.Root != rootPassphrase || safeID(h.ID) == "" {
+		return ErrCorrupt
+	}
+	if h.KDF.Algorithm != algoArgon2id {
+		return ErrCorrupt
+	}
+	if len(h.KDF.Salt) < saltLen || len(h.KDF.Salt) > 64 {
+		return ErrCorrupt
+	}
+	if h.KDF.Time < 1 || h.KDF.Time > maxKDFTime {
+		return ErrCorrupt
+	}
+	if h.KDF.Memory < minKDFMemory || h.KDF.Memory > maxKDFMemory {
+		return ErrCorrupt
+	}
+	if h.KDF.Threads < 1 || h.KDF.Threads > maxKDFThreads {
+		return ErrCorrupt
+	}
+	if h.KDF.KeyLen != keyLen {
+		return ErrCorrupt
+	}
+	if len(h.WrapNonce) != nonceLen || len(h.DataNonce) != nonceLen {
+		return ErrCorrupt
+	}
+	if len(h.WrappedDEK) < keyLen+16 || len(h.Data) < 16 {
+		return ErrCorrupt
+	}
+	if len(h.AuditHead) != 64 || h.AuditSeq == 0 {
+		return ErrCorrupt
+	}
+	if _, err := hex.DecodeString(h.AuditHead); err != nil {
+		return ErrCorrupt
+	}
+	return nil
+}
+
+func unmarshalStrict(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return ErrCorrupt
+	}
+	return nil
+}

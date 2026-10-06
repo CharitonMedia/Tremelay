@@ -45,7 +45,7 @@ Early development may ship as one server binary plus a web UI and CLI. Logical b
 
 ## Initial data-store approach
 
-SQLite is acceptable for the single-node/self-hosted starting point. PostgreSQL support may follow for multi-user or clustered deployments.
+M1 uses one local SQLite database as the transactional store for encrypted credential state and the audit chain ([ADR 0003](docs/adr/0003-custody-audit-hash-chain.md)). PostgreSQL support may follow for multi-user or clustered deployments.
 
 ## Cryptography
 
