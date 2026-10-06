@@ -964,6 +964,24 @@ func TestAuthenticatedPlaintextRejectionIsAudited(t *testing.T) {
 	assertAbsent(t, logs.Bytes(), pass)
 }
 
+func TestCredentialTypesCopyDoesNotChangeAllowlist(t *testing.T) {
+	got := CredentialTypes()
+	if len(got) == 0 {
+		t.Fatal("empty allowlist")
+	}
+	got[0] = "not-a-type"
+	again := CredentialTypes()
+	if again[0] == "not-a-type" {
+		t.Fatal("CredentialTypes returned the live allowlist")
+	}
+	if err := validateType("not-a-type"); err == nil {
+		t.Fatal("mutated copy accepted by validateType")
+	}
+	if err := validateType(again[0]); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOutOfRangePassphraseUnlockIsAudited(t *testing.T) {
 	var logs bytes.Buffer
 	path, pass, session := mustCreate(t, nil)

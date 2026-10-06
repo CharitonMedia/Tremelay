@@ -54,8 +54,10 @@ const (
 	StateActive = "active"
 )
 
-// CredentialTypes is the allowlist stored with each credential.
-var CredentialTypes = []string{
+// credentialTypes is the allowlist stored with each credential.
+// Other packages see only a copy so they cannot widen Put or store a type
+// that validateStored later rejects as corrupt.
+var credentialTypes = []string{
 	"password",
 	"api_key",
 	"bearer_token",
@@ -65,6 +67,11 @@ var CredentialTypes = []string{
 	"database",
 	"totp",
 	"generic",
+}
+
+// CredentialTypes returns a copy of the credential-type allowlist.
+func CredentialTypes() []string {
+	return append([]string(nil), credentialTypes...)
 }
 
 var (
@@ -648,7 +655,7 @@ func validateLabel(label string) error {
 }
 
 func validateType(typ string) error {
-	for _, allowed := range CredentialTypes {
+	for _, allowed := range credentialTypes {
 		if typ == allowed {
 			return nil
 		}

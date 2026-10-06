@@ -54,7 +54,7 @@ It does not provide an agent interface or raw-secret retrieval for agents.
 Types: %s
 Passphrase: TREMELAY_PASSPHRASE, or a no-echo terminal prompt.
 The passphrase is not accepted as an argument. credential get writes the raw secret to stdout.
-`, strings.Join(vault.CredentialTypes, ", "))
+`, strings.Join(vault.CredentialTypes(), ", "))
 }
 
 func cmdVault(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
