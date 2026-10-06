@@ -624,6 +624,70 @@ func TestLogOmitsFreeFormLabel(t *testing.T) {
 	}
 }
 
+func TestDeniedGetOmitsUnknownHexID(t *testing.T) {
+	var logs bytes.Buffer
+	path, _, session := mustCreate(t, log.New(&logs, "", 0))
+	stored, err := session.Put("label", "generic", []byte(randHex(t, 8)), PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A 32-character hex value is the shape of a credential id, but this one
+	// is a foreign secret the vault has never stored. It must not be copied
+	// into the denial's plaintext credential_id or the process log.
+	foreign := randHex(t, 16)
+	if len(foreign) != 32 || foreign == stored.ID {
+		t.Fatalf("foreign id %q", foreign)
+	}
+	logs.Reset()
+	if _, err := session.Get(foreign); !errors.Is(err, ErrNotFound) {
+		t.Fatal(err)
+	}
+	var denied int
+	for _, ev := range session.audit {
+		if ev.Action != actionGet || ev.Result != resultDenied {
+			continue
+		}
+		denied++
+		if ev.CredID != "" || ev.CredType != "" {
+			t.Fatalf("unknown lookup denial carried metadata id=%q type=%q", ev.CredID, ev.CredType)
+		}
+	}
+	if denied != 1 {
+		t.Fatalf("denied gets %d", denied)
+	}
+	if _, err := session.Get(stored.ID); err != nil {
+		t.Fatal(err)
+	}
+	var allowed bool
+	for _, ev := range session.audit {
+		if ev.Action == actionGet && ev.Result == resultAllowed && ev.CredID == stored.ID && ev.CredType == "generic" {
+			allowed = true
+		}
+	}
+	if !allowed {
+		t.Fatal("known credential id missing from allowed lookup")
+	}
+	session.Lock()
+	raw := readAll(t, path)
+	assertAbsent(t, raw, []byte(foreign))
+	assertAbsent(t, logs.Bytes(), []byte(foreign))
+	var sawKnown bool
+	for _, ev := range mustAudit(t, path) {
+		if strings.Contains(ev.CredID, foreign) || strings.Contains(ev.CredType, foreign) || strings.Contains(ev.Action, foreign) || strings.Contains(ev.Result, foreign) {
+			t.Fatal("foreign secret flowed into plaintext audit storage")
+		}
+		if ev.Action == actionGet && ev.Result == resultAllowed && ev.CredID == stored.ID {
+			sawKnown = true
+		}
+		if ev.Action == actionGet && ev.Result == resultDenied && ev.CredID != "" {
+			t.Fatalf("persisted denial id %q", ev.CredID)
+		}
+	}
+	if !sawKnown {
+		t.Fatal("known credential id missing from persisted audit")
+	}
+}
+
 func TestDeniedGetOmitsEmbeddedSecret(t *testing.T) {
 	var logs bytes.Buffer
 	path := filepath.Join(t.TempDir(), "vault.db")
@@ -648,27 +712,25 @@ func TestDeniedGetOmitsEmbeddedSecret(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var sawClean bool
+	var denied int
 	for _, ev := range session.audit {
 		if ev.Action != actionGet || ev.Result != resultDenied {
 			continue
 		}
-		if strings.Contains(ev.CredID, string(secret)) || strings.Contains(ev.CredID, string(pass)) {
-			t.Fatal("denial id contains secret material")
-		}
-		if ev.CredID == clean {
-			sawClean = true
+		denied++
+		if ev.CredID != "" || ev.CredType != "" {
+			t.Fatalf("unknown lookup denial carried metadata id=%q type=%q", ev.CredID, ev.CredType)
 		}
 	}
-	if !sawClean {
-		t.Fatal("safe miss id was dropped")
+	if denied != 3 {
+		t.Fatalf("denied gets %d", denied)
 	}
 	session.Lock()
 	raw := readAll(t, path)
-	assertAbsent(t, raw, secret)
-	assertAbsent(t, raw, pass)
-	assertAbsent(t, logs.Bytes(), secret)
-	assertAbsent(t, logs.Bytes(), pass)
+	for _, leaked := range [][]byte{secret, pass, []byte(embeddedSecret), []byte(embeddedPass), []byte(clean)} {
+		assertAbsent(t, raw, leaked)
+		assertAbsent(t, logs.Bytes(), leaked)
+	}
 }
 
 func TestSentinelSecretDoesNotFlowIntoPlaintext(t *testing.T) {

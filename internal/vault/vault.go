@@ -414,17 +414,12 @@ func (s *Session) Get(id string) (Credential, error) {
 		out.Secret = append([]byte(nil), c.Secret...)
 		return out, nil
 	}
-	// A caller-supplied id is not a stored identifier. Drop it when it
-	// contains a known secret or passphrase; exact equality is not enough,
-	// because a 32-character hex id can embed a shorter secret.
-	auditedID := safeID(id)
-	if s.redactor.Redact(auditedID) != auditedID {
-		auditedID = ""
-	}
-	if err := s.persistEvent(actionGet, auditedID, "", resultDenied); err != nil {
+	// An unmatched caller-supplied id is not a stored identifier. It may be
+	// a foreign secret in credential-id shape, so the denial records none.
+	if err := s.persistEvent(actionGet, "", "", resultDenied); err != nil {
 		return Credential{}, err
 	}
-	s.logf("credential_get id=%s result=denied", auditedID)
+	s.logf("credential_get result=denied")
 	return Credential{}, ErrNotFound
 }
 
