@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -85,7 +86,7 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 		"127.0.0.1", "127.0.0.2", "::1", "10.1.2.3", "192.168.0.1", "172.16.0.1",
 		"169.254.169.254", "0.0.0.0", "100.64.0.1", "255.255.255.255", "224.0.0.1",
 		"::ffff:127.0.0.1", "fe80::1", "fc00::1", "fd00::1", "2001:db8::1", "2002::1",
-		"192.0.2.1", "198.51.100.1", "203.0.113.1",
+		"192.0.2.1", "198.51.100.1", "203.0.113.1", "192.88.99.2", "::ffff:192.88.99.2",
 		"fec0::1", "64:ff9b::1", "64:ff9b:1::1", "100::1", "100:0:0:1::1",
 		"2001::1", "2001:2::1", "3fff::1", "3fff:fff::1", "5f00::1", "2620:4f:8000::1", "4000::1",
 	}
@@ -102,6 +103,9 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 		t.Fatalf("pin %s %v", got, err)
 	}
 	if _, err := pinTarget(net.ParseIP("10.0.0.1"), "443"); !errors.Is(err, errDestination) {
+		t.Fatal(err)
+	}
+	if _, err := pinTarget(net.ParseIP("192.88.99.2"), "443"); !errors.Is(err, errDestination) {
 		t.Fatal(err)
 	}
 	if _, err := pinTarget(net.ParseIP("::ffff:1.1.1.1"), "443"); err != nil {
@@ -302,12 +306,12 @@ func TestBrokerHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.StatusCode != 200 || !bytes.Equal(res.Body, []byte(`{"ok":true}`)) || calls != 1 {
+	if res.StatusCode != 200 || calls != 1 {
 		t.Fatalf("status %d calls %d", res.StatusCode, calls)
 	}
 	encoded, err := json.Marshal(res)
-	if err != nil || bytes.Contains(encoded, secret) {
-		t.Fatal("credential in broker JSON")
+	if err != nil || string(encoded) != `{"StatusCode":200}` || bytes.Contains(encoded, secret) || bytes.Contains(encoded, []byte(`{"ok":true}`)) {
+		t.Fatalf("broker result %s", encoded)
 	}
 	res, err = principal.BrokerHTTP(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: target})
 	if err != nil || res.StatusCode != 200 || calls != 2 {
@@ -325,8 +329,11 @@ func TestBrokerHTTP(t *testing.T) {
 		return &http.Response{StatusCode: 201, Body: io.NopCloser(strings.NewReader("saved")), Header: make(http.Header)}, nil
 	}
 	res, err = principal.BrokerHTTP(HTTPBrokerRequest{CredentialID: pw.ID, Method: http.MethodPost, Target: "https://svc.example/v1/submit"})
-	if err != nil || res.StatusCode != 201 || string(res.Body) != "saved" {
+	if err != nil || res.StatusCode != 201 {
 		t.Fatalf("class broker %d %v", res.StatusCode, err)
+	}
+	if encoded, err := json.Marshal(res); err != nil || bytes.Contains(encoded, []byte("saved")) {
+		t.Fatal("class broker returned the upstream body")
 	}
 
 	denyNet := func() {
@@ -347,8 +354,8 @@ func TestBrokerHTTP(t *testing.T) {
 		t.Helper()
 		before := calls
 		res, err := who.BrokerHTTP(req)
-		if !errors.Is(err, want) || res.StatusCode != 0 || len(res.Body) != 0 || calls != before {
-			t.Fatalf("res %d body %d calls %d err %v", res.StatusCode, len(res.Body), calls, err)
+		if !errors.Is(err, want) || res.StatusCode != 0 || calls != before {
+			t.Fatalf("res %d calls %d err %v", res.StatusCode, calls, err)
 		}
 		if secretIn(err.Error(), secret, otherSecret, pwSecret, unsafeSecret) {
 			t.Fatal("credential in broker error")
@@ -412,7 +419,7 @@ func TestBrokerHTTP(t *testing.T) {
 		return []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.1")}, nil
 	}
 	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: target}, principal, ErrDeniedDestination)
-	for _, raw := range []string{"fec0::1", "64:ff9b::c000:201", "64:ff9b:1::1", "100::1", "2001:2::1", "3fff::1", "3fff:fff::1"} {
+	for _, raw := range []string{"fec0::1", "64:ff9b::c000:201", "64:ff9b:1::1", "100::1", "2001:2::1", "3fff::1", "3fff:fff::1", "192.88.99.2"} {
 		session.resolve = func(context.Context, string) ([]net.IP, error) {
 			return []net.IP{net.ParseIP(raw)}, nil
 		}
@@ -431,7 +438,7 @@ func TestBrokerHTTP(t *testing.T) {
 			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("public")), Header: make(http.Header)}, nil
 		}
 		res, err = principal.BrokerHTTP(good)
-		if err != nil || string(res.Body) != "public" {
+		if err != nil || res.StatusCode != 200 {
 			t.Fatalf("%s was refused: %v", raw, err)
 		}
 	}
@@ -482,22 +489,21 @@ func TestBrokerHTTP(t *testing.T) {
 		return nil, errors.New("dial " + string(secret))
 	}
 	expect(good, principal, ErrBrokerUpstream)
-	session.httpDo = func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("echo " + string(secret))), Header: make(http.Header)}, nil
-	}
-	expect(good, principal, ErrBrokerResponse)
-	session.httpDo = func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("Bearer " + string(secret))), Header: make(http.Header)}, nil
-	}
-	expect(good, principal, ErrBrokerResponse)
 	for _, body := range []string{
+		"echo " + string(secret),
+		"Bearer " + string(secret),
 		base64.StdEncoding.EncodeToString(secret),
 		base64.URLEncoding.EncodeToString(append([]byte("Bearer "), secret...)),
 	} {
 		session.httpDo = func(*http.Request) (*http.Response, error) {
+			calls++
 			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 		}
-		expect(good, principal, ErrBrokerResponse)
+		res, err = principal.BrokerHTTP(good)
+		encoded, mErr := json.Marshal(res)
+		if err != nil || mErr != nil || string(encoded) != `{"StatusCode":200}` || bytes.Contains(encoded, secret) || strings.Contains(string(encoded), body) {
+			t.Fatalf("reflected body returned %s err %v", encoded, err)
+		}
 	}
 
 	denyNet()
@@ -543,7 +549,7 @@ func TestBrokerHTTP(t *testing.T) {
 	}
 	res, err = principal.BrokerHTTP(good)
 	session.commitFault = nil
-	if !errors.Is(err, ErrAudit) || res.StatusCode != 0 || len(res.Body) != 0 || secretIn(err.Error(), secret) {
+	if !errors.Is(err, ErrAudit) || res.StatusCode != 0 || secretIn(err.Error(), secret) {
 		t.Fatalf("withheld %d %v", res.StatusCode, err)
 	}
 
@@ -587,8 +593,32 @@ func TestBrokerHTTP(t *testing.T) {
 	}
 }
 
-func TestEncodedSecretIsNotReturned(t *testing.T) {
+func TestBrokerReturnsStatusOnly(t *testing.T) {
+	var logs bytes.Buffer
+	path, pass, session := mustCreate(t, log.New(&logs, "", 0))
 	secret := []byte(`tok"en\x<a/b`)
+	api, err := session.Put("api", "api_key", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := session.CreateAgent("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := session.Agent(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const target = "https://svc.example/v1/ping"
+	if _, err := session.IssueGrant(GrantSpec{
+		AgentID: agent.ID, CredentialID: api.ID, Operations: []string{OpHTTPRequest},
+		Resource: "GET " + target, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	session.resolve = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("1.1.1.1")}, nil
+	}
 	quoted, err := json.Marshal(string(secret))
 	if err != nil || len(quoted) < 2 {
 		t.Fatal(err)
@@ -612,7 +642,13 @@ func TestEncodedSecretIsNotReturned(t *testing.T) {
 		t.Fatal(err)
 	}
 	percent := url.QueryEscape(string(secret))
-	rejected := []string{
+	nested := string(secret)
+	for range 7 {
+		nested = base64.StdEncoding.EncodeToString([]byte(nested))
+	}
+	tabbed := []byte(`tok\ten"x`)
+	bodies := []string{
+		`{"ok":true,"path":"C:\\temp","next":"https://cdn.example/a%2Fb","blob":"` + base64.StdEncoding.EncodeToString([]byte("hello-not-the-credential")) + `"}`,
 		string(secret),
 		string(inner),
 		`tok\"en\\x<a\/b`,
@@ -620,7 +656,7 @@ func TestEncodedSecretIsNotReturned(t *testing.T) {
 		percent,
 		strings.ToLower(percent),
 		"pre " + percent + " post",
-		base64.StdEncoding.EncodeToString(secret),
+		wrapped,
 		base64.RawURLEncoding.EncodeToString(bearer),
 		folded.String(),
 		url.QueryEscape(percent),
@@ -632,60 +668,34 @@ func TestEncodedSecretIsNotReturned(t *testing.T) {
 		base64.StdEncoding.EncodeToString([]byte(percent)),
 		base64.URLEncoding.EncodeToString([]byte(base64.StdEncoding.EncodeToString(secret))),
 		base64.StdEncoding.EncodeToString(inner),
-	}
-	for i, body := range rejected {
-		_, got, kind := takeBody(&http.Response{
-			StatusCode: 200,
-			Body:       io.NopCloser(strings.NewReader(body)),
-			Header:     make(http.Header),
-		}, append([]byte(nil), secret...))
-		wipe(got)
-		if kind != brokerBodyLeak {
-			t.Fatalf("encoded credential was returned (%d)", i)
-		}
-	}
-	benign := `{"ok":true,"path":"C:\\temp","next":"https://cdn.example/a%2Fb","blob":"` + base64.StdEncoding.EncodeToString([]byte("hello-not-the-credential")) + `"}`
-	_, got, kind := takeBody(&http.Response{
-		StatusCode: 200,
-		Body:       io.NopCloser(strings.NewReader(benign)),
-		Header:     make(http.Header),
-	}, append([]byte(nil), secret...))
-	if kind != brokerBodyOK || string(got) != benign {
-		t.Fatal("benign body was rejected")
-	}
-	wipe(got)
-	tabbed := []byte(`tok\ten"x`)
-	for i, body := range []string{
+		nested,
+		hex.EncodeToString(secret),
+		hex.EncodeToString(bearer),
 		url.QueryEscape(string(tabbed)),
 		url.QueryEscape(url.QueryEscape(string(tabbed))),
 		base64.StdEncoding.EncodeToString([]byte(strings.ToLower(url.QueryEscape(string(tabbed))))),
-	} {
-		_, got, kind = takeBody(&http.Response{
-			StatusCode: 200,
-			Body:       io.NopCloser(strings.NewReader(body)),
-			Header:     make(http.Header),
-		}, append([]byte(nil), tabbed...))
-		wipe(got)
-		if kind != brokerBodyLeak {
-			t.Fatalf("tabbed credential was returned (%d)", i)
+	}
+	for i, body := range bodies {
+		session.httpDo = func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		}
+		res, err := principal.BrokerHTTP(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: target})
+		encoded, mErr := json.Marshal(res)
+		if err != nil || mErr != nil || string(encoded) != `{"StatusCode":200}` {
+			t.Fatalf("body %d result %s err %v", i, encoded, err)
 		}
 	}
-}
-
-func TestSevenNestedBase64IsNotReturned(t *testing.T) {
-	secret := []byte("sentinel-credential-value")
-	body := string(secret)
-	for range 7 {
-		body = base64.StdEncoding.EncodeToString([]byte(body))
+	for _, ev := range session.audit {
+		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Time, ev.Prev, ev.Hash}, "\n")
+		if secretIn(fields, secret, tabbed) {
+			t.Fatal("audit recorded credential material")
+		}
 	}
-	_, got, kind := takeBody(&http.Response{
-		StatusCode: 200,
-		Body:       io.NopCloser(strings.NewReader(body)),
-		Header:     make(http.Header),
-	}, append([]byte(nil), secret...))
-	wipe(got)
-	if kind != brokerBodyLeak {
-		t.Fatal("seven nested base64 encodings of the credential were returned")
+	if _, err := VerifyAudit(path, pass); err != nil {
+		t.Fatal(err)
+	}
+	if secretIn(string(readAll(t, path)), secret, tabbed) || secretIn(logs.String(), secret, tabbed) {
+		t.Fatal("credential in plaintext persistence or logs")
 	}
 }
 

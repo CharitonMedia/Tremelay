@@ -118,9 +118,6 @@ var (
 	// ErrBrokerUpstream means the upstream call failed or could not be completed.
 	// The error text is fixed and does not include the credential or the URL.
 	ErrBrokerUpstream = errors.New("broker upstream failed")
-	// ErrBrokerResponse means an upstream response was withheld because it
-	// carried credential material or could not be returned safely.
-	ErrBrokerResponse = errors.New("broker response withheld")
 )
 
 // Lifecycle is non-secret metadata stored with a credential.

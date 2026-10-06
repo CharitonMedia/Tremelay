@@ -275,8 +275,12 @@ func TestNoGetSecretMethod(t *testing.T) {
 				}
 			}
 			resp := m.Type.Out(0)
-			if resp != reflect.TypeOf(HTTPBrokerResponse{}) || resp.NumField() != 2 || resp.Field(0).Name != "StatusCode" || resp.Field(1).Name != "Body" {
+			if resp != reflect.TypeOf(HTTPBrokerResponse{}) || resp.NumField() != 1 {
 				t.Fatalf("broker response %s", resp)
+			}
+			field := resp.Field(0)
+			if field.Name != "StatusCode" || field.Type.Kind() != reflect.Int {
+				t.Fatalf("broker response field %s", field.Name)
 			}
 		default:
 			t.Fatal(m.Name)

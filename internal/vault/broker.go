@@ -1,9 +1,7 @@
 package vault
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -23,9 +21,6 @@ const (
 	brokerBodyOK    = 0
 	brokerBodyBad   = 1
 	brokerBodyRedir = 2
-	brokerBodyLeak  = 3
-	// reflectRounds unwinds every percent and JSON layer that fits in the body.
-	reflectRounds = 32
 )
 
 // HTTPBrokerRequest is the agent-facing broker call.
@@ -36,11 +31,10 @@ type HTTPBrokerRequest struct {
 	Target       string
 }
 
-// HTTPBrokerResponse is the least data returned after a completed upstream call.
-// Headers, including the injected Authorization value, are not returned.
+// HTTPBrokerResponse is the broker-defined result of a completed upstream call.
+// StatusCode is the upstream status. Upstream body bytes are not a field.
 type HTTPBrokerResponse struct {
 	StatusCode int
-	Body       []byte
 }
 
 var (
@@ -108,26 +102,19 @@ func (s *Session) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerR
 		partial.Result = resultUpstreamError
 		return s.brokerAudit(partial, ErrBrokerUpstream)
 	}
-	status, body, kind := takeBody(resp, secret)
+	status, kind := takeStatus(resp)
 	switch kind {
 	case brokerBodyRedir:
-		wipe(body)
 		partial.Result = resultDeniedDestination
 		return s.brokerAudit(partial, ErrDeniedDestination)
-	case brokerBodyLeak:
-		wipe(body)
-		partial.Result = resultUpstreamError
-		return s.brokerAudit(partial, ErrBrokerResponse)
 	case brokerBodyBad:
-		wipe(body)
 		partial.Result = resultUpstreamError
 		return s.brokerAudit(partial, ErrBrokerUpstream)
 	}
 	if err := s.brokerCommit(partial, resultCompleted); err != nil {
-		wipe(body)
 		return HTTPBrokerResponse{}, err
 	}
-	return HTTPBrokerResponse{StatusCode: status, Body: body}, nil
+	return HTTPBrokerResponse{StatusCode: status}, nil
 }
 
 func (s *Session) brokerAudit(partial auditEvent, cause error) (HTTPBrokerResponse, error) {
@@ -197,11 +184,11 @@ func (s *Session) doBroker(req *http.Request, ip net.IP, port string) (*http.Res
 	}
 	buf, readErr := readLimited(resp.Body)
 	_ = resp.Body.Close()
+	wipe(buf)
 	if readErr != nil {
-		wipe(buf)
 		return nil, errBrokerTransport
 	}
-	resp.Body = io.NopCloser(bytes.NewReader(buf))
+	resp.Body = http.NoBody
 	return resp, nil
 }
 
@@ -284,6 +271,9 @@ func isPublicIP(ip net.IP) bool {
 			return false
 		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19):
 			return false
+		case v4[0] == 192 && v4[1] == 88 && v4[2] == 99 && v4[3] == 2:
+			// 192.88.99.2 is the 6a44 relay anycast and is not globally reachable.
+			return false
 		case v4[0] >= 240:
 			return false
 		}
@@ -324,337 +314,26 @@ func ipv6Public(ip net.IP) bool {
 	}
 }
 
-func takeBody(resp *http.Response, secret []byte) (status int, body []byte, kind int) {
-	defer wipe(secret)
+// takeStatus returns the upstream status and wipes the body.
+// Upstream bytes are not a broker result. Redirects stay refused.
+func takeStatus(resp *http.Response) (int, int) {
 	if resp == nil {
-		return 0, nil, brokerBodyBad
+		return 0, brokerBodyBad
+	}
+	var readErr error
+	if resp.Body != nil {
+		buf, err := readLimited(resp.Body)
+		_ = resp.Body.Close()
+		wipe(buf)
+		readErr = err
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		if resp.Body != nil {
-			discardBody(resp.Body)
-		}
-		return 0, nil, brokerBodyRedir
+		return 0, brokerBodyRedir
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 599 {
-		if resp.Body != nil {
-			discardBody(resp.Body)
-		}
-		return 0, nil, brokerBodyBad
+	if readErr != nil || resp.StatusCode < 200 || resp.StatusCode > 599 {
+		return 0, brokerBodyBad
 	}
-	if resp.Body == nil {
-		return resp.StatusCode, nil, brokerBodyOK
-	}
-	buf, err := readLimited(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil || len(buf) > maxBrokerBody {
-		wipe(buf)
-		return 0, nil, brokerBodyBad
-	}
-	if secretReflected(buf, secret) {
-		return 0, buf, brokerBodyLeak
-	}
-	return resp.StatusCode, buf, brokerBodyOK
-}
-
-// secretReflected reports whether buf contains the secret or a form the agent
-// can turn back into the secret or the Authorization bearer value.
-// ponytail: thirty-two single percent or JSON steps. Base64 unwraps while each
-// layer shrinks, so every nesting that fits in the body is examined. A percent
-// or JSON body that still changes at the layer cap is withheld, as is a base64
-// step that does not shrink. Ceiling: a base64 token glued to extra alphabet
-// characters is not split out of the longer run. Upgrade path: a response
-// schema that does not return free-form upstream bytes.
-func secretReflected(buf, secret []byte) bool {
-	if len(buf) == 0 || len(secret) == 0 {
-		return false
-	}
-	bearer := append([]byte("Bearer "), secret...)
-	defer wipe(bearer)
-	return reflectLayers(buf, secret, bearer)
-}
-
-func reflectLayers(buf, secret, bearer []byte) bool {
-	cur := append([]byte(nil), buf...)
-	for round := 0; round < reflectRounds; round++ {
-		if layerReflects(cur, secret, bearer) {
-			wipe(cur)
-			return true
-		}
-		next, changed := stepDecode(cur)
-		if !changed {
-			wipe(cur)
-			return false
-		}
-		wipe(cur)
-		cur = next
-	}
-	wipe(cur)
-	return true
-}
-
-func layerReflects(buf, secret, bearer []byte) bool {
-	if bytes.Contains(buf, secret) || base64Forms(buf, secret, bearer) || tokensReveal(buf, secret, bearer) {
-		return true
-	}
-	folded, fresh := foldSpace(buf)
-	if !fresh {
-		return false
-	}
-	defer wipe(folded)
-	return tokensReveal(folded, secret, bearer)
-}
-
-func base64Forms(buf, secret, bearer []byte) bool {
-	folded, fresh := foldSpace(buf)
-	if fresh {
-		defer wipe(folded)
-	}
-	for _, src := range [][]byte{secret, bearer} {
-		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
-			form := []byte(enc.EncodeToString(src))
-			hit := bytes.Contains(buf, form) || bytes.Contains(folded, form)
-			wipe(form)
-			if hit {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func stepDecode(buf []byte) ([]byte, bool) {
-	if bytes.Contains(buf, []byte{'%'}) {
-		next := percentDecode(buf)
-		if !bytes.Equal(next, buf) {
-			return next, true
-		}
-		wipe(next)
-	}
-	if bytes.Contains(buf, []byte{'\\'}) {
-		next := jsonUnescape(buf)
-		if !bytes.Equal(next, buf) {
-			return next, true
-		}
-		wipe(next)
-	}
-	return nil, false
-}
-
-func tokensReveal(buf, secret, bearer []byte) bool {
-	minRun := base64.RawStdEncoding.EncodedLen(len(secret))
-	if minRun < 8 {
-		minRun = 8
-	}
-	hit := func(urlSafe bool) bool {
-		return scanB64(buf, urlSafe, minRun, func(tok []byte) bool {
-			return chainDecode(tok, urlSafe, secret, bearer)
-		})
-	}
-	return hit(false) || hit(true)
-}
-
-func chainDecode(tok []byte, urlSafe bool, secret, bearer []byte) bool {
-	cur, ok := decodeToken(tok, urlSafe)
-	if !ok {
-		return false
-	}
-	for {
-		if payloadReflects(cur, secret, bearer) {
-			wipe(cur)
-			return true
-		}
-		next, ok := decodeToken(cur, false)
-		if !ok {
-			next, ok = decodeToken(cur, true)
-		}
-		if !ok {
-			wipe(cur)
-			return false
-		}
-		// A successful decode of a real base64 layer is shorter. A step that
-		// does not shrink is withheld rather than returned still encoded.
-		if len(next) >= len(cur) {
-			wipe(next)
-			wipe(cur)
-			return true
-		}
-		wipe(cur)
-		cur = next
-	}
-}
-
-func payloadReflects(buf, secret, bearer []byte) bool {
-	if bytes.Contains(buf, secret) || base64Forms(buf, secret, bearer) {
-		return true
-	}
-	cur := append([]byte(nil), buf...)
-	for round := 0; round < reflectRounds; round++ {
-		next, changed := stepDecode(cur)
-		if !changed {
-			wipe(cur)
-			return false
-		}
-		wipe(cur)
-		cur = next
-		if bytes.Contains(cur, secret) || base64Forms(cur, secret, bearer) {
-			wipe(cur)
-			return true
-		}
-	}
-	wipe(cur)
-	return true
-}
-
-func scanB64(buf []byte, urlSafe bool, minRun int, fn func([]byte) bool) bool {
-	for i := 0; i < len(buf); {
-		if !b64Char(buf[i], urlSafe) {
-			i++
-			continue
-		}
-		j := i + 1
-		for j < len(buf) && b64Char(buf[j], urlSafe) {
-			j++
-		}
-		k := j
-		for n := 0; k < len(buf) && buf[k] == '=' && n < 2; n++ {
-			k++
-		}
-		if k-i >= minRun && fn(buf[i:k]) {
-			return true
-		}
-		i = k
-	}
-	return false
-}
-
-func b64Char(c byte, urlSafe bool) bool {
-	switch {
-	case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-		return true
-	case !urlSafe && (c == '+' || c == '/'):
-		return true
-	case urlSafe && (c == '-' || c == '_'):
-		return true
-	default:
-		return false
-	}
-}
-
-func decodeToken(tok []byte, urlSafe bool) ([]byte, bool) {
-	enc, raw := base64.StdEncoding, base64.RawStdEncoding
-	if urlSafe {
-		enc, raw = base64.URLEncoding, base64.RawURLEncoding
-	}
-	if out, ok := decodeB64(enc, tok); ok {
-		return out, true
-	}
-	return decodeB64(raw, tok)
-}
-
-func decodeB64(enc *base64.Encoding, tok []byte) ([]byte, bool) {
-	dst := make([]byte, enc.DecodedLen(len(tok)))
-	n, err := enc.Decode(dst, tok)
-	if err != nil || n == 0 {
-		wipe(dst)
-		return nil, false
-	}
-	return dst[:n], true
-}
-
-func jsonUnescape(buf []byte) []byte {
-	out := make([]byte, 0, len(buf))
-	for i := 0; i < len(buf); i++ {
-		if buf[i] != '\\' || i+1 >= len(buf) {
-			out = append(out, buf[i])
-			continue
-		}
-		i++
-		switch buf[i] {
-		case '"', '\\', '/':
-			out = append(out, buf[i])
-		case 'b':
-			out = append(out, '\b')
-		case 'f':
-			out = append(out, '\f')
-		case 'n':
-			out = append(out, '\n')
-		case 'r':
-			out = append(out, '\r')
-		case 't':
-			out = append(out, '\t')
-		case 'u':
-			r, ok := jsonHex4(buf, i+1)
-			if !ok {
-				out = append(out, '\\', 'u')
-				continue
-			}
-			i += 4
-			out = append(out, string(rune(r))...)
-		default:
-			out = append(out, '\\', buf[i])
-		}
-	}
-	return out
-}
-
-func jsonHex4(buf []byte, i int) (uint16, bool) {
-	if i+3 >= len(buf) {
-		return 0, false
-	}
-	var r uint16
-	for _, c := range buf[i : i+4] {
-		h, ok := hexVal(c)
-		if !ok {
-			return 0, false
-		}
-		r = r<<4 | uint16(h)
-	}
-	return r, true
-}
-
-func percentDecode(buf []byte) []byte {
-	out := make([]byte, 0, len(buf))
-	for i := 0; i < len(buf); i++ {
-		if buf[i] == '%' && i+2 < len(buf) {
-			hi, ok1 := hexVal(buf[i+1])
-			lo, ok2 := hexVal(buf[i+2])
-			if ok1 && ok2 {
-				out = append(out, hi<<4|lo)
-				i += 2
-				continue
-			}
-		}
-		out = append(out, buf[i])
-	}
-	return out
-}
-
-func hexVal(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	default:
-		return 0, false
-	}
-}
-
-func foldSpace(buf []byte) ([]byte, bool) {
-	if !bytes.ContainsAny(buf, " \t\r\n") {
-		return buf, false
-	}
-	out := make([]byte, 0, len(buf))
-	for _, b := range buf {
-		switch b {
-		case ' ', '\t', '\r', '\n':
-		default:
-			out = append(out, b)
-		}
-	}
-	return out, true
+	return resp.StatusCode, brokerBodyOK
 }
 
 func readLimited(body io.Reader) ([]byte, error) {
@@ -667,8 +346,9 @@ func readLimited(body io.Reader) ([]byte, error) {
 }
 
 func discardBody(body io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxBrokerBody))
+	buf, _ := readLimited(body)
 	_ = body.Close()
+	wipe(buf)
 }
 
 func safeHeaderSecret(secret []byte) bool {
