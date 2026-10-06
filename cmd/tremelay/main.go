@@ -126,15 +126,16 @@ func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 		usage(stderr)
 		return 2
 	}
-	secret, err := readSecretFile(*secretFile)
-	if err != nil {
-		fmt.Fprintln(stderr, err.Error())
-		return 1
-	}
-	defer vault.Wipe(secret)
 	red := &vault.Redactor{}
-	red.Add(secret)
 	return withSession(*path, getenv, stdin, stderr, red, func(session *vault.Session) error {
+		// File checks used to return before unlock, so empty, oversized, and
+		// unreadable secret files never produced a credential_put denial.
+		secret, err := readSecretFile(*secretFile)
+		if err != nil {
+			return session.RejectPut(err)
+		}
+		defer vault.Wipe(secret)
+		red.Add(secret)
 		cred, err := session.Put(*label, *typ, secret, vault.PutOptions{})
 		if err != nil {
 			return err

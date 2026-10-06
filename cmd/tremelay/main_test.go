@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/CharitonMedia/Tremelay/internal/vault"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestCLICreatePutGetListAndRedaction(t *testing.T) {
@@ -156,6 +161,119 @@ func TestCLICreateReportsStdoutWriteFailure(t *testing.T) {
 	if strings.Contains(stderr.String(), pass) {
 		t.Fatal("stderr echoed passphrase")
 	}
+}
+
+func TestCLIPutSecretFileRejectionIsAudited(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	env := map[string]string{"TREMELAY_PASSPHRASE": pass}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"vault", "create", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("create %d %s", code, stderr.String())
+	}
+
+	sentinel := randBytes(t, 32)
+	oversized := append(append([]byte{}, sentinel...), make([]byte, vault.MaxSecret+1-len(sentinel))...)
+	oversizedPath := filepath.Join(dir, "oversized")
+	if err := os.WriteFile(oversizedPath, oversized, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	emptyPath := filepath.Join(dir, "empty")
+	if err := os.WriteFile(emptyPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missingPath := filepath.Join(dir, "missing")
+	dirPath := filepath.Join(dir, "not-a-file")
+	if err := os.Mkdir(dirPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	attempts := []struct {
+		file string
+		want error
+	}{
+		{file: emptyPath, want: vault.ErrInvalid},
+		{file: oversizedPath, want: vault.ErrInvalid},
+		{file: missingPath, want: vault.ErrInvalid},
+		{file: dirPath, want: vault.ErrIO},
+	}
+	for _, attempt := range attempts {
+		stdout.Reset()
+		stderr.Reset()
+		code := run([]string{"credential", "put", "--path", path, "--label", "ci", "--type", "api_key", "--secret-file", attempt.file}, envGet(env), strings.NewReader(""), &stdout, &stderr)
+		if code == 0 {
+			t.Fatalf("put accepted %s", attempt.file)
+		}
+		if stdout.Len() != 0 {
+			t.Fatal("rejected put wrote stdout")
+		}
+		if !strings.Contains(stderr.String(), attempt.want.Error()) {
+			t.Fatalf("stderr %q, want %s", stderr.String(), attempt.want)
+		}
+		if bytes.Contains(stderr.Bytes(), sentinel) || strings.Contains(stderr.String(), pass) {
+			t.Fatal("stderr contains secret material")
+		}
+	}
+	if n := deniedPutCount(t, path); n != len(attempts) {
+		t.Fatalf("denied credential_put events %d", n)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, sentinel) || bytes.Contains(raw, []byte(pass)) {
+		t.Fatal("vault file contains secret material")
+	}
+
+	good := randBytes(t, 24)
+	goodPath := filepath.Join(dir, "secret")
+	if err := os.WriteFile(goodPath, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "put", "--path", path, "--label", "ci", "--type", "api_key", "--secret-file", goodPath}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("put %d %s", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) == "" {
+		t.Fatal("missing id after audited denials")
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"audit", "verify", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("verify %d %s", code, stderr.String())
+	}
+}
+
+func deniedPutCount(t *testing.T, path string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT credential_id, credential_type FROM audit WHERE action = ? AND result = ?`, "credential_put", "denied")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var id, typ string
+		if err := rows.Scan(&id, &typ); err != nil {
+			t.Fatal(err)
+		}
+		if id != "" || typ != "" {
+			t.Fatalf("denial carried metadata id=%q type=%q", id, typ)
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func TestCLIPutReportsStdoutWriteFailure(t *testing.T) {

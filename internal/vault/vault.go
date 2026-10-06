@@ -469,6 +469,18 @@ func (s *Session) live() error {
 	return nil
 }
 
+// RejectPut records a secret-free credential_put denial for a write rejected
+// before a secret was accepted, such as a secret file that cannot be read.
+// Caller input is not stored. A durable denial returns cause; a nil cause is
+// treated as ErrInvalid. A failed audit returns that error instead.
+func (s *Session) RejectPut(cause error) error {
+	if cause == nil {
+		cause = ErrInvalid
+	}
+	_, err := s.denyPut(cause)
+	return err
+}
+
 func (s *Session) denyPut(cause error) (Credential, error) {
 	if err := s.persistEvent(actionPut, "", "", resultDenied); err != nil {
 		return Credential{}, err
