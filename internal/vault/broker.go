@@ -3,6 +3,7 @@ package vault
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -286,17 +287,39 @@ func isPublicIP(ip net.IP) bool {
 		}
 		return true
 	}
-	if len(ip) != net.IPv6len {
+	return ipv6Public(ip)
+}
+
+// ipv6Public reports whether ip is an ordinary public IPv6 destination.
+// Global unicast is 2000::/3. Everything else is refused, which covers
+// deprecated site-local fec0::/10, NAT64 64:ff9b::/96 and 64:ff9b:1::/48,
+// discard-only 100::/64, and unique-local space that IsPrivate missed.
+// ponytail: the exception list is the IANA special-purpose ranges inside
+// 2000::/3 that are not ordinary public servers. Upgrade path: refresh it
+// from the IANA IPv6 Special-Purpose Address Registry.
+func ipv6Public(ip net.IP) bool {
+	if len(ip) != net.IPv6len || ip[0]&0xe0 != 0x20 {
 		return false
 	}
-	// 2001:db8::/32 documentation and 2002::/16 6to4.
-	if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8 {
+	switch {
+	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2]&0xfe == 0x00:
+		// 2001::/23 IETF Protocol Assignments, including benchmarking and TEREDO.
 		return false
-	}
-	if ip[0] == 0x20 && ip[1] == 0x02 {
+	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8:
+		// 2001:db8::/32 documentation.
 		return false
+	case ip[0] == 0x20 && ip[1] == 0x02:
+		// 2002::/16 6to4.
+		return false
+	case ip[0] == 0x26 && ip[1] == 0x20 && ip[2] == 0x00 && ip[3] == 0x4f && ip[4] == 0x80 && ip[5] == 0x00:
+		// 2620:4f:8000::/48 AS112 direct delegation.
+		return false
+	case ip[0] == 0x3f && ip[1]&0xf0 == 0xf0:
+		// 3fff::/20 documentation.
+		return false
+	default:
+		return true
 	}
-	return true
 }
 
 func takeBody(resp *http.Response, secret []byte) (status int, body []byte, kind int) {
@@ -325,10 +348,153 @@ func takeBody(resp *http.Response, secret []byte) (status int, body []byte, kind
 		wipe(buf)
 		return 0, nil, brokerBodyBad
 	}
-	if bytes.Contains(buf, secret) {
+	if secretReflected(buf, secret) {
 		return 0, buf, brokerBodyLeak
 	}
 	return resp.StatusCode, buf, brokerBodyOK
+}
+
+// secretReflected reports whether buf contains the secret or a form the agent
+// can turn back into the secret or the Authorization bearer value.
+// ponytail: JSON escapes, percent-encoding, and standard or URL base64 with
+// optional whitespace. Upgrade path: a response schema that does not return
+// free-form upstream bytes.
+func secretReflected(buf, secret []byte) bool {
+	if len(buf) == 0 || len(secret) == 0 {
+		return false
+	}
+	if bytes.Contains(buf, secret) {
+		return true
+	}
+	if bytes.Contains(buf, []byte{'\\'}) {
+		decoded := jsonUnescape(buf)
+		hit := bytes.Contains(decoded, secret)
+		wipe(decoded)
+		if hit {
+			return true
+		}
+	}
+	if bytes.Contains(buf, []byte{'%'}) {
+		decoded := percentDecode(buf)
+		hit := bytes.Contains(decoded, secret)
+		wipe(decoded)
+		if hit {
+			return true
+		}
+	}
+	folded, fresh := foldSpace(buf)
+	if fresh {
+		defer wipe(folded)
+	}
+	bearer := append([]byte("Bearer "), secret...)
+	defer wipe(bearer)
+	for _, src := range [][]byte{secret, bearer} {
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+			form := []byte(enc.EncodeToString(src))
+			hit := bytes.Contains(buf, form) || bytes.Contains(folded, form)
+			wipe(form)
+			if hit {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func jsonUnescape(buf []byte) []byte {
+	out := make([]byte, 0, len(buf))
+	for i := 0; i < len(buf); i++ {
+		if buf[i] != '\\' || i+1 >= len(buf) {
+			out = append(out, buf[i])
+			continue
+		}
+		i++
+		switch buf[i] {
+		case '"', '\\', '/':
+			out = append(out, buf[i])
+		case 'b':
+			out = append(out, '\b')
+		case 'f':
+			out = append(out, '\f')
+		case 'n':
+			out = append(out, '\n')
+		case 'r':
+			out = append(out, '\r')
+		case 't':
+			out = append(out, '\t')
+		case 'u':
+			r, ok := jsonHex4(buf, i+1)
+			if !ok {
+				out = append(out, '\\', 'u')
+				continue
+			}
+			i += 4
+			out = append(out, string(rune(r))...)
+		default:
+			out = append(out, '\\', buf[i])
+		}
+	}
+	return out
+}
+
+func jsonHex4(buf []byte, i int) (uint16, bool) {
+	if i+3 >= len(buf) {
+		return 0, false
+	}
+	var r uint16
+	for _, c := range buf[i : i+4] {
+		h, ok := hexVal(c)
+		if !ok {
+			return 0, false
+		}
+		r = r<<4 | uint16(h)
+	}
+	return r, true
+}
+
+func percentDecode(buf []byte) []byte {
+	out := make([]byte, 0, len(buf))
+	for i := 0; i < len(buf); i++ {
+		if buf[i] == '%' && i+2 < len(buf) {
+			hi, ok1 := hexVal(buf[i+1])
+			lo, ok2 := hexVal(buf[i+2])
+			if ok1 && ok2 {
+				out = append(out, hi<<4|lo)
+				i += 2
+				continue
+			}
+		}
+		out = append(out, buf[i])
+	}
+	return out
+}
+
+func hexVal(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func foldSpace(buf []byte) ([]byte, bool) {
+	if !bytes.ContainsAny(buf, " \t\r\n") {
+		return buf, false
+	}
+	out := make([]byte, 0, len(buf))
+	for _, b := range buf {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+		default:
+			out = append(out, b)
+		}
+	}
+	return out, true
 }
 
 func readLimited(body io.Reader) ([]byte, error) {

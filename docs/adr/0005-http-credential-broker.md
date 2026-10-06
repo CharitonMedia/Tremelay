@@ -20,11 +20,11 @@ The M2 resource string for a brokered call is the exact text `METHOD https://hos
 - an absolute path with no `.` or `..` segments;
 - port omitted when it is 443, otherwise an explicit non-zero port.
 
-Authorization uses the M2 `judge` decision and the session clock. The operation is always `http_request`. A missing, expired, revoked, or non-matching grant fails before DNS and before any use of the secret. After an allow, the broker resolves the host once. Every returned address must be a public unicast address. Loopback, private, link-local, multicast, unspecified, documentation, benchmarking, and carrier-grade NAT addresses are refused. The production client dials only the first accepted address and does not consult `HTTP_PROXY`. Redirects are refused, including same-origin redirects and chains.
+Authorization uses the M2 `judge` decision and the session clock. The operation is always `http_request`. A missing, expired, revoked, or non-matching grant fails before DNS and before any use of the secret. After an allow, the broker resolves the host once. Every returned address must be a public unicast address. IPv4 loopback, private, link-local, multicast, unspecified, documentation, benchmarking, and carrier-grade NAT addresses are refused. IPv6 is limited to `2000::/3`, excluding special-purpose ranges that are not ordinary public destinations: `2001::/23` (benchmarking, TEREDO, and the other IETF assignments), `2001:db8::/32`, `2002::/16`, `3fff::/20`, and `2620:4f:8000::/48`. That also refuses addresses outside `2000::/3`, including deprecated site-local `fec0::/10`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, and discard-only `100::/64`. The production client dials only the first accepted address and does not consult `HTTP_PROXY`. Redirects are refused, including same-origin redirects and chains.
 
 The stored secret is copied only after those checks. It is placed in one `Authorization: Bearer` header. The caller cannot supply that header. Secrets that contain a space or a non-printable byte are not sent. The header value is not returned, logged, or audited.
 
-The agent receives a body only when the upstream status is outside the 3xx range, the body is at most 64 KiB, and the body does not contain the secret bytes. A reflected credential, a transport error, or an audit failure returns a fixed error and an empty body. Upstream error text is not copied into the agent-visible error.
+The agent receives a body only when the upstream status is outside the 3xx range, the body is at most 64 KiB, and the body does not contain the secret or a recoverable encoding of it. JSON string escapes, percent-encoding, and base64 of the secret or of the bearer value are the secret. A reflected credential, a transport error, or an audit failure returns a fixed error and an empty body. Upstream error text is not copied into the agent-visible error.
 
 Broker attempts use audit action `broker_http` and hash version 2. The version-1 preimage and the version-2 field list are unchanged. The resource string and the target URL are not audit fields. Result codes distinguish the attempt:
 
@@ -52,7 +52,7 @@ M2 grants are not single-use. Repeating a broker call inside an active grant is 
 - A grant whose target is an IP literal, a loopback name, or a private address does not cause the credential to be sent. Resolution to a non-public address fails the same way.
 - The production dialer pins the connection to the address that passed that check. Environment proxies are not used.
 - Redirect responses are discarded. The broker does not issue the next request, so the credential is not forwarded.
-- A response or transport error that contains the secret is not returned. The agent sees a fixed error string.
+- A response or transport error that contains the secret, including a JSON-escaped, percent-encoded, or base64 form of the secret or bearer value, is not returned. The agent sees a fixed error string.
 - Audit rows, process logs, and the vault file do not gain a new plaintext path for the secret. Tests use a high-entropy sentinel and check those surfaces.
 
 ## Consequences
@@ -66,7 +66,7 @@ M2 grants are not single-use. Repeating a broker call inside an active grant is 
 
 - A human stores a sentinel credential, creates an agent, issues an expiring `http_request` grant, and binds an `AgentPrincipal`. The broker calls a stub upstream that requires the injected bearer value. The agent-visible body, errors, logs, audit columns, environment, and vault file do not contain the sentinel.
 - The same call is refused before any upstream request for the wrong credential, method, host, path, principal, expiry, revocation, missing grant, and malformed input.
-- Loopback, link-local, private, and obfuscated destinations are refused, including when a grant names that destination. A name that resolves only after authorization to a loopback or mixed private address is refused before the upstream hook.
+- Loopback, link-local, private, non-public IPv6, and obfuscated destinations are refused, including when a grant names that destination. A name that resolves only after authorization to a loopback, mixed private, site-local, or NAT64 address is refused before the upstream hook.
 - Redirects, including 301, 302, 303, 307, and 308, produce one upstream request and no second hop.
-- A reflected secret, a transport error that embeds the secret, and an unsafe secret byte are not returned and are not sent when they cannot be a header.
+- A reflected secret, including JSON-escaped, percent-encoded, and base64 forms, a transport error that embeds the secret, and an unsafe secret byte are not returned and are not sent when they cannot be a header.
 - Allowed, completed, capability-denial, destination-denial, and upstream-error audit rows are present, secret-free, and accepted by audit verification.
