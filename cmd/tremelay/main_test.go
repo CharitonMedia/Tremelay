@@ -273,12 +273,14 @@ func TestCLIPutInvalidFieldsAreAudited(t *testing.T) {
 	}
 
 	badLabel := "bad-\n" + hex.EncodeToString(secret)
+	extra := hex.EncodeToString(secret)
 	attempts := [][]string{
 		{"credential", "put", "--path", path, "--label", "ci", "--type", "api_key"},
 		{"credential", "put", "--path", path, "--type", "api_key", "--secret-file", secretPath},
 		{"credential", "put", "--path", path, "--label", "ci", "--secret-file", secretPath},
 		{"credential", "put", "--path", path, "--label", "ci", "--type", "not-a-type", "--secret-file", secretPath},
 		{"credential", "put", "--path", path, "--label", badLabel, "--type", "api_key", "--secret-file", secretPath},
+		{"credential", "put", "--path", path, "--label", "ci", "--type", "api_key", "--secret-file", secretPath, extra},
 	}
 	for _, args := range attempts {
 		stdout.Reset()
@@ -297,8 +299,8 @@ func TestCLIPutInvalidFieldsAreAudited(t *testing.T) {
 			t.Fatalf("stderr missing denial: %s", stderr.String())
 		}
 		assertNoSecret(t, &stderr, secret, pass)
-		if strings.Contains(stderr.String(), badLabel) {
-			t.Fatal("stderr echoed rejected label")
+		if strings.Contains(stderr.String(), badLabel) || strings.Contains(stderr.String(), extra) {
+			t.Fatal("stderr echoed rejected label or positional")
 		}
 	}
 	if n := deniedPutCount(t, path); n != len(attempts) {
@@ -308,8 +310,8 @@ func TestCLIPutInvalidFieldsAreAudited(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(raw, secret) || bytes.Contains(raw, []byte(pass)) || bytes.Contains(raw, []byte(badLabel)) {
-		t.Fatal("vault file contains secret material or rejected label")
+	if bytes.Contains(raw, secret) || bytes.Contains(raw, []byte(pass)) || bytes.Contains(raw, []byte(badLabel)) || bytes.Contains(raw, []byte(extra)) {
+		t.Fatal("vault file contains secret material, rejected label, or positional")
 	}
 
 	stdout.Reset()

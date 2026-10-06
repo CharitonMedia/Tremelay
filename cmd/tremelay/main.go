@@ -122,15 +122,16 @@ func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	// Label, type, and a missing secret file are checked in the unlocked
-	// session. Rejecting them here skipped the credential_put denial.
-	if *path == "" || fs.NArg() != 0 {
+	// A missing path cannot name a vault. Every other path-known rejection,
+	// including an extra positional, is an attempted put and is denied inside
+	// the unlocked session so the audit chain records it.
+	if *path == "" {
 		usage(stderr)
 		return 2
 	}
 	red := &vault.Redactor{}
 	return withSession(*path, getenv, stdin, stderr, red, func(session *vault.Session) error {
-		if *secretFile == "" {
+		if fs.NArg() != 0 || *secretFile == "" {
 			return session.RejectPut(vault.ErrInvalid)
 		}
 		// File checks used to return before unlock, so empty, oversized, and
