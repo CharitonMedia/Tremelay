@@ -294,7 +294,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Enforce three-cycle human-review breaker
+      - name: Enforce remediation circuit breaker
         id: cycle
         env:
           GH_TOKEN: ${{ github.token }}
@@ -302,27 +302,45 @@ jobs:
         run: |
           set -euo pipefail
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > cycle_comments.json
-          count=$(python - <<'PY'
+          read -r count max_cycles < <(python - <<'PY'
           import json
+          from datetime import datetime, timedelta, timezone
           pages=json.load(open("cycle_comments.json", encoding="utf-8"))
           comments=[c for page in pages for c in page]
+          trusted="pattalkslaw-del"
           resume="<!-- tremelay-human-resume -->"
+          window="<!-- tremelay-unattended-window hours:6 max-cycles:9 -->"
           start=0
+          max_cycles=3
+          now=datetime.now(timezone.utc)
           for i,c in enumerate(comments):
-              if (c.get("user") or {}).get("login","").casefold()=="pattalkslaw-del" and resume in (c.get("body") or ""):
+              if (c.get("user") or {}).get("login","").casefold()!=trusted:
+                  continue
+              body=c.get("body") or ""
+              if resume in body:
                   start=i+1
+              if window in body:
+                  raw=c.get("created_at") or ""
+                  try:
+                      created=datetime.fromisoformat(raw.replace("Z","+00:00"))
+                  except ValueError:
+                      continue
+                  if created <= now < created + timedelta(hours=6):
+                      max_cycles=9
           markers=(
               "A cloud agent is working through the review findings:",
               "Cursor remediation round ",
           )
-          print(sum(any(m in (c.get("body") or "") for m in markers) for c in comments[start:]))
+          count=sum(any(m in (c.get("body") or "") for m in markers) for c in comments[start:])
+          print(count, max_cycles)
           PY
           )
           echo "count=${count}" >> "$GITHUB_OUTPUT"
-          if [ "$count" -ge 3 ]; then
+          echo "max_cycles=${max_cycles}" >> "$GITHUB_OUTPUT"
+          if [ "$count" -ge "$max_cycles" ]; then
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
-            marker="<!-- tremelay-three-cycle-stop head:${head} -->"
+            marker="<!-- tremelay-cycle-stop head:${head} limit:${max_cycles} -->"
             existing=$(MARKER="$marker" python - <<'PY'
           import json, os
           pages=json.load(open("cycle_comments.json", encoding="utf-8"))
@@ -332,8 +350,9 @@ jobs:
           PY
             )
             if [ "$existing" != "yes" ]; then
+              gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped at the active remediation circuit breaker." --force
               gh pr edit "$PR_NUMBER" --add-label "human-review-required"
-              gh pr comment "$PR_NUMBER" --body "Automation stopped after three implementation/remediation cycles for this pull-request lineage. Human review is required before another Cursor run. Latest head: \`${head}\`. Review the unresolved Codex/CI findings and explicitly resume only after deciding the next approach.\n\n${marker}"
+              gh pr comment "$PR_NUMBER" --body "Automation stopped after ${max_cycles} implementation/remediation cycles for this supervised segment. Human review is required before another Cursor run. Latest head: \`${head}\`. Review the unresolved Codex/CI findings and explicitly resume only after deciding the next approach.\n\n${marker}"
             fi
           else
             echo "allowed=true" >> "$GITHUB_OUTPUT"
