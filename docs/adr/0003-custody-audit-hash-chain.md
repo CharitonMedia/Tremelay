@@ -27,7 +27,7 @@ For any credential-state mutation, the encrypted-state update and corresponding 
 
 A credential read that is required to be audited MUST append its allowed audit event transactionally before returning the secret. If the audit transaction fails, the secret is not returned.
 
-Locked-state authentication denials are the one intentional asymmetry: the process does not possess the DEK after a rejected passphrase, so it may append a `vault_unlock / denied` audit row without updating encrypted credential state. On the next valid unlock, Tremelay MUST verify that every row after the authenticated audit head is a canonical locked-state denial — `vault_unlock` / `denied` with empty credential id and credential type, and a timestamp in the UTC RFC3339Nano form event creation writes that is not before the previous event and not after the check — then advance the authenticated audit head in the same transaction as the successful unlock event and updated encrypted state.
+Locked-state authentication denials are the one intentional asymmetry: the process does not possess the DEK after a rejected passphrase, so it may append a `vault_unlock / denied` audit row without updating encrypted credential state. The denial sequence is allocated inside that write transaction so concurrent denials cannot reuse one sequence and drop an attempt. On the next valid unlock, Tremelay MUST verify that every row after the authenticated audit head is a canonical locked-state denial — `vault_unlock` / `denied` with empty credential id and credential type, and a timestamp in the UTC RFC3339Nano form event creation writes that is not before the previous event and not after the check — then advance the authenticated audit head in the same transaction as the successful unlock event and updated encrypted state.
 
 ## Audit hash
 
@@ -132,6 +132,7 @@ These mechanisms should be deleted rather than preserved as dormant compatibilit
 - forged or non-denial rows after the authenticated head fail unlock;
 - a hash-linked unlock denial that carries a credential id or type fails unlock and is not incorporated;
 - a hash-linked unlock denial with a malformed, backdated, or future timestamp fails unlock and is not incorporated;
+- concurrent denied unlocks each receive a distinct audit sequence and remain verifiable;
 - rewriting the plaintext audit head onto a truncated chain fails verify;
 - hash-chain tampering fails verification;
 - a unique sentinel secret and passphrase are absent from audit rows and ordinary error/log output; equality with a fixed literal is not disclosure;

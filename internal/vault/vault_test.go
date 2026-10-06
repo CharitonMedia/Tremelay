@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -640,6 +641,75 @@ func TestNoncanonicalDenialTimeRejected(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestConcurrentDenialsAllocateDistinctSequences(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	id := session.id
+	session.Lock()
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			db, err := openDB(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer db.Close()
+			errs <- appendDenial(db, id)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	events := mustAudit(t, path)
+	if err := verifyChain(events); err != nil {
+		t.Fatal(err)
+	}
+	denied := 0
+	var prev time.Time
+	for _, ev := range events {
+		if ev.Action != actionUnlock || ev.Result != resultDenied {
+			continue
+		}
+		denied++
+		if ev.CredID != "" || ev.CredType != "" {
+			t.Fatal("denial carried credential metadata")
+		}
+		ts, ok := canonicalAuditTime(ev.Time)
+		if !ok || (!prev.IsZero() && ts.Before(prev)) {
+			t.Fatalf("denial time %q", ev.Time)
+		}
+		prev = ts
+	}
+	if denied != n {
+		t.Fatalf("denials %d", denied)
+	}
+	if _, err := VerifyAudit(path, pass); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Lock()
+	sealed := 0
+	for _, ev := range opened.audit {
+		if ev.Action == actionUnlock && ev.Result == resultDenied {
+			sealed++
+		}
+	}
+	if sealed != n {
+		t.Fatalf("incorporated denials %d", sealed)
 	}
 }
 

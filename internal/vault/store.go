@@ -331,11 +331,12 @@ func insertAudit(tx *sql.Tx, ev auditEvent) error {
 // appendDenial records a locked-state unlock failure without the DEK.
 // It does not update encrypted credential state. The next valid unlock
 // checks this suffix and links the successful unlock after it.
-func appendDenial(db *sql.DB, chain []auditEvent, vaultID string) error {
-	ev, err := nextEvent(chain, actionUnlock, vaultID, "", "", resultDenied)
-	if err != nil {
-		return err
-	}
+//
+// The sequence is allocated inside the write transaction. The DSN starts
+// that transaction with BEGIN IMMEDIATE, so the reserved lock covers the
+// tip read and the insert. A concurrent denial waits, then observes the
+// committed sequence instead of reusing it.
+func appendDenial(db *sql.DB, vaultID string) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return ErrIO
@@ -346,6 +347,17 @@ func appendDenial(db *sql.DB, chain []auditEvent, vaultID string) error {
 			_ = tx.Rollback()
 		}
 	}()
+	tip, err := readAuditTip(tx)
+	if err != nil {
+		return err
+	}
+	if tip.VaultID != vaultID {
+		return ErrAudit
+	}
+	ev, err := nextEvent([]auditEvent{tip}, actionUnlock, vaultID, "", "", resultDenied)
+	if err != nil {
+		return err
+	}
 	if err := insertAudit(tx, ev); err != nil {
 		return err
 	}
@@ -354,4 +366,18 @@ func appendDenial(db *sql.DB, chain []auditEvent, vaultID string) error {
 	}
 	committed = true
 	return nil
+}
+
+func readAuditTip(tx *sql.Tx) (auditEvent, error) {
+	var ev auditEvent
+	var seq int64
+	err := tx.QueryRow(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash FROM audit ORDER BY seq DESC LIMIT 1`).Scan(
+		&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash,
+	)
+	if err != nil || seq <= 0 {
+		return auditEvent{}, ErrAudit
+	}
+	ev.V = auditVersion
+	ev.Seq = uint64(seq)
+	return ev, nil
 }

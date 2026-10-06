@@ -260,7 +260,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		}
 	}()
 	deny := func(cause error) error {
-		if aerr := appendDenial(db, events, header.ID); aerr != nil {
+		if aerr := appendDenial(db, header.ID); aerr != nil {
 			logLine(logger, "vault_unlock result=denied")
 			return ErrAudit
 		}
