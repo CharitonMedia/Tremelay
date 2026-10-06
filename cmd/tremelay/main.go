@@ -120,7 +120,11 @@ func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 	typ := fs.String("type", "", "credential type")
 	secretFile := fs.String("secret-file", "", "file containing the secret")
 	if err := fs.Parse(args); err != nil {
-		return 2
+		// --path is applied before a later bad flag. That is an attempted put.
+		// A bad flag before --path leaves the path empty and cannot name a vault.
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectPut(vault.ErrInvalid)
+		})
 	}
 	// A missing path cannot name a vault. Every other path-known rejection,
 	// including an extra positional, is an attempted put and is denied inside
@@ -157,15 +161,21 @@ func cmdGet(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectGet(vault.ErrInvalid)
+		})
 	}
 	// An empty id is an attempted get. Session.Get records a metadata-free denial.
-	if *path == "" || fs.NArg() != 0 {
+	// An extra positional is rejected the same way, without looking up --id.
+	if *path == "" {
 		usage(stderr)
 		return 2
 	}
 	red := &vault.Redactor{}
 	return withSession(*path, getenv, stdin, stderr, red, func(session *vault.Session) error {
+		if fs.NArg() != 0 {
+			return session.RejectGet(vault.ErrInvalid)
+		}
 		cred, err := session.Get(*id)
 		if err != nil {
 			return err
@@ -185,14 +195,19 @@ func cmdList(args []string, getenv func(string) string, stdin io.Reader, stdout,
 	fs.SetOutput(stderr)
 	path := fs.String("path", "", "vault file")
 	if err := fs.Parse(args); err != nil {
-		return 2
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectList(vault.ErrInvalid)
+		})
 	}
-	if *path == "" || fs.NArg() != 0 {
+	if *path == "" {
 		usage(stderr)
 		return 2
 	}
 	red := &vault.Redactor{}
 	return withSession(*path, getenv, stdin, stderr, red, func(session *vault.Session) error {
+		if fs.NArg() != 0 {
+			return session.RejectList(vault.ErrInvalid)
+		}
 		creds, err := session.List()
 		if err != nil {
 			return err
@@ -266,6 +281,16 @@ func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout
 		return 1
 	}
 	return 0
+}
+
+// denyKnownVault records a metadata-free denial when parsing fails after a
+// vault path is known. An empty path cannot name a vault; the flag package
+// has already described that error.
+func denyKnownVault(path string, getenv func(string) string, stdin io.Reader, stderr io.Writer, deny func(*vault.Session) error) int {
+	if path == "" {
+		return 2
+	}
+	return withSession(path, getenv, stdin, stderr, &vault.Redactor{}, deny)
 }
 
 func withSession(path string, getenv func(string) string, stdin io.Reader, stderr io.Writer, red *vault.Redactor, fn func(*vault.Session) error) int {

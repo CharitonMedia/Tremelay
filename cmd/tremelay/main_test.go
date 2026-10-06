@@ -329,6 +329,110 @@ func TestCLIPutInvalidFieldsAreAudited(t *testing.T) {
 	}
 }
 
+func TestCLIMalformedCredentialArgsAreAudited(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	secret := randBytes(t, 32)
+	secretPath := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"TREMELAY_PASSPHRASE": pass}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"vault", "create", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("create %d %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "put", "--path", path, "--label", "ci", "--type", "api_key", "--secret-file", secretPath}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("put %d %s", code, stderr.String())
+	}
+	id := strings.TrimSpace(stdout.String())
+	extra := hex.EncodeToString(secret)
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "put", "--bogus", "--path", path, "--label", "ci", "--type", "api_key", "--secret-file", secretPath}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 2 {
+		t.Fatalf("unknown flag before path code %d %s", code, stderr.String())
+	}
+	if deniedPutCount(t, path) != 0 {
+		t.Fatal("unknown flag before path wrote a credential_put denial")
+	}
+
+	attempts := []struct {
+		args   []string
+		action string
+		log    string
+	}{
+		{[]string{"credential", "put", "--path", path, "--bogus"}, "credential_put", "credential_put result=denied"},
+		{[]string{"credential", "get", "--path", path, "--bogus"}, "credential_get", "credential_get result=denied"},
+		{[]string{"credential", "list", "--path", path, "--bogus"}, "credential_list", "credential_list result=denied"},
+		{[]string{"credential", "get", "--path", path, "--id", id, extra}, "credential_get", "credential_get result=denied"},
+		{[]string{"credential", "list", "--path", path, extra}, "credential_list", "credential_list result=denied"},
+	}
+	for _, attempt := range attempts {
+		stdout.Reset()
+		stderr.Reset()
+		code := run(attempt.args, envGet(env), strings.NewReader(""), &stdout, &stderr)
+		if code == 0 {
+			t.Fatalf("accepted %q", attempt.args)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("rejected %q wrote stdout", attempt.args)
+		}
+		if !strings.Contains(stderr.String(), vault.ErrInvalid.Error()) {
+			t.Fatalf("stderr %q", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), attempt.log) {
+			t.Fatalf("stderr missing denial: %s", stderr.String())
+		}
+		assertNoSecret(t, &stderr, secret, pass)
+		if strings.Contains(stderr.String(), extra) {
+			t.Fatal("stderr echoed rejected positional")
+		}
+	}
+	if n := deniedPutCount(t, path); n != 1 {
+		t.Fatalf("denied credential_put events %d", n)
+	}
+	if n := deniedActionCount(t, path, "credential_get"); n != 2 {
+		t.Fatalf("denied credential_get events %d", n)
+	}
+	if n := deniedActionCount(t, path, "credential_list"); n != 2 {
+		t.Fatalf("denied credential_list events %d", n)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, secret) || bytes.Contains(raw, []byte(pass)) || bytes.Contains(raw, []byte(extra)) {
+		t.Fatal("vault file contains secret material or rejected positional")
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "get", "--path", path, "--id", id}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("get %d %s", code, stderr.String())
+	}
+	if !bytes.Equal(stdout.Bytes(), secret) {
+		t.Fatal("get after denial returned the wrong secret")
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "list", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("list %d %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), id) || bytes.Contains(stdout.Bytes(), secret) {
+		t.Fatal("list after denial missing id or included secret")
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"audit", "verify", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("verify %d %s", code, stderr.String())
+	}
+}
+
 func TestCLIGetMissingIDIsAudited(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vault.db")

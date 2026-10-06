@@ -474,19 +474,35 @@ func (s *Session) live() error {
 // Caller input is not stored. A durable denial returns cause; a nil cause is
 // treated as ErrInvalid. A failed audit returns that error instead.
 func (s *Session) RejectPut(cause error) error {
-	if cause == nil {
-		cause = ErrInvalid
-	}
-	_, err := s.denyPut(cause)
-	return err
+	return s.denyAction(actionPut, cause)
+}
+
+// RejectGet records a metadata-free credential_get denial for a retrieval
+// rejected before lookup, such as a malformed invocation. Caller input is
+// not stored.
+func (s *Session) RejectGet(cause error) error {
+	return s.denyAction(actionGet, cause)
+}
+
+// RejectList records a metadata-free credential_list denial for a listing
+// rejected before it runs. Caller input is not stored.
+func (s *Session) RejectList(cause error) error {
+	return s.denyAction(actionList, cause)
 }
 
 func (s *Session) denyPut(cause error) (Credential, error) {
-	if err := s.persistEvent(actionPut, "", "", resultDenied); err != nil {
-		return Credential{}, err
+	return Credential{}, s.denyAction(actionPut, cause)
+}
+
+func (s *Session) denyAction(action string, cause error) error {
+	if cause == nil {
+		cause = ErrInvalid
 	}
-	s.logf("credential_put result=denied")
-	return Credential{}, cause
+	if err := s.persistEvent(action, "", "", resultDenied); err != nil {
+		return err
+	}
+	s.logf("%s result=denied", action)
+	return cause
 }
 
 func (s *Session) persistEvent(action, credID, credType, result string) error {
