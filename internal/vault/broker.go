@@ -358,11 +358,12 @@ func takeBody(resp *http.Response, secret []byte) (status int, body []byte, kind
 
 // secretReflected reports whether buf contains the secret or a form the agent
 // can turn back into the secret or the Authorization bearer value.
-// ponytail: thirty-two single percent or JSON steps and four whole-token
-// base64 unwraps. A body that still changes at the layer cap is withheld.
-// Ceiling: a base64 token glued to extra alphabet characters is not split
-// out of the longer run. Upgrade path: a response schema that does not
-// return free-form upstream bytes.
+// ponytail: thirty-two single percent or JSON steps. Base64 unwraps while each
+// layer shrinks, so every nesting that fits in the body is examined. A percent
+// or JSON body that still changes at the layer cap is withheld, as is a base64
+// step that does not shrink. Ceiling: a base64 token glued to extra alphabet
+// characters is not split out of the longer run. Upgrade path: a response
+// schema that does not return free-form upstream bytes.
 func secretReflected(buf, secret []byte) bool {
 	if len(buf) == 0 || len(secret) == 0 {
 		return false
@@ -457,7 +458,7 @@ func chainDecode(tok []byte, urlSafe bool, secret, bearer []byte) bool {
 	if !ok {
 		return false
 	}
-	for depth := 0; depth < 4; depth++ {
+	for {
 		if payloadReflects(cur, secret, bearer) {
 			wipe(cur)
 			return true
@@ -466,15 +467,20 @@ func chainDecode(tok []byte, urlSafe bool, secret, bearer []byte) bool {
 		if !ok {
 			next, ok = decodeToken(cur, true)
 		}
-		wipe(cur)
 		if !ok {
+			wipe(cur)
 			return false
 		}
+		// A successful decode of a real base64 layer is shorter. A step that
+		// does not shrink is withheld rather than returned still encoded.
+		if len(next) >= len(cur) {
+			wipe(next)
+			wipe(cur)
+			return true
+		}
+		wipe(cur)
 		cur = next
 	}
-	hit := payloadReflects(cur, secret, bearer)
-	wipe(cur)
-	return hit
 }
 
 func payloadReflects(buf, secret, bearer []byte) bool {

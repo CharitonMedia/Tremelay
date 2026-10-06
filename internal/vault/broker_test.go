@@ -672,6 +672,23 @@ func TestEncodedSecretIsNotReturned(t *testing.T) {
 	}
 }
 
+func TestSevenNestedBase64IsNotReturned(t *testing.T) {
+	secret := []byte("sentinel-credential-value")
+	body := string(secret)
+	for range 7 {
+		body = base64.StdEncoding.EncodeToString([]byte(body))
+	}
+	_, got, kind := takeBody(&http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
+	}, append([]byte(nil), secret...))
+	wipe(got)
+	if kind != brokerBodyLeak {
+		t.Fatal("seven nested base64 encodings of the credential were returned")
+	}
+}
+
 func secretIn(s string, secrets ...[]byte) bool {
 	for _, secret := range secrets {
 		if len(secret) > 0 && strings.Contains(s, string(secret)) {
