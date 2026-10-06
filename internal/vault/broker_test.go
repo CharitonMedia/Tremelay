@@ -75,7 +75,7 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 	if _, host, _, got := classifyTarget(http.MethodGet, "https://rebind.nip.io/latest"); got != targetOK || host != "rebind.nip.io" {
 		t.Fatal("rebinding name was rejected before DNS")
 	}
-	public := []string{"1.1.1.1", "8.8.8.8", "2001:4860:4860::8888", "2606:4700:4700::1111"}
+	public := []string{"1.1.1.1", "8.8.8.8", "2001:4860:4860::8888", "2606:4700:4700::1111", "3ff1::1", "3ff0::1", "3fff:1000::1"}
 	for _, raw := range public {
 		if !isPublicIP(net.ParseIP(raw)) {
 			t.Fatal(raw)
@@ -87,7 +87,7 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 		"::ffff:127.0.0.1", "fe80::1", "fc00::1", "fd00::1", "2001:db8::1", "2002::1",
 		"192.0.2.1", "198.51.100.1", "203.0.113.1",
 		"fec0::1", "64:ff9b::1", "64:ff9b:1::1", "100::1", "100:0:0:1::1",
-		"2001::1", "2001:2::1", "3fff::1", "5f00::1", "2620:4f:8000::1", "4000::1",
+		"2001::1", "2001:2::1", "3fff::1", "3fff:fff::1", "5f00::1", "2620:4f:8000::1", "4000::1",
 	}
 	for _, raw := range private {
 		if isPublicIP(net.ParseIP(raw)) {
@@ -412,7 +412,7 @@ func TestBrokerHTTP(t *testing.T) {
 		return []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.1")}, nil
 	}
 	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: target}, principal, ErrDeniedDestination)
-	for _, raw := range []string{"fec0::1", "64:ff9b::c000:201", "64:ff9b:1::1", "100::1", "2001:2::1", "3fff::1"} {
+	for _, raw := range []string{"fec0::1", "64:ff9b::c000:201", "64:ff9b:1::1", "100::1", "2001:2::1", "3fff::1", "3fff:fff::1"} {
 		session.resolve = func(context.Context, string) ([]net.IP, error) {
 			return []net.IP{net.ParseIP(raw)}, nil
 		}
@@ -421,6 +421,19 @@ func TestBrokerHTTP(t *testing.T) {
 			return nil, errors.New("network")
 		}
 		expect(good, principal, ErrDeniedDestination)
+	}
+	for _, raw := range []string{"3ff1::1", "3fff:1000::1"} {
+		session.resolve = func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP(raw)}, nil
+		}
+		session.httpDo = func(*http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("public")), Header: make(http.Header)}, nil
+		}
+		res, err = principal.BrokerHTTP(good)
+		if err != nil || string(res.Body) != "public" {
+			t.Fatalf("%s was refused: %v", raw, err)
+		}
 	}
 	session.resolve = func(context.Context, string) ([]net.IP, error) {
 		return nil, errors.New("lookup " + string(secret))
@@ -594,19 +607,33 @@ func TestEncodedSecretIsNotReturned(t *testing.T) {
 		}
 		folded.WriteString(wrapped[i:end])
 	}
+	twice, err := json.Marshal(string(quoted))
+	if err != nil {
+		t.Fatal(err)
+	}
+	percent := url.QueryEscape(string(secret))
 	rejected := []string{
 		string(secret),
 		string(inner),
 		`tok\"en\\x<a\/b`,
 		`tok\u0022en\u005cx<a/b`,
-		url.QueryEscape(string(secret)),
-		strings.ToLower(url.QueryEscape(string(secret))),
-		"pre " + url.QueryEscape(string(secret)) + " post",
+		percent,
+		strings.ToLower(percent),
+		"pre " + percent + " post",
 		base64.StdEncoding.EncodeToString(secret),
 		base64.RawURLEncoding.EncodeToString(bearer),
 		folded.String(),
+		url.QueryEscape(percent),
+		strings.ToLower(url.QueryEscape(percent)),
+		"pre " + url.QueryEscape(percent) + " post",
+		url.QueryEscape(string(inner)),
+		string(twice),
+		url.QueryEscape(base64.StdEncoding.EncodeToString(secret)),
+		base64.StdEncoding.EncodeToString([]byte(percent)),
+		base64.URLEncoding.EncodeToString([]byte(base64.StdEncoding.EncodeToString(secret))),
+		base64.StdEncoding.EncodeToString(inner),
 	}
-	for _, body := range rejected {
+	for i, body := range rejected {
 		_, got, kind := takeBody(&http.Response{
 			StatusCode: 200,
 			Body:       io.NopCloser(strings.NewReader(body)),
@@ -614,18 +641,35 @@ func TestEncodedSecretIsNotReturned(t *testing.T) {
 		}, append([]byte(nil), secret...))
 		wipe(got)
 		if kind != brokerBodyLeak {
-			t.Fatal("encoded credential was returned")
+			t.Fatalf("encoded credential was returned (%d)", i)
 		}
 	}
+	benign := `{"ok":true,"path":"C:\\temp","next":"https://cdn.example/a%2Fb","blob":"` + base64.StdEncoding.EncodeToString([]byte("hello-not-the-credential")) + `"}`
 	_, got, kind := takeBody(&http.Response{
 		StatusCode: 200,
-		Body:       io.NopCloser(strings.NewReader(`{"ok":true,"path":"C:\\temp"}`)),
+		Body:       io.NopCloser(strings.NewReader(benign)),
 		Header:     make(http.Header),
 	}, append([]byte(nil), secret...))
-	if kind != brokerBodyOK || string(got) != `{"ok":true,"path":"C:\\temp"}` {
+	if kind != brokerBodyOK || string(got) != benign {
 		t.Fatal("benign body was rejected")
 	}
 	wipe(got)
+	tabbed := []byte(`tok\ten"x`)
+	for i, body := range []string{
+		url.QueryEscape(string(tabbed)),
+		url.QueryEscape(url.QueryEscape(string(tabbed))),
+		base64.StdEncoding.EncodeToString([]byte(strings.ToLower(url.QueryEscape(string(tabbed))))),
+	} {
+		_, got, kind = takeBody(&http.Response{
+			StatusCode: 200,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+		}, append([]byte(nil), tabbed...))
+		wipe(got)
+		if kind != brokerBodyLeak {
+			t.Fatalf("tabbed credential was returned (%d)", i)
+		}
+	}
 }
 
 func secretIn(s string, secrets ...[]byte) bool {

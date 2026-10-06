@@ -24,7 +24,7 @@ Authorization uses the M2 `judge` decision and the session clock. The operation 
 
 The stored secret is copied only after those checks. It is placed in one `Authorization: Bearer` header. The caller cannot supply that header. Secrets that contain a space or a non-printable byte are not sent. The header value is not returned, logged, or audited.
 
-The agent receives a body only when the upstream status is outside the 3xx range, the body is at most 64 KiB, and the body does not contain the secret or a recoverable encoding of it. JSON string escapes, percent-encoding, and base64 of the secret or of the bearer value are the secret. A reflected credential, a transport error, or an audit failure returns a fixed error and an empty body. Upstream error text is not copied into the agent-visible error.
+The agent receives a body only when the upstream status is outside the 3xx range, the body is at most 64 KiB, and the body does not contain the secret or a recoverable encoding of it. JSON string escapes, percent-encoding, and base64 of the secret or of the bearer value are the secret, including nested compositions of those encodings. A reflected credential, a transport error, or an audit failure returns a fixed error and an empty body. Upstream error text is not copied into the agent-visible error.
 
 Broker attempts use audit action `broker_http` and hash version 2. The version-1 preimage and the version-2 field list are unchanged. The resource string and the target URL are not audit fields. Result codes distinguish the attempt:
 
@@ -52,7 +52,7 @@ M2 grants are not single-use. Repeating a broker call inside an active grant is 
 - A grant whose target is an IP literal, a loopback name, or a private address does not cause the credential to be sent. Resolution to a non-public address fails the same way.
 - The production dialer pins the connection to the address that passed that check. Environment proxies are not used.
 - Redirect responses are discarded. The broker does not issue the next request, so the credential is not forwarded.
-- A response or transport error that contains the secret, including a JSON-escaped, percent-encoded, or base64 form of the secret or bearer value, is not returned. The agent sees a fixed error string.
+- A response or transport error that contains the secret, including a JSON-escaped, percent-encoded, or base64 form of the secret or bearer value, and nested compositions of those forms, is not returned. The agent sees a fixed error string.
 - Audit rows, process logs, and the vault file do not gain a new plaintext path for the secret. Tests use a high-entropy sentinel and check those surfaces.
 
 ## Consequences
@@ -68,5 +68,5 @@ M2 grants are not single-use. Repeating a broker call inside an active grant is 
 - The same call is refused before any upstream request for the wrong credential, method, host, path, principal, expiry, revocation, missing grant, and malformed input.
 - Loopback, link-local, private, non-public IPv6, and obfuscated destinations are refused, including when a grant names that destination. A name that resolves only after authorization to a loopback, mixed private, site-local, or NAT64 address is refused before the upstream hook.
 - Redirects, including 301, 302, 303, 307, and 308, produce one upstream request and no second hop.
-- A reflected secret, including JSON-escaped, percent-encoded, and base64 forms, a transport error that embeds the secret, and an unsafe secret byte are not returned and are not sent when they cannot be a header.
+- A reflected secret, including JSON-escaped, percent-encoded, and base64 forms and nested compositions of those forms, a transport error that embeds the secret, and an unsafe secret byte are not returned and are not sent when they cannot be a header.
 - Allowed, completed, capability-denial, destination-denial, and upstream-error audit rows are present, secret-free, and accepted by audit verification.

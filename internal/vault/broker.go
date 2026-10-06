@@ -24,6 +24,8 @@ const (
 	brokerBodyBad   = 1
 	brokerBodyRedir = 2
 	brokerBodyLeak  = 3
+	// reflectRounds unwinds every percent and JSON layer that fits in the body.
+	reflectRounds = 32
 )
 
 // HTTPBrokerRequest is the agent-facing broker call.
@@ -314,8 +316,8 @@ func ipv6Public(ip net.IP) bool {
 	case ip[0] == 0x26 && ip[1] == 0x20 && ip[2] == 0x00 && ip[3] == 0x4f && ip[4] == 0x80 && ip[5] == 0x00:
 		// 2620:4f:8000::/48 AS112 direct delegation.
 		return false
-	case ip[0] == 0x3f && ip[1]&0xf0 == 0xf0:
-		// 3fff::/20 documentation.
+	case ip[0] == 0x3f && ip[1] == 0xff && ip[2]&0xf0 == 0x00:
+		// 3fff::/20 documentation. The next four bits are 0, so 3fff:1000:: is outside it.
 		return false
 	default:
 		return true
@@ -356,38 +358,56 @@ func takeBody(resp *http.Response, secret []byte) (status int, body []byte, kind
 
 // secretReflected reports whether buf contains the secret or a form the agent
 // can turn back into the secret or the Authorization bearer value.
-// ponytail: JSON escapes, percent-encoding, and standard or URL base64 with
-// optional whitespace. Upgrade path: a response schema that does not return
-// free-form upstream bytes.
+// ponytail: thirty-two single percent or JSON steps and four whole-token
+// base64 unwraps. A body that still changes at the layer cap is withheld.
+// Ceiling: a base64 token glued to extra alphabet characters is not split
+// out of the longer run. Upgrade path: a response schema that does not
+// return free-form upstream bytes.
 func secretReflected(buf, secret []byte) bool {
 	if len(buf) == 0 || len(secret) == 0 {
 		return false
 	}
-	if bytes.Contains(buf, secret) {
+	bearer := append([]byte("Bearer "), secret...)
+	defer wipe(bearer)
+	return reflectLayers(buf, secret, bearer)
+}
+
+func reflectLayers(buf, secret, bearer []byte) bool {
+	cur := append([]byte(nil), buf...)
+	for round := 0; round < reflectRounds; round++ {
+		if layerReflects(cur, secret, bearer) {
+			wipe(cur)
+			return true
+		}
+		next, changed := stepDecode(cur)
+		if !changed {
+			wipe(cur)
+			return false
+		}
+		wipe(cur)
+		cur = next
+	}
+	wipe(cur)
+	return true
+}
+
+func layerReflects(buf, secret, bearer []byte) bool {
+	if bytes.Contains(buf, secret) || base64Forms(buf, secret, bearer) || tokensReveal(buf, secret, bearer) {
 		return true
 	}
-	if bytes.Contains(buf, []byte{'\\'}) {
-		decoded := jsonUnescape(buf)
-		hit := bytes.Contains(decoded, secret)
-		wipe(decoded)
-		if hit {
-			return true
-		}
+	folded, fresh := foldSpace(buf)
+	if !fresh {
+		return false
 	}
-	if bytes.Contains(buf, []byte{'%'}) {
-		decoded := percentDecode(buf)
-		hit := bytes.Contains(decoded, secret)
-		wipe(decoded)
-		if hit {
-			return true
-		}
-	}
+	defer wipe(folded)
+	return tokensReveal(folded, secret, bearer)
+}
+
+func base64Forms(buf, secret, bearer []byte) bool {
 	folded, fresh := foldSpace(buf)
 	if fresh {
 		defer wipe(folded)
 	}
-	bearer := append([]byte("Bearer "), secret...)
-	defer wipe(bearer)
 	for _, src := range [][]byte{secret, bearer} {
 		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
 			form := []byte(enc.EncodeToString(src))
@@ -399,6 +419,140 @@ func secretReflected(buf, secret []byte) bool {
 		}
 	}
 	return false
+}
+
+func stepDecode(buf []byte) ([]byte, bool) {
+	if bytes.Contains(buf, []byte{'%'}) {
+		next := percentDecode(buf)
+		if !bytes.Equal(next, buf) {
+			return next, true
+		}
+		wipe(next)
+	}
+	if bytes.Contains(buf, []byte{'\\'}) {
+		next := jsonUnescape(buf)
+		if !bytes.Equal(next, buf) {
+			return next, true
+		}
+		wipe(next)
+	}
+	return nil, false
+}
+
+func tokensReveal(buf, secret, bearer []byte) bool {
+	minRun := base64.RawStdEncoding.EncodedLen(len(secret))
+	if minRun < 8 {
+		minRun = 8
+	}
+	hit := func(urlSafe bool) bool {
+		return scanB64(buf, urlSafe, minRun, func(tok []byte) bool {
+			return chainDecode(tok, urlSafe, secret, bearer)
+		})
+	}
+	return hit(false) || hit(true)
+}
+
+func chainDecode(tok []byte, urlSafe bool, secret, bearer []byte) bool {
+	cur, ok := decodeToken(tok, urlSafe)
+	if !ok {
+		return false
+	}
+	for depth := 0; depth < 4; depth++ {
+		if payloadReflects(cur, secret, bearer) {
+			wipe(cur)
+			return true
+		}
+		next, ok := decodeToken(cur, false)
+		if !ok {
+			next, ok = decodeToken(cur, true)
+		}
+		wipe(cur)
+		if !ok {
+			return false
+		}
+		cur = next
+	}
+	hit := payloadReflects(cur, secret, bearer)
+	wipe(cur)
+	return hit
+}
+
+func payloadReflects(buf, secret, bearer []byte) bool {
+	if bytes.Contains(buf, secret) || base64Forms(buf, secret, bearer) {
+		return true
+	}
+	cur := append([]byte(nil), buf...)
+	for round := 0; round < reflectRounds; round++ {
+		next, changed := stepDecode(cur)
+		if !changed {
+			wipe(cur)
+			return false
+		}
+		wipe(cur)
+		cur = next
+		if bytes.Contains(cur, secret) || base64Forms(cur, secret, bearer) {
+			wipe(cur)
+			return true
+		}
+	}
+	wipe(cur)
+	return true
+}
+
+func scanB64(buf []byte, urlSafe bool, minRun int, fn func([]byte) bool) bool {
+	for i := 0; i < len(buf); {
+		if !b64Char(buf[i], urlSafe) {
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(buf) && b64Char(buf[j], urlSafe) {
+			j++
+		}
+		k := j
+		for n := 0; k < len(buf) && buf[k] == '=' && n < 2; n++ {
+			k++
+		}
+		if k-i >= minRun && fn(buf[i:k]) {
+			return true
+		}
+		i = k
+	}
+	return false
+}
+
+func b64Char(c byte, urlSafe bool) bool {
+	switch {
+	case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		return true
+	case !urlSafe && (c == '+' || c == '/'):
+		return true
+	case urlSafe && (c == '-' || c == '_'):
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeToken(tok []byte, urlSafe bool) ([]byte, bool) {
+	enc, raw := base64.StdEncoding, base64.RawStdEncoding
+	if urlSafe {
+		enc, raw = base64.URLEncoding, base64.RawURLEncoding
+	}
+	if out, ok := decodeB64(enc, tok); ok {
+		return out, true
+	}
+	return decodeB64(raw, tok)
+}
+
+func decodeB64(enc *base64.Encoding, tok []byte) ([]byte, bool) {
+	dst := make([]byte, enc.DecodedLen(len(tok)))
+	n, err := enc.Decode(dst, tok)
+	if err != nil || n == 0 {
+		wipe(dst)
+		return nil, false
+	}
+	return dst[:n], true
 }
 
 func jsonUnescape(buf []byte) []byte {
