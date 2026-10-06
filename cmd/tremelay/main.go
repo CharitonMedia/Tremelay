@@ -122,7 +122,9 @@ func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *path == "" || *label == "" || *typ == "" || *secretFile == "" || fs.NArg() != 0 {
+	// Label and type are checked in the unlocked session. Rejecting them
+	// here skipped the credential_put denial.
+	if *path == "" || *secretFile == "" || fs.NArg() != 0 {
 		usage(stderr)
 		return 2
 	}

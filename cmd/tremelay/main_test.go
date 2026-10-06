@@ -247,6 +247,85 @@ func TestCLIPutSecretFileRejectionIsAudited(t *testing.T) {
 	}
 }
 
+func TestCLIPutInvalidFieldsAreAudited(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	secret := randBytes(t, 32)
+	secretPath := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"TREMELAY_PASSPHRASE": pass}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"vault", "create", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("create %d %s", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "put", "--path", path, "--label", "ci", "--type", "api_key"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 2 {
+		t.Fatalf("missing secret file code %d %s", code, stderr.String())
+	}
+	if deniedPutCount(t, path) != 0 {
+		t.Fatal("usage rejection wrote a credential_put denial")
+	}
+
+	badLabel := "bad-\n" + hex.EncodeToString(secret)
+	attempts := [][]string{
+		{"credential", "put", "--path", path, "--type", "api_key", "--secret-file", secretPath},
+		{"credential", "put", "--path", path, "--label", "ci", "--secret-file", secretPath},
+		{"credential", "put", "--path", path, "--label", "ci", "--type", "not-a-type", "--secret-file", secretPath},
+		{"credential", "put", "--path", path, "--label", badLabel, "--type", "api_key", "--secret-file", secretPath},
+	}
+	for _, args := range attempts {
+		stdout.Reset()
+		stderr.Reset()
+		code := run(args, envGet(env), strings.NewReader(""), &stdout, &stderr)
+		if code == 0 {
+			t.Fatalf("put accepted %q", args)
+		}
+		if stdout.Len() != 0 {
+			t.Fatal("rejected put wrote stdout")
+		}
+		if !strings.Contains(stderr.String(), vault.ErrInvalid.Error()) {
+			t.Fatalf("stderr %q", stderr.String())
+		}
+		if !strings.Contains(stderr.String(), "credential_put result=denied") {
+			t.Fatalf("stderr missing denial: %s", stderr.String())
+		}
+		assertNoSecret(t, &stderr, secret, pass)
+		if strings.Contains(stderr.String(), badLabel) {
+			t.Fatal("stderr echoed rejected label")
+		}
+	}
+	if n := deniedPutCount(t, path); n != len(attempts) {
+		t.Fatalf("denied credential_put events %d", n)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, secret) || bytes.Contains(raw, []byte(pass)) || bytes.Contains(raw, []byte(badLabel)) {
+		t.Fatal("vault file contains secret material or rejected label")
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "put", "--path", path, "--label", "ci", "--type", "api_key", "--secret-file", secretPath}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("put %d %s", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) == "" {
+		t.Fatal("missing id after audited denials")
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"audit", "verify", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("verify %d %s", code, stderr.String())
+	}
+}
+
 func deniedPutCount(t *testing.T, path string) int {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
