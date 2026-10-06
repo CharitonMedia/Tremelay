@@ -140,7 +140,7 @@ jobs:
           REASON: ${{ steps.plan.outputs.reason }}
         run: |
           set -euo pipefail
-          LIMIT: ${{ steps.plan.outputs.max_rounds }}
+          LIMIT="${{ steps.plan.outputs.max_rounds }}"
           if [[ "$REASON" == *"circuit breaker reached ${LIMIT} rounds"* ]]; then
             gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped at the active remediation circuit breaker." --force
             gh pr edit "$PR_NUMBER" --add-label human-review-required
