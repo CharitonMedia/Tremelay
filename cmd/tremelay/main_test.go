@@ -234,6 +234,40 @@ func TestCLIGetOutputErrorOmitsSecret(t *testing.T) {
 	}
 }
 
+func TestCLIListOutputErrorOmitsLabel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	secret := randBytes(t, 32)
+	label := randHex(t, 32)
+	secretPath := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"TREMELAY_PASSPHRASE": pass}
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"vault", "create", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("create %d %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "put", "--path", path, "--label", label, "--type", "api_key", "--secret-file", secretPath}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("put %d %s", code, stderr.String())
+	}
+
+	stderr.Reset()
+	if code := run([]string{"credential", "list", "--path", path}, envGet(env), strings.NewReader(""), payloadErrWriter{}, &stderr); code == 0 {
+		t.Fatal("list returned success after stdout write failure")
+	}
+	if strings.Contains(stderr.String(), label) || bytes.Contains(stderr.Bytes(), secret) || strings.Contains(stderr.String(), pass) {
+		t.Fatal("stderr echoed secret material from the writer error")
+	}
+	if !strings.Contains(stderr.String(), "stdout write failed") {
+		t.Fatalf("stderr missing write failure: %s", stderr.String())
+	}
+}
+
 func TestCLIAuditVerifyReportsStdoutWriteFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vault.db")

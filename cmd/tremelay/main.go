@@ -203,7 +203,10 @@ func cmdList(args []string, getenv func(string) string, stdin io.Reader, stdout,
 				RotationDueAt: cred.Lifecycle.RotationDueAt,
 			}
 			if err := enc.Encode(view); err != nil {
-				return err
+				// A writer error can echo the encoded entry. Labels are
+				// free-form and may hold a credential the session redactor
+				// does not know. Do not return that error.
+				return errors.New("stdout write failed")
 			}
 		}
 		return nil
