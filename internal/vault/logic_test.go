@@ -238,7 +238,19 @@ func TestNoGetSecretMethod(t *testing.T) {
 	for i := 0; i < typ.NumMethod(); i++ {
 		m := typ.Method(i)
 		switch m.Name {
-		case "Capabilities", "Authorize":
+		case "Capabilities":
+			if m.Type.NumIn() != 1 {
+				t.Fatal("Capabilities accepts a caller argument")
+			}
+		case "Authorize":
+			if m.Type.NumIn() != 4 {
+				t.Fatalf("Authorize arity %d", m.Type.NumIn())
+			}
+			for j := 1; j < m.Type.NumIn(); j++ {
+				if m.Type.In(j).Kind() != reflect.String {
+					t.Fatalf("Authorize arg %d is %s", j, m.Type.In(j))
+				}
+			}
 		default:
 			t.Fatal(m.Name)
 		}

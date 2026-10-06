@@ -26,7 +26,7 @@ agent_id || grant_id || operation
 
 `operation` is empty or a sorted comma-joined subset of the allowlist. Version-1 rows must keep those three columns empty; a value there is unauthenticated relative to the version-1 hash and fails verification. Authorization denials use fixed result codes: `denied_agent`, `denied_credential`, `denied_operation`, `denied_scope`, `denied_expired`, `denied_revoked`, and `denied_missing`. Malformed input uses `denied` and does not copy the caller string into the audit row.
 
-Agent, grant, and credential state remain one encrypted document. `commitState` writes that document and the audit row in the existing SQLite transaction. Evaluation uses a caller-supplied clock so expiry tests do not sleep. Issuance and revocation stamp creation and revocation with the process clock.
+Agent, grant, and credential state remain one encrypted document. `commitState` writes that document and the audit row in the existing SQLite transaction. Grant expiry and capability status use a clock on the unlocked session. Agent-facing authorize and list methods do not accept a time, so a compromised agent cannot present a historical timestamp and keep an expired grant allowed. Tests replace the session clock; production uses the process clock. Issuance and revocation stamp creation and revocation with the process clock.
 
 The M1 statement that the CLI has no agent subcommand is superseded only for these human administrative commands. `agent get-secret`, `capability get-secret`, and any raw-secret agent command remain rejected. `credential get` is still the human retrieval path and still requires the passphrase.
 
@@ -41,6 +41,7 @@ The M1 statement that the CLI has no agent subcommand is superseded only for the
 ## Security implications
 
 - An agent principal cannot call `Get` or any raw-secret retrieval method. Adding one to `AgentPrincipal` is a failed test.
+- Expiry is decided by the session clock. An agent principal cannot supply the evaluation time. A grant at or after its expiration is denied.
 - Authorization fails closed when no active grant matches the agent, credential or class, operation, and resource. An unknown operation, including `get_secret`, is denied before grant matching and is not copied into the audit row.
 - A grant mutation that fails its audit transaction leaves neither the grant nor the audit event durable.
 - A document that rewrites an agent as a human, or a grant as a secret-read operation, fails unlock. The authenticated audit head does not advance.
@@ -59,6 +60,7 @@ The M1 statement that the CLI has no agent subcommand is superseded only for the
 - Distinct agent ids persist across lock and unlock and are not human records.
 - Grant create, revoke, expire, and authorize commit with audit events, and an induced commit failure rolls both back.
 - Deny-by-default decisions cover the wrong agent, wrong credential, wrong class, wrong operation, wrong resource, expiry, revocation, and a missing grant.
+- The agent principal's authorize and list methods take no time argument. Moving the session clock to the grant expiration denies the same request the process clock still allows.
 - An active grant authorizes only its own operation, credential binding, and resource. Two active matches select the lowest grant id.
 - An agent principal lists only its grants, and the list has no credential plaintext.
 - A sentinel secret does not appear in the vault file, audit fields, logs, errors, or capability JSON. A secret-shaped scope on a denied authorize is not stored.

@@ -101,26 +101,26 @@ type grantRecord struct {
 // capabilityView is the slice of the vault an agent principal can call.
 // It is not *Session, so a principal cannot be asserted back to credential retrieval.
 type capabilityView interface {
-	listCapabilities(agentID string, now time.Time) ([]Capability, error)
-	authorizeCapability(agentID, credentialID, operation, resource string, now time.Time) (string, error)
+	listCapabilities(agentID string) ([]Capability, error)
+	authorizeCapability(agentID, credentialID, operation, resource string) (string, error)
 }
 
 type agentBinder struct {
 	s *Session
 }
 
-func (b agentBinder) listCapabilities(agentID string, now time.Time) ([]Capability, error) {
+func (b agentBinder) listCapabilities(agentID string) ([]Capability, error) {
 	if b.s == nil {
 		return nil, ErrUnauthenticated
 	}
-	return b.s.listCapabilities(agentID, now)
+	return b.s.listCapabilities(agentID)
 }
 
-func (b agentBinder) authorizeCapability(agentID, credentialID, operation, resource string, now time.Time) (string, error) {
+func (b agentBinder) authorizeCapability(agentID, credentialID, operation, resource string) (string, error) {
 	if b.s == nil {
 		return "", ErrUnauthenticated
 	}
-	return b.s.authorizeCapability(agentID, credentialID, operation, resource, now)
+	return b.s.authorizeCapability(agentID, credentialID, operation, resource)
 }
 
 // AgentPrincipal is the agent-facing handle for one identity.
@@ -141,21 +141,22 @@ func (s *Session) Agent(id string) (*AgentPrincipal, error) {
 }
 
 // Capabilities lists grants for this principal only.
-func (a *AgentPrincipal) Capabilities(now time.Time) ([]Capability, error) {
+// Status uses the session clock.
+func (a *AgentPrincipal) Capabilities() ([]Capability, error) {
 	if a == nil || a.view == nil {
 		return nil, ErrUnauthenticated
 	}
-	return a.view.listCapabilities(a.id, now)
+	return a.view.listCapabilities(a.id)
 }
 
 // Authorize decides whether this principal may perform operation on resource
 // with the named credential. A grant id is returned only when the decision is
-// allow. The credential plaintext is not returned.
-func (a *AgentPrincipal) Authorize(credentialID, operation, resource string, now time.Time) (string, error) {
+// allow. Expiry uses the session clock. The credential plaintext is not returned.
+func (a *AgentPrincipal) Authorize(credentialID, operation, resource string) (string, error) {
 	if a == nil || a.view == nil {
 		return "", ErrUnauthenticated
 	}
-	return a.view.authorizeCapability(a.id, credentialID, operation, resource, now)
+	return a.view.authorizeCapability(a.id, credentialID, operation, resource)
 }
 
 // CreateAgent persists a new agent principal.
@@ -328,11 +329,11 @@ func (s *Session) RejectAuthorize(cause error) error {
 	return s.denyAction(actionAuthorize, cause)
 }
 
-func (s *Session) listCapabilities(agentID string, now time.Time) ([]Capability, error) {
+func (s *Session) listCapabilities(agentID string) ([]Capability, error) {
 	if err := s.live(); err != nil {
 		return nil, err
 	}
-	now, err := requireTime(now)
+	now, err := s.evaluationTime()
 	if err != nil {
 		return nil, s.denyAction(actionCapList, err)
 	}
@@ -352,11 +353,11 @@ func (s *Session) listCapabilities(agentID string, now time.Time) ([]Capability,
 	return caps, nil
 }
 
-func (s *Session) authorizeCapability(agentID, credentialID, operation, resource string, now time.Time) (string, error) {
+func (s *Session) authorizeCapability(agentID, credentialID, operation, resource string) (string, error) {
 	if err := s.live(); err != nil {
 		return "", err
 	}
-	now, err := requireTime(now)
+	now, err := s.evaluationTime()
 	if err != nil || safeID(agentID) == "" || safeID(credentialID) == "" || !allowedOperation(operation) || validateResource(resource) != nil {
 		if err := s.finish(auditEvent{Action: actionAuthorize, Result: resultDenied}, ErrInvalid); err != nil {
 			return "", err
@@ -675,6 +676,16 @@ func validateResource(resource string) error {
 		return ErrInvalid
 	}
 	return nil
+}
+
+// evaluationTime is the trusted instant for expiry and capability status.
+// A nil clock is the process clock. Callers cannot supply this value.
+func (s *Session) evaluationTime() (time.Time, error) {
+	now := time.Now()
+	if s.clock != nil {
+		now = s.clock()
+	}
+	return requireTime(now)
 }
 
 func requireTime(t time.Time) (time.Time, error) {

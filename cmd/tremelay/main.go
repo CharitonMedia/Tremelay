@@ -495,7 +495,7 @@ func cmdCapabilityList(args []string, getenv func(string) string, stdin io.Reade
 		if err != nil {
 			return err
 		}
-		caps, err := agent.Capabilities(time.Now().UTC())
+		caps, err := agent.Capabilities()
 		if err != nil {
 			return err
 		}
@@ -546,7 +546,7 @@ func cmdCapabilityAuthorize(args []string, getenv func(string) string, stdin io.
 		if err != nil {
 			return err
 		}
-		grantID, err := agent.Authorize(*cred, *operation, *resource, time.Now().UTC())
+		grantID, err := agent.Authorize(*cred, *operation, *resource)
 		if err != nil {
 			return err
 		}

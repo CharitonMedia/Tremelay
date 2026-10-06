@@ -120,7 +120,7 @@ func TestGrantLifecycleAuditAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, "svc:one", time.Now().UTC()); !errors.Is(err, ErrDeniedMissing) {
+	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, "svc:one"); !errors.Is(err, ErrDeniedMissing) {
 		t.Fatal(err)
 	}
 
@@ -140,7 +140,7 @@ func TestGrantLifecycleAuditAndPersistence(t *testing.T) {
 			t.Fatal("invalid grant accepted")
 		}
 	}
-	if _, err := principalA.Authorize(api.ID, "get_secret", scope, time.Now().UTC()); !errors.Is(err, ErrInvalid) {
+	if _, err := principalA.Authorize(api.ID, "get_secret", scope); !errors.Is(err, ErrInvalid) {
 		t.Fatal(err)
 	}
 
@@ -189,45 +189,58 @@ func TestGrantLifecycleAuditAndPersistence(t *testing.T) {
 		wantID = twin.ID
 	}
 
-	if _, err := principalB.Authorize(api.ID, OpHTTPRequest, scope, time.Now().UTC()); !errors.Is(err, ErrDeniedAgent) {
+	if _, err := principalB.Authorize(api.ID, OpHTTPRequest, scope); !errors.Is(err, ErrDeniedAgent) {
 		t.Fatal(err)
 	}
-	if _, err := principalA.Authorize(second.ID, OpHTTPRequest, scope, time.Now().UTC()); !errors.Is(err, ErrDeniedCredential) {
+	if _, err := principalA.Authorize(second.ID, OpHTTPRequest, scope); !errors.Is(err, ErrDeniedCredential) {
 		t.Fatal(err)
 	}
-	if _, err := principalA.Authorize(api.ID, OpSign, scope, time.Now().UTC()); !errors.Is(err, ErrDeniedOperation) {
+	if _, err := principalA.Authorize(api.ID, OpSign, scope); !errors.Is(err, ErrDeniedOperation) {
 		t.Fatal(err)
 	}
-	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, scope+"-other", time.Now().UTC()); !errors.Is(err, ErrDeniedScope) {
+	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, scope+"-other"); !errors.Is(err, ErrDeniedScope) {
 		t.Fatal(err)
 	}
-	gotGrant, err := principalA.Authorize(pw.ID, OpSign, scope+"-pass", time.Now().UTC())
+	gotGrant, err := principalA.Authorize(pw.ID, OpSign, scope+"-pass")
 	if err != nil || gotGrant != classGrant.ID {
 		t.Fatalf("class authorize %s %v", gotGrant, err)
 	}
-	gotGrant, err = principalA.Authorize(api.ID, OpHTTPRequest, scope, time.Now().UTC())
+	gotGrant, err = principalA.Authorize(api.ID, OpHTTPRequest, scope)
 	if err != nil || gotGrant != wantID {
 		t.Fatalf("authorize %s want %s err %v", gotGrant, wantID, err)
 	}
-	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, scope, grant.ExpiresAt); !errors.Is(err, ErrDeniedExpired) {
+	// Expiry follows the session clock. The principal cannot pass an earlier time.
+	session.clock = func() time.Time { return grant.ExpiresAt }
+	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, scope); !errors.Is(err, ErrDeniedExpired) {
 		t.Fatal(err)
 	}
-	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, scope, grant.ExpiresAt.Add(-time.Nanosecond)); err != nil {
+	expiredCaps, err := principalA.Capabilities()
+	if err != nil {
 		t.Fatal(err)
 	}
+	for _, cap := range expiredCaps {
+		if cap.Status != GrantExpired {
+			t.Fatalf("status %s at expiration", cap.Status)
+		}
+	}
+	session.clock = func() time.Time { return grant.ExpiresAt.Add(-time.Nanosecond) }
+	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, scope); err != nil {
+		t.Fatal(err)
+	}
+	session.clock = nil
 	if err := session.RevokeGrant(grant.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := session.RevokeGrant(twin.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, scope, time.Now().UTC()); !errors.Is(err, ErrDeniedRevoked) {
+	if _, err := principalA.Authorize(api.ID, OpHTTPRequest, scope); !errors.Is(err, ErrDeniedRevoked) {
 		t.Fatal(err)
 	}
 	if err := session.RevokeGrant(grant.ID); !errors.Is(err, ErrInvalid) {
 		t.Fatal(err)
 	}
-	_, err = principalA.Authorize(pw.ID, OpSign, string(sentinel), time.Now().UTC())
+	_, err = principalA.Authorize(pw.ID, OpSign, string(sentinel))
 	if !errors.Is(err, ErrDeniedScope) || strings.Contains(err.Error(), string(sentinel)) {
 		t.Fatal(err)
 	}
@@ -242,7 +255,7 @@ func TestGrantLifecycleAuditAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	caps, err := principalA.Capabilities(time.Now().UTC())
+	caps, err := principalA.Capabilities()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +279,7 @@ func TestGrantLifecycleAuditAndPersistence(t *testing.T) {
 	if seen[classGrant.ID].CredentialClass != "password" || seen[classGrant.ID].CredentialID != "" {
 		t.Fatal("class capability binding")
 	}
-	bCaps, err := principalB.Capabilities(time.Now().UTC())
+	bCaps, err := principalB.Capabilities()
 	if err != nil || len(bCaps) != 1 || bCaps[0].GrantID != bGrant.ID {
 		t.Fatalf("principal B caps %#v %v", bCaps, err)
 	}
@@ -274,14 +287,14 @@ func TestGrantLifecycleAuditAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := unknown.Capabilities(time.Now().UTC()); !errors.Is(err, ErrAgentNotFound) {
+	if _, err := unknown.Capabilities(); !errors.Is(err, ErrAgentNotFound) {
 		t.Fatal(err)
 	}
 	malformed, err := session.Agent("not-an-id-" + string(sentinel))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := malformed.Capabilities(time.Now().UTC()); !errors.Is(err, ErrInvalid) {
+	if _, err := malformed.Capabilities(); !errors.Is(err, ErrInvalid) {
 		t.Fatal(err)
 	}
 
@@ -332,7 +345,7 @@ func TestGrantLifecycleAuditAndPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	caps, err = again.Capabilities(time.Now().UTC())
+	caps, err = again.Capabilities()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +361,7 @@ func TestGrantLifecycleAuditAndPersistence(t *testing.T) {
 	if !found {
 		t.Fatal("class grant did not survive reopen")
 	}
-	if _, err := again.Authorize(pw.ID, OpSign, scope+"-pass", time.Now().UTC()); err != nil {
+	if _, err := again.Authorize(pw.ID, OpSign, scope+"-pass"); err != nil {
 		t.Fatal(err)
 	}
 	round, err := opened.Get(api.ID)
@@ -437,7 +450,7 @@ func TestGrantCommitFailureRollsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	session.commitFault = func() error { return errors.New("induced") }
-	id, err := principal.Authorize(cred.ID, OpHTTPRequest, "svc:one", time.Now().UTC())
+	id, err := principal.Authorize(cred.ID, OpHTTPRequest, "svc:one")
 	if !errors.Is(err, ErrAudit) || id != "" || bytes.Contains([]byte(err.Error()), secret) {
 		t.Fatalf("id %q err %v", id, err)
 	}
@@ -451,7 +464,7 @@ func TestGrantCommitFailureRollsBack(t *testing.T) {
 		t.Fatal("rolled-back authorize stayed in the session")
 	}
 	session.commitFault = nil
-	if _, err := principal.Authorize(cred.ID, OpHTTPRequest, "svc:one", time.Now().UTC()); err != nil {
+	if _, err := principal.Authorize(cred.ID, OpHTTPRequest, "svc:one"); err != nil {
 		t.Fatal(err)
 	}
 	session.Lock()

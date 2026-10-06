@@ -203,6 +203,10 @@ type Session struct {
 	// commitFault, when set, fails a credential-state transaction before commit.
 	// Tests use it to prove rollback. Production leaves it nil.
 	commitFault func() error
+	// clock, when set, is the trusted time for grant expiry and capability
+	// status. Production leaves it nil and uses time.Now. Agent-facing
+	// methods cannot set it.
+	clock func() time.Time
 }
 
 // Create makes a new vault at path and returns it unlocked.
