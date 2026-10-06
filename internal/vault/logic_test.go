@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAuditHashVector(t *testing.T) {
@@ -76,6 +77,100 @@ func TestSuffixAllowsDenialOnly(t *testing.T) {
 	if err := suffixAllows([]auditEvent{create, idOnly}, header); !errors.Is(err, ErrAudit) {
 		t.Fatalf("id-only denial: %v", err)
 	}
+}
+
+func TestSuffixRejectsBadDenialTime(t *testing.T) {
+	id := strings.Repeat("ab", 16)
+	const headTS = "2020-01-01T00:00:00Z"
+	const laterTS = "2020-01-01T00:00:01Z"
+	create, err := linkedEvent(hex.EncodeToString(make([]byte, 32)), 1, headTS, actionCreate, id, "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := fileHeader{ID: id, AuditHead: create.Hash, AuditSeq: create.Seq}
+	same, err := denialAt(create, headTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := suffixAllows([]auditEvent{create, same}, header); err != nil {
+		t.Fatal(err)
+	}
+	later, err := denialAt(create, laterTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := suffixAllows([]auditEvent{create, later}, header); err != nil {
+		t.Fatal(err)
+	}
+	again, err := denialAt(later, laterTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := suffixAllows([]auditEvent{create, later, again}, header); err != nil {
+		t.Fatal(err)
+	}
+	reject := func(name string, ev auditEvent) {
+		t.Helper()
+		if err := suffixAllows([]auditEvent{create, ev}, header); !errors.Is(err, ErrAudit) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	back, err := denialAt(create, "2019-12-31T23:59:59.999999999Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reject("backdated", back)
+	future, err := denialAt(create, time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reject("future", future)
+	malformed, err := denialAt(create, "not-a-time")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reject("malformed", malformed)
+	padded, err := denialAt(create, "2020-01-01T00:00:01.000000000Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reject("padded fraction", padded)
+	off, err := denialAt(create, "2020-01-01T00:00:01+00:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reject("numeric offset", off)
+	backward, err := denialAt(later, headTS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := suffixAllows([]auditEvent{create, later, backward}, header); !errors.Is(err, ErrAudit) {
+		t.Fatalf("suffix stepped backward: %v", err)
+	}
+}
+
+func denialAt(prev auditEvent, ts string) (auditEvent, error) {
+	return linkedEvent(prev.Hash, prev.Seq+1, ts, actionUnlock, prev.VaultID, "", "", resultDenied)
+}
+
+func linkedEvent(prevHash string, seq uint64, ts, action, vaultID, credID, credType, result string) (auditEvent, error) {
+	raw, err := hex.DecodeString(prevHash)
+	if err != nil || len(raw) != 32 {
+		return auditEvent{}, ErrAudit
+	}
+	sum := eventHash(raw, seq, ts, action, vaultID, credID, credType, result)
+	return auditEvent{
+		V:        auditVersion,
+		Seq:      seq,
+		Time:     ts,
+		Action:   action,
+		VaultID:  vaultID,
+		CredID:   credID,
+		CredType: credType,
+		Result:   result,
+		Prev:     prevHash,
+		Hash:     hex.EncodeToString(sum),
+	}, nil
 }
 
 func TestRedactorHidesSecretAndPassphrase(t *testing.T) {

@@ -581,6 +581,68 @@ func TestNoncanonicalDenialSuffixRejected(t *testing.T) {
 	})
 }
 
+func TestNoncanonicalDenialTimeRejected(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 24)
+	if _, err := session.Put("label", "generic", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	head := session.header.AuditHead
+	seq := session.header.AuditSeq
+	session.Lock()
+	stamps := []string{
+		"not-a-time",
+		"2000-01-01T00:00:00Z",
+		time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+	}
+	for _, ts := range stamps {
+		var forged auditEvent
+		mutateDB(t, path, func(db *sql.DB) {
+			events, err := readAuditRows(db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			forged, err = denialAt(events[len(events)-1], ts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := insertAudit(tx, forged); err != nil {
+				tx.Rollback()
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if _, err := VerifyAudit(path, pass); !errors.Is(err, ErrAudit) {
+			t.Fatalf("verify %q: %v", ts, err)
+		}
+		_, err := Unlock(path, pass, nil)
+		if !errors.Is(err, ErrAudit) {
+			t.Fatalf("unlock %q: %v", ts, err)
+		}
+		if bytes.Contains([]byte(err.Error()), secret) || strings.Contains(err.Error(), string(pass)) {
+			t.Fatal("error contains secret material")
+		}
+		mutateDB(t, path, func(db *sql.DB) {
+			h, err := readVaultRow(db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if h.AuditHead != head || h.AuditSeq != seq {
+				t.Fatalf("head advanced to %s seq %d", h.AuditHead, h.AuditSeq)
+			}
+			if _, err := db.Exec(`DELETE FROM audit WHERE seq=?`, int64(forged.Seq)); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestCorruptDatabase(t *testing.T) {
 	path, pass, session := mustCreate(t, nil)
 	secret := randBytesT(t, 24)

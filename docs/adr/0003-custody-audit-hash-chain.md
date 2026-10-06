@@ -27,7 +27,7 @@ For any credential-state mutation, the encrypted-state update and corresponding 
 
 A credential read that is required to be audited MUST append its allowed audit event transactionally before returning the secret. If the audit transaction fails, the secret is not returned.
 
-Locked-state authentication denials are the one intentional asymmetry: the process does not possess the DEK after a rejected passphrase, so it may append a `vault_unlock / denied` audit row without updating encrypted credential state. On the next valid unlock, Tremelay MUST verify that every row after the authenticated audit head is a canonical locked-state denial — `vault_unlock` / `denied` with empty credential id and credential type — then advance the authenticated audit head in the same transaction as the successful unlock event and updated encrypted state.
+Locked-state authentication denials are the one intentional asymmetry: the process does not possess the DEK after a rejected passphrase, so it may append a `vault_unlock / denied` audit row without updating encrypted credential state. On the next valid unlock, Tremelay MUST verify that every row after the authenticated audit head is a canonical locked-state denial — `vault_unlock` / `denied` with empty credential id and credential type, and a timestamp in the UTC RFC3339Nano form event creation writes that is not before the previous event and not after the check — then advance the authenticated audit head in the same transaction as the successful unlock event and updated encrypted state.
 
 ## Audit hash
 
@@ -83,7 +83,7 @@ The driver is `modernc.org/sqlite`, a pure-Go SQLite build, so Linux, Windows, a
 
 ## Verification semantics
 
-`tremelay audit verify` reads the vault passphrase the same way as other commands. It iterates the authoritative audit rows in sequence, validates the version-1 hash chain, and authenticates the encrypted document under the plaintext `audit_head` and `audit_seq`. Those columns are associated data on the credential ciphertext, so pointing them at a truncated chain fails authentication and verify does not report success. Rows after that head are accepted only when they are canonical locked-state denials: `vault_unlock` / `denied`, with empty credential id and credential type. Any other suffix fails verification and is not incorporated on unlock.
+`tremelay audit verify` reads the vault passphrase the same way as other commands. It iterates the authoritative audit rows in sequence, validates the version-1 hash chain, and authenticates the encrypted document under the plaintext `audit_head` and `audit_seq`. Those columns are associated data on the credential ciphertext, so pointing them at a truncated chain fails authentication and verify does not report success. Rows after that head are accepted only when they are canonical locked-state denials: `vault_unlock` / `denied`, with empty credential id and credential type, and a timestamp in that same form that is not before the previous event and not after the check. Any other suffix fails verification and is not incorporated on unlock.
 
 Verify does not append an audit event. The audit tip remains suitable for later external checkpointing.
 
@@ -105,7 +105,7 @@ These mechanisms should be deleted rather than preserved as dormant compatibilit
 - SQLite transactions provide the atomic durability boundary for credential-state mutations plus their audit events.
 - SQLite does not replace encryption. Credential plaintext remains protected by the existing DEK/KEK design.
 - The authenticated audit head remains bound into encrypted-state authentication. Unlock and `audit verify` both reject a plaintext head that does not match that binding.
-- Locked-state denial suffixes remain distinguishable from authenticated state changes. Only a canonical denial (empty credential fields) is incorporated, and only after verification.
+- Locked-state denial suffixes remain distinguishable from authenticated state changes. Only a canonical denial (empty credential fields and a chronological canonical timestamp) is incorporated, and only after verification.
 - M5 may add off-host checkpoints, SIEM export, signed checkpoints, retention, or archival without changing the M1 transaction invariant.
 
 ## Alternatives considered
@@ -131,6 +131,7 @@ These mechanisms should be deleted rather than preserved as dormant compatibilit
 - valid unlock verifies and incorporates an outstanding denial suffix;
 - forged or non-denial rows after the authenticated head fail unlock;
 - a hash-linked unlock denial that carries a credential id or type fails unlock and is not incorporated;
+- a hash-linked unlock denial with a malformed, backdated, or future timestamp fails unlock and is not incorporated;
 - rewriting the plaintext audit head onto a truncated chain fails verify;
 - hash-chain tampering fails verification;
 - a unique sentinel secret and passphrase are absent from audit rows and ordinary error/log output; equality with a fixed literal is not disclosure;

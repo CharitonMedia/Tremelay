@@ -39,8 +39,9 @@ type auditEvent struct {
 // on the credential ciphertext, so rewriting it to match a truncated chain
 // fails here. The passphrase unwraps the DEK for that check and is not
 // retained. Rows after the head are accepted only when they are canonical
-// locked-state unlock denials. The returned hash is the chain tip, for a
-// later external checkpoint. This read does not append an audit event.
+// locked-state unlock denials with a chronological timestamp. The returned
+// hash is the chain tip, for a later external checkpoint. This read does not
+// append an audit event.
 func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 	db, header, events, err := loadVault(vaultPath)
 	if err != nil {
@@ -180,12 +181,38 @@ func suffixAllows(events []auditEvent, header fileHeader) error {
 	if idx < 0 {
 		return ErrAudit
 	}
+	if idx == len(events)-1 {
+		return nil
+	}
+	// ponytail: wall-clock order only. A step backward can make a real denial
+	// look forged and block unlock until that row is removed. Upgrade path: a trusted time source.
+	prevTime, ok := canonicalAuditTime(events[idx].Time)
+	if !ok {
+		return ErrAudit
+	}
+	now := time.Now()
 	for _, ev := range events[idx+1:] {
-		// appendDenial leaves credential fields empty. A hash-linked row
-		// with any other metadata is a forged suffix and must not be incorporated.
+		// appendDenial leaves credential fields empty and stamps Time with
+		// time.Now().UTC().Format(time.RFC3339Nano). Any other metadata, a
+		// noncanonical timestamp, or a time outside [previous, now] is a
+		// forged suffix and must not be incorporated.
 		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != header.ID || ev.CredID != "" || ev.CredType != "" {
 			return ErrAudit
 		}
+		ts, ok := canonicalAuditTime(ev.Time)
+		if !ok || ts.Before(prevTime) || ts.After(now) {
+			return ErrAudit
+		}
+		prevTime = ts
 	}
 	return nil
+}
+
+// canonicalAuditTime accepts only the UTC RFC3339Nano text nextEvent writes.
+func canonicalAuditTime(s string) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil || t.Location() != time.UTC || t.Format(time.RFC3339Nano) != s {
+		return time.Time{}, false
+	}
+	return t, true
 }
