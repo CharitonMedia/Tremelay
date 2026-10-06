@@ -223,16 +223,20 @@ func TestProductionKDFParams(t *testing.T) {
 }
 
 func TestNoGetSecretMethod(t *testing.T) {
-	for _, typ := range []reflect.Type{reflect.TypeOf(&Session{}), reflect.TypeOf(&AgentPrincipal{})} {
+	sessionType := reflect.TypeOf(&Session{})
+	if _, ok := sessionType.MethodByName("BrokerHTTP"); ok {
+		t.Fatal("human session exports the broker")
+	}
+	for _, typ := range []reflect.Type{sessionType, reflect.TypeOf(&AgentPrincipal{})} {
 		for i := 0; i < typ.NumMethod(); i++ {
 			name := strings.ToLower(typ.Method(i).Name)
-			if strings.Contains(name, "getsecret") || strings.Contains(name, "secretvalue") || name == "secret" {
+			if strings.Contains(name, "getsecret") || strings.Contains(name, "secretvalue") || strings.Contains(name, "dumpheader") || strings.Contains(name, "debugsecret") || name == "secret" {
 				t.Fatal(typ.Method(i).Name)
 			}
 		}
 	}
 	typ := reflect.TypeOf(&AgentPrincipal{})
-	if typ.NumMethod() != 2 {
+	if typ.NumMethod() != 3 {
 		t.Fatalf("agent method count %d", typ.NumMethod())
 	}
 	for i := 0; i < typ.NumMethod(); i++ {
@@ -250,6 +254,29 @@ func TestNoGetSecretMethod(t *testing.T) {
 				if m.Type.In(j).Kind() != reflect.String {
 					t.Fatalf("Authorize arg %d is %s", j, m.Type.In(j))
 				}
+			}
+		case "BrokerHTTP":
+			if m.Type.NumIn() != 2 || m.Type.NumOut() != 2 {
+				t.Fatalf("BrokerHTTP signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
+			}
+			req := m.Type.In(1)
+			if req != reflect.TypeOf(HTTPBrokerRequest{}) || req.NumField() != 3 {
+				t.Fatalf("broker request %s", req)
+			}
+			for j := 0; j < req.NumField(); j++ {
+				f := req.Field(j)
+				if f.Type.Kind() != reflect.String {
+					t.Fatal(f.Name)
+				}
+				switch f.Name {
+				case "CredentialID", "Method", "Target":
+				default:
+					t.Fatal(f.Name)
+				}
+			}
+			resp := m.Type.Out(0)
+			if resp != reflect.TypeOf(HTTPBrokerResponse{}) || resp.NumField() != 2 || resp.Field(0).Name != "StatusCode" || resp.Field(1).Name != "Body" {
+				t.Fatalf("broker response %s", resp)
 			}
 		default:
 			t.Fatal(m.Name)

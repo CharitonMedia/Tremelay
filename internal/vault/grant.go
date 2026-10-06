@@ -11,8 +11,8 @@ const (
 	principalAgent   = "agent"
 	agentStateActive = "active"
 
-	// OpHTTPRequest authorizes a future broker to use the credential on one scope.
-	// Authorizing it does not perform a request or reveal the credential.
+	// OpHTTPRequest authorizes the broker to use the credential on one exact
+	// resource. Authorizing it does not perform a request or reveal the credential.
 	OpHTTPRequest = "http_request"
 	// OpSign authorizes a future signing operation. Authorizing it does not sign
 	// or reveal key material.
@@ -103,6 +103,7 @@ type grantRecord struct {
 type capabilityView interface {
 	listCapabilities(agentID string) ([]Capability, error)
 	authorizeCapability(agentID, credentialID, operation, resource string) (string, error)
+	brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error)
 }
 
 type agentBinder struct {
@@ -123,9 +124,16 @@ func (b agentBinder) authorizeCapability(agentID, credentialID, operation, resou
 	return b.s.authorizeCapability(agentID, credentialID, operation, resource)
 }
 
+func (b agentBinder) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error) {
+	if b.s == nil {
+		return HTTPBrokerResponse{}, ErrUnauthenticated
+	}
+	return b.s.brokerHTTP(agentID, req)
+}
+
 // AgentPrincipal is the agent-facing handle for one identity.
-// Its method set is capability listing and authorization. It has no credential
-// retrieval, grant issuance, or way to select a different principal.
+// Its method set is capability listing, authorization, and the HTTP broker.
+// It has no credential retrieval, grant issuance, or way to select a different principal.
 type AgentPrincipal struct {
 	view capabilityView
 	id   string
@@ -157,6 +165,16 @@ func (a *AgentPrincipal) Authorize(credentialID, operation, resource string) (st
 		return "", ErrUnauthenticated
 	}
 	return a.view.authorizeCapability(a.id, credentialID, operation, resource)
+}
+
+// BrokerHTTP performs one authorized HTTP request with a stored credential.
+// The credential is applied inside the broker. The request and response carry
+// no credential plaintext, headers, or upstream URL dump.
+func (a *AgentPrincipal) BrokerHTTP(req HTTPBrokerRequest) (HTTPBrokerResponse, error) {
+	if a == nil || a.view == nil {
+		return HTTPBrokerResponse{}, ErrUnauthenticated
+	}
+	return a.view.brokerHTTP(a.id, req)
 }
 
 // CreateAgent persists a new agent principal.
@@ -357,17 +375,28 @@ func (s *Session) authorizeCapability(agentID, credentialID, operation, resource
 	if err := s.live(); err != nil {
 		return "", err
 	}
+	partial, cause := s.judge(agentID, credentialID, operation, resource)
+	partial.Action = actionAuthorize
+	if err := s.finish(partial, cause); err != nil {
+		return "", err
+	}
+	if cause != nil {
+		return "", cause
+	}
+	return partial.GrantID, nil
+}
+
+// judge is the M2 allow decision. It does not write an audit event and it does
+// not read credential plaintext. A malformed caller string is not copied out.
+func (s *Session) judge(agentID, credentialID, operation, resource string) (auditEvent, error) {
 	now, err := s.evaluationTime()
 	if err != nil || safeID(agentID) == "" || safeID(credentialID) == "" || !allowedOperation(operation) || validateResource(resource) != nil {
-		if err := s.finish(auditEvent{Action: actionAuthorize, Result: resultDenied}, ErrInvalid); err != nil {
-			return "", err
-		}
-		return "", ErrInvalid
+		return auditEvent{Result: resultDenied}, ErrInvalid
 	}
 	agentOK := s.agentExists(agentID)
 	credID, credType, credOK := s.lookupCred(credentialID)
 	result, grantID := decideAccess(s.grants, agentOK, agentID, credID, credType, credOK, operation, resource, now)
-	partial := auditEvent{Action: actionAuthorize, Result: result, Operation: operation, GrantID: grantID}
+	partial := auditEvent{Result: result, Operation: operation, GrantID: grantID}
 	if agentOK {
 		partial.AgentID = agentID
 	}
@@ -375,17 +404,10 @@ func (s *Session) authorizeCapability(agentID, credentialID, operation, resource
 		partial.CredID = credID
 		partial.CredType = credType
 	}
-	var cause error
 	if result != resultAllowed {
-		cause = denialError(result)
+		return partial, denialError(result)
 	}
-	if err := s.finish(partial, cause); err != nil {
-		return "", err
-	}
-	if result != resultAllowed {
-		return "", cause
-	}
-	return grantID, nil
+	return partial, nil
 }
 
 func (s *Session) writeAudit(partial auditEvent, creds []credential, agents []agentRecord, grants []grantRecord) error {
