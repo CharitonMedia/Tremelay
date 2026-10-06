@@ -2,11 +2,14 @@ package vault
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/hex"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -249,5 +252,71 @@ func TestDatabasePragmasAndExistingFile(t *testing.T) {
 	}
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("unlock created a database")
+	}
+}
+
+func TestFreshConnectionReportsRequiredPragmas(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vault.db")
+	created, err := createDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dsn, err := sqliteDSN(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := u.Query()["_pragma"]
+	for _, want := range []string{
+		"busy_timeout(5000)",
+		"foreign_keys(ON)",
+		"journal_mode(DELETE)",
+		"synchronous(FULL)",
+	} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("dsn _pragma=%v, missing %s", got, want)
+		}
+	}
+
+	fresh, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { fresh.Close() })
+	fresh.SetMaxOpenConns(1)
+
+	var mode string
+	if err := fresh.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(mode, "delete") {
+		t.Fatalf("journal_mode=%q", mode)
+	}
+	var syncMode int
+	if err := fresh.QueryRow(`PRAGMA synchronous`).Scan(&syncMode); err != nil {
+		t.Fatal(err)
+	}
+	if syncMode != 2 {
+		t.Fatalf("synchronous=%d", syncMode)
+	}
+	var fk int
+	if err := fresh.QueryRow(`PRAGMA foreign_keys`).Scan(&fk); err != nil {
+		t.Fatal(err)
+	}
+	if fk != 1 {
+		t.Fatalf("foreign_keys=%d", fk)
+	}
+	var busy int
+	if err := fresh.QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil {
+		t.Fatal(err)
+	}
+	if busy != 5000 {
+		t.Fatalf("busy_timeout=%d", busy)
 	}
 }

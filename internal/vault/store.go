@@ -54,12 +54,18 @@ func sqliteDSN(path string) (string, error) {
 	}
 	q := url.Values{}
 	q.Set("mode", "rw")
-	q.Set("_busy_timeout", "5000")
 	q.Set("_defensive", "1")
-	q.Set("_foreign_keys", "on")
-	q.Set("_journal_mode", "DELETE")
-	q.Set("_synchronous", "FULL")
 	q.Set("_txlock", "immediate")
+	// modernc.org/sqlite runs each repeated _pragma value as one PRAGMA.
+	// foreign_keys(ON) is the function-call form that driver accepts.
+	for _, pragma := range []string{
+		"busy_timeout(5000)",
+		"foreign_keys(ON)",
+		"journal_mode(DELETE)",
+		"synchronous(FULL)",
+	} {
+		q.Add("_pragma", pragma)
+	}
 	return (&url.URL{Scheme: "file", Path: slash, RawQuery: q.Encode()}).String(), nil
 }
 
@@ -147,6 +153,13 @@ func assertDurable(db *sql.DB) error {
 		return ErrCorrupt
 	}
 	if fk != 1 {
+		return ErrIO
+	}
+	var busy int
+	if err := db.QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil {
+		return ErrCorrupt
+	}
+	if busy != 5000 {
 		return ErrIO
 	}
 	var check string

@@ -79,7 +79,7 @@ audit
 
 SQLite should use durable transactional settings appropriate for a local security store. Schema details and driver choice must use a mature, actively maintained implementation and must not weaken portability tests.
 
-The driver is `modernc.org/sqlite`, a pure-Go SQLite build, so Linux, Windows, and macOS CI do not need cgo. `go.mod` pins the newest release that supports the repository Go toolchain. Each connection sets `busy_timeout`, `foreign_keys=ON`, `journal_mode=DELETE`, `synchronous=FULL`, and SQLite defensive mode. Credential-state writes use `BEGIN IMMEDIATE`. The toolchain is a current Go release whose `net/url` is outside GO-2026-4341, because opening a database reaches query-string parsing.
+The driver is `modernc.org/sqlite`, a pure-Go SQLite build, so Linux, Windows, and macOS CI do not need cgo. `go.mod` pins the newest release that supports the repository Go toolchain. Each connection sets `busy_timeout(5000)`, `foreign_keys(ON)`, `journal_mode(DELETE)`, and `synchronous(FULL)` through repeated `_pragma` query parameters, which is the syntax that driver applies when the connection opens. `_defensive=1` enables SQLite defensive mode. Opening the database reads those pragma values back from that connection and refuses the file when any required value is absent. Credential-state writes use `BEGIN IMMEDIATE` via `_txlock=immediate`. The toolchain is a current Go release whose `net/url` is outside GO-2026-4341, because opening a database reaches query-string parsing.
 
 ## Verification semantics
 
