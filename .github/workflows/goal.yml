@@ -171,6 +171,24 @@ jobs:
               after=$(git rev-parse "origin/${branch}")
             fi
           fi
+          if [ "$status" != "FINISHED" ]; then
+            body="Cursor agent stopped without producing a reviewable result. Terminal status: \`$status\`. No Codex rereview was requested; human review or explicit relaunch is required."
+            if [ -n "$comment_target" ]; then
+              gh pr comment "$comment_target" --body "$body"
+            else
+              gh issue comment "$issue" --body "$body"
+            fi
+            exit 0
+          fi
+          if [ "$before" = "$after" ]; then
+            body="Cursor agent finished but did not move the goal branch from \`$before\`. No Codex rereview was requested; human review or explicit relaunch is required."
+            if [ -n "$comment_target" ]; then
+              gh pr comment "$comment_target" --body "$body"
+            else
+              gh issue comment "$issue" --body "$body"
+            fi
+            exit 0
+          fi
           if [ -n "$comment_target" ] && comment=$(python scripts/goal_agent_request.py codex-rereview --status "$status" --before "$before" --after "$after"); then
             gh pr comment "$comment_target" --body "$comment"
           fi
@@ -406,9 +424,18 @@ jobs:
           bash scripts/require_goal_github_token.sh
           number="${{ needs.review-launch.outputs.pr_number }}"
           status=$(bash scripts/wait_for_agent_run.sh "${{ needs.review-launch.outputs.agent_id }}" "${{ needs.review-launch.outputs.run_id }}")
+          before="${{ needs.review-launch.outputs.before_sha }}"
           after=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
+          if [ "$status" != "FINISHED" ]; then
+            gh pr comment "$number" --body "Cursor remediation stopped without a commit. Terminal status: \`$status\`. No Codex rereview was requested; human review or explicit relaunch is required."
+            exit 0
+          fi
+          if [ "$before" = "$after" ]; then
+            gh pr comment "$number" --body "Cursor remediation finished but did not move the pull-request head from \`$before\`. No Codex rereview was requested; human review or explicit relaunch is required."
+            exit 0
+          fi
           gh pr view "$number" --json reviews > reviews.json
-          if comment=$(python scripts/goal_agent_request.py codex-rereview --status "$status" --before "${{ needs.review-launch.outputs.before_sha }}" --after "$after" --reviews reviews.json); then
+          if comment=$(python scripts/goal_agent_request.py codex-rereview --status "$status" --before "$before" --after "$after" --reviews reviews.json); then
             gh pr comment "$number" --body "$comment"
           else
             echo "no fresh Codex review requested (status ${status})"
