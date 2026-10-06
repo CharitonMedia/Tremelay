@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
 
@@ -758,6 +759,105 @@ func TestCLIAuditVerifyReportsStdoutWriteFailure(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), pass) {
 		t.Fatal("stderr echoed passphrase")
+	}
+}
+
+func TestCLIAgentGrantAndCapability(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	secret := randBytes(t, 32)
+	secretPath := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"TREMELAY_PASSPHRASE": pass}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"vault", "create", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("create %d %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "put", "--path", path, "--label", "ci", "--type", "api_key", "--secret-file", secretPath}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("put %d %s", code, stderr.String())
+	}
+	credID := strings.TrimSpace(stdout.String())
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"agent", "create", "--path", path, "--label", "worker"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("agent %d %s", code, stderr.String())
+	}
+	agentID := strings.TrimSpace(stdout.String())
+	if agentID == "" || strings.Contains(stdout.String(), string(secret)) {
+		t.Fatal(stdout.String())
+	}
+	expires := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"grant", "create", "--path", path, "--agent", agentID, "--credential", credID, "--operation", "http_request", "--resource", "svc:one", "--expires", expires}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("grant %d %s", code, stderr.String())
+	}
+	grantID := strings.TrimSpace(stdout.String())
+	assertNoSecret(t, &stdout, secret, pass)
+	assertNoSecret(t, &stderr, secret, pass)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"capability", "list", "--path", path, "--agent", agentID}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("list %d %s", code, stderr.String())
+	}
+	var listed map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := listed["secret"]; ok || listed["grant_id"] != grantID || listed["status"] != "active" {
+		t.Fatalf("list %#v", listed)
+	}
+	assertNoSecret(t, &stdout, secret, pass)
+	assertNoSecret(t, &stderr, secret, pass)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"capability", "authorize", "--path", path, "--agent", agentID, "--credential", credID, "--operation", "http_request", "--resource", "svc:one"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("authorize %d %s", code, stderr.String())
+	}
+	if !strings.HasPrefix(stdout.String(), "allowed "+grantID) {
+		t.Fatal(stdout.String())
+	}
+	assertNoSecret(t, &stdout, secret, pass)
+	assertNoSecret(t, &stderr, secret, pass)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"capability", "authorize", "--path", path, "--agent", agentID, "--credential", credID, "--operation", "http_request", "--resource", "svc:other"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code == 0 {
+		t.Fatal("wrong scope was authorized")
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "denied_scope") {
+		t.Fatalf("stdout %q stderr %s", stdout.String(), stderr.String())
+	}
+	assertNoSecret(t, &stderr, secret, pass)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"grant", "revoke", "--path", path, "--id", grantID}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("revoke %d %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"capability", "authorize", "--path", path, "--agent", agentID, "--credential", credID, "--operation", "http_request", "--resource", "svc:one"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code == 0 {
+		t.Fatal("revoked grant authorized")
+	}
+	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "denied_revoked") {
+		t.Fatalf("stdout %q stderr %s", stdout.String(), stderr.String())
+	}
+	assertNoSecret(t, &stderr, secret, pass)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"capability", "get-secret"}, envGet(nil), strings.NewReader(""), &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "unknown command") {
+		t.Fatalf("get-secret %d %s", code, stderr.String())
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, secret) || bytes.Contains(raw, []byte(pass)) {
+		t.Fatal("vault file contains secret material")
 	}
 }
 

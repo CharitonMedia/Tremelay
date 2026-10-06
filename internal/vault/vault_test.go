@@ -909,7 +909,7 @@ func TestSentinelSecretDoesNotFlowIntoPlaintext(t *testing.T) {
 	assertAbsent(t, logs.Bytes(), sentinel)
 	assertAbsent(t, logs.Bytes(), pass)
 	for _, ev := range mustAudit(t, path) {
-		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Time, ev.Prev, ev.Hash}, "\n")
+		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Time, ev.Prev, ev.Hash, ev.AgentID, ev.GrantID, ev.Operation}, "\n")
 		if strings.Contains(fields, string(sentinel)) || strings.Contains(fields, string(pass)) {
 			t.Fatal("sentinel flowed into an audit field")
 		}

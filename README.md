@@ -8,13 +8,18 @@ Tremelay is a self-hosted credential vault and capability broker. Humans can sto
 
 ## Project status
 
-M1 is a local single-user vault. A human can create a vault, unlock it with a passphrase, and store and retrieve a credential with the `tremelay` CLI. That CLI is the human control plane: it has no agent interface and no raw-secret retrieval for agents. Later milestones add capabilities, the HTTP broker, audit review, and credential health. See [MILESTONES.md](MILESTONES.md).
+M1 is a local single-user vault. A human can create a vault, unlock it with a passphrase, and store and retrieve a credential with the `tremelay` CLI. M2 adds distinct agent principals and revocable, expiring capability grants. The CLI remains the human control plane: agent and grant commands do not retrieve raw secrets, and there is no agent-facing `getSecret`. Later milestones add the HTTP broker, audit review, and credential health. See [MILESTONES.md](MILESTONES.md).
 
 ```
 tremelay vault create --path vault.db
 tremelay credential put --path vault.db --label ci --type api_key --secret-file ./secret
 tremelay credential get --path vault.db --id CREDENTIAL_ID
 tremelay credential list --path vault.db
+tremelay agent create --path vault.db --label worker
+tremelay grant create --path vault.db --agent AGENT_ID --credential CREDENTIAL_ID --operation http_request --resource svc:example --expires 2030-01-01T00:00:00Z
+tremelay capability list --path vault.db --agent AGENT_ID
+tremelay capability authorize --path vault.db --agent AGENT_ID --credential CREDENTIAL_ID --operation http_request --resource svc:example
+tremelay grant revoke --path vault.db --id GRANT_ID
 tremelay audit verify --path vault.db
 ```
 

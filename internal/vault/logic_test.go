@@ -223,12 +223,85 @@ func TestProductionKDFParams(t *testing.T) {
 }
 
 func TestNoGetSecretMethod(t *testing.T) {
-	typ := reflect.TypeOf(&Session{})
-	for i := 0; i < typ.NumMethod(); i++ {
-		name := strings.ToLower(typ.Method(i).Name)
-		if strings.Contains(name, "getsecret") {
-			t.Fatal(typ.Method(i).Name)
+	for _, typ := range []reflect.Type{reflect.TypeOf(&Session{}), reflect.TypeOf(&AgentPrincipal{})} {
+		for i := 0; i < typ.NumMethod(); i++ {
+			name := strings.ToLower(typ.Method(i).Name)
+			if strings.Contains(name, "getsecret") || strings.Contains(name, "secretvalue") || name == "secret" {
+				t.Fatal(typ.Method(i).Name)
+			}
 		}
+	}
+	typ := reflect.TypeOf(&AgentPrincipal{})
+	if typ.NumMethod() != 2 {
+		t.Fatalf("agent method count %d", typ.NumMethod())
+	}
+	for i := 0; i < typ.NumMethod(); i++ {
+		m := typ.Method(i)
+		switch m.Name {
+		case "Capabilities":
+			if m.Type.NumIn() != 1 {
+				t.Fatal("Capabilities accepts a caller argument")
+			}
+		case "Authorize":
+			if m.Type.NumIn() != 4 {
+				t.Fatalf("Authorize arity %d", m.Type.NumIn())
+			}
+			for j := 1; j < m.Type.NumIn(); j++ {
+				if m.Type.In(j).Kind() != reflect.String {
+					t.Fatalf("Authorize arg %d is %s", j, m.Type.In(j))
+				}
+			}
+		default:
+			t.Fatal(m.Name)
+		}
+		for j := 0; j < m.Type.NumOut(); j++ {
+			out := m.Type.Out(j)
+			if out.Kind() == reflect.Slice && out.Elem().Kind() == reflect.Uint8 {
+				t.Fatalf("%s returns a byte slice", m.Name)
+			}
+		}
+	}
+	fields := reflect.TypeOf(AgentPrincipal{})
+	for i := 0; i < fields.NumField(); i++ {
+		if fields.Field(i).Type == reflect.TypeOf(&Session{}) {
+			t.Fatal("AgentPrincipal holds *Session")
+		}
+	}
+}
+
+func TestCapabilityChainBindsAgent(t *testing.T) {
+	id := strings.Repeat("ab", 16)
+	create, err := nextEvent(nil, actionCreate, id, "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := nextAudit([]auditEvent{create}, id, auditEvent{
+		Action:    actionGrantCreate,
+		Result:    resultAllowed,
+		AgentID:   id,
+		GrantID:   strings.Repeat("cd", 16),
+		CredType:  "api_key",
+		Operation: OpHTTPRequest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyChain([]auditEvent{create, grant}); err != nil {
+		t.Fatal(err)
+	}
+	grant.AgentID = strings.Repeat("ef", 16)
+	if err := verifyChain([]auditEvent{create, grant}); !errors.Is(err, ErrAudit) {
+		t.Fatalf("rebound agent: %v", err)
+	}
+	header := fileHeader{ID: id, AuditHead: create.Hash, AuditSeq: create.Seq}
+	if err := suffixAllows([]auditEvent{create, grant}, header); !errors.Is(err, ErrAudit) {
+		t.Fatalf("capability suffix: %v", err)
+	}
+	prev := make([]byte, 32)
+	v1 := eventHash(prev, 1, "2026-01-01T00:00:00Z", actionAuthorize, "abc", "", "", resultAllowed)
+	v2 := eventHashV2(prev, 1, "2026-01-01T00:00:00Z", actionAuthorize, "abc", "", "", resultAllowed, "", "", "")
+	if bytes.Equal(v1, v2) {
+		t.Fatal("v2 hash collapsed into v1")
 	}
 }
 

@@ -1,7 +1,10 @@
 // Package vault is the human control plane for a local encrypted credential store.
 //
 // Retrieval requires an unlocked session, which requires the vault passphrase.
-// This package must not grow an agent-facing raw-secret retrieval API.
+// Agent principals and capability grants are a separate authority from that
+// human session. AgentPrincipal can list and authorize capabilities for one
+// identity. It cannot retrieve credential plaintext. This package must not
+// grow an agent-facing raw-secret retrieval API.
 package vault
 
 import (
@@ -89,6 +92,24 @@ var (
 	ErrIO = errors.New("vault file operation failed")
 	// ErrPassphrase means the CLI has no passphrase source.
 	ErrPassphrase = errors.New("passphrase required")
+	// ErrAgentNotFound means the agent id is not a principal in this vault.
+	ErrAgentNotFound = errors.New("agent not found")
+	// ErrGrantNotFound means the grant id is not in this vault.
+	ErrGrantNotFound = errors.New("grant not found")
+	// ErrDeniedAgent means authorization failed because the principal does not hold the grant.
+	ErrDeniedAgent = errors.New("denied_agent")
+	// ErrDeniedCredential means authorization failed because the credential does not match.
+	ErrDeniedCredential = errors.New("denied_credential")
+	// ErrDeniedOperation means authorization failed because the operation does not match.
+	ErrDeniedOperation = errors.New("denied_operation")
+	// ErrDeniedScope means authorization failed because the resource scope does not match.
+	ErrDeniedScope = errors.New("denied_scope")
+	// ErrDeniedExpired means the matching grant is past its expiration.
+	ErrDeniedExpired = errors.New("denied_expired")
+	// ErrDeniedRevoked means the matching grant has been revoked.
+	ErrDeniedRevoked = errors.New("denied_revoked")
+	// ErrDeniedMissing means the principal has no capability grant.
+	ErrDeniedMissing = errors.New("denied_missing")
 )
 
 // Lifecycle is non-secret metadata stored with a credential.
@@ -158,9 +179,12 @@ type fileHeader struct {
 }
 
 // document is the plaintext inside the encrypted blob. Audit history lives
-// in the SQLite audit table, not in this document.
+// in the SQLite audit table, not in this document. Agents and grants are
+// vault state, not an agent-facing secret channel.
 type document struct {
-	Credentials []credential `json:"credentials"`
+	Credentials []credential  `json:"credentials"`
+	Agents      []agentRecord `json:"agents,omitempty"`
+	Grants      []grantRecord `json:"grants,omitempty"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -170,6 +194,8 @@ type Session struct {
 	dek      []byte
 	header   fileHeader
 	creds    []credential
+	agents   []agentRecord
+	grants   []grantRecord
 	audit    []auditEvent
 	redactor *Redactor
 	logger   *log.Logger
@@ -177,6 +203,10 @@ type Session struct {
 	// commitFault, when set, fails a credential-state transaction before commit.
 	// Tests use it to prove rollback. Production leaves it nil.
 	commitFault func() error
+	// clock, when set, is the trusted time for grant expiry and capability
+	// status. Production leaves it nil and uses time.Now. Agent-facing
+	// methods cannot set it.
+	clock func() time.Time
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -287,7 +317,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		wipe(dek)
 		return nil, deny(ErrCorrupt)
 	}
-	if err := validateStored(doc.Credentials); err != nil {
+	if err := validateDocument(doc); err != nil {
 		wipe(dek)
 		return nil, deny(err)
 	}
@@ -302,6 +332,8 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		dek:      dek,
 		header:   header,
 		creds:    doc.Credentials,
+		agents:   doc.Agents,
+		grants:   doc.Grants,
 		audit:    events,
 		redactor: red,
 		logger:   logger,
@@ -329,6 +361,8 @@ func (s *Session) Lock() {
 		s.creds[i].Secret = nil
 	}
 	s.creds = nil
+	s.agents = nil
+	s.grants = nil
 	s.audit = nil
 	if s.redactor != nil {
 		s.redactor.Wipe()
@@ -514,12 +548,17 @@ func (s *Session) persistEvent(action, credID, credType, result string) error {
 }
 
 // commit encrypts credential state under the new audit head and writes that
-// ciphertext plus the audit row in one transaction.
+// ciphertext plus the audit row in one transaction. Agent and grant rows
+// already on the session are sealed in the same document.
 func (s *Session) commit(ev auditEvent, creds []credential) error {
+	return s.commitState(ev, creds, s.agents, s.grants)
+}
+
+func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentRecord, grants []grantRecord) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
-	plain, err := json.Marshal(document{Credentials: creds})
+	plain, err := json.Marshal(document{Credentials: creds, Agents: agents, Grants: grants})
 	if err != nil {
 		return ErrIO
 	}
@@ -545,6 +584,8 @@ func (s *Session) commit(ev auditEvent, creds []credential) error {
 	s.header = h
 	s.audit = append(s.audit, ev)
 	s.creds = creds
+	s.agents = agents
+	s.grants = grants
 	return nil
 }
 
