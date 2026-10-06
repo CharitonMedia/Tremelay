@@ -96,14 +96,36 @@ jobs:
 
       - name: Build exact-head remediation plan
         id: plan
-        env:
-          MAX_REMEDIATION_ROUNDS: "3"
         run: |
           set -euo pipefail
-          python scripts/codex_cursor_remediation.py build --event normalized_event.json --pull pull.json --review-comments review_comments.json --issue-comments issue_comments.json --out plan.json --max-rounds "$MAX_REMEDIATION_ROUNDS" --repo-url "https://github.com/${GITHUB_REPOSITORY}" --trusted-marker-login "${{ steps.marker_identity.outputs.login }}"
+          max_rounds=$(python - <<'PY'
+          import json
+          from datetime import datetime, timedelta, timezone
+          pages=json.load(open("issue_comments.json", encoding="utf-8"))
+          comments=[c for page in pages for c in page]
+          marker="<!-- tremelay-unattended-window hours:6 max-cycles:9 -->"
+          now=datetime.now(timezone.utc)
+          limit=3
+          for c in comments:
+              if (c.get("user") or {}).get("login","").casefold()!="pattalkslaw-del":
+                  continue
+              if marker not in (c.get("body") or ""):
+                  continue
+              raw=c.get("created_at") or ""
+              try:
+                  created=datetime.fromisoformat(raw.replace("Z","+00:00"))
+              except ValueError:
+                  continue
+              if created <= now < created + timedelta(hours=6):
+                  limit=9
+          print(limit)
+          PY
+          )
+          python scripts/codex_cursor_remediation.py build --event normalized_event.json --pull pull.json --review-comments review_comments.json --issue-comments issue_comments.json --out plan.json --max-rounds "$max_rounds" --repo-url "https://github.com/${GITHUB_REPOSITORY}" --trusted-marker-login "${{ steps.marker_identity.outputs.login }}"
           action=$(python -c 'import json; print(json.load(open("plan.json"))["action"])')
           reason=$(python -c 'import json; print(json.load(open("plan.json")).get("reason", ""))')
           echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "max_rounds=$max_rounds" >> "$GITHUB_OUTPUT"
           {
             echo "reason<<EOF"
             echo "$reason"
@@ -118,10 +140,11 @@ jobs:
           REASON: ${{ steps.plan.outputs.reason }}
         run: |
           set -euo pipefail
-          if [[ "$REASON" == *"circuit breaker reached 3 rounds"* ]]; then
-            gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped after the three-cycle remediation limit." --force
+          LIMIT: ${{ steps.plan.outputs.max_rounds }}
+          if [[ "$REASON" == *"circuit breaker reached ${LIMIT} rounds"* ]]; then
+            gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped at the active remediation circuit breaker." --force
             gh pr edit "$PR_NUMBER" --add-label human-review-required
-            gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped after three remediation cycles. Human review is required before another agent run. Reason: ${REASON}"
+            gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped after ${LIMIT} remediation cycles. Human review is required before another agent run. Reason: ${REASON}"
           else
             gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped: ${REASON}"
           fi
