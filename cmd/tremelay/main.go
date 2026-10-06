@@ -122,14 +122,17 @@ func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	// Label and type are checked in the unlocked session. Rejecting them
-	// here skipped the credential_put denial.
-	if *path == "" || *secretFile == "" || fs.NArg() != 0 {
+	// Label, type, and a missing secret file are checked in the unlocked
+	// session. Rejecting them here skipped the credential_put denial.
+	if *path == "" || fs.NArg() != 0 {
 		usage(stderr)
 		return 2
 	}
 	red := &vault.Redactor{}
 	return withSession(*path, getenv, stdin, stderr, red, func(session *vault.Session) error {
+		if *secretFile == "" {
+			return session.RejectPut(vault.ErrInvalid)
+		}
 		// File checks used to return before unlock, so empty, oversized, and
 		// unreadable secret files never produced a credential_put denial.
 		secret, err := readSecretFile(*secretFile)
@@ -155,7 +158,8 @@ func cmdGet(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *path == "" || *id == "" || fs.NArg() != 0 {
+	// An empty id is an attempted get. Session.Get records a metadata-free denial.
+	if *path == "" || fs.NArg() != 0 {
 		usage(stderr)
 		return 2
 	}
@@ -269,6 +273,16 @@ func withSession(path string, getenv func(string) string, stdin io.Reader, stder
 	}
 	pass, err := readPassphrase(getenv, stdin, stderr)
 	if err != nil {
+		// No passphrase never reached Unlock, so a credential attempt against
+		// an existing vault left no denial. An empty passphrase is rejected
+		// and recorded like any other locked-state failure. A missing vault
+		// is ErrInvalid from Unlock and still surfaces as ErrPassphrase.
+		if errors.Is(err, vault.ErrPassphrase) {
+			logger := log.New(vault.RedactingWriter{Dst: stderr, Redactor: red}, "", 0)
+			if _, uerr := vault.Unlock(path, nil, logger); uerr != nil && !errors.Is(uerr, vault.ErrInvalid) {
+				err = uerr
+			}
+		}
 		fmt.Fprintln(stderr, red.Redact(err.Error()))
 		return 1
 	}
