@@ -76,7 +76,7 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 	if _, host, _, got := classifyTarget(http.MethodGet, "https://rebind.nip.io/latest"); got != targetOK || host != "rebind.nip.io" {
 		t.Fatal("rebinding name was rejected before DNS")
 	}
-	public := []string{"1.1.1.1", "8.8.8.8", "2001:4860:4860::8888", "2606:4700:4700::1111", "3ff1::1", "3ff0::1", "3fff:1000::1"}
+	public := []string{"1.1.1.1", "8.8.8.8", "192.88.98.1", "192.88.100.1", "2001:4860:4860::8888", "2606:4700:4700::1111", "3ff1::1", "3ff0::1", "3fff:1000::1"}
 	for _, raw := range public {
 		if !isPublicIP(net.ParseIP(raw)) {
 			t.Fatal(raw)
@@ -86,7 +86,7 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 		"127.0.0.1", "127.0.0.2", "::1", "10.1.2.3", "192.168.0.1", "172.16.0.1",
 		"169.254.169.254", "0.0.0.0", "100.64.0.1", "255.255.255.255", "224.0.0.1",
 		"::ffff:127.0.0.1", "fe80::1", "fc00::1", "fd00::1", "2001:db8::1", "2002::1",
-		"192.0.2.1", "198.51.100.1", "203.0.113.1", "192.88.99.2", "::ffff:192.88.99.2",
+		"192.0.2.1", "198.51.100.1", "203.0.113.1", "192.88.99.0", "192.88.99.1", "192.88.99.2", "192.88.99.255", "::ffff:192.88.99.1", "::ffff:192.88.99.2",
 		"fec0::1", "64:ff9b::1", "64:ff9b:1::1", "100::1", "100:0:0:1::1",
 		"2001::1", "2001:2::1", "3fff::1", "3fff:fff::1", "5f00::1", "2620:4f:8000::1", "4000::1",
 	}
@@ -103,6 +103,9 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 		t.Fatalf("pin %s %v", got, err)
 	}
 	if _, err := pinTarget(net.ParseIP("10.0.0.1"), "443"); !errors.Is(err, errDestination) {
+		t.Fatal(err)
+	}
+	if _, err := pinTarget(net.ParseIP("192.88.99.1"), "443"); !errors.Is(err, errDestination) {
 		t.Fatal(err)
 	}
 	if _, err := pinTarget(net.ParseIP("192.88.99.2"), "443"); !errors.Is(err, errDestination) {
@@ -419,7 +422,7 @@ func TestBrokerHTTP(t *testing.T) {
 		return []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.1")}, nil
 	}
 	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: target}, principal, ErrDeniedDestination)
-	for _, raw := range []string{"fec0::1", "64:ff9b::c000:201", "64:ff9b:1::1", "100::1", "2001:2::1", "3fff::1", "3fff:fff::1", "192.88.99.2"} {
+	for _, raw := range []string{"fec0::1", "64:ff9b::c000:201", "64:ff9b:1::1", "100::1", "2001:2::1", "3fff::1", "3fff:fff::1", "192.88.99.0", "192.88.99.1", "192.88.99.2", "192.88.99.255"} {
 		session.resolve = func(context.Context, string) ([]net.IP, error) {
 			return []net.IP{net.ParseIP(raw)}, nil
 		}
@@ -429,7 +432,7 @@ func TestBrokerHTTP(t *testing.T) {
 		}
 		expect(good, principal, ErrDeniedDestination)
 	}
-	for _, raw := range []string{"3ff1::1", "3fff:1000::1"} {
+	for _, raw := range []string{"3ff1::1", "3fff:1000::1", "192.88.98.1", "192.88.100.1"} {
 		session.resolve = func(context.Context, string) ([]net.IP, error) {
 			return []net.IP{net.ParseIP(raw)}, nil
 		}

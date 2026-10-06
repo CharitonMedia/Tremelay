@@ -271,8 +271,8 @@ func isPublicIP(ip net.IP) bool {
 			return false
 		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19):
 			return false
-		case v4[0] == 192 && v4[1] == 88 && v4[2] == 99 && v4[3] == 2:
-			// 192.88.99.2 is the 6a44 relay anycast and is not globally reachable.
+		case v4[0] == 192 && v4[1] == 88 && v4[2] == 99:
+			// 192.88.99.0/24 is the deprecated 6to4 relay prefix (RFC 7526), including 192.88.99.2.
 			return false
 		case v4[0] >= 240:
 			return false
