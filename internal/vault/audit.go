@@ -9,29 +9,45 @@ import (
 )
 
 const (
-	auditVersion = 1
+	auditVersion           = 1
+	auditCapabilityVersion = 2
 
-	actionCreate = "vault_create"
-	actionUnlock = "vault_unlock"
-	actionPut    = "credential_put"
-	actionGet    = "credential_get"
-	actionList   = "credential_list"
+	actionCreate      = "vault_create"
+	actionUnlock      = "vault_unlock"
+	actionPut         = "credential_put"
+	actionGet         = "credential_get"
+	actionList        = "credential_list"
+	actionAgentCreate = "agent_create"
+	actionGrantCreate = "grant_create"
+	actionGrantRevoke = "grant_revoke"
+	actionAuthorize   = "capability_authorize"
+	actionCapList     = "capability_list"
 
-	resultAllowed = "allowed"
-	resultDenied  = "denied"
+	resultAllowed          = "allowed"
+	resultDenied           = "denied"
+	resultDeniedAgent      = "denied_agent"
+	resultDeniedCredential = "denied_credential"
+	resultDeniedOperation  = "denied_operation"
+	resultDeniedScope      = "denied_scope"
+	resultDeniedExpired    = "denied_expired"
+	resultDeniedRevoked    = "denied_revoked"
+	resultDeniedMissing    = "denied_missing"
 )
 
 type auditEvent struct {
-	V        int    `json:"v"`
-	Seq      uint64 `json:"seq"`
-	Time     string `json:"time"`
-	Action   string `json:"action"`
-	VaultID  string `json:"vault_id"`
-	CredID   string `json:"credential_id,omitempty"`
-	CredType string `json:"credential_type,omitempty"`
-	Result   string `json:"result"`
-	Prev     string `json:"prev"`
-	Hash     string `json:"hash"`
+	V         int    `json:"v"`
+	Seq       uint64 `json:"seq"`
+	Time      string `json:"time"`
+	Action    string `json:"action"`
+	VaultID   string `json:"vault_id"`
+	CredID    string `json:"credential_id,omitempty"`
+	CredType  string `json:"credential_type,omitempty"`
+	Result    string `json:"result"`
+	AgentID   string `json:"agent_id,omitempty"`
+	GrantID   string `json:"grant_id,omitempty"`
+	Operation string `json:"operation,omitempty"`
+	Prev      string `json:"prev"`
+	Hash      string `json:"hash"`
 }
 
 // VerifyAudit checks the hash chain, then authenticates the encrypted
@@ -67,12 +83,22 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 }
 
 func eventHash(prev []byte, seq uint64, timeStr, action, vaultID, credID, credType, result string) []byte {
+	return hashParts(prev, seq, timeStr, action, vaultID, credID, credType, result)
+}
+
+// eventHashV2 extends the version-1 preimage with the capability fields.
+// Resource strings are not part of the preimage; they stay in the encrypted document.
+func eventHashV2(prev []byte, seq uint64, timeStr, action, vaultID, credID, credType, result, agentID, grantID, operation string) []byte {
+	return hashParts(prev, seq, timeStr, action, vaultID, credID, credType, result, agentID, grantID, operation)
+}
+
+func hashParts(prev []byte, seq uint64, parts ...string) []byte {
 	h := sha256.New()
 	h.Write(prev)
 	var seqb [8]byte
 	binary.BigEndian.PutUint64(seqb[:], seq)
 	h.Write(seqb[:])
-	for _, part := range []string{timeStr, action, vaultID, credID, credType, result} {
+	for _, part := range parts {
 		b := []byte(part)
 		var n [4]byte
 		binary.BigEndian.PutUint32(n[:], uint32(len(b)))
@@ -83,6 +109,15 @@ func eventHash(prev []byte, seq uint64, timeStr, action, vaultID, credID, credTy
 }
 
 func nextEvent(chain []auditEvent, action, vaultID, credID, credType, result string) (auditEvent, error) {
+	return nextAudit(chain, vaultID, auditEvent{
+		Action:   action,
+		CredID:   credID,
+		CredType: credType,
+		Result:   result,
+	})
+}
+
+func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEvent, error) {
 	prev := make([]byte, 32)
 	seq := uint64(1)
 	if len(chain) > 0 {
@@ -94,20 +129,31 @@ func nextEvent(chain []auditEvent, action, vaultID, credID, credType, result str
 		prev = decoded
 		seq = last.Seq + 1
 	}
-	ts := time.Now().UTC().Format(time.RFC3339Nano)
-	sum := eventHash(prev, seq, ts, action, vaultID, credID, credType, result)
-	return auditEvent{
-		V:        auditVersion,
-		Seq:      seq,
-		Time:     ts,
-		Action:   action,
-		VaultID:  vaultID,
-		CredID:   credID,
-		CredType: credType,
-		Result:   result,
-		Prev:     hex.EncodeToString(prev),
-		Hash:     hex.EncodeToString(sum),
-	}, nil
+	ev := partial
+	ev.V = auditVersion
+	ev.Seq = seq
+	ev.Time = time.Now().UTC().Format(time.RFC3339Nano)
+	ev.VaultID = vaultID
+	ev.Prev = hex.EncodeToString(prev)
+	var sum []byte
+	if capabilityAction(ev.Action) {
+		ev.V = auditCapabilityVersion
+		sum = eventHashV2(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation)
+	} else {
+		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" {
+			return auditEvent{}, ErrAudit
+		}
+		sum = eventHash(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result)
+	}
+	ev.Hash = hex.EncodeToString(sum)
+	return ev, nil
+}
+
+func hashEvent(prev []byte, ev auditEvent) []byte {
+	if capabilityAction(ev.Action) {
+		return eventHashV2(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation)
+	}
+	return eventHash(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result)
 }
 
 func verifyChain(events []auditEvent) error {
@@ -139,20 +185,24 @@ func verifyLinked(events []auditEvent) error {
 		return ErrAudit
 	}
 	for i, ev := range events {
-		if ev.V != auditVersion || ev.Seq != first.Seq+uint64(i) {
+		wantV := auditVersion
+		if capabilityAction(ev.Action) {
+			wantV = auditCapabilityVersion
+		}
+		if ev.V != wantV || ev.Seq != first.Seq+uint64(i) {
 			return ErrAudit
 		}
 		if ev.VaultID != first.VaultID || !knownAction(ev.Action) {
 			return ErrAudit
 		}
-		if ev.Result != resultAllowed && ev.Result != resultDenied {
-			return ErrAudit
+		if err := validAuditShape(ev); err != nil {
+			return err
 		}
 		gotPrev, err := hex.DecodeString(ev.Prev)
 		if err != nil || !bytes.Equal(gotPrev, prev) {
 			return ErrAudit
 		}
-		sum := eventHash(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result)
+		sum := hashEvent(prev, ev)
 		if hex.EncodeToString(sum) != ev.Hash {
 			return ErrAudit
 		}
@@ -163,11 +213,103 @@ func verifyLinked(events []auditEvent) error {
 
 func knownAction(action string) bool {
 	switch action {
-	case actionCreate, actionUnlock, actionPut, actionGet, actionList:
+	case actionCreate, actionUnlock, actionPut, actionGet, actionList,
+		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList:
 		return true
 	default:
 		return false
 	}
+}
+
+func capabilityAction(action string) bool {
+	switch action {
+	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList:
+		return true
+	default:
+		return false
+	}
+}
+
+func validAuditShape(ev auditEvent) error {
+	if !capabilityAction(ev.Action) {
+		if ev.Result != resultAllowed && ev.Result != resultDenied {
+			return ErrAudit
+		}
+		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" {
+			return ErrAudit
+		}
+		return nil
+	}
+	if ev.AgentID != "" && safeID(ev.AgentID) == "" {
+		return ErrAudit
+	}
+	if ev.GrantID != "" && safeID(ev.GrantID) == "" {
+		return ErrAudit
+	}
+	if ev.CredID != "" && safeID(ev.CredID) == "" {
+		return ErrAudit
+	}
+	if ev.CredType != "" && validateType(ev.CredType) != nil {
+		return ErrAudit
+	}
+	if !validAuditOperation(ev.Operation) {
+		return ErrAudit
+	}
+	switch ev.Result {
+	case resultAllowed, resultDenied, resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,
+		resultDeniedScope, resultDeniedExpired, resultDeniedRevoked, resultDeniedMissing:
+	default:
+		return ErrAudit
+	}
+	switch ev.Action {
+	case actionAgentCreate:
+		if ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
+			return ErrAudit
+		}
+		if ev.Result == resultAllowed && ev.AgentID == "" {
+			return ErrAudit
+		}
+		if ev.Result != resultAllowed && ev.Result != resultDenied {
+			return ErrAudit
+		}
+	case actionGrantCreate:
+		if ev.Result == resultAllowed && (ev.AgentID == "" || ev.GrantID == "" || ev.CredType == "" || ev.Operation == "") {
+			return ErrAudit
+		}
+	case actionGrantRevoke:
+		if ev.Result == resultAllowed && (ev.AgentID == "" || ev.GrantID == "" || ev.Operation == "") {
+			return ErrAudit
+		}
+	case actionAuthorize:
+		if stringsContainComma(ev.Operation) {
+			return ErrAudit
+		}
+		if ev.Result == resultAllowed && (ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType == "" || ev.Operation == "") {
+			return ErrAudit
+		}
+	case actionCapList:
+		if ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
+			return ErrAudit
+		}
+		if ev.Result == resultAllowed && ev.AgentID == "" {
+			return ErrAudit
+		}
+		if ev.Result != resultAllowed && ev.Result != resultDenied && ev.Result != resultDeniedAgent {
+			return ErrAudit
+		}
+	default:
+		return ErrAudit
+	}
+	return nil
+}
+
+func stringsContainComma(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' {
+			return true
+		}
+	}
+	return false
 }
 
 func suffixAllows(events []auditEvent, header fileHeader) error {
@@ -196,7 +338,7 @@ func suffixAllows(events []auditEvent, header fileHeader) error {
 		// time.Now().UTC().Format(time.RFC3339Nano). Any other metadata, a
 		// noncanonical timestamp, or a time outside [previous, now] is a
 		// forged suffix and must not be incorporated.
-		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != header.ID || ev.CredID != "" || ev.CredType != "" {
+		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != header.ID || ev.CredID != "" || ev.CredType != "" || ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" {
 			return ErrAudit
 		}
 		ts, ok := canonicalAuditTime(ev.Time)

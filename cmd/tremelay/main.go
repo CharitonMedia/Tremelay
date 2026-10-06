@@ -33,6 +33,12 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 		return cmdVault(args[1:], getenv, stdin, stdout, stderr)
 	case "credential":
 		return cmdCredential(args[1:], getenv, stdin, stdout, stderr)
+	case "agent":
+		return cmdAgent(args[1:], getenv, stdin, stdout, stderr)
+	case "grant":
+		return cmdGrant(args[1:], getenv, stdin, stdout, stderr)
+	case "capability":
+		return cmdCapability(args[1:], getenv, stdin, stdout, stderr)
 	case "audit":
 		return cmdAudit(args[1:], getenv, stdin, stdout, stderr)
 	default:
@@ -43,18 +49,24 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 
 func usage(w io.Writer) {
 	fmt.Fprintf(w, `tremelay is the human control plane for a local vault.
-It does not provide an agent interface or raw-secret retrieval for agents.
+Agent and grant commands manage capability authority. They do not retrieve raw secrets.
 
   tremelay vault create --path PATH
   tremelay credential put --path PATH --label LABEL --type TYPE --secret-file PATH
   tremelay credential get --path PATH --id ID
   tremelay credential list --path PATH
+  tremelay agent create --path PATH --label LABEL
+  tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339
+  tremelay grant revoke --path PATH --id ID
+  tremelay capability list --path PATH --agent ID
+  tremelay capability authorize --path PATH --agent ID --credential ID --operation OP --resource SCOPE
   tremelay audit verify --path PATH
 
 Types: %s
+Grant operations: %s
 Passphrase: TREMELAY_PASSPHRASE, or a no-echo terminal prompt.
 The passphrase is not accepted as an argument. credential get writes the raw secret to stdout.
-`, strings.Join(vault.CredentialTypes(), ", "))
+`, strings.Join(vault.CredentialTypes(), ", "), strings.Join(vault.GrantOperations(), ", "))
 }
 
 func cmdVault(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -326,6 +338,243 @@ func withSession(path string, getenv func(string) string, stdin io.Reader, stder
 		return 1
 	}
 	return 0
+}
+
+func cmdAgent(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] != "create" {
+		fmt.Fprintln(stderr, "unknown command")
+		return 2
+	}
+	fs := flag.NewFlagSet("agent create", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	label := fs.String("label", "", "agent label")
+	if err := fs.Parse(args[1:]); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectAgentCreate(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		if fs.NArg() != 0 || *label == "" {
+			return session.RejectAgentCreate(vault.ErrInvalid)
+		}
+		agent, err := session.CreateAgent(*label)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, agent.ID)
+		return err
+	})
+}
+
+func cmdGrant(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		usage(stderr)
+		return 2
+	}
+	switch args[0] {
+	case "create":
+		return cmdGrantCreate(args[1:], getenv, stdin, stdout, stderr)
+	case "revoke":
+		return cmdGrantRevoke(args[1:], getenv, stdin, stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, "unknown command")
+		return 2
+	}
+}
+
+func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("grant create", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	agent := fs.String("agent", "", "agent id")
+	cred := fs.String("credential", "", "credential id")
+	class := fs.String("class", "", "credential class")
+	resource := fs.String("resource", "", "resource scope")
+	expires := fs.String("expires", "", "expiration time (RFC3339)")
+	var ops opsFlag
+	fs.Var(&ops, "operation", "permitted operation")
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectGrantCreate(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		if fs.NArg() != 0 || *agent == "" || *resource == "" || *expires == "" || len(ops) == 0 || (*cred == "") == (*class == "") {
+			return session.RejectGrantCreate(vault.ErrInvalid)
+		}
+		exp, err := time.Parse(time.RFC3339, *expires)
+		if err != nil {
+			return session.RejectGrantCreate(vault.ErrInvalid)
+		}
+		grant, err := session.IssueGrant(vault.GrantSpec{
+			AgentID:         *agent,
+			CredentialID:    *cred,
+			CredentialClass: *class,
+			Operations:      ops,
+			Resource:        *resource,
+			ExpiresAt:       exp.UTC(),
+		})
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, grant.ID)
+		return err
+	})
+}
+
+func cmdGrantRevoke(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("grant revoke", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	id := fs.String("id", "", "grant id")
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectGrantRevoke(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		if fs.NArg() != 0 || *id == "" {
+			return session.RejectGrantRevoke(vault.ErrInvalid)
+		}
+		if err := session.RevokeGrant(*id); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintln(stdout, *id)
+		return err
+	})
+}
+
+func cmdCapability(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		usage(stderr)
+		return 2
+	}
+	switch args[0] {
+	case "list":
+		return cmdCapabilityList(args[1:], getenv, stdin, stdout, stderr)
+	case "authorize":
+		return cmdCapabilityAuthorize(args[1:], getenv, stdin, stdout, stderr)
+	default:
+		fmt.Fprintln(stderr, "unknown command")
+		return 2
+	}
+}
+
+func cmdCapabilityList(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("capability list", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	agentID := fs.String("agent", "", "agent id")
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectCapabilityList(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		if fs.NArg() != 0 || *agentID == "" {
+			return session.RejectCapabilityList(vault.ErrInvalid)
+		}
+		agent, err := session.Agent(*agentID)
+		if err != nil {
+			return err
+		}
+		caps, err := agent.Capabilities(time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		enc := json.NewEncoder(stdout)
+		for _, cap := range caps {
+			view := capabilityEntry{
+				GrantID:         cap.GrantID,
+				AgentID:         cap.AgentID,
+				CredentialID:    cap.CredentialID,
+				CredentialClass: cap.CredentialClass,
+				Operations:      cap.Operations,
+				Resource:        cap.Resource,
+				CreatedAt:       cap.CreatedAt,
+				ExpiresAt:       cap.ExpiresAt,
+				RevokedAt:       cap.RevokedAt,
+				Status:          cap.Status,
+			}
+			if err := enc.Encode(view); err != nil {
+				return errors.New("stdout write failed")
+			}
+		}
+		return nil
+	})
+}
+
+func cmdCapabilityAuthorize(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("capability authorize", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	agentID := fs.String("agent", "", "agent id")
+	cred := fs.String("credential", "", "credential id")
+	operation := fs.String("operation", "", "operation")
+	resource := fs.String("resource", "", "resource scope")
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectAuthorize(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		if fs.NArg() != 0 || *agentID == "" || *cred == "" || *operation == "" || *resource == "" {
+			return session.RejectAuthorize(vault.ErrInvalid)
+		}
+		agent, err := session.Agent(*agentID)
+		if err != nil {
+			return err
+		}
+		grantID, err := agent.Authorize(*cred, *operation, *resource, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(stdout, "allowed %s\n", grantID)
+		return err
+	})
+}
+
+type capabilityEntry struct {
+	GrantID         string     `json:"grant_id"`
+	AgentID         string     `json:"agent_id"`
+	CredentialID    string     `json:"credential_id,omitempty"`
+	CredentialClass string     `json:"credential_class,omitempty"`
+	Operations      []string   `json:"operations"`
+	Resource        string     `json:"resource"`
+	CreatedAt       time.Time  `json:"created_at"`
+	ExpiresAt       time.Time  `json:"expires_at"`
+	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
+	Status          string     `json:"status"`
+}
+
+type opsFlag []string
+
+func (o *opsFlag) String() string { return strings.Join(*o, ",") }
+
+func (o *opsFlag) Set(v string) error {
+	*o = append(*o, v)
+	return nil
 }
 
 func readPassphrase(getenv func(string) string, stdin io.Reader, stderr io.Writer) ([]byte, error) {
