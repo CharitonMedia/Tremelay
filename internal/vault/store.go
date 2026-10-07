@@ -385,10 +385,15 @@ func readAuditRows(db *sql.DB) ([]auditEvent, error) {
 	return out, nil
 }
 
-// writeTx commits the encrypted vault row and one audit event together.
+// writeTx commits the encrypted vault row and the audit events together.
 // fresh inserts the vault row; later calls update it. fault, when set, fails
-// the transaction after both statements so tests can observe rollback.
-func writeTx(db *sql.DB, h fileHeader, ev auditEvent, fresh bool, fault func() error) error {
+// the transaction after the statements so tests can observe rollback.
+// A failure rolls every event in the call back; callers put a security
+// event, its response decision, and its containment row in one call.
+func writeTx(db *sql.DB, h fileHeader, events []auditEvent, fresh bool, fault func() error) error {
+	if len(events) == 0 {
+		return ErrAudit
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return ErrIO
@@ -406,8 +411,10 @@ func writeTx(db *sql.DB, h fileHeader, ev auditEvent, fresh bool, fault func() e
 	} else if err := updateVault(tx, h); err != nil {
 		return err
 	}
-	if err := insertAudit(tx, ev); err != nil {
-		return err
+	for _, ev := range events {
+		if err := insertAudit(tx, ev); err != nil {
+			return err
+		}
 	}
 	if fault != nil {
 		if err := fault(); err != nil {

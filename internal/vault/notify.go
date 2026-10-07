@@ -119,15 +119,16 @@ func (s *Session) SetResponsePolicy(p ResponsePolicy) error {
 	return nil
 }
 
-// DeliverPending retries notification for high-risk rows that do not yet
-// have a successful delivery. Each source sequence gets at most two attempts,
-// and one call sends at most notifyBatch alerts. A delivery error is audited
-// as notify/failed and is not returned to the caller.
+// DeliverPending retries notification for high-risk rows whose recorded
+// decision is notify and that do not yet have a successful delivery.
+// It does not read the current response policy. Each source sequence gets
+// at most two attempts, and one call sends at most notifyBatch alerts.
+// A delivery error is audited as notify/failed and is not returned to the caller.
 func (s *Session) DeliverPending() error {
 	if err := s.live(); err != nil {
 		return err
 	}
-	if s.notifier == nil || s.responding || s.policy.High == ContainFlag {
+	if s.notifier == nil || s.responding {
 		return nil
 	}
 	s.responding = true
@@ -137,7 +138,7 @@ func (s *Session) DeliverPending() error {
 		if sent >= notifyBatch {
 			break
 		}
-		if noticeAction(ev.Action) {
+		if noticeAction(ev.Action) || !notifyChosen(s.audit, ev.Seq) {
 			continue
 		}
 		class := classify(s.audit, ev)
@@ -157,7 +158,7 @@ func (s *Session) DeliverPending() error {
 }
 
 func (s *Session) afterCommit(ev auditEvent) {
-	if s == nil || s.responding || noticeAction(ev.Action) {
+	if s == nil || s.responding || noticeAction(ev.Action) || !notifyChosen(s.audit, ev.Seq) {
 		return
 	}
 	class := classify(s.audit, ev)
@@ -166,76 +167,109 @@ func (s *Session) afterCommit(ev auditEvent) {
 	}
 	s.responding = true
 	defer func() { s.responding = false }()
-	if err := s.contain(ev, class); err != nil {
-		s.logf("contain seq=%d result=error", ev.Seq)
-	}
-	if s.policy.High == ContainFlag {
-		return
-	}
 	if err := s.deliverOne(ev, class); err != nil {
 		s.logf("notify seq=%d result=error", ev.Seq)
 	}
 }
 
-func (s *Session) contain(src auditEvent, class Classification) error {
-	if contained(s.audit, src.Seq) {
-		return nil
+// withResponse appends the authenticated response decision, and any configured
+// suspension, to the same commit as ev. Notification transport is not part of
+// that commit. A row that is not an alert is returned unchanged.
+func (s *Session) withResponse(ev auditEvent, creds []credential, agents []agentRecord, grants []grantRecord) ([]auditEvent, []credential, []agentRecord, []grantRecord, error) {
+	chain := make([]auditEvent, len(s.audit)+1)
+	copy(chain, s.audit)
+	chain[len(s.audit)] = ev
+	class := classify(chain, ev)
+	if !class.alert() {
+		return []auditEvent{ev}, creds, agents, grants, nil
 	}
-	switch s.policy.High {
+	decision := resultDecisionNotify
+	if s.policy.High == ContainFlag {
+		decision = resultDecisionFlag
+	}
+	var err error
+	chain, err = appendHashed(chain, s.id, noticePartial(actionRespond, decision, ev, class))
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	nextAgents, nextGrants, containResult, ok := planContainment(s.policy, ev, agents, grants)
+	if ok {
+		chain, err = appendHashed(chain, s.id, noticePartial(actionContain, containResult, ev, class))
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+	}
+	out := make([]auditEvent, len(chain)-len(s.audit))
+	copy(out, chain[len(s.audit):])
+	return out, creds, nextAgents, nextGrants, nil
+}
+
+func appendHashed(chain []auditEvent, vaultID string, partial auditEvent) ([]auditEvent, error) {
+	ev, err := nextAudit(chain, vaultID, partial)
+	if err != nil {
+		return nil, err
+	}
+	return append(chain, ev), nil
+}
+
+func planContainment(p ResponsePolicy, src auditEvent, agents []agentRecord, grants []grantRecord) ([]agentRecord, []grantRecord, string, bool) {
+	switch p.High {
 	case ContainFlag:
-		return s.writeNotice(actionContain, resultFlagged, src, class, s.creds, s.agents, s.grants)
+		return agents, grants, resultFlagged, true
 	case ContainSuspendGrant:
-		return s.containGrant(src, class)
+		next, result := planSuspendGrant(src, grants)
+		return agents, next, result, true
 	case ContainSuspendAgent:
-		return s.containAgent(src, class)
+		next, result := planSuspendAgent(src, agents)
+		return next, grants, result, true
 	default:
-		return nil
+		return agents, grants, "", false
 	}
 }
 
-func (s *Session) containGrant(src auditEvent, class Classification) error {
+func planSuspendGrant(src auditEvent, grants []grantRecord) ([]grantRecord, string) {
 	if safeID(src.GrantID) == "" {
-		return s.writeNotice(actionContain, resultFlagged, src, class, s.creds, s.agents, s.grants)
+		return grants, resultFlagged
 	}
 	idx := -1
-	for i := range s.grants {
-		if s.grants[i].ID == src.GrantID {
+	for i := range grants {
+		if grants[i].ID == src.GrantID {
 			idx = i
 			break
 		}
 	}
 	if idx < 0 {
-		return s.writeNotice(actionContain, resultFlagged, src, class, s.creds, s.agents, s.grants)
+		return grants, resultFlagged
 	}
-	if s.grants[idx].RevokedAt != nil {
-		return s.writeNotice(actionContain, resultUnchanged, src, class, s.creds, s.agents, s.grants)
+	if grants[idx].RevokedAt != nil {
+		return grants, resultUnchanged
 	}
-	next := append([]grantRecord{}, s.grants...)
+	next := append([]grantRecord{}, grants...)
 	revoked := time.Now().UTC()
 	next[idx].RevokedAt = &revoked
-	return s.writeNotice(actionContain, resultSuspended, src, class, s.creds, s.agents, next)
+	return next, resultSuspended
 }
 
-func (s *Session) containAgent(src auditEvent, class Classification) error {
+func planSuspendAgent(src auditEvent, agents []agentRecord) ([]agentRecord, string) {
 	if safeID(src.AgentID) == "" {
-		return s.writeNotice(actionContain, resultFlagged, src, class, s.creds, s.agents, s.grants)
+		return agents, resultFlagged
 	}
 	idx := -1
-	for i := range s.agents {
-		if s.agents[i].ID == src.AgentID {
+	for i := range agents {
+		if agents[i].ID == src.AgentID {
 			idx = i
 			break
 		}
 	}
 	if idx < 0 {
-		return s.writeNotice(actionContain, resultFlagged, src, class, s.creds, s.agents, s.grants)
+		return agents, resultFlagged
 	}
-	if s.agents[idx].State == agentStateSuspended {
-		return s.writeNotice(actionContain, resultUnchanged, src, class, s.creds, s.agents, s.grants)
+	if agents[idx].State == agentStateSuspended {
+		return agents, resultUnchanged
 	}
-	next := append([]agentRecord{}, s.agents...)
+	next := append([]agentRecord{}, agents...)
 	next[idx].State = agentStateSuspended
-	return s.writeNotice(actionContain, resultSuspended, src, class, s.creds, next, s.grants)
+	return next, resultSuspended
 }
 
 func (s *Session) deliverOne(src auditEvent, class Classification) error {
@@ -257,8 +291,8 @@ func (s *Session) deliverOne(src auditEvent, class Classification) error {
 	return s.writeNotice(actionNotify, result, src, class, s.creds, s.agents, s.grants)
 }
 
-func (s *Session) writeNotice(action, result string, src auditEvent, class Classification, creds []credential, agents []agentRecord, grants []grantRecord) error {
-	partial := auditEvent{
+func noticePartial(action, result string, src auditEvent, class Classification) auditEvent {
+	return auditEvent{
 		Action:   action,
 		Result:   result,
 		AgentID:  src.AgentID,
@@ -268,7 +302,10 @@ func (s *Session) writeNotice(action, result string, src auditEvent, class Class
 		Class:    class.Class,
 		RefSeq:   src.Seq,
 	}
-	return s.writeAudit(partial, creds, agents, grants)
+}
+
+func (s *Session) writeNotice(action, result string, src auditEvent, class Classification, creds []credential, agents []agentRecord, grants []grantRecord) error {
+	return s.writeAudit(noticePartial(action, result, src, class), creds, agents, grants)
 }
 
 func notificationFrom(ev auditEvent, class Classification) Notification {
@@ -305,11 +342,33 @@ func notifyDelivered(events []auditEvent, ref uint64) bool {
 	return false
 }
 
-func contained(events []auditEvent, ref uint64) bool {
+// notifyChosen reports whether ref should be delivered. A respond row is the
+// decision. A row sealed before that decision existed is delivered only when
+// a notify row already records that delivery was chosen. Current session
+// policy is not a substitute for either record.
+func notifyChosen(events []auditEvent, ref uint64) bool {
+	switch responseDecision(events, ref) {
+	case resultDecisionNotify:
+		return true
+	case resultDecisionFlag:
+		return false
+	}
 	for _, ev := range events {
-		if ev.Action == actionContain && ev.RefSeq == ref {
+		if ev.Action == actionNotify && ev.RefSeq == ref {
 			return true
 		}
 	}
 	return false
+}
+
+func responseDecision(events []auditEvent, ref uint64) string {
+	for _, ev := range events {
+		if ev.Action == actionRespond && ev.RefSeq == ref {
+			switch ev.Result {
+			case resultDecisionNotify, resultDecisionFlag:
+				return ev.Result
+			}
+		}
+	}
+	return ""
 }

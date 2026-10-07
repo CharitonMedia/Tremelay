@@ -40,6 +40,8 @@ func TestM5ClassifyTable(t *testing.T) {
 		{auditEvent{Action: actionNotify, Result: resultFailed, Class: ClassSSRF}, Classification{ClassNotice, SeverityInfo}},
 		{auditEvent{Action: actionNotify, Result: resultAttempted, Class: ClassSSRF}, Classification{ClassNotice, SeverityInfo}},
 		{auditEvent{Action: actionContain, Result: resultSuspended, Class: ClassSSRF}, Classification{ClassNotice, SeverityInfo}},
+		{auditEvent{Action: actionRespond, Result: resultDecisionNotify, Class: ClassSSRF}, Classification{ClassNotice, SeverityInfo}},
+		{auditEvent{Action: actionRespond, Result: resultDecisionFlag, Class: ClassSSRF}, Classification{ClassNotice, SeverityInfo}},
 		{auditEvent{Result: "caller-supplied"}, Classification{ClassAuditTamper, SeverityCritical}},
 	}
 	for _, tc := range cases {
@@ -857,6 +859,333 @@ func legacyDocument(t *testing.T, doc document) []byte {
 		t.Fatal("legacy document still has detection")
 	}
 	return plain
+}
+
+func TestContainmentCommitsWithTrigger(t *testing.T) {
+	const target = "https://svc.example/v1/ping"
+	ssrf := HTTPBrokerRequest{CredentialID: "", Method: http.MethodGet, Target: "https://127.0.0.1/latest"}
+
+	t.Run("rollback", func(t *testing.T) {
+		e := newBrokerEnv(t)
+		ssrf.CredentialID = e.apiID
+		sink := &MemoryNotifier{}
+		if err := e.session.SetNotifier(sink); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+			t.Fatal(err)
+		}
+		before := len(e.session.audit)
+		head := e.session.header.AuditHead
+		e.session.commitFault = func() error { return errors.New("full") }
+		res, err := e.principal.BrokerHTTP(ssrf)
+		if !errors.Is(err, ErrAudit) || res.StatusCode != 0 {
+			t.Fatalf("status %d err %v", res.StatusCode, err)
+		}
+		if len(e.session.audit) != before || e.session.header.AuditHead != head {
+			t.Fatal("failed transaction left a trigger")
+		}
+		if agentState(e.session, e.agentID) != agentStateActive {
+			t.Fatal("agent suspended without a committed trigger")
+		}
+		if len(sink.Snapshot()) != 0 {
+			t.Fatal("sink ran inside a failed transaction")
+		}
+		opened := reopen(t, e)
+		if agentState(opened, e.agentID) != agentStateActive {
+			t.Fatal("reopen showed a suspension")
+		}
+		for _, ev := range opened.audit {
+			if ev.Action == actionBroker && ev.Result == resultDeniedSSRF {
+				t.Fatal("reopen showed the trigger")
+			}
+			if ev.Action == actionRespond || ev.Action == actionContain {
+				t.Fatal("reopen showed a response row")
+			}
+		}
+	})
+
+	t.Run("later write keeps suspension", func(t *testing.T) {
+		e := newBrokerEnv(t)
+		ssrf.CredentialID = e.apiID
+		sink := &MemoryNotifier{}
+		if err := e.session.SetNotifier(sink); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		e.session.commitFault = func() error {
+			n++
+			if n >= 2 {
+				return errors.New("full")
+			}
+			return nil
+		}
+		e.deny(t, ssrf, ErrDeniedSSRF)
+		if agentState(e.session, e.agentID) != agentStateSuspended {
+			t.Fatal("trigger committed without suspension")
+		}
+		if !bundled(e.session.audit, resultDeniedSSRF, resultDecisionNotify, resultSuspended) {
+			t.Fatal("event, decision, and suspension were not one commit")
+		}
+		for _, ev := range e.session.audit {
+			if ev.Action == actionNotify {
+				t.Fatal("notification was inside the containment transaction")
+			}
+		}
+		if len(sink.Snapshot()) != 0 {
+			t.Fatal("sink ran before its attempt row committed")
+		}
+		if _, err := VerifyAudit(e.path, e.pass); err != nil {
+			t.Fatal(err)
+		}
+		opened := reopen(t, e)
+		if agentState(opened, e.agentID) != agentStateSuspended {
+			t.Fatal("suspension did not survive reopen")
+		}
+		if !bundled(opened.audit, resultDeniedSSRF, resultDecisionNotify, resultSuspended) {
+			t.Fatal("reopen split the bundle")
+		}
+	})
+
+	t.Run("grant", func(t *testing.T) {
+		e := newBrokerEnv(t)
+		sink := &MemoryNotifier{}
+		if err := e.session.SetNotifier(sink); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainSuspendGrant}); err != nil {
+			t.Fatal(err)
+		}
+		var grantID string
+		for _, g := range e.session.grants {
+			if g.Resource == "GET "+target {
+				grantID = g.ID
+			}
+		}
+		if grantID == "" {
+			t.Fatal("missing grant")
+		}
+		e.session.commitFault = func() error { return errors.New("full") }
+		res, err := e.principal.BrokerHTTP(HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodHead, Target: target})
+		if !errors.Is(err, ErrAudit) || res.StatusCode != 0 {
+			t.Fatalf("status %d err %v", res.StatusCode, err)
+		}
+		if grantRevoked(e.session, grantID) {
+			t.Fatal("grant revoked without a committed trigger")
+		}
+		e.session.commitFault = nil
+		e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodHead, Target: target}, ErrDeniedMethod)
+		if !grantRevoked(e.session, grantID) {
+			t.Fatal("grant was not suspended with the trigger")
+		}
+		if !bundled(e.session.audit, resultDeniedMethod, resultDecisionNotify, resultSuspended) {
+			t.Fatal("grant suspension was not bundled")
+		}
+		opened := reopen(t, e)
+		if !grantRevoked(opened, grantID) {
+			t.Fatal("grant suspension did not survive reopen")
+		}
+		if _, err := VerifyAudit(e.path, e.pass); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestDeliverPendingUsesRecordedDecision(t *testing.T) {
+	e := newBrokerEnv(t)
+	sink := &MemoryNotifier{}
+	if err := e.session.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainFlag}); err != nil {
+		t.Fatal(err)
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+	if len(sink.Snapshot()) != 0 {
+		t.Fatal("flag notified")
+	}
+	if !hasDecision(e.session.audit, resultDecisionFlag) {
+		t.Fatal("flag decision was not recorded")
+	}
+	if err := e.session.SetResponsePolicy(ResponsePolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.session.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Snapshot()) != 0 {
+		t.Fatal("flag decision followed the notify policy")
+	}
+	opened := reopen(t, e)
+	if err := opened.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.SetResponsePolicy(ResponsePolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Snapshot()) != 0 {
+		t.Fatal("reopen notified a flag decision")
+	}
+	principal, err := opened.Agent(e.agentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.session = opened
+	e.principal = principal
+
+	sink.Fail(errors.New("down"))
+	if err := e.session.SetResponsePolicy(ResponsePolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://192.88.99.2/latest"}, ErrDeniedSSRF)
+	if len(sink.Snapshot()) != 1 {
+		t.Fatal("notify decision did not deliver")
+	}
+	sink.Fail(nil)
+	if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainFlag}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.session.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Snapshot()) != 2 {
+		t.Fatalf("flag policy suppressed a notify decision: %d", len(sink.Snapshot()))
+	}
+	opened = reopen(t, e)
+	fresh := &MemoryNotifier{}
+	if err := opened.SetNotifier(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.SetResponsePolicy(ResponsePolicy{High: ContainFlag}); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh.Snapshot()) != 0 {
+		t.Fatal("reopen retried a finished notify decision or a flag decision")
+	}
+	if !hasDecision(opened.audit, resultDecisionFlag) || !hasDecision(opened.audit, resultDecisionNotify) {
+		t.Fatal("reopen lost a recorded decision")
+	}
+}
+
+func TestSuspendedSecretProbeStaysOrdinary(t *testing.T) {
+	e := newBrokerEnv(t)
+	sink := &MemoryNotifier{}
+	if err := e.session.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+		t.Fatal(err)
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+	if len(sink.Snapshot()) != 1 {
+		t.Fatal("suspension did not notify once")
+	}
+	const target = "https://svc.example/v1/ping"
+	for i := 0; i < 3; i++ {
+		if _, err := e.principal.Authorize(e.apiID, "get_secret", target); !errors.Is(err, ErrDeniedAgent) {
+			t.Fatalf("probe %d: %v", i, err)
+		}
+	}
+	if len(sink.Snapshot()) != 1 {
+		t.Fatal("suspended secret probe raised another alert")
+	}
+	for _, ev := range e.session.audit {
+		if ev.Result == resultDeniedSecret || strings.Contains(ev.Operation, "get_secret") {
+			t.Fatalf("probe recorded %+v", ev)
+		}
+		if ev.Action == actionAuthorize && classify(e.session.audit, ev).Severity != SeverityLow {
+			t.Fatalf("authorize class %+v", ev)
+		}
+	}
+}
+
+func TestLegacyDecisionDoesNotUsePolicy(t *testing.T) {
+	src := auditEvent{Seq: 2, Action: actionBroker, Result: resultDeniedSSRF}
+	chain := []auditEvent{src}
+	if notifyChosen(chain, src.Seq) {
+		t.Fatal("missing decision was delivered")
+	}
+	flagged := append(chain, auditEvent{Action: actionContain, Result: resultFlagged, RefSeq: src.Seq})
+	if notifyChosen(flagged, src.Seq) {
+		t.Fatal("legacy flag was treated as notify")
+	}
+	attempted := append(chain, auditEvent{Action: actionNotify, Result: resultAttempted, RefSeq: src.Seq})
+	if !notifyChosen(attempted, src.Seq) {
+		t.Fatal("legacy notify attempt was dropped")
+	}
+	decidedFlag := append(chain, auditEvent{Action: actionRespond, Result: resultDecisionFlag, RefSeq: src.Seq})
+	if notifyChosen(decidedFlag, src.Seq) {
+		t.Fatal("flag decision was delivered")
+	}
+	decidedNotify := append(chain, auditEvent{Action: actionRespond, Result: resultDecisionNotify, RefSeq: src.Seq})
+	if !notifyChosen(decidedNotify, src.Seq) {
+		t.Fatal("notify decision was suppressed")
+	}
+}
+
+func agentState(s *Session, id string) string {
+	for _, a := range s.agents {
+		if a.ID == id {
+			return a.State
+		}
+	}
+	return ""
+}
+
+func grantRevoked(s *Session, id string) bool {
+	for _, g := range s.grants {
+		if g.ID == id {
+			return g.RevokedAt != nil
+		}
+	}
+	return false
+}
+
+func bundled(events []auditEvent, trigger, decision, contain string) bool {
+	for i := 0; i+2 < len(events); i++ {
+		ev, resp, hold := events[i], events[i+1], events[i+2]
+		if ev.Result != trigger || resp.Action != actionRespond || resp.Result != decision || resp.RefSeq != ev.Seq {
+			continue
+		}
+		if hold.Action != actionContain || hold.Result != contain || hold.RefSeq != ev.Seq {
+			continue
+		}
+		if resp.Seq != ev.Seq+1 || hold.Seq != ev.Seq+2 {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func hasDecision(events []auditEvent, result string) bool {
+	for _, ev := range events {
+		if ev.Action == actionRespond && ev.Result == result {
+			return true
+		}
+	}
+	return false
+}
+
+func reopen(t *testing.T, e brokerEnv) *Session {
+	t.Helper()
+	path, pass := e.path, append([]byte(nil), e.pass...)
+	e.session.Lock()
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(opened.Lock)
+	return opened
 }
 
 func denialHas(st detectionState, id string) bool {

@@ -391,6 +391,20 @@ func (s *Session) authorizeCapability(agentID, credentialID, operation, resource
 // not read credential plaintext. A malformed caller string is not copied out.
 func (s *Session) judge(agentID, credentialID, operation, resource string) (auditEvent, error) {
 	now, err := s.evaluationTime()
+	// Suspension is an ordinary denial, including a secret probe. The probe
+	// token is not an audit field. Checking it first would raise another alert
+	// for an agent that containment already suspended.
+	if safeID(agentID) != "" && s.agentExists(agentID) && !s.agentActive(agentID) {
+		partial := auditEvent{Result: resultDeniedAgent, AgentID: agentID}
+		if !secretProbe(operation) && allowedOperation(operation) {
+			partial.Operation = operation
+		}
+		if id, typ, ok := s.lookupCred(credentialID); ok {
+			partial.CredID = id
+			partial.CredType = typ
+		}
+		return partial, ErrDeniedAgent
+	}
 	// get_secret is the closed probe token. The caller string is not an audit field.
 	if secretProbe(operation) {
 		partial := auditEvent{Result: resultDeniedSecret}
@@ -405,14 +419,6 @@ func (s *Session) judge(agentID, credentialID, operation, resource string) (audi
 	}
 	if err != nil || safeID(agentID) == "" || safeID(credentialID) == "" || !allowedOperation(operation) || validateResource(resource) != nil {
 		return auditEvent{Result: resultDenied}, ErrInvalid
-	}
-	if s.agentExists(agentID) && !s.agentActive(agentID) {
-		partial := auditEvent{Result: resultDeniedAgent, AgentID: agentID, Operation: operation}
-		if id, typ, ok := s.lookupCred(credentialID); ok {
-			partial.CredID = id
-			partial.CredType = typ
-		}
-		return partial, ErrDeniedAgent
 	}
 	agentOK := s.agentExists(agentID)
 	credID, credType, credOK := s.lookupCred(credentialID)

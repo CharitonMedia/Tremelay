@@ -615,7 +615,9 @@ func (s *Session) persistEvent(action, credID, credType, result string) error {
 
 // commit encrypts credential state under the new audit head and writes that
 // ciphertext plus the audit row in one transaction. Agent and grant rows
-// already on the session are sealed in the same document.
+// already on the session are sealed in the same document. A high-risk row
+// also carries its response decision and any configured suspension in that
+// same transaction.
 func (s *Session) commit(ev auditEvent, creds []credential) error {
 	return s.commitState(ev, creds, s.agents, s.grants)
 }
@@ -624,19 +626,28 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
-	nextAuditLog := make([]auditEvent, len(s.audit)+1)
+	events := []auditEvent{ev}
+	if !noticeAction(ev.Action) {
+		var err error
+		events, creds, agents, grants, err = s.withResponse(ev, creds, agents, grants)
+		if err != nil {
+			return err
+		}
+	}
+	nextAuditLog := make([]auditEvent, len(s.audit)+len(events))
 	copy(nextAuditLog, s.audit)
-	nextAuditLog[len(s.audit)] = ev
+	copy(nextAuditLog[len(s.audit):], events)
 	det := detectionFromAudit(nextAuditLog)
 	if err := validateDetection(det); err != nil {
 		return err
 	}
+	tip := events[len(events)-1]
 	plain, err := json.Marshal(document{Credentials: creds, Agents: agents, Grants: grants, Detection: det})
 	if err != nil {
 		return ErrIO
 	}
 	defer wipe(plain)
-	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, ev.Hash, ev.Seq))
+	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, tip.Hash, tip.Seq))
 	if err != nil {
 		return err
 	}
@@ -646,9 +657,9 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	h.Root = rootPassphrase
 	h.DataNonce = nonce
 	h.Data = ct
-	h.AuditHead = ev.Hash
-	h.AuditSeq = ev.Seq
-	if err := writeTx(s.db, h, ev, len(s.audit) == 0, s.commitFault); err != nil {
+	h.AuditHead = tip.Hash
+	h.AuditSeq = tip.Seq
+	if err := writeTx(s.db, h, events, len(s.audit) == 0, s.commitFault); err != nil {
 		if errors.Is(err, ErrIO) {
 			s.logf("vault_write result=error")
 		}
@@ -660,7 +671,7 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	s.agents = agents
 	s.grants = grants
 	s.detection = det
-	s.afterCommit(ev)
+	s.afterCommit(events[0])
 	return nil
 }
 

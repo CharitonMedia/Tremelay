@@ -26,6 +26,7 @@ const (
 	actionBroker      = "broker_http"
 	actionNotify      = "notify"
 	actionContain     = "contain"
+	actionRespond     = "respond"
 
 	resultAllowed           = "allowed"
 	resultDenied            = "denied"
@@ -55,6 +56,10 @@ const (
 	resultFlagged           = "flagged"
 	resultSuspended         = "suspended"
 	resultUnchanged         = "unchanged"
+	// Response decisions are fixed codes on a respond row. They are not
+	// inferred from the process-local policy at delivery time.
+	resultDecisionNotify = "notify"
+	resultDecisionFlag   = "flag"
 )
 
 type auditEvent struct {
@@ -297,7 +302,7 @@ func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPut, actionGet, actionList,
 		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
-		actionBroker, actionNotify, actionContain:
+		actionBroker, actionNotify, actionContain, actionRespond:
 		return true
 	default:
 		return false
@@ -305,7 +310,7 @@ func knownAction(action string) bool {
 }
 
 func noticeAction(action string) bool {
-	return action == actionNotify || action == actionContain
+	return action == actionNotify || action == actionContain || action == actionRespond
 }
 
 func capabilityAction(action string) bool {
@@ -430,6 +435,10 @@ func validNoticeAudit(ev auditEvent) error {
 		switch ev.Result {
 		case resultFlagged, resultSuspended, resultUnchanged:
 		default:
+			return ErrAudit
+		}
+	case actionRespond:
+		if ev.Result != resultDecisionNotify && ev.Result != resultDecisionFlag {
 			return ErrAudit
 		}
 	default:
