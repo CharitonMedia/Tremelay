@@ -55,6 +55,7 @@ const (
 	resultAttempted         = "attempted"
 	resultFlagged           = "flagged"
 	resultSuspended         = "suspended"
+	resultAgentSuspended    = "agent_suspended"
 	resultUnchanged         = "unchanged"
 	// Response decisions are fixed codes on a respond row. They are not
 	// inferred from the process-local policy at delivery time.
@@ -435,7 +436,7 @@ func validNoticeAudit(ev auditEvent) error {
 		}
 	case actionContain:
 		switch ev.Result {
-		case resultFlagged, resultSuspended, resultUnchanged:
+		case resultFlagged, resultSuspended, resultAgentSuspended, resultUnchanged:
 		default:
 			return ErrAudit
 		}

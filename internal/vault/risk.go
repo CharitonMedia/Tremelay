@@ -83,11 +83,30 @@ func classify(events []auditEvent, ev auditEvent) Classification {
 		return base
 	}
 	if ev.Action == actionBroker && ordinaryBrokerDenial(ev.Result) && safeID(ev.AgentID) != "" {
+		// A denial after ContainSuspendAgent stays ordinary. The mirror still
+		// counts the row. An active agent's denials still promote.
+		if ev.Result == resultDeniedAgent && agentSuspendedBefore(events, ev.AgentID, ev.Seq) {
+			return base
+		}
 		if brokerDenialCount(events, ev.AgentID, ev.Seq) >= detectionThreshold {
 			return Classification{Class: ClassRepeatedDenial, Severity: SeverityHigh}
 		}
 	}
 	return base
+}
+
+// agentSuspendedBefore reports a prior contain row that suspended this agent.
+// A grant suspension uses resultSuspended and does not match.
+func agentSuspendedBefore(events []auditEvent, agentID string, seq uint64) bool {
+	for _, row := range events {
+		if seq != 0 && row.Seq >= seq {
+			break
+		}
+		if row.Action == actionContain && row.Result == resultAgentSuspended && row.AgentID == agentID {
+			return true
+		}
+	}
+	return false
 }
 
 func baseClass(ev auditEvent) Classification {

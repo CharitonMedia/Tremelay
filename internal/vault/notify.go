@@ -269,7 +269,7 @@ func planSuspendAgent(src auditEvent, agents []agentRecord) ([]agentRecord, stri
 	}
 	next := append([]agentRecord{}, agents...)
 	next[idx].State = agentStateSuspended
-	return next, resultSuspended
+	return next, resultAgentSuspended
 }
 
 func (s *Session) deliverOne(src auditEvent, class Classification) error {

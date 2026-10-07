@@ -66,6 +66,28 @@ func TestM5ClassifyTable(t *testing.T) {
 	if classify(rows, rows[0]).Class != ClassExpectedDenial {
 		t.Fatal("history was reclassified")
 	}
+	// Grant suspension uses resultSuspended and must not hide an active agent's denials.
+	held := []auditEvent{{Seq: 1, Action: actionContain, Result: resultSuspended, AgentID: agent, Class: ClassPolicyViolation, RefSeq: 1}}
+	for i := 0; i < detectionThreshold; i++ {
+		held = append(held, auditEvent{Seq: uint64(len(held) + 1), Action: actionBroker, Result: resultDeniedAgent, AgentID: agent})
+	}
+	if classify(held, held[len(held)-1]).Class != ClassRepeatedDenial {
+		t.Fatal("grant suspension suppressed an active denial")
+	}
+	// Agent suspension stays low after the triggering row leaves the lookback.
+	suspended := []auditEvent{
+		{Seq: 1, Action: actionBroker, Result: resultDeniedSSRF, AgentID: agent},
+		{Seq: 2, Action: actionContain, Result: resultAgentSuspended, AgentID: agent, Class: ClassSSRF, RefSeq: 1},
+	}
+	for i := 0; i < detectionLookback; i++ {
+		suspended = append(suspended, auditEvent{Seq: uint64(len(suspended) + 1), Action: actionBroker, Result: resultDeniedAgent, AgentID: agent})
+	}
+	if got := classify(suspended, suspended[len(suspended)-1]); got.Class != ClassExpectedDenial || got.Severity != SeverityLow {
+		t.Fatalf("suspended denial %+v", got)
+	}
+	if classify(suspended, suspended[0]).Severity != SeverityCritical {
+		t.Fatal("trigger was downgraded")
+	}
 	if err := validateDetection(detectionState{Denials: []denialSubject{{AgentID: "not-an-id", N: 1}}}); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("bad id %v", err)
 	}
@@ -928,7 +950,7 @@ func TestContainmentCommitsWithTrigger(t *testing.T) {
 		if agentState(e.session, e.agentID) != agentStateSuspended {
 			t.Fatal("trigger committed without suspension")
 		}
-		if !bundled(e.session.audit, resultDeniedSSRF, resultDecisionNotify, resultSuspended) {
+		if !bundled(e.session.audit, resultDeniedSSRF, resultDecisionNotify, resultAgentSuspended) {
 			t.Fatal("event, decision, and suspension were not one commit")
 		}
 		for _, ev := range e.session.audit {
@@ -946,7 +968,7 @@ func TestContainmentCommitsWithTrigger(t *testing.T) {
 		if agentState(opened, e.agentID) != agentStateSuspended {
 			t.Fatal("suspension did not survive reopen")
 		}
-		if !bundled(opened.audit, resultDeniedSSRF, resultDecisionNotify, resultSuspended) {
+		if !bundled(opened.audit, resultDeniedSSRF, resultDecisionNotify, resultAgentSuspended) {
 			t.Fatal("reopen split the bundle")
 		}
 	})
@@ -1106,6 +1128,147 @@ func TestSuspendedSecretProbeStaysOrdinary(t *testing.T) {
 		if ev.Action == actionAuthorize && classify(e.session.audit, ev).Severity != SeverityLow {
 			t.Fatalf("authorize class %+v", ev)
 		}
+	}
+}
+
+func TestSuspendedFollowUpsStayOrdinary(t *testing.T) {
+	e := newBrokerEnv(t)
+	sink := &MemoryNotifier{}
+	if err := e.session.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+		t.Fatal(err)
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+	if len(sink.Snapshot()) != 1 || sink.Snapshot()[0].Class != ClassSSRF {
+		t.Fatal("suspension did not notify once")
+	}
+	// One past the lookback, so the triggering denial is outside the window.
+	const target = "https://svc.example/v1/ping"
+	followUps := detectionLookback + 1
+	for i := 0; i < followUps; i++ {
+		e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedAgent)
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: target}, ErrDeniedAgent)
+	followUps++
+	for i := 0; i < 3; i++ {
+		if _, err := e.principal.Authorize(e.apiID, "get_secret", target); !errors.Is(err, ErrDeniedAgent) {
+			t.Fatalf("probe %d: %v", i, err)
+		}
+	}
+	if len(sink.Snapshot()) != 1 {
+		t.Fatalf("follow-up raised an alert: %d", len(sink.Snapshot()))
+	}
+	deniedAgent := 0
+	probes := 0
+	for _, ev := range e.session.audit {
+		class := classify(e.session.audit, ev)
+		if ev.Action == actionBroker && ev.AgentID == e.agentID && ev.Result == resultDeniedAgent {
+			deniedAgent++
+			if class.Class != ClassExpectedDenial || class.Severity != SeverityLow {
+				t.Fatalf("follow-up class %+v", class)
+			}
+			if responseDecision(e.session.audit, ev.Seq) != "" {
+				t.Fatal("follow-up recorded a response")
+			}
+		}
+		if ev.Action == actionAuthorize && ev.AgentID == e.agentID {
+			probes++
+			if ev.Result != resultDeniedAgent || class.Severity != SeverityLow || strings.Contains(ev.Operation, "get_secret") {
+				t.Fatalf("authorize %+v", ev)
+			}
+		}
+		if ev.Result == resultDeniedSSRF && class.Severity != SeverityCritical {
+			t.Fatal("trigger was downgraded")
+		}
+	}
+	if deniedAgent != followUps {
+		t.Fatalf("audited follow-ups %d", deniedAgent)
+	}
+	if probes != 3 {
+		t.Fatalf("probes %d", probes)
+	}
+	var window []auditEvent
+	for _, ev := range e.session.audit {
+		if ev.Action == actionBroker && ev.AgentID == e.agentID && brokerDenialResult(ev.Result) {
+			window = append(window, ev)
+		}
+	}
+	if len(window) > detectionLookback {
+		window = window[len(window)-detectionLookback:]
+	}
+	gotN := 0
+	for _, d := range e.session.detection.Denials {
+		if d.AgentID == e.agentID {
+			gotN = d.N
+		}
+	}
+	if gotN != len(window) || gotN < detectionThreshold {
+		t.Fatalf("mirror n=%d window=%d", gotN, len(window))
+	}
+	if _, err := VerifyAudit(e.path, e.pass); err != nil {
+		t.Fatal(err)
+	}
+	opened := reopen(t, e)
+	fresh := &MemoryNotifier{}
+	if err := opened.SetNotifier(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.SetResponsePolicy(ResponsePolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh.Snapshot()) != 0 {
+		t.Fatal("deliver pending notified a suspended follow-up")
+	}
+	for _, ev := range opened.audit {
+		if ev.Action == actionBroker && ev.Result == resultDeniedAgent && classify(opened.audit, ev).Class != ClassExpectedDenial {
+			t.Fatal("reopen promoted a suspended denial")
+		}
+	}
+
+	active := newBrokerEnv(t)
+	activeSink := &MemoryNotifier{}
+	if err := active.session.SetNotifier(activeSink); err != nil {
+		t.Fatal(err)
+	}
+	other, err := active.session.CreateAgent("other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe, err := active.session.Agent(other.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < detectionThreshold; i++ {
+		res, err := probe.BrokerHTTP(HTTPBrokerRequest{CredentialID: active.apiID, Method: http.MethodGet, Target: target})
+		if !errors.Is(err, ErrDeniedAgent) || res.StatusCode != 0 {
+			t.Fatalf("active %d status %d err %v", i, res.StatusCode, err)
+		}
+	}
+	notes := activeSink.Snapshot()
+	if len(notes) != 1 || notes[0].Class != ClassRepeatedDenial {
+		t.Fatalf("active agent notes %+v", notes)
+	}
+	var ordinary, repeated int
+	for _, ev := range active.session.audit {
+		if ev.Action != actionBroker || ev.AgentID != other.ID || ev.Result != resultDeniedAgent {
+			continue
+		}
+		switch classify(active.session.audit, ev).Class {
+		case ClassExpectedDenial:
+			ordinary++
+		case ClassRepeatedDenial:
+			repeated++
+		default:
+			t.Fatalf("active class %+v", ev)
+		}
+	}
+	if ordinary != detectionThreshold-1 || repeated != 1 {
+		t.Fatalf("ordinary %d repeated %d", ordinary, repeated)
 	}
 }
 
