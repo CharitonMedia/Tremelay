@@ -1242,3 +1242,64 @@ func rewriteAudit(t *testing.T, path string, capability bool) {
 		}
 	}
 }
+
+func TestFailedUnlockWipesDecodedCredentials(t *testing.T) {
+	cases := []struct {
+		name  string
+		alter func(*document)
+	}{
+		{
+			name: "detection mismatch",
+			alter: func(doc *document) {
+				doc.Detection = detectionState{Denials: []denialSubject{{AgentID: strings.Repeat("ab", 16), N: 1}}}
+			},
+		},
+		{
+			name: "invalid document",
+			alter: func(doc *document) {
+				doc.Credentials[0].Type = "not-a-type"
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path, pass, session := mustCreate(t, nil)
+			secret := []byte(randHex(t, 24))
+			if _, err := session.Put("api", "api_key", secret, PutOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			doc := document{Credentials: session.creds}
+			tc.alter(&doc)
+			plain, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nonce, ct, err := seal(session.dek, plain, dataAAD(session.id, session.header.AuditHead, session.header.AuditSeq))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := session.db.Exec(`UPDATE vault SET data_nonce=?, encrypted_document=? WHERE id=?`, nonce, ct, session.id); err != nil {
+				t.Fatal(err)
+			}
+			session.Lock()
+			var got []byte
+			unlockDecoded = func(creds []credential) {
+				if len(creds) == 1 {
+					got = creds[0].Secret
+				}
+			}
+			t.Cleanup(func() { unlockDecoded = nil })
+			if _, err := Unlock(path, pass, nil); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("unlock %v", err)
+			}
+			if len(got) != len(secret) {
+				t.Fatal("decoded credential was not observed")
+			}
+			for _, b := range got {
+				if b != 0 {
+					t.Fatal("decoded credential survived a failed unlock")
+				}
+			}
+		})
+	}
+}

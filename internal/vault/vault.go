@@ -327,6 +327,11 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	return s, nil
 }
 
+// unlockDecoded, when set, sees credentials after Unlock decodes them and
+// before a rejected document is wiped. Tests capture that buffer. Production
+// leaves it nil.
+var unlockDecoded func([]credential)
+
 // Unlock opens path with passphrase. A rejected unlock appends a denial and
 // does not update encrypted credential state. The denial has no passphrase
 // bytes. A later valid unlock checks that denial suffix and links its own
@@ -366,9 +371,20 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	}
 	defer wipe(plain)
 	var doc document
+	// retained is set only when the session keeps these buffers. Every earlier
+	// return, including a partial decode, zeroes them. VerifyAudit does the same.
+	retained := false
+	defer func() {
+		if !retained {
+			wipeCredentials(doc.Credentials)
+		}
+	}()
 	if err := unmarshalStrict(plain, &doc); err != nil {
 		wipe(dek)
 		return nil, deny(ErrCorrupt)
+	}
+	if unlockDecoded != nil {
+		unlockDecoded(doc.Credentials)
 	}
 	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
 	if err != nil {
@@ -409,6 +425,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	}
 	closeDB = false
 	s.logf("vault_unlock id=%s result=allowed", s.id)
+	retained = true
 	return s, nil
 }
 
