@@ -16,8 +16,10 @@ const (
 	brokerTimeout   = 10 * time.Second
 	maxBrokerBody   = 64 << 10
 	targetInvalid   = 0
-	targetBlocked   = 1
-	targetOK        = 2
+	targetMalformed = 1
+	targetSSRF      = 2
+	targetOrigin    = 3
+	targetOK        = 4
 	brokerBodyOK    = 0
 	brokerBodyBad   = 1
 	brokerBodyRedir = 2
@@ -44,50 +46,82 @@ var (
 )
 
 // brokerHTTP is the trusted broker path for one agent id.
-// Credential bytes are copied only after authorization and destination checks
-// succeed, and only into the outbound Authorization header.
+// Credential bytes are copied only after policy, destination, and abuse-hook
+// checks succeed, and only into the outbound Authorization header.
 func (s *Session) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error) {
 	if err := s.live(); err != nil {
 		return HTTPBrokerResponse{}, err
 	}
 	if safeID(req.CredentialID) == "" || !brokerMethod(req.Method) {
-		return s.brokerAudit(auditEvent{Result: resultDenied}, ErrInvalid)
+		return s.brokerDeny(auditEvent{Result: resultDenied}, "", ErrInvalid)
 	}
 	resource, host, port, class := classifyTarget(req.Method, req.Target)
 	switch class {
 	case targetInvalid:
-		return s.brokerAudit(auditEvent{Result: resultDenied}, ErrInvalid)
-	case targetBlocked:
-		return s.brokerAudit(s.destinationEvent(agentID, req.CredentialID), ErrDeniedDestination)
+		return s.brokerDeny(auditEvent{Result: resultDenied}, req.Method, ErrInvalid)
+	case targetMalformed:
+		return s.brokerDeny(s.policyDenial(agentID, req.CredentialID, req.Method, req.Target, resultDeniedMalformed), req.Method, ErrDeniedMalformed)
+	case targetSSRF:
+		return s.brokerDeny(s.policyDenial(agentID, req.CredentialID, req.Method, req.Target, resultDeniedSSRF), req.Method, ErrDeniedSSRF)
+	case targetOrigin:
+		return s.brokerDeny(s.policyDenial(agentID, req.CredentialID, req.Method, req.Target, resultDeniedOrigin), req.Method, ErrDeniedOrigin)
 	}
 	partial, cause := s.judge(agentID, req.CredentialID, OpHTTPRequest, resource)
 	if cause != nil {
-		return s.brokerAudit(partial, cause)
+		if partial.Result == resultDeniedScope {
+			if class, id, ok := reclassifyScope(s.grants, agentID, partial.CredID, partial.CredType, req.Method, req.Target); ok {
+				partial.Result = class
+				partial.GrantID = id
+				cause = brokerDenial(class)
+			}
+		}
+		return s.brokerDeny(partial, req.Method, cause)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), brokerTimeout)
 	defer cancel()
 	ips, err := s.lookupBroker(ctx, host)
-	if err != nil || !publicIPs(ips) {
+	if err != nil || len(ips) == 0 {
 		partial.Result = resultDeniedDestination
-		return s.brokerAudit(partial, ErrDeniedDestination)
+		return s.brokerDeny(partial, req.Method, ErrDeniedDestination)
 	}
+	if !publicIPs(ips) {
+		partial.Result = resultDeniedSSRF
+		return s.brokerDeny(partial, req.Method, ErrDeniedSSRF)
+	}
+	// ponytail: pin the first validated address. A mixed answer set was refused
+	// above. Upgrade path: dial any address in the already-validated set,
+	// still without a second lookup.
 	pin := normalizeIP(ips[0])
+	if !isPublicIP(pin) {
+		partial.Result = resultDeniedSSRF
+		return s.brokerDeny(partial, req.Method, ErrDeniedSSRF)
+	}
 	upstream, err := http.NewRequestWithContext(ctx, req.Method, req.Target, nil)
 	if err != nil || upstream.URL == nil || upstream.URL.String() != req.Target || upstream.URL.User != nil {
 		partial.Result = resultUpstreamError
-		return s.brokerAudit(partial, ErrBrokerUpstream)
+		return s.brokerDeny(partial, req.Method, ErrBrokerUpstream)
+	}
+	if err := s.abuseHook(AbuseDecision{
+		AgentID:      partial.AgentID,
+		GrantID:      partial.GrantID,
+		CredentialID: partial.CredID,
+		Action:       actionClass(req.Method),
+		Class:        resultAllowed,
+	}); err != nil {
+		partial.Result = resultDeniedAbuse
+		return s.brokerAudit(partial, ErrDeniedAbuse)
 	}
 	secret, ok := s.copySecret(partial.CredID)
 	if !ok || !safeHeaderSecret(secret) {
 		wipe(secret)
 		partial.Result = resultUpstreamError
-		return s.brokerAudit(partial, ErrBrokerUpstream)
+		return s.brokerDeny(partial, req.Method, ErrBrokerUpstream)
 	}
 	defer wipe(secret)
 	if err := s.brokerCommit(partial, resultAllowed); err != nil {
 		return HTTPBrokerResponse{}, err
 	}
-	// ponytail: bearer header only. Upgrade path: a typed credential adapter after M3.
+	// ponytail: bearer header only. Upgrade path: a typed credential adapter.
 	upstream.Header.Set("Authorization", "Bearer "+string(secret))
 	defer upstream.Header.Del("Authorization")
 	resp, err := s.doBroker(upstream, pin, port)
@@ -95,26 +129,41 @@ func (s *Session) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerR
 		if resp != nil && resp.Body != nil {
 			discardBody(resp.Body)
 		}
-		if errors.Is(err, errRedirectRefused) || errors.Is(err, errDestination) {
-			partial.Result = resultDeniedDestination
-			return s.brokerAudit(partial, ErrDeniedDestination)
+		if errors.Is(err, errRedirectRefused) {
+			partial.Result = resultDeniedRedirect
+			return s.brokerDeny(partial, req.Method, ErrDeniedRedirect)
+		}
+		if errors.Is(err, errDestination) {
+			partial.Result = resultDeniedSSRF
+			return s.brokerDeny(partial, req.Method, ErrDeniedSSRF)
 		}
 		partial.Result = resultUpstreamError
-		return s.brokerAudit(partial, ErrBrokerUpstream)
+		return s.brokerDeny(partial, req.Method, ErrBrokerUpstream)
 	}
 	status, kind := takeStatus(resp)
 	switch kind {
 	case brokerBodyRedir:
-		partial.Result = resultDeniedDestination
-		return s.brokerAudit(partial, ErrDeniedDestination)
+		partial.Result = resultDeniedRedirect
+		return s.brokerDeny(partial, req.Method, ErrDeniedRedirect)
 	case brokerBodyBad:
 		partial.Result = resultUpstreamError
-		return s.brokerAudit(partial, ErrBrokerUpstream)
+		return s.brokerDeny(partial, req.Method, ErrBrokerUpstream)
 	}
 	if err := s.brokerCommit(partial, resultCompleted); err != nil {
 		return HTTPBrokerResponse{}, err
 	}
 	return HTTPBrokerResponse{StatusCode: status}, nil
+}
+
+func (s *Session) brokerDeny(ev auditEvent, method string, cause error) (HTTPBrokerResponse, error) {
+	_ = s.abuseHook(AbuseDecision{
+		AgentID:      ev.AgentID,
+		GrantID:      ev.GrantID,
+		CredentialID: ev.CredID,
+		Action:       actionClass(method),
+		Class:        ev.Result,
+	})
+	return s.brokerAudit(ev, cause)
 }
 
 func (s *Session) brokerAudit(partial auditEvent, cause error) (HTTPBrokerResponse, error) {
@@ -131,8 +180,8 @@ func (s *Session) brokerCommit(partial auditEvent, result string) error {
 	return s.finish(partial, nil)
 }
 
-func (s *Session) destinationEvent(agentID, credentialID string) auditEvent {
-	ev := auditEvent{Result: resultDeniedDestination, Operation: OpHTTPRequest}
+func (s *Session) destinationEvent(agentID, credentialID, result string) auditEvent {
+	ev := auditEvent{Result: result, Operation: OpHTTPRequest}
 	if safeID(agentID) == "" || !s.agentExists(agentID) {
 		return ev
 	}
@@ -141,6 +190,25 @@ func (s *Session) destinationEvent(agentID, credentialID string) auditEvent {
 		ev.CredID = id
 		ev.CredType = typ
 	}
+	return ev
+}
+
+// policyDenial records a destination-class refusal. The raw target is used
+// only to find an exact grant id. It is not an audit field.
+func (s *Session) policyDenial(agentID, credentialID, method, target, result string) auditEvent {
+	ev := s.destinationEvent(agentID, credentialID, result)
+	resource := method + " " + target
+	if ev.AgentID == "" || ev.CredID == "" || validateResource(resource) != nil {
+		return ev
+	}
+	var id string
+	for i := range s.grants {
+		g := s.grants[i]
+		if g.AgentID == ev.AgentID && g.Resource == resource && grantAllowsOp(g, OpHTTPRequest) && grantMatchesCred(g, ev.CredID, ev.CredType) {
+			id = preferID(id, g.ID)
+		}
+	}
+	ev.GrantID = id
 	return ev
 }
 
@@ -164,23 +232,25 @@ func (s *Session) doBroker(req *http.Request, ip net.IP, port string) (*http.Res
 	if s.httpDo != nil {
 		return s.httpDo(req)
 	}
-	transport, err := pinnedTransport(ip, port)
+	dial := s.dial
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: brokerTimeout}).DialContext
+	}
+	transport, err := pinnedTransportDial(ip, port, dial)
 	if err != nil {
 		return nil, err
 	}
 	defer transport.CloseIdleConnections()
-	client := &http.Client{
-		Timeout:       brokerTimeout,
-		CheckRedirect: refuseRedirect,
-		Transport:     transport,
-	}
-	resp, err := client.Do(req)
+	resp, err := brokerClient(transport).Do(req)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			discardBody(resp.Body)
 			resp.Body = nil
 		}
-		return nil, err
+		if errors.Is(err, errRedirectRefused) || errors.Is(err, errDestination) {
+			return nil, err
+		}
+		return nil, errBrokerTransport
 	}
 	buf, readErr := readLimited(resp.Body)
 	_ = resp.Body.Close()
@@ -193,25 +263,43 @@ func (s *Session) doBroker(req *http.Request, ip net.IP, port string) (*http.Res
 }
 
 // refuseRedirect stops every redirect. A 3xx is not followed, including chains.
+// The next hop does not inherit the credential.
 func refuseRedirect(*http.Request, []*http.Request) error {
 	return errRedirectRefused
 }
 
-// pinnedTransport dials one already-checked address.
-// ponytail: one resolver answer, first address only. Upgrade path: M4 rebinding policy.
-func pinnedTransport(ip net.IP, port string) (*http.Transport, error) {
-	target, err := pinTarget(ip, port)
-	if err != nil {
-		return nil, err
+// refuseProxy ignores HTTP_PROXY, HTTPS_PROXY, and ALL_PROXY.
+func refuseProxy(*http.Request) (*url.URL, error) {
+	return nil, nil
+}
+
+func brokerClient(transport *http.Transport) *http.Client {
+	return &http.Client{
+		Timeout:       brokerTimeout,
+		CheckRedirect: refuseRedirect,
+		Transport:     transport,
 	}
-	dialer := &net.Dialer{Timeout: brokerTimeout}
+}
+
+// pinnedTransportDial dials one already-checked address.
+// The address argument from the HTTP stack is ignored, so a proxy or a
+// second resolution cannot move the credential-bearing connection.
+func pinnedTransportDial(ip net.IP, port string, dial func(context.Context, string, string) (net.Conn, error)) (*http.Transport, error) {
+	target, err := pinTarget(ip, port)
+	if err != nil || dial == nil {
+		return nil, errDestination
+	}
 	return &http.Transport{
-		Proxy: nil,
+		Proxy: refuseProxy,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			if network != "tcp" && network != "tcp4" && network != "tcp6" {
 				return nil, errDestination
 			}
-			return dialer.DialContext(ctx, network, target)
+			pinned, err := pinTarget(ip, port)
+			if err != nil || pinned != target {
+				return nil, errDestination
+			}
+			return dial(ctx, network, target)
 		},
 		TLSHandshakeTimeout:   brokerTimeout,
 		ResponseHeaderTimeout: brokerTimeout,
@@ -248,70 +336,6 @@ func normalizeIP(ip net.IP) net.IP {
 		return append(net.IP(nil), v4...)
 	}
 	return append(net.IP(nil), ip...)
-}
-
-func isPublicIP(ip net.IP) bool {
-	ip = normalizeIP(ip)
-	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-		return false
-	}
-	if v4 := ip.To4(); v4 != nil {
-		switch {
-		case v4[0] == 0:
-			return false
-		case v4[0] == 100 && v4[1]&0xc0 == 64:
-			return false
-		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0:
-			return false
-		case v4[0] == 192 && v4[1] == 0 && v4[2] == 2:
-			return false
-		case v4[0] == 198 && v4[1] == 51 && v4[2] == 100:
-			return false
-		case v4[0] == 203 && v4[1] == 0 && v4[2] == 113:
-			return false
-		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19):
-			return false
-		case v4[0] == 192 && v4[1] == 88 && v4[2] == 99:
-			// 192.88.99.0/24 is the deprecated 6to4 relay prefix (RFC 7526), including 192.88.99.2.
-			return false
-		case v4[0] >= 240:
-			return false
-		}
-		return true
-	}
-	return ipv6Public(ip)
-}
-
-// ipv6Public reports whether ip is an ordinary public IPv6 destination.
-// Global unicast is 2000::/3. Everything else is refused, which covers
-// deprecated site-local fec0::/10, NAT64 64:ff9b::/96 and 64:ff9b:1::/48,
-// discard-only 100::/64, and unique-local space that IsPrivate missed.
-// ponytail: the exception list is the IANA special-purpose ranges inside
-// 2000::/3 that are not ordinary public servers. Upgrade path: refresh it
-// from the IANA IPv6 Special-Purpose Address Registry.
-func ipv6Public(ip net.IP) bool {
-	if len(ip) != net.IPv6len || ip[0]&0xe0 != 0x20 {
-		return false
-	}
-	switch {
-	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2]&0xfe == 0x00:
-		// 2001::/23 IETF Protocol Assignments, including benchmarking and TEREDO.
-		return false
-	case ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8:
-		// 2001:db8::/32 documentation.
-		return false
-	case ip[0] == 0x20 && ip[1] == 0x02:
-		// 2002::/16 6to4.
-		return false
-	case ip[0] == 0x26 && ip[1] == 0x20 && ip[2] == 0x00 && ip[3] == 0x4f && ip[4] == 0x80 && ip[5] == 0x00:
-		// 2620:4f:8000::/48 AS112 direct delegation.
-		return false
-	case ip[0] == 0x3f && ip[1] == 0xff && ip[2]&0xf0 == 0x00:
-		// 3fff::/20 documentation. The next four bits are 0, so 3fff:1000:: is outside it.
-		return false
-	default:
-		return true
-	}
 }
 
 // takeStatus returns the upstream status and wipes the body.
@@ -377,17 +401,31 @@ func classifyTarget(method, target string) (resource, host, port string, class i
 		return "", "", "", targetInvalid
 	}
 	// ponytail: reject every ambiguous or encoded form instead of rewriting it.
-	// Upgrade path: a canonicalizer with an explicit encoding allowlist in M4.
-	if strings.ContainsAny(target, " \\@#%") {
-		return "", "", "", targetBlocked
-	}
+	// Upgrade path: a documented encoding allowlist if a caller must send one.
 	u, err := url.Parse(target)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	hostName := ""
+	if err == nil && u != nil {
+		hostName = u.Hostname()
+	}
+	if hostName != "" && specialDestination(hostName) {
+		return "", "", "", targetSSRF
+	}
+	ambiguous := strings.ContainsAny(target, " \\@#%")
+	if err != nil || u == nil || u.Scheme == "" || u.Host == "" || ambiguous {
+		if ambiguous {
+			return "", "", "", targetMalformed
+		}
 		return "", "", "", targetInvalid
+	}
+	if ip := net.ParseIP(hostName); ip != nil && isPublicIP(ip) {
+		return "", "", "", targetOrigin
+	}
+	if u.Scheme != "https" {
+		return "", "", "", targetOrigin
 	}
 	host, port, built, ok := canonicalForm(u)
 	if !ok || built != target {
-		return "", "", "", targetBlocked
+		return "", "", "", targetMalformed
 	}
 	resource = method + " " + built
 	if validateResource(resource) != nil {
@@ -457,13 +495,33 @@ func dnsNameOK(host string) bool {
 	if !letter {
 		return false
 	}
+	return !specialUseName(host)
+}
+
+func specialDestination(host string) bool {
+	folded := strings.ToLower(strings.TrimSuffix(host, "."))
+	if folded == "" {
+		return false
+	}
+	if ip := net.ParseIP(folded); ip != nil {
+		return !isPublicIP(ip)
+	}
+	if looksLikeObfuscatedIP(folded) {
+		return true
+	}
+	return specialUseName(folded)
+}
+
+func specialUseName(host string) bool {
 	switch {
 	case host == "localhost" || strings.HasSuffix(host, ".localhost"):
-		return false
-	case strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") || strings.HasSuffix(host, ".localdomain") || strings.HasSuffix(host, ".arpa") || strings.HasSuffix(host, ".onion"):
-		return false
-	default:
 		return true
+	case strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") || strings.HasSuffix(host, ".localdomain") || strings.HasSuffix(host, ".arpa") || strings.HasSuffix(host, ".onion"):
+		return true
+	case host == "test" || strings.HasSuffix(host, ".test") || host == "invalid" || strings.HasSuffix(host, ".invalid"):
+		return true
+	default:
+		return false
 	}
 }
 
@@ -485,6 +543,9 @@ func looksLikeObfuscatedIP(host string) bool {
 		return true
 	}
 	labels := strings.Split(host, ".")
+	if len(labels) == 1 {
+		return decimalLabel(labels[0]) || hexLabel(labels[0])
+	}
 	if len(labels) < 2 || len(labels) > 4 {
 		return false
 	}

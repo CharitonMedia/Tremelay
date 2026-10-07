@@ -34,6 +34,14 @@ const (
 	resultDeniedRevoked     = "denied_revoked"
 	resultDeniedMissing     = "denied_missing"
 	resultDeniedDestination = "denied_destination"
+	resultDeniedOrigin      = "denied_origin"
+	resultDeniedSSRF        = "denied_ssrf"
+	resultDeniedRedirect    = "denied_redirect"
+	resultDeniedMethod      = "denied_method"
+	resultDeniedPath        = "denied_path"
+	resultDeniedAction      = "denied_action"
+	resultDeniedMalformed   = "denied_malformed"
+	resultDeniedAbuse       = "denied_abuse"
 	resultUpstreamError     = "upstream_error"
 	resultCompleted         = "completed"
 )
@@ -316,7 +324,9 @@ func validAuditShape(ev auditEvent) error {
 
 func brokerOnlyResult(result string) bool {
 	switch result {
-	case resultDeniedDestination, resultUpstreamError, resultCompleted:
+	case resultDeniedDestination, resultDeniedOrigin, resultDeniedSSRF, resultDeniedRedirect,
+		resultDeniedMethod, resultDeniedPath, resultDeniedAction, resultDeniedMalformed,
+		resultDeniedAbuse, resultUpstreamError, resultCompleted:
 		return true
 	default:
 		return false
@@ -330,7 +340,7 @@ func validBrokerAudit(ev auditEvent) error {
 		return ErrAudit
 	}
 	switch ev.Result {
-	case resultAllowed, resultCompleted, resultUpstreamError:
+	case resultAllowed, resultCompleted, resultUpstreamError, resultDeniedAbuse:
 		if ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType == "" || ev.Operation != OpHTTPRequest {
 			return ErrAudit
 		}
@@ -338,7 +348,9 @@ func validBrokerAudit(ev auditEvent) error {
 		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
 			return ErrAudit
 		}
-	case resultDeniedDestination, resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,
+	case resultDeniedDestination, resultDeniedOrigin, resultDeniedSSRF, resultDeniedRedirect,
+		resultDeniedMethod, resultDeniedPath, resultDeniedAction, resultDeniedMalformed,
+		resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,
 		resultDeniedScope, resultDeniedExpired, resultDeniedRevoked, resultDeniedMissing:
 	default:
 		return ErrAudit

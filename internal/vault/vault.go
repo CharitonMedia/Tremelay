@@ -113,8 +113,24 @@ var (
 	ErrDeniedRevoked = errors.New("denied_revoked")
 	// ErrDeniedMissing means the principal has no capability grant.
 	ErrDeniedMissing = errors.New("denied_missing")
-	// ErrDeniedDestination means the broker refused the upstream destination.
+	// ErrDeniedDestination means the broker could not confirm a public origin.
 	ErrDeniedDestination = errors.New("denied_destination")
+	// ErrDeniedOrigin means the request origin is not the granted origin.
+	ErrDeniedOrigin = errors.New("denied_origin")
+	// ErrDeniedSSRF means the destination is a non-public or special-use address.
+	ErrDeniedSSRF = errors.New("denied_ssrf")
+	// ErrDeniedRedirect means a redirect was refused instead of forwarding the credential.
+	ErrDeniedRedirect = errors.New("denied_redirect")
+	// ErrDeniedMethod means the HTTP method is outside the granted method.
+	ErrDeniedMethod = errors.New("denied_method")
+	// ErrDeniedPath means the path or query is outside the granted resource.
+	ErrDeniedPath = errors.New("denied_path")
+	// ErrDeniedAction means the request action class is outside the grant.
+	ErrDeniedAction = errors.New("denied_action")
+	// ErrDeniedMalformed means the target authority is ambiguous or not canonical.
+	ErrDeniedMalformed = errors.New("denied_malformed")
+	// ErrDeniedAbuse means the abuse-control hook vetoed the call before the credential was sent.
+	ErrDeniedAbuse = errors.New("denied_abuse")
 	// ErrBrokerUpstream means the upstream call failed or could not be completed.
 	// The error text is fixed and does not include the credential or the URL.
 	ErrBrokerUpstream = errors.New("broker upstream failed")
@@ -220,6 +236,13 @@ type Session struct {
 	httpDo func(*http.Request) (*http.Response, error)
 	// resolve, when set, answers the broker DNS check. Production leaves it nil.
 	resolve func(ctx context.Context, host string) ([]net.IP, error)
+	// dial, when set, places the pinned broker connection. Production leaves
+	// it nil and uses net.Dialer. The address it receives is the validated pin.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// abuseGuard, when set, can veto an allowed broker call before the
+	// credential is copied. It cannot turn a denial into an allow.
+	// Production leaves it nil. See ADR 0006.
+	abuseGuard func(AbuseDecision) error
 }
 
 // Create makes a new vault at path and returns it unlocked.
