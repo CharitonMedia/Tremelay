@@ -647,6 +647,93 @@ func TestM5MigratesPriorAuditSchema(t *testing.T) {
 	}
 }
 
+func TestM5AdoptsLegacyDetection(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	agent := strings.Repeat("cd", 16)
+	if err := session.writeAudit(auditEvent{
+		Action: actionBroker, Result: resultDeniedMissing, AgentID: agent, Operation: OpHTTPRequest,
+	}, session.creds, session.agents, session.grants); err != nil {
+		t.Fatal(err)
+	}
+	var denialHash string
+	if err := session.db.QueryRow(`SELECT hash FROM audit WHERE action=?`, actionBroker).Scan(&denialHash); err != nil {
+		t.Fatal(err)
+	}
+	plain := legacyDocument(t, document{Credentials: session.creds, Agents: session.agents, Grants: session.grants})
+	nonce, ct, err := seal(session.dek, plain, dataAAD(session.id, session.header.AuditHead, session.header.AuditSeq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.db.Exec(`UPDATE vault SET data_nonce=?, encrypted_document=? WHERE id=?`, nonce, ct, session.id); err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	rewriteAudit(t, path, true)
+	if _, err := VerifyAudit(path, pass); err != nil {
+		t.Fatalf("legacy verify %v", err)
+	}
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatalf("legacy unlock %v", err)
+	}
+	if len(opened.detection.Denials) != 1 || !denialHas(opened.detection, agent) || opened.detection.Denials[0].N != 1 {
+		t.Fatalf("adopted mirror %+v", opened.detection.Denials)
+	}
+	var hash string
+	if err := opened.db.QueryRow(`SELECT hash FROM audit WHERE action=?`, actionBroker).Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	if hash != denialHash {
+		t.Fatal("denial hash changed")
+	}
+	stored, err := openAEAD(opened.dek, opened.header.DataNonce, opened.header.Data, dataAAD(opened.id, opened.header.AuditHead, opened.header.AuditSeq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wipe(stored)
+	if !bytes.Contains(stored, []byte(`"detection"`)) {
+		t.Fatal("unlock did not persist the mirror")
+	}
+	opened.Lock()
+	reopened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatalf("second unlock %v", err)
+	}
+	t.Cleanup(reopened.Lock)
+	if len(reopened.detection.Denials) != 1 || reopened.detection.Denials[0].N != 1 {
+		t.Fatalf("persisted mirror %+v", reopened.detection.Denials)
+	}
+	if err := reopened.writeAudit(auditEvent{
+		Action: actionBroker, Result: resultDeniedMissing, AgentID: agent, Operation: OpHTTPRequest,
+	}, reopened.creds, reopened.agents, reopened.grants); err != nil {
+		t.Fatal(err)
+	}
+	if len(reopened.detection.Denials) != 1 || reopened.detection.Denials[0].N != 2 {
+		t.Fatalf("later denial %+v", reopened.detection.Denials)
+	}
+}
+
+func legacyDocument(t *testing.T, doc document) []byte {
+	t.Helper()
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "detection")
+	plain, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(plain, []byte(`"detection"`)) {
+		t.Fatal("legacy document still has detection")
+	}
+	return plain
+}
+
 func denialHas(st detectionState, id string) bool {
 	for _, d := range st.Denials {
 		if d.AgentID == id {

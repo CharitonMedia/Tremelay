@@ -210,10 +210,12 @@ type fileHeader struct {
 // in the SQLite audit table, not in this document. Agents and grants are
 // vault state, not an agent-facing secret channel.
 type document struct {
-	Credentials []credential   `json:"credentials"`
-	Agents      []agentRecord  `json:"agents,omitempty"`
-	Grants      []grantRecord  `json:"grants,omitempty"`
-	Detection   detectionState `json:"detection,omitempty"`
+	Credentials []credential  `json:"credentials"`
+	Agents      []agentRecord `json:"agents,omitempty"`
+	Grants      []grantRecord `json:"grants,omitempty"`
+	// Detection is always written, including when empty. A missing member
+	// means the document was sealed before M5. See sealedDetection.
+	Detection detectionState `json:"detection"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -367,6 +369,11 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	if err := unmarshalStrict(plain, &doc); err != nil {
 		wipe(dek)
 		return nil, deny(ErrCorrupt)
+	}
+	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
+	if err != nil {
+		wipe(dek)
+		return nil, deny(err)
 	}
 	if err := validateDocument(doc); err != nil {
 		wipe(dek)

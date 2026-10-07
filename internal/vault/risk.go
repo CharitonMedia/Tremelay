@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"encoding/json"
 	"slices"
 	"strings"
 	"time"
@@ -246,6 +247,21 @@ func validateDetection(st detectionState) error {
 		prev = d.AgentID
 	}
 	return nil
+}
+
+// sealedDetection returns the mirror from an authenticated document.
+// Pre-M5 ciphertext has no detection member, so the chain supplies the
+// mirror and the next commit writes it. A present member is returned as
+// stored, including an empty one, so dropping a retained count still fails.
+func sealedDetection(plain []byte, events []auditEvent, stored detectionState) (detectionState, error) {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(plain, &probe); err != nil {
+		return detectionState{}, ErrCorrupt
+	}
+	if _, ok := probe["detection"]; !ok {
+		return detectionFromAudit(events), nil
+	}
+	return stored, nil
 }
 
 func checkDetection(events []auditEvent, got detectionState) error {

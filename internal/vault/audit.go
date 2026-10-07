@@ -108,9 +108,11 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 		return "", ErrAudit
 	}
 	defer wipeCredentials(doc.Credentials)
-	// The detection mirror is inside the authenticated document. A counter
-	// that does not match the chain is a failed verification, not a clean tip.
-	if err := checkDetection(events, doc.Detection); err != nil {
+	// The detection mirror is inside the authenticated document. A pre-M5
+	// document has no member; the chain supplies it. A stored member that
+	// does not match the chain is a failed verification, not a clean tip.
+	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
+	if err != nil || checkDetection(events, doc.Detection) != nil {
 		return "", ErrAudit
 	}
 	return events[len(events)-1].Hash, nil
