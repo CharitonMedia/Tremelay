@@ -24,41 +24,50 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 	if class != targetOK || resource != "GET "+okURL || host != "svc.example" || port != "443" {
 		t.Fatalf("class %d resource %s host %s port %s", class, resource, host, port)
 	}
-	blocked := []string{
-		"https://127.0.0.1/latest",
-		"https://127.0.0.1/",
-		"https://localhost/latest",
-		"https://db.localhost/latest",
-		"https://printer.local/latest",
-		"https://metadata.google.internal/latest",
-		"https://[::1]/",
-		"https://[fe80::1]/",
-		"https://[fd00::1]/",
-		"https://169.254.169.254/latest",
-		"https://10.0.0.1/",
-		"https://192.168.1.20/",
-		"https://172.16.0.1/",
-		"https://0.0.0.0/",
-		"https://2130706433/",
-		"https://0177.0.0.1/",
-		"https://0x7f.0.0.1/",
-		"https://127.1/",
-		"http://svc.example/v1/ping",
-		"https://user:secret@svc.example/v1/ping",
-		"https://svc.example/v1/../admin",
-		"https://svc.example/v1/./ping",
-		"https://svc.example/v1/ping%2fadmin",
-		"https://svc.example\\@evil.example/v1/ping",
-		"https://svc.example/v1/ping#frag",
-		"https://SVC.example/v1/ping",
-		"https://svc.example./v1/ping",
-		"https://svc.example:443/v1/ping",
-		"https://svc.example",
-		"HTTPS://svc.example/v1/ping",
+	classified := []struct {
+		target string
+		class  int
+	}{
+		{"https://127.0.0.1/latest", targetSSRF},
+		{"https://user@127.0.0.1/latest", targetSSRF},
+		{"https://127.0.0.1/", targetSSRF},
+		{"https://localhost/latest", targetSSRF},
+		{"https://LOCALHOST/latest", targetSSRF},
+		{"https://db.localhost/latest", targetSSRF},
+		{"https://printer.local/latest", targetSSRF},
+		{"https://metadata.google.internal/latest", targetSSRF},
+		{"https://name.invalid/latest", targetSSRF},
+		{"https://name.test/latest", targetSSRF},
+		{"https://[::1]/", targetSSRF},
+		{"https://[fe80::1]/", targetSSRF},
+		{"https://[fd00::1]/", targetSSRF},
+		{"https://169.254.169.254/latest", targetSSRF},
+		{"https://10.0.0.1/", targetSSRF},
+		{"https://192.168.1.20/", targetSSRF},
+		{"https://172.16.0.1/", targetSSRF},
+		{"https://0.0.0.0/", targetSSRF},
+		{"https://2130706433/", targetSSRF},
+		{"https://0177.0.0.1/", targetSSRF},
+		{"https://0x7f.0.0.1/", targetSSRF},
+		{"https://127.1/", targetSSRF},
+		{"https://192.88.99.2/", targetSSRF},
+		{"http://svc.example/v1/ping", targetOrigin},
+		{"https://1.1.1.1/v1/ping", targetOrigin},
+		{"https://user:secret@svc.example/v1/ping", targetMalformed},
+		{"https://svc.example/v1/../admin", targetMalformed},
+		{"https://svc.example/v1/./ping", targetMalformed},
+		{"https://svc.example/v1/ping%2fadmin", targetMalformed},
+		{"https://svc.example\\@evil.example/v1/ping", targetMalformed},
+		{"https://svc.example/v1/ping#frag", targetMalformed},
+		{"https://SVC.example/v1/ping", targetMalformed},
+		{"https://svc.example./v1/ping", targetMalformed},
+		{"https://svc.example:443/v1/ping", targetMalformed},
+		{"https://svc.example", targetMalformed},
+		{"HTTPS://svc.example/v1/ping", targetMalformed},
 	}
-	for _, target := range blocked {
-		if _, _, _, got := classifyTarget(http.MethodGet, target); got != targetBlocked {
-			t.Fatalf("%s class %d", target, got)
+	for _, tc := range classified {
+		if _, _, _, got := classifyTarget(http.MethodGet, tc.target); got != tc.class {
+			t.Fatalf("%s class %d want %d", tc.target, got, tc.class)
 		}
 	}
 	invalid := []string{"", "not-a-url", "https://svc.example/*", "https://svc.example/v1/ping\n"}
@@ -76,7 +85,7 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 	if _, host, _, got := classifyTarget(http.MethodGet, "https://rebind.nip.io/latest"); got != targetOK || host != "rebind.nip.io" {
 		t.Fatal("rebinding name was rejected before DNS")
 	}
-	public := []string{"1.1.1.1", "8.8.8.8", "192.88.98.1", "192.88.100.1", "2001:4860:4860::8888", "2606:4700:4700::1111", "3ff1::1", "3ff0::1", "3fff:1000::1"}
+	public := []string{"1.1.1.1", "8.8.8.8", "192.88.98.1", "192.88.98.255", "192.88.100.0", "192.88.100.1", "192.0.1.1", "100.63.255.255", "100.128.0.0", "198.17.255.255", "198.20.0.0", "192.31.195.255", "192.31.197.0", "2001:4860:4860::8888", "2606:4700:4700::1111", "3ff1::1", "3ff0::1", "3fff:1000::1", "2620:4f:8001::1"}
 	for _, raw := range public {
 		if !isPublicIP(net.ParseIP(raw)) {
 			t.Fatal(raw)
@@ -87,6 +96,7 @@ func TestClassifyAndPublicDestination(t *testing.T) {
 		"169.254.169.254", "0.0.0.0", "100.64.0.1", "255.255.255.255", "224.0.0.1",
 		"::ffff:127.0.0.1", "fe80::1", "fc00::1", "fd00::1", "2001:db8::1", "2002::1",
 		"192.0.2.1", "198.51.100.1", "203.0.113.1", "192.88.99.0", "192.88.99.1", "192.88.99.2", "192.88.99.255", "::ffff:192.88.99.1", "::ffff:192.88.99.2",
+		"192.31.196.1", "192.52.193.1", "192.175.48.1", "198.18.0.1", "198.19.255.255", "100.64.0.1", "100.127.255.255", "240.0.0.1", "192.0.0.8",
 		"fec0::1", "64:ff9b::1", "64:ff9b:1::1", "100::1", "100:0:0:1::1",
 		"2001::1", "2001:2::1", "3fff::1", "3fff:fff::1", "5f00::1", "2620:4f:8000::1", "4000::1",
 	}
@@ -134,7 +144,11 @@ func TestBrokerAuditShape(t *testing.T) {
 	}
 	var chain []auditEvent
 	chain = append(chain, create)
-	for _, result := range []string{resultAllowed, resultCompleted, resultUpstreamError, resultDeniedDestination, resultDeniedScope} {
+	for _, result := range []string{
+		resultAllowed, resultCompleted, resultUpstreamError, resultDeniedDestination, resultDeniedScope,
+		resultDeniedOrigin, resultDeniedSSRF, resultDeniedRedirect, resultDeniedMethod, resultDeniedPath,
+		resultDeniedAction, resultDeniedMalformed, resultDeniedAbuse,
+	} {
 		ev := base
 		ev.Result = result
 		if result == resultDeniedDestination || result == resultDeniedScope {
@@ -167,6 +181,16 @@ func TestBrokerAuditShape(t *testing.T) {
 	}
 	if err := verifyChain(append(chain, next)); !errors.Is(err, ErrAudit) {
 		t.Fatalf("free-form result: %v", err)
+	}
+	bad = base
+	bad.Result = resultDeniedAbuse
+	bad.GrantID = ""
+	next, err = nextAudit(chain, vaultID, bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyChain(append(chain, next)); !errors.Is(err, ErrAudit) {
+		t.Fatalf("abuse row without grant: %v", err)
 	}
 }
 
@@ -368,17 +392,26 @@ func TestBrokerHTTP(t *testing.T) {
 	denyNet()
 	denyDNS()
 	expect(HTTPBrokerRequest{CredentialID: other.ID, Method: http.MethodGet, Target: target}, principal, ErrDeniedCredential)
-	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodPost, Target: target}, principal, ErrDeniedScope)
-	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://evil.example/v1/ping"}, principal, ErrDeniedScope)
-	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://svc.example/v1/admin"}, principal, ErrDeniedScope)
-	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://svc.example/v1/ping?x=" + string(secret)}, principal, ErrDeniedScope)
+	if _, err := session.IssueGrant(GrantSpec{
+		AgentID: agent.ID, CredentialID: other.ID, Operations: []string{OpHTTPRequest},
+		Resource: "svc:legacy", ExpiresAt: exp,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	expect(HTTPBrokerRequest{CredentialID: other.ID, Method: http.MethodGet, Target: target}, principal, ErrDeniedScope)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodHead, Target: target}, principal, ErrDeniedMethod)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodDelete, Target: target}, principal, ErrDeniedAction)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodPost, Target: target}, principal, ErrDeniedAction)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://evil.example/v1/ping"}, principal, ErrDeniedOrigin)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://svc.example/v1/admin"}, principal, ErrDeniedPath)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://svc.example/v1/ping?x=" + string(secret)}, principal, ErrDeniedPath)
 	expect(good, otherPrincipal, ErrDeniedOperation)
 	expect(good, barePrincipal, ErrDeniedAgent)
 	expect(HTTPBrokerRequest{CredentialID: string(secret), Method: http.MethodGet, Target: target}, principal, ErrInvalid)
 	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: "TRACE", Target: target}, principal, ErrInvalid)
 	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: ""}, principal, ErrInvalid)
 	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://svc.example/*"}, principal, ErrInvalid)
-	for _, raw := range []string{
+	ssrf := []string{
 		"https://127.0.0.1/latest",
 		"https://127.0.0.1/",
 		"https://localhost/latest",
@@ -393,7 +426,14 @@ func TestBrokerHTTP(t *testing.T) {
 		"https://2130706433/",
 		"https://0177.0.0.1/",
 		"https://0x7f.0.0.1/",
-		"http://svc.example/v1/ping",
+		"https://metadata.google.internal/latest",
+		"https://192.88.99.2/latest",
+	}
+	for _, raw := range ssrf {
+		expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: raw}, principal, ErrDeniedSSRF)
+	}
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "http://svc.example/v1/ping"}, principal, ErrDeniedOrigin)
+	for _, raw := range []string{
 		"https://user:" + string(secret) + "@svc.example/v1/ping",
 		"https://svc.example/v1/../admin",
 		"https://svc.example/v1/ping%2fadmin",
@@ -401,9 +441,8 @@ func TestBrokerHTTP(t *testing.T) {
 		"https://svc.example/v1/ping#x",
 		"https://SVC.example/v1/ping",
 		"https://svc.example:443/v1/ping",
-		"https://metadata.google.internal/latest",
 	} {
-		expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: raw}, principal, ErrDeniedDestination)
+		expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: raw}, principal, ErrDeniedMalformed)
 	}
 
 	var lookups int
@@ -414,14 +453,14 @@ func TestBrokerHTTP(t *testing.T) {
 		}
 		return []net.IP{net.ParseIP("127.0.0.1")}, nil
 	}
-	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://rebind.nip.io/latest"}, principal, ErrDeniedDestination)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://rebind.nip.io/latest"}, principal, ErrDeniedSSRF)
 	if lookups != 1 {
 		t.Fatalf("rebind lookups %d", lookups)
 	}
 	session.resolve = func(context.Context, string) ([]net.IP, error) {
 		return []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.1")}, nil
 	}
-	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: target}, principal, ErrDeniedDestination)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: target}, principal, ErrDeniedSSRF)
 	for _, raw := range []string{"fec0::1", "64:ff9b::c000:201", "64:ff9b:1::1", "100::1", "2001:2::1", "3fff::1", "3fff:fff::1", "192.88.99.0", "192.88.99.1", "192.88.99.2", "192.88.99.255"} {
 		session.resolve = func(context.Context, string) ([]net.IP, error) {
 			return []net.IP{net.ParseIP(raw)}, nil
@@ -430,7 +469,7 @@ func TestBrokerHTTP(t *testing.T) {
 			t.Fatal("non-public address was dialed")
 			return nil, errors.New("network")
 		}
-		expect(good, principal, ErrDeniedDestination)
+		expect(good, principal, ErrDeniedSSRF)
 	}
 	for _, raw := range []string{"3ff1::1", "3fff:1000::1", "192.88.98.1", "192.88.100.1"} {
 		session.resolve = func(context.Context, string) ([]net.IP, error) {
@@ -465,7 +504,7 @@ func TestBrokerHTTP(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader(string(secret))),
 		}, nil
 	}
-	expect(good, principal, ErrDeniedDestination)
+	expect(good, principal, ErrDeniedRedirect)
 	if redirects != 1 {
 		t.Fatalf("redirect calls %d", redirects)
 	}
@@ -479,7 +518,7 @@ func TestBrokerHTTP(t *testing.T) {
 				Body:       io.NopCloser(strings.NewReader("next")),
 			}, nil
 		}
-		expect(good, principal, ErrDeniedDestination)
+		expect(good, principal, ErrDeniedRedirect)
 		if redirects != 1 {
 			t.Fatalf("chain status %d calls %d", code, redirects)
 		}
@@ -487,7 +526,7 @@ func TestBrokerHTTP(t *testing.T) {
 	session.httpDo = func(*http.Request) (*http.Response, error) {
 		return nil, &url.Error{Op: "Get", URL: "https://evil.example/" + string(secret), Err: errRedirectRefused}
 	}
-	expect(good, principal, ErrDeniedDestination)
+	expect(good, principal, ErrDeniedRedirect)
 	session.httpDo = func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("dial " + string(secret))
 	}
@@ -561,6 +600,9 @@ func TestBrokerHTTP(t *testing.T) {
 		resultDeniedScope: true, resultDeniedExpired: true, resultDeniedRevoked: true,
 		resultDeniedMissing: true, resultDeniedOperation: true, resultUpstreamError: true,
 		resultDenied: true, resultDeniedAgent: true, resultDeniedCredential: true,
+		resultDeniedOrigin: true, resultDeniedSSRF: true, resultDeniedRedirect: true,
+		resultDeniedMethod: true, resultDeniedPath: true, resultDeniedAction: true,
+		resultDeniedMalformed: true,
 	}
 	got := map[string]bool{}
 	for _, ev := range session.audit {
