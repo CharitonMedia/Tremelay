@@ -43,6 +43,9 @@ CREATE TABLE audit (
   agent_id TEXT NOT NULL,
   grant_id TEXT NOT NULL,
   operation TEXT NOT NULL,
+  v INTEGER NOT NULL,
+  class TEXT NOT NULL,
+  ref_seq INTEGER NOT NULL,
   FOREIGN KEY (vault_id) REFERENCES vault(id)
 );`
 
@@ -227,7 +230,7 @@ func readVaultRow(db *sql.DB) (fileHeader, error) {
 }
 
 func readAuditRows(db *sql.DB) ([]auditEvent, error) {
-	rows, err := db.Query(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation FROM audit ORDER BY seq`)
+	rows, err := db.Query(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq FROM audit ORDER BY seq`)
 	if err != nil {
 		return nil, ErrCorrupt
 	}
@@ -236,18 +239,15 @@ func readAuditRows(db *sql.DB) ([]auditEvent, error) {
 	var prev uint64
 	for rows.Next() {
 		var ev auditEvent
-		var seq int64
-		if err := rows.Scan(&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation); err != nil {
+		var seq, ref int64
+		if err := rows.Scan(&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref); err != nil {
 			return nil, ErrCorrupt
 		}
-		if seq <= 0 {
+		if seq <= 0 || ref < 0 || (ev.V != auditVersion && ev.V != auditCapabilityVersion && ev.V != auditNoticeVersion) {
 			return nil, ErrAudit
 		}
-		ev.V = auditVersion
-		if capabilityAction(ev.Action) {
-			ev.V = auditCapabilityVersion
-		}
 		ev.Seq = uint64(seq)
+		ev.RefSeq = uint64(ref)
 		if prev != 0 && ev.Seq != prev+1 {
 			return nil, ErrAudit
 		}
@@ -325,9 +325,9 @@ func updateVault(tx *sql.Tx, h fileHeader) error {
 
 func insertAudit(tx *sql.Tx, ev auditEvent) error {
 	_, err := tx.Exec(`INSERT INTO audit (
-		seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		int64(ev.Seq), ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Prev, ev.Hash, ev.AgentID, ev.GrantID, ev.Operation)
+		seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		int64(ev.Seq), ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Prev, ev.Hash, ev.AgentID, ev.GrantID, ev.Operation, ev.V, ev.Class, int64(ev.RefSeq))
 	if err != nil {
 		return ErrIO
 	}
@@ -376,17 +376,14 @@ func appendDenial(db *sql.DB, vaultID string) error {
 
 func readAuditTip(tx *sql.Tx) (auditEvent, error) {
 	var ev auditEvent
-	var seq int64
-	err := tx.QueryRow(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation FROM audit ORDER BY seq DESC LIMIT 1`).Scan(
-		&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation,
+	var seq, ref int64
+	err := tx.QueryRow(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq FROM audit ORDER BY seq DESC LIMIT 1`).Scan(
+		&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref,
 	)
-	if err != nil || seq <= 0 {
+	if err != nil || seq <= 0 || ref < 0 || ev.V != auditVersionFor(ev.Action) {
 		return auditEvent{}, ErrAudit
 	}
-	ev.V = auditVersion
-	if capabilityAction(ev.Action) {
-		ev.V = auditCapabilityVersion
-	}
 	ev.Seq = uint64(seq)
+	ev.RefSeq = uint64(ref)
 	return ev, nil
 }

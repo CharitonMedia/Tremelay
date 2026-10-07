@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	principalAgent   = "agent"
-	agentStateActive = "active"
+	principalAgent      = "agent"
+	agentStateActive    = "active"
+	agentStateSuspended = "suspended"
 
 	// OpHTTPRequest authorizes the broker to use the credential on one exact
 	// resource. Authorizing it does not perform a request or reveal the credential.
@@ -390,8 +391,28 @@ func (s *Session) authorizeCapability(agentID, credentialID, operation, resource
 // not read credential plaintext. A malformed caller string is not copied out.
 func (s *Session) judge(agentID, credentialID, operation, resource string) (auditEvent, error) {
 	now, err := s.evaluationTime()
+	// get_secret is the closed probe token. The caller string is not an audit field.
+	if secretProbe(operation) {
+		partial := auditEvent{Result: resultDeniedSecret}
+		if safeID(agentID) != "" && s.agentExists(agentID) {
+			partial.AgentID = agentID
+		}
+		if id, typ, ok := s.lookupCred(credentialID); ok {
+			partial.CredID = id
+			partial.CredType = typ
+		}
+		return partial, ErrInvalid
+	}
 	if err != nil || safeID(agentID) == "" || safeID(credentialID) == "" || !allowedOperation(operation) || validateResource(resource) != nil {
 		return auditEvent{Result: resultDenied}, ErrInvalid
+	}
+	if s.agentExists(agentID) && !s.agentActive(agentID) {
+		partial := auditEvent{Result: resultDeniedAgent, AgentID: agentID, Operation: operation}
+		if id, typ, ok := s.lookupCred(credentialID); ok {
+			partial.CredID = id
+			partial.CredType = typ
+		}
+		return partial, ErrDeniedAgent
 	}
 	agentOK := s.agentExists(agentID)
 	credID, credType, credOK := s.lookupCred(credentialID)
@@ -436,6 +457,19 @@ func (s *Session) agentExists(id string) bool {
 		}
 	}
 	return false
+}
+
+func (s *Session) agentActive(id string) bool {
+	for i := range s.agents {
+		if s.agents[i].ID == id && s.agents[i].State == agentStateActive {
+			return true
+		}
+	}
+	return false
+}
+
+func secretProbe(operation string) bool {
+	return operation == "get_secret"
 }
 
 func (s *Session) lookupCred(id string) (credID, credType string, ok bool) {
@@ -725,13 +759,16 @@ func validateDocument(doc document) error {
 	if err := validateStored(doc.Credentials); err != nil {
 		return err
 	}
-	return validateAgentsAndGrants(doc)
+	if err := validateAgentsAndGrants(doc); err != nil {
+		return err
+	}
+	return validateDetection(doc.Detection)
 }
 
 func validateAgentsAndGrants(doc document) error {
 	agents := make(map[string]struct{}, len(doc.Agents))
 	for _, a := range doc.Agents {
-		if safeID(a.ID) == "" || validateLabel(a.Label) != nil || a.Kind != principalAgent || a.State != agentStateActive {
+		if safeID(a.ID) == "" || validateLabel(a.Label) != nil || a.Kind != principalAgent || (a.State != agentStateActive && a.State != agentStateSuspended) {
 			return ErrCorrupt
 		}
 		if _, err := requireTime(a.CreatedAt); err != nil {

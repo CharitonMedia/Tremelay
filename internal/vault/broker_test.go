@@ -609,7 +609,7 @@ func TestBrokerHTTP(t *testing.T) {
 		if ev.Action == actionBroker {
 			got[ev.Result] = true
 		}
-		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Time, ev.Prev, ev.Hash}, "\n")
+		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Class, ev.Time, ev.Prev, ev.Hash}, "\n")
 		if secretIn(fields, secret, otherSecret, pwSecret, unsafeSecret) {
 			t.Fatal("audit recorded credential material")
 		}
@@ -731,7 +731,7 @@ func TestBrokerReturnsStatusOnly(t *testing.T) {
 		}
 	}
 	for _, ev := range session.audit {
-		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Time, ev.Prev, ev.Hash}, "\n")
+		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Class, ev.Time, ev.Prev, ev.Hash}, "\n")
 		if secretIn(fields, secret, tabbed) {
 			t.Fatal("audit recorded credential material")
 		}

@@ -330,7 +330,7 @@ func TestGrantLifecycleAuditAndPersistence(t *testing.T) {
 	assertAbsent(t, logs.Bytes(), pass)
 	assertAbsent(t, logs.Bytes(), []byte(scope))
 	for _, ev := range mustAudit(t, path) {
-		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Time}, "\n")
+		fields := strings.Join([]string{ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Class, ev.Time}, "\n")
 		if strings.Contains(fields, string(sentinel)) || strings.Contains(fields, string(pass)) || strings.Contains(fields, scope) || strings.Contains(fields, "get_secret") || strings.Contains(fields, "not-an-id") {
 			t.Fatal("audit recorded secret material or caller scope")
 		}

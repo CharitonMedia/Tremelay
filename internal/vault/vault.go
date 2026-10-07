@@ -131,6 +131,10 @@ var (
 	ErrDeniedMalformed = errors.New("denied_malformed")
 	// ErrDeniedAbuse means the abuse-control hook vetoed the call before the credential was sent.
 	ErrDeniedAbuse = errors.New("denied_abuse")
+	// ErrDeniedDestructive means a configured destructive-method rule refused the call before the credential was sent.
+	ErrDeniedDestructive = errors.New("denied_destructive")
+	// ErrAuditNotFound means the requested audit sequence is not in the verified chain.
+	ErrAuditNotFound = errors.New("audit record not found")
 	// ErrBrokerUpstream means the upstream call failed or could not be completed.
 	// The error text is fixed and does not include the credential or the URL.
 	ErrBrokerUpstream = errors.New("broker upstream failed")
@@ -206,9 +210,10 @@ type fileHeader struct {
 // in the SQLite audit table, not in this document. Agents and grants are
 // vault state, not an agent-facing secret channel.
 type document struct {
-	Credentials []credential  `json:"credentials"`
-	Agents      []agentRecord `json:"agents,omitempty"`
-	Grants      []grantRecord `json:"grants,omitempty"`
+	Credentials []credential   `json:"credentials"`
+	Agents      []agentRecord  `json:"agents,omitempty"`
+	Grants      []grantRecord  `json:"grants,omitempty"`
+	Detection   detectionState `json:"detection,omitempty"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -243,6 +248,16 @@ type Session struct {
 	// credential is copied. It cannot turn a denial into an allow.
 	// Production leaves it nil. See ADR 0006.
 	abuseGuard func(AbuseDecision) error
+	// detection is the encrypted mirror of broker-denial counts. The audit
+	// chain is authoritative; a mirror that disagrees fails closed.
+	detection detectionState
+	// notifier delivers high-risk alerts. Nil means delivery is not configured.
+	notifier Notifier
+	// policy chooses containment. The zero value notifies only and does not
+	// mutate grants or agents. See ADR 0007.
+	policy ResponsePolicy
+	// responding stops a notification or containment row from raising another one.
+	responding bool
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -357,23 +372,28 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		wipe(dek)
 		return nil, deny(err)
 	}
+	if err := checkDetection(events, doc.Detection); err != nil {
+		wipe(dek)
+		return nil, deny(ErrCorrupt)
+	}
 	red := &Redactor{}
 	red.Add(passphrase)
 	for i := range doc.Credentials {
 		red.Add(doc.Credentials[i].Secret)
 	}
 	s := &Session{
-		path:     path,
-		id:       header.ID,
-		dek:      dek,
-		header:   header,
-		creds:    doc.Credentials,
-		agents:   doc.Agents,
-		grants:   doc.Grants,
-		audit:    events,
-		redactor: red,
-		logger:   logger,
-		db:       db,
+		path:      path,
+		id:        header.ID,
+		dek:       dek,
+		header:    header,
+		creds:     doc.Credentials,
+		agents:    doc.Agents,
+		grants:    doc.Grants,
+		audit:     events,
+		detection: doc.Detection,
+		redactor:  red,
+		logger:    logger,
+		db:        db,
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -400,6 +420,9 @@ func (s *Session) Lock() {
 	s.agents = nil
 	s.grants = nil
 	s.audit = nil
+	s.detection = detectionState{}
+	s.notifier = nil
+	s.responding = false
 	if s.redactor != nil {
 		s.redactor.Wipe()
 	}
@@ -594,7 +617,14 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
-	plain, err := json.Marshal(document{Credentials: creds, Agents: agents, Grants: grants})
+	nextAuditLog := make([]auditEvent, len(s.audit)+1)
+	copy(nextAuditLog, s.audit)
+	nextAuditLog[len(s.audit)] = ev
+	det := detectionFromAudit(nextAuditLog)
+	if err := validateDetection(det); err != nil {
+		return err
+	}
+	plain, err := json.Marshal(document{Credentials: creds, Agents: agents, Grants: grants, Detection: det})
 	if err != nil {
 		return ErrIO
 	}
@@ -618,11 +648,19 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 		return err
 	}
 	s.header = h
-	s.audit = append(s.audit, ev)
+	s.audit = nextAuditLog
 	s.creds = creds
 	s.agents = agents
 	s.grants = grants
+	s.detection = det
+	s.afterCommit(ev)
 	return nil
+}
+
+func wipeCredentials(creds []credential) {
+	for i := range creds {
+		wipe(creds[i].Secret)
+	}
 }
 
 func (s *Session) logf(format string, args ...any) {

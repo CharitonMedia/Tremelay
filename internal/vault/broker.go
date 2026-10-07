@@ -77,6 +77,10 @@ func (s *Session) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerR
 		}
 		return s.brokerDeny(partial, req.Method, cause)
 	}
+	if req.Method == http.MethodDelete && s.policy.Destructive == DestructiveDeny {
+		partial.Result = resultDeniedDestructive
+		return s.brokerDeny(partial, req.Method, ErrDeniedDestructive)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), brokerTimeout)
 	defer cancel()
 	ips, err := s.lookupBroker(ctx, host)
