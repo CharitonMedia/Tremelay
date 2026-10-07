@@ -3,8 +3,10 @@ package vault
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -507,5 +509,195 @@ func TestM5TruncationAndVersion(t *testing.T) {
 	}
 	if _, err := readAuditRows(db); !errors.Is(err, ErrAudit) {
 		t.Fatalf("deleted row %v", err)
+	}
+}
+
+func TestDetectionEvictsLeastRecent(t *testing.T) {
+	var events []auditEvent
+	ids := make([]string, detectionMaxAgents+1)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("%032x", i+1)
+		events = append(events, auditEvent{
+			Seq: uint64(i + 1), Action: actionBroker, Result: resultDeniedMissing, AgentID: ids[i],
+		})
+	}
+	capped := detectionFromAudit(events)
+	if err := validateDetection(capped); err != nil {
+		t.Fatal(err)
+	}
+	if len(capped.Denials) != detectionMaxAgents {
+		t.Fatalf("kept %d", len(capped.Denials))
+	}
+	if denialHas(capped, ids[0]) || !denialHas(capped, ids[len(ids)-1]) {
+		t.Fatal("evicted the newest subject or kept the oldest")
+	}
+	if err := checkDetection(events, capped); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkDetection(events, detectionState{}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("suppressed retained subject %v", err)
+	}
+	oversized := detectionState{Denials: append(append([]denialSubject{}, capped.Denials...), denialSubject{AgentID: ids[0], N: 1})}
+	if err := validateDetection(oversized); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("oversized mirror %v", err)
+	}
+	full := detectionFromAudit(events[:detectionMaxAgents])
+	if len(full.Denials) != detectionMaxAgents || !denialHas(full, ids[0]) {
+		t.Fatal("ceiling dropped a subject that still fit")
+	}
+}
+
+func TestM5AuditsPastDetectionCeiling(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	var oldest, newest string
+	for i := 0; i < detectionMaxAgents+1; i++ {
+		id := fmt.Sprintf("%032x", i+1)
+		if i == 0 {
+			oldest = id
+		}
+		newest = id
+		err := session.writeAudit(auditEvent{
+			Action: actionBroker, Result: resultDeniedMissing, AgentID: id, Operation: OpHTTPRequest,
+		}, session.creds, session.agents, session.grants)
+		if err != nil {
+			t.Fatalf("denial %d: %v", i, err)
+		}
+	}
+	if len(session.detection.Denials) != detectionMaxAgents {
+		t.Fatalf("mirror %d", len(session.detection.Denials))
+	}
+	if denialHas(session.detection, oldest) || !denialHas(session.detection, newest) {
+		t.Fatal("committed mirror evicted the newest subject")
+	}
+	if len(session.audit) != detectionMaxAgents+2 {
+		t.Fatalf("audit rows %d", len(session.audit))
+	}
+	session.Lock()
+	if _, err := VerifyAudit(path, pass); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(opened.Lock)
+	if len(opened.detection.Denials) != detectionMaxAgents || denialHas(opened.detection, oldest) {
+		t.Fatal("reopened mirror")
+	}
+}
+
+func TestM5MigratesPriorAuditSchema(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	if _, err := session.CreateAgent("legacy"); err != nil {
+		t.Fatal(err)
+	}
+	var created string
+	if err := session.db.QueryRow(`SELECT hash FROM audit WHERE seq=1`).Scan(&created); err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	rewriteAudit(t, path, true)
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatalf("m4 unlock %v", err)
+	}
+	var v int
+	var class, hash string
+	var ref int64
+	if err := opened.db.QueryRow(`SELECT v, class, ref_seq, hash FROM audit WHERE action=?`, actionAgentCreate).Scan(&v, &class, &ref, new(string)); err != nil {
+		t.Fatal(err)
+	}
+	if v != auditCapabilityVersion || class != "" || ref != 0 {
+		t.Fatalf("capability backfill v=%d class=%q ref=%d", v, class, ref)
+	}
+	if err := opened.db.QueryRow(`SELECT v, class, ref_seq, hash FROM audit WHERE seq=1`).Scan(&v, &class, &ref, &hash); err != nil {
+		t.Fatal(err)
+	}
+	if v != auditVersion || class != "" || ref != 0 || hash != created {
+		t.Fatalf("v1 backfill v=%d class=%q ref=%d hash changed %v", v, class, ref, hash != created)
+	}
+	opened.Lock()
+	if _, err := VerifyAudit(path, pass); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Unlock(path, []byte("not-the-passphrase-xxxx"), nil); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("wrong pass %v", err)
+	}
+	if _, err := VerifyAudit(path, pass); err != nil {
+		t.Fatalf("verify after denial %v", err)
+	}
+
+	path1, pass1, session1 := mustCreate(t, nil)
+	session1.Lock()
+	rewriteAudit(t, path1, false)
+	opened1, err := Unlock(path1, pass1, nil)
+	if err != nil {
+		t.Fatalf("m1 unlock %v", err)
+	}
+	t.Cleanup(opened1.Lock)
+	var agentID string
+	if err := opened1.db.QueryRow(`SELECT v, agent_id, grant_id, operation, class, ref_seq FROM audit WHERE seq=1`).Scan(&v, &agentID, new(string), new(string), &class, &ref); err != nil {
+		t.Fatal(err)
+	}
+	if v != auditVersion || agentID != "" || class != "" || ref != 0 {
+		t.Fatalf("m1 backfill v=%d agent=%q class=%q ref=%d", v, agentID, class, ref)
+	}
+	if _, err := VerifyAudit(path1, pass1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func denialHas(st detectionState, id string) bool {
+	for _, d := range st.Denials {
+		if d.AgentID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func rewriteAudit(t *testing.T, path string, capability bool) {
+	t.Helper()
+	dsn, err := sqliteDSN(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cols := `seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash`
+	schema := `CREATE TABLE audit (
+  seq INTEGER PRIMARY KEY,
+  time TEXT NOT NULL,
+  action TEXT NOT NULL,
+  vault_id TEXT NOT NULL,
+  credential_id TEXT NOT NULL,
+  credential_type TEXT NOT NULL,
+  result TEXT NOT NULL,
+  prev_hash TEXT NOT NULL,
+  hash TEXT NOT NULL`
+	if capability {
+		cols += `, agent_id, grant_id, operation`
+		schema += `,
+  agent_id TEXT NOT NULL,
+  grant_id TEXT NOT NULL,
+  operation TEXT NOT NULL`
+	}
+	schema += `,
+  FOREIGN KEY (vault_id) REFERENCES vault(id)
+)`
+	steps := []string{
+		`CREATE TABLE audit_legacy AS SELECT ` + cols + ` FROM audit`,
+		`DROP TABLE audit`,
+		schema,
+		`INSERT INTO audit (` + cols + `) SELECT ` + cols + ` FROM audit_legacy`,
+		`DROP TABLE audit_legacy`,
+	}
+	for _, step := range steps {
+		if _, err := db.Exec(step); err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
 	}
 }

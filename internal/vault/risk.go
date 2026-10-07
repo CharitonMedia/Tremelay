@@ -44,7 +44,8 @@ const (
 	ClassNotice = "notice"
 
 	// ponytail: one counter per agent over the last 32 broker rows, capped at
-	// 256 agents. Upgrade path: a time window keyed by grant and credential.
+	// 256 agents by dropping whoever has the oldest latest broker row.
+	// Upgrade path: a time window keyed by grant and credential.
 	detectionLookback  = 32
 	detectionThreshold = 3
 	detectionMaxAgents = 256
@@ -179,24 +180,53 @@ type denialSubject struct {
 }
 
 func detectionFromAudit(events []auditEvent) detectionState {
-	grouped := map[string][]auditEvent{}
+	type tally struct {
+		rows []auditEvent
+		last uint64
+	}
+	grouped := map[string]*tally{}
 	var order []string
 	for _, ev := range events {
 		if ev.Action != actionBroker || safeID(ev.AgentID) == "" {
 			continue
 		}
-		if _, ok := grouped[ev.AgentID]; !ok {
+		g := grouped[ev.AgentID]
+		if g == nil {
+			g = &tally{}
+			grouped[ev.AgentID] = g
 			order = append(order, ev.AgentID)
 		}
-		grouped[ev.AgentID] = append(grouped[ev.AgentID], ev)
+		g.rows = append(g.rows, ev)
+		g.last = ev.Seq
 	}
-	var denials []denialSubject
+	type ranked struct {
+		denialSubject
+		last uint64
+	}
+	var rankedDenials []ranked
 	for _, id := range order {
-		n := countBrokerDenials(grouped[id])
+		g := grouped[id]
+		n := countBrokerDenials(g.rows)
 		if n == 0 {
 			continue
 		}
-		denials = append(denials, denialSubject{AgentID: id, N: n})
+		rankedDenials = append(rankedDenials, ranked{denialSubject{AgentID: id, N: n}, g.last})
+	}
+	if len(rankedDenials) > detectionMaxAgents {
+		slices.SortFunc(rankedDenials, func(a, b ranked) int {
+			if a.last != b.last {
+				if a.last > b.last {
+					return -1
+				}
+				return 1
+			}
+			return strings.Compare(a.AgentID, b.AgentID)
+		})
+		rankedDenials = rankedDenials[:detectionMaxAgents]
+	}
+	var denials []denialSubject
+	for _, d := range rankedDenials {
+		denials = append(denials, d.denialSubject)
 	}
 	slices.SortFunc(denials, func(a, b denialSubject) int {
 		return strings.Compare(a.AgentID, b.AgentID)

@@ -189,6 +189,12 @@ func loadVault(path string) (*sql.DB, fileHeader, []auditEvent, error) {
 		db.Close()
 		return nil, fileHeader{}, nil, err
 	}
+	// M1–M4 files predate v, class, and ref_seq. Add the missing columns
+	// before the read so an older vault still unlocks. Hashes are not rewritten.
+	if err := migrateAudit(db); err != nil {
+		db.Close()
+		return nil, fileHeader{}, nil, err
+	}
 	events, err := readAuditRows(db)
 	if err != nil {
 		db.Close()
@@ -227,6 +233,125 @@ func readVaultRow(db *sql.DB) (fileHeader, error) {
 	h.KDF.KeyLen = uint32(keyLen)
 	h.AuditSeq = uint64(seq)
 	return h, nil
+}
+
+func auditColumnSet(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(audit)`)
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return nil, ErrCorrupt
+		}
+		cols[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, ErrCorrupt
+	}
+	return cols, nil
+}
+
+// migrateAudit adds audit columns introduced after M1. Existing rows keep
+// their hash preimage. v is derived from the action. class and ref_seq
+// stay empty on rows that did not have those columns.
+func migrateAudit(db *sql.DB) error {
+	cols, err := auditColumnSet(db)
+	if err != nil {
+		return err
+	}
+	if len(cols) == 0 || !cols["seq"] || !cols["hash"] {
+		return ErrCorrupt
+	}
+	type addCol struct {
+		name string
+		ddl  string
+	}
+	adds := []addCol{
+		{"agent_id", `ALTER TABLE audit ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`},
+		{"grant_id", `ALTER TABLE audit ADD COLUMN grant_id TEXT NOT NULL DEFAULT ''`},
+		{"operation", `ALTER TABLE audit ADD COLUMN operation TEXT NOT NULL DEFAULT ''`},
+		{"v", `ALTER TABLE audit ADD COLUMN v INTEGER NOT NULL DEFAULT 1`},
+		{"class", `ALTER TABLE audit ADD COLUMN class TEXT NOT NULL DEFAULT ''`},
+		{"ref_seq", `ALTER TABLE audit ADD COLUMN ref_seq INTEGER NOT NULL DEFAULT 0`},
+	}
+	missing := false
+	for _, col := range adds {
+		if !cols[col.name] {
+			missing = true
+			break
+		}
+	}
+	if !missing {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return ErrIO
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, col := range adds {
+		if cols[col.name] {
+			continue
+		}
+		if _, err := tx.Exec(col.ddl); err != nil {
+			return ErrCorrupt
+		}
+	}
+	if !cols["v"] {
+		if err := backfillAuditVersion(tx); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ErrIO
+	}
+	committed = true
+	return nil
+}
+
+func backfillAuditVersion(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT seq, action FROM audit`)
+	if err != nil {
+		return ErrCorrupt
+	}
+	type versioned struct {
+		seq int64
+		v   int
+	}
+	var updates []versioned
+	for rows.Next() {
+		var seq int64
+		var action string
+		if err := rows.Scan(&seq, &action); err != nil {
+			rows.Close()
+			return ErrCorrupt
+		}
+		updates = append(updates, versioned{seq: seq, v: auditVersionFor(action)})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return ErrCorrupt
+	}
+	if err := rows.Close(); err != nil {
+		return ErrCorrupt
+	}
+	for _, row := range updates {
+		if _, err := tx.Exec(`UPDATE audit SET v=? WHERE seq=?`, row.v, row.seq); err != nil {
+			return ErrCorrupt
+		}
+	}
+	return nil
 }
 
 func readAuditRows(db *sql.DB) ([]auditEvent, error) {
