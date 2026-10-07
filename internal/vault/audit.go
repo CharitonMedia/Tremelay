@@ -51,6 +51,7 @@ const (
 	resultCompleted         = "completed"
 	resultDelivered         = "delivered"
 	resultFailed            = "failed"
+	resultAttempted         = "attempted"
 	resultFlagged           = "flagged"
 	resultSuspended         = "suspended"
 	resultUnchanged         = "unchanged"
@@ -422,7 +423,7 @@ func validNoticeAudit(ev auditEvent) error {
 	}
 	switch ev.Action {
 	case actionNotify:
-		if ev.Result != resultDelivered && ev.Result != resultFailed {
+		if ev.Result != resultDelivered && ev.Result != resultFailed && ev.Result != resultAttempted {
 			return ErrAudit
 		}
 	case actionContain:

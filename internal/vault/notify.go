@@ -245,15 +245,16 @@ func (s *Session) deliverOne(src auditEvent, class Classification) error {
 	if notifyDelivered(s.audit, src.Seq) || notifyAttempts(s.audit, src.Seq) >= notifyAttemptLimit {
 		return nil
 	}
-	err := s.notifier.Notify(notificationFrom(src, class))
+	// The attempt is durable before the sink runs. A crash or a failed outcome
+	// write cannot erase it, so DeliverPending cannot exceed notifyAttemptLimit.
+	if err := s.writeNotice(actionNotify, resultAttempted, src, class, s.creds, s.agents, s.grants); err != nil {
+		return err
+	}
 	result := resultDelivered
-	if err != nil {
+	if err := s.notifier.Notify(notificationFrom(src, class)); err != nil {
 		result = resultFailed
 	}
-	if werr := s.writeNotice(actionNotify, result, src, class, s.creds, s.agents, s.grants); werr != nil {
-		return werr
-	}
-	return nil
+	return s.writeNotice(actionNotify, result, src, class, s.creds, s.agents, s.grants)
 }
 
 func (s *Session) writeNotice(action, result string, src auditEvent, class Classification, creds []credential, agents []agentRecord, grants []grantRecord) error {
@@ -288,7 +289,7 @@ func notificationFrom(ev auditEvent, class Classification) Notification {
 func notifyAttempts(events []auditEvent, ref uint64) int {
 	n := 0
 	for _, ev := range events {
-		if ev.Action == actionNotify && ev.RefSeq == ref {
+		if ev.Action == actionNotify && ev.RefSeq == ref && ev.Result == resultAttempted {
 			n++
 		}
 	}

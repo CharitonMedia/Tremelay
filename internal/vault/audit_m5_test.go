@@ -38,6 +38,7 @@ func TestM5ClassifyTable(t *testing.T) {
 		{auditEvent{Action: actionBroker, Result: resultDeniedDestructive, AgentID: agent}, Classification{ClassDestructive, SeverityHigh}},
 		{auditEvent{Action: actionBroker, Result: resultDeniedDestination, AgentID: agent}, Classification{ClassExpectedDenial, SeverityLow}},
 		{auditEvent{Action: actionNotify, Result: resultFailed, Class: ClassSSRF}, Classification{ClassNotice, SeverityInfo}},
+		{auditEvent{Action: actionNotify, Result: resultAttempted, Class: ClassSSRF}, Classification{ClassNotice, SeverityInfo}},
 		{auditEvent{Action: actionContain, Result: resultSuspended, Class: ClassSSRF}, Classification{ClassNotice, SeverityInfo}},
 		{auditEvent{Result: "caller-supplied"}, Classification{ClassAuditTamper, SeverityCritical}},
 	}
@@ -292,14 +293,14 @@ func TestM5NotifyContainAndViews(t *testing.T) {
 	if err := e.session.DeliverPending(); err != nil {
 		t.Fatal(err)
 	}
-	failed = 0
+	attempts := 0
 	for _, ev := range e.session.audit {
-		if ev.Action == actionNotify && ev.RefSeq == failedRef {
-			failed++
+		if ev.Action == actionNotify && ev.RefSeq == failedRef && ev.Result == resultAttempted {
+			attempts++
 		}
 	}
-	if failed != notifyAttemptLimit {
-		t.Fatalf("attempts %d", failed)
+	if attempts != notifyAttemptLimit {
+		t.Fatalf("attempts %d", attempts)
 	}
 	calls := len(sink.Snapshot())
 	if err := e.session.DeliverPending(); err != nil {
@@ -399,7 +400,7 @@ func TestM5NotifyContainAndViews(t *testing.T) {
 	if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainFlag}); err != nil {
 		t.Fatal(err)
 	}
-	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://[fd00::1]/"}, ErrDeniedSSRF)
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://[fd00::1]/"}, ErrDeniedAgent)
 	if len(sink.Snapshot()) != calls {
 		t.Fatal("flag notified")
 	}
@@ -473,6 +474,130 @@ func TestM5NotifyContainAndViews(t *testing.T) {
 	}
 	if got := len(mustAudit(t, path)); got < kept {
 		t.Fatalf("audit rows suppressed %d < %d", got, kept)
+	}
+}
+
+func TestSuspendedAgentDeniesBeforeDestinationClass(t *testing.T) {
+	targets := []string{
+		"https://127.0.0.1/latest",
+		"http://svc.example/v1/ping",
+		"https://user@svc.example/v1/ping",
+	}
+	for _, target := range targets {
+		t.Run(target, func(t *testing.T) {
+			e := newBrokerEnv(t)
+			sink := &MemoryNotifier{}
+			if err := e.session.SetNotifier(sink); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+				t.Fatal(err)
+			}
+			e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+			if len(sink.Snapshot()) != 1 || sink.Snapshot()[0].Class != ClassSSRF {
+				t.Fatal("suspension did not notify once")
+			}
+			e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: target}, ErrDeniedAgent)
+			if len(sink.Snapshot()) != 1 {
+				t.Fatal("suspended agent raised another alert")
+			}
+			var follow auditEvent
+			for _, ev := range e.session.audit {
+				if ev.Action == actionBroker && ev.AgentID == e.agentID && ev.Result == resultDeniedAgent {
+					follow = ev
+				}
+			}
+			if follow.Seq == 0 || classify(e.session.audit, follow).Severity != SeverityLow {
+				t.Fatalf("follow-up %+v", follow)
+			}
+		})
+	}
+}
+
+func TestNotifyReservesAttemptBeforeDelivery(t *testing.T) {
+	e := newBrokerEnv(t)
+	sink := &MemoryNotifier{}
+	if err := e.session.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	e.session.commitFault = func() error {
+		n++
+		if n >= 2 {
+			return errors.New("full")
+		}
+		return nil
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+	if len(sink.Snapshot()) != 0 {
+		t.Fatal("sink ran without a durable attempt")
+	}
+	for _, ev := range e.session.audit {
+		if ev.Action == actionNotify {
+			t.Fatal("failed reservation was audited")
+		}
+	}
+	e.session.commitFault = nil
+	if err := e.session.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Snapshot()) != 1 || sink.Snapshot()[0].Class != ClassSSRF {
+		t.Fatalf("pending %+v", sink.Snapshot())
+	}
+	if _, err := VerifyAudit(e.path, e.pass); err != nil {
+		t.Fatal(err)
+	}
+
+	e = newBrokerEnv(t)
+	sink = &MemoryNotifier{}
+	if err := e.session.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	n = 0
+	e.session.commitFault = func() error {
+		n++
+		if n >= 3 {
+			return errors.New("full")
+		}
+		return nil
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+	if len(sink.Snapshot()) != 1 {
+		t.Fatal("outcome failure skipped the sink")
+	}
+	attempted := 0
+	for _, ev := range e.session.audit {
+		if ev.Action != actionNotify {
+			continue
+		}
+		if ev.Result == resultDelivered || ev.Result == resultFailed {
+			t.Fatalf("outcome stored after a failed write: %s", ev.Result)
+		}
+		if ev.Result == resultAttempted {
+			attempted++
+		}
+	}
+	if attempted != 1 {
+		t.Fatalf("attempts %d", attempted)
+	}
+	e.session.commitFault = nil
+	if err := e.session.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.session.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Snapshot()) != 2 {
+		t.Fatalf("deliveries %d", len(sink.Snapshot()))
+	}
+	attempted = 0
+	for _, ev := range e.session.audit {
+		if ev.Action == actionNotify && ev.Result == resultAttempted {
+			attempted++
+		}
+	}
+	if attempted != notifyAttemptLimit {
+		t.Fatalf("attempts %d", attempted)
 	}
 }
 
