@@ -1272,6 +1272,62 @@ func TestSuspendedFollowUpsStayOrdinary(t *testing.T) {
 	}
 }
 
+func TestSuspendedUnsupportedMethodStaysAttributed(t *testing.T) {
+	e := newBrokerEnv(t)
+	sink := &MemoryNotifier{}
+	if err := e.session.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+		t.Fatal(err)
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: "TRACE", Target: "https://svc.example/v1/ping"}, ErrInvalid)
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+	if len(sink.Snapshot()) != 1 {
+		t.Fatal("suspension did not notify once")
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: "TRACE", Target: "https://svc.example/v1/ping"}, ErrDeniedAgent)
+	e.deny(t, HTTPBrokerRequest{CredentialID: string(e.secret), Method: "TRACE", Target: "https://127.0.0.1/" + string(e.secret)}, ErrDeniedAgent)
+	if len(sink.Snapshot()) != 1 {
+		t.Fatal("unsupported method raised another alert")
+	}
+	var shape, attributed, leaked int
+	for _, ev := range e.session.audit {
+		if ev.Action != actionBroker {
+			continue
+		}
+		fields := strings.Join([]string{ev.CredID, ev.CredType, ev.Operation, ev.AgentID, ev.GrantID, ev.Result}, "\n")
+		if strings.Contains(fields, "TRACE") || secretIn(fields, e.secret) || strings.Contains(fields, "127.0.0.1") {
+			leaked++
+		}
+		switch ev.Result {
+		case resultDenied:
+			shape++
+			if ev.AgentID != "" || ev.CredID != "" || ev.Operation != "" {
+				t.Fatalf("active shape denial %+v", ev)
+			}
+		case resultDeniedAgent:
+			attributed++
+			class := classify(e.session.audit, ev)
+			if ev.AgentID != e.agentID || class.Class != ClassExpectedDenial || class.Severity != SeverityLow {
+				t.Fatalf("suspended method denial %+v class %+v", ev, class)
+			}
+			if responseDecision(e.session.audit, ev.Seq) != "" {
+				t.Fatal("unsupported method recorded a response")
+			}
+			if attributed == 1 && (ev.CredID != e.apiID || ev.CredType != "api_key" || ev.Operation != OpHTTPRequest) {
+				t.Fatalf("valid credential dropped %+v", ev)
+			}
+			if attributed == 2 && (ev.CredID != "" || ev.CredType != "" || ev.Operation != OpHTTPRequest) {
+				t.Fatalf("malformed credential copied %+v", ev)
+			}
+		}
+	}
+	if shape != 1 || attributed != 2 || leaked != 0 {
+		t.Fatalf("shape %d attributed %d leaked %d", shape, attributed, leaked)
+	}
+}
+
 func TestLegacyDecisionDoesNotUsePolicy(t *testing.T) {
 	src := auditEvent{Seq: 2, Action: actionBroker, Result: resultDeniedSSRF}
 	chain := []auditEvent{src}

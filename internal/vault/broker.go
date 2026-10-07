@@ -52,13 +52,19 @@ func (s *Session) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerR
 	if err := s.live(); err != nil {
 		return HTTPBrokerResponse{}, err
 	}
+	// A suspended agent is an ordinary denial before request-shape checks and
+	// destination classification, so an unsupported method stays attributed
+	// and a later SSRF or origin target cannot raise another alert.
+	// Malformed caller fields stay off the event.
+	if s.agentExists(agentID) && !s.agentActive(agentID) {
+		method := ""
+		if brokerMethod(req.Method) {
+			method = req.Method
+		}
+		return s.brokerDeny(s.destinationEvent(agentID, req.CredentialID, resultDeniedAgent), method, ErrDeniedAgent)
+	}
 	if safeID(req.CredentialID) == "" || !brokerMethod(req.Method) {
 		return s.brokerDeny(auditEvent{Result: resultDenied}, "", ErrInvalid)
-	}
-	// A suspended agent is an ordinary denial before destination classification,
-	// so a later SSRF or origin target cannot raise another alert.
-	if s.agentExists(agentID) && !s.agentActive(agentID) {
-		return s.brokerDeny(s.destinationEvent(agentID, req.CredentialID, resultDeniedAgent), req.Method, ErrDeniedAgent)
 	}
 	resource, host, port, class := classifyTarget(req.Method, req.Target)
 	switch class {
