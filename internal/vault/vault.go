@@ -332,6 +332,10 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 // leaves it nil.
 var unlockDecoded func([]credential)
 
+// wipedSecret, when set, sees each credential secret immediately before it
+// is zeroed. Tests hold that buffer. Production leaves it nil.
+var wipedSecret func([]byte)
+
 // Unlock opens path with passphrase. A rejected unlock appends a denial and
 // does not update encrypted credential state. The denial has no passphrase
 // bytes. A later valid unlock checks that denial suffix and links its own
@@ -694,6 +698,9 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 
 func wipeCredentials(creds []credential) {
 	for i := range creds {
+		if wipedSecret != nil {
+			wipedSecret(creds[i].Secret)
+		}
 		wipe(creds[i].Secret)
 	}
 }

@@ -110,10 +110,12 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 	}
 	defer wipe(plain)
 	var doc document
+	// The closure reads doc after unmarshal. A deferred wipeCredentials(doc.Credentials)
+	// would capture the nil slice header from before the decode.
+	defer func() { wipeCredentials(doc.Credentials) }()
 	if err := unmarshalStrict(plain, &doc); err != nil {
 		return "", ErrAudit
 	}
-	defer wipeCredentials(doc.Credentials)
 	// The detection mirror is inside the authenticated document. A pre-M5
 	// document has no member; the chain supplies it. A stored member that
 	// does not match the chain is a failed verification, not a clean tip.

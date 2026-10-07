@@ -252,13 +252,20 @@ func validateDetection(st detectionState) error {
 // sealedDetection returns the mirror from an authenticated document.
 // Pre-M5 ciphertext has no detection member, so the chain supplies the
 // mirror and the next commit writes it. A present member is returned as
-// stored, including an empty one, so dropping a retained count still fails.
+// stored, including null or empty, so dropping a retained count still fails.
+// Only that member is copied. A map of raw values would keep a second copy
+// of every credential after plain is wiped.
 func sealedDetection(plain []byte, events []auditEvent, stored detectionState) (detectionState, error) {
-	var probe map[string]json.RawMessage
-	if err := json.Unmarshal(plain, &probe); err != nil {
+	var probe struct {
+		Detection json.RawMessage `json:"detection"`
+	}
+	err := json.Unmarshal(plain, &probe)
+	present := probe.Detection != nil
+	wipe(probe.Detection)
+	if err != nil {
 		return detectionState{}, ErrCorrupt
 	}
-	if _, ok := probe["detection"]; !ok {
+	if !present {
 		return detectionFromAudit(events), nil
 	}
 	return stored, nil

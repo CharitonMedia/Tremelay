@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1239,6 +1240,95 @@ func rewriteAudit(t *testing.T, path string, capability bool) {
 	for _, step := range steps {
 		if _, err := db.Exec(step); err != nil {
 			t.Fatalf("%s: %v", step, err)
+		}
+	}
+}
+
+func TestSealedDetectionDoesNotCopyCredentials(t *testing.T) {
+	stored := detectionState{Denials: []denialSubject{{AgentID: strings.Repeat("ab", 16), N: 1}}}
+	cases := []struct {
+		name string
+		body string
+		want detectionState
+	}{
+		{name: "absent", body: `{"credentials":[]}`, want: detectionState{}},
+		{name: "null", body: `{"detection":null}`, want: stored},
+		{name: "empty", body: `{"detection":{}}`, want: stored},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := sealedDetection([]byte(tc.body), nil, stored)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("mirror %+v", got)
+			}
+		})
+	}
+	if _, err := sealedDetection([]byte(`{`), nil, stored); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("truncated %v", err)
+	}
+
+	secret := bytes.Repeat([]byte("k"), 256*1024)
+	payload, err := json.Marshal(map[string]any{
+		"credentials": []any{map[string]any{"secret": secret}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wipe(payload)
+	if _, err := sealedDetection([]byte(`{"detection":{}}`), nil, stored); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := sealedDetection(payload, nil, stored); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 64*1024 {
+		t.Fatalf("detection probe retained %d bytes of credential JSON", grew)
+	}
+}
+
+func TestVerifyAuditWipesPartialDecode(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	secret := []byte(randHex(t, 24))
+	if _, err := session.Put("api", "api_key", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	plain, err := json.Marshal(document{Credentials: session.creds})
+	if err != nil || len(plain) == 0 || plain[len(plain)-1] != '}' {
+		t.Fatalf("document %v", err)
+	}
+	plain = append(plain[:len(plain)-1], []byte(`,"bogus":1}`)...)
+	nonce, ct, err := seal(session.dek, plain, dataAAD(session.id, session.header.AuditHead, session.header.AuditSeq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wipe(plain)
+	if _, err := session.db.Exec(`UPDATE vault SET data_nonce=?, encrypted_document=? WHERE id=?`, nonce, ct, session.id); err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	var held []byte
+	wipedSecret = func(b []byte) {
+		if bytes.Equal(b, secret) {
+			held = b
+		}
+	}
+	t.Cleanup(func() { wipedSecret = nil })
+	if _, err := VerifyAudit(path, pass); !errors.Is(err, ErrAudit) {
+		t.Fatalf("verify %v", err)
+	}
+	if len(held) != len(secret) {
+		t.Fatal("partially decoded credential was not observed")
+	}
+	for _, b := range held {
+		if b != 0 {
+			t.Fatal("partially decoded credential survived verify")
 		}
 	}
 }
