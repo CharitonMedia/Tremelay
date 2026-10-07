@@ -2,13 +2,14 @@
 //
 // Retrieval requires an unlocked session, which requires the vault passphrase.
 // Agent principals and capability grants are a separate authority from that
-// human session. AgentPrincipal can list and authorize capabilities for one
-// identity. It cannot retrieve credential plaintext. This package must not
-// grow an agent-facing raw-secret retrieval API.
+// human session. AgentPrincipal can list capabilities, authorize them, and
+// invoke the HTTP broker for one identity. It cannot retrieve credential
+// plaintext. This package must not grow an agent-facing raw-secret retrieval API.
 package vault
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -20,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -110,6 +113,11 @@ var (
 	ErrDeniedRevoked = errors.New("denied_revoked")
 	// ErrDeniedMissing means the principal has no capability grant.
 	ErrDeniedMissing = errors.New("denied_missing")
+	// ErrDeniedDestination means the broker refused the upstream destination.
+	ErrDeniedDestination = errors.New("denied_destination")
+	// ErrBrokerUpstream means the upstream call failed or could not be completed.
+	// The error text is fixed and does not include the credential or the URL.
+	ErrBrokerUpstream = errors.New("broker upstream failed")
 )
 
 // Lifecycle is non-secret metadata stored with a credential.
@@ -207,6 +215,11 @@ type Session struct {
 	// status. Production leaves it nil and uses time.Now. Agent-facing
 	// methods cannot set it.
 	clock func() time.Time
+	// httpDo, when set, sends one already-authorized request. Destination
+	// checks run before this hook. Production leaves it nil.
+	httpDo func(*http.Request) (*http.Response, error)
+	// resolve, when set, answers the broker DNS check. Production leaves it nil.
+	resolve func(ctx context.Context, host string) ([]net.IP, error)
 }
 
 // Create makes a new vault at path and returns it unlocked.

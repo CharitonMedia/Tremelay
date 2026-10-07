@@ -22,16 +22,20 @@ const (
 	actionGrantRevoke = "grant_revoke"
 	actionAuthorize   = "capability_authorize"
 	actionCapList     = "capability_list"
+	actionBroker      = "broker_http"
 
-	resultAllowed          = "allowed"
-	resultDenied           = "denied"
-	resultDeniedAgent      = "denied_agent"
-	resultDeniedCredential = "denied_credential"
-	resultDeniedOperation  = "denied_operation"
-	resultDeniedScope      = "denied_scope"
-	resultDeniedExpired    = "denied_expired"
-	resultDeniedRevoked    = "denied_revoked"
-	resultDeniedMissing    = "denied_missing"
+	resultAllowed           = "allowed"
+	resultDenied            = "denied"
+	resultDeniedAgent       = "denied_agent"
+	resultDeniedCredential  = "denied_credential"
+	resultDeniedOperation   = "denied_operation"
+	resultDeniedScope       = "denied_scope"
+	resultDeniedExpired     = "denied_expired"
+	resultDeniedRevoked     = "denied_revoked"
+	resultDeniedMissing     = "denied_missing"
+	resultDeniedDestination = "denied_destination"
+	resultUpstreamError     = "upstream_error"
+	resultCompleted         = "completed"
 )
 
 type auditEvent struct {
@@ -214,7 +218,8 @@ func verifyLinked(events []auditEvent) error {
 func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPut, actionGet, actionList,
-		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList:
+		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
+		actionBroker:
 		return true
 	default:
 		return false
@@ -223,7 +228,7 @@ func knownAction(action string) bool {
 
 func capabilityAction(action string) bool {
 	switch action {
-	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList:
+	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker:
 		return true
 	default:
 		return false
@@ -259,7 +264,9 @@ func validAuditShape(ev auditEvent) error {
 	case resultAllowed, resultDenied, resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,
 		resultDeniedScope, resultDeniedExpired, resultDeniedRevoked, resultDeniedMissing:
 	default:
-		return ErrAudit
+		if ev.Action != actionBroker || !brokerOnlyResult(ev.Result) {
+			return ErrAudit
+		}
 	}
 	switch ev.Action {
 	case actionAgentCreate:
@@ -297,6 +304,42 @@ func validAuditShape(ev auditEvent) error {
 		if ev.Result != resultAllowed && ev.Result != resultDenied && ev.Result != resultDeniedAgent {
 			return ErrAudit
 		}
+	case actionBroker:
+		if err := validBrokerAudit(ev); err != nil {
+			return err
+		}
+	default:
+		return ErrAudit
+	}
+	return nil
+}
+
+func brokerOnlyResult(result string) bool {
+	switch result {
+	case resultDeniedDestination, resultUpstreamError, resultCompleted:
+		return true
+	default:
+		return false
+	}
+}
+
+// validBrokerAudit keeps broker rows on the closed result set. Free-form
+// caller text is not a legal result or operation.
+func validBrokerAudit(ev auditEvent) error {
+	if stringsContainComma(ev.Operation) || (ev.Operation != "" && ev.Operation != OpHTTPRequest) {
+		return ErrAudit
+	}
+	switch ev.Result {
+	case resultAllowed, resultCompleted, resultUpstreamError:
+		if ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType == "" || ev.Operation != OpHTTPRequest {
+			return ErrAudit
+		}
+	case resultDenied:
+		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
+			return ErrAudit
+		}
+	case resultDeniedDestination, resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,
+		resultDeniedScope, resultDeniedExpired, resultDeniedRevoked, resultDeniedMissing:
 	default:
 		return ErrAudit
 	}
