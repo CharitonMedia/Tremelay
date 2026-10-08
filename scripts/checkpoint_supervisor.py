@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -345,7 +346,19 @@ def active_goal_work(number, head):
     return any(r["status"] != "completed" for r in runs)
 
 
+def wait_for_goal_idle(number, head):
+    # Owner-token checkpoint comments themselves trigger skipped goal runs.
+    # Let those settle while still refusing to overlap any real worker job.
+    for attempt in range(13):
+        if not active_goal_work(number, head):
+            return
+        if attempt < 12:
+            time.sleep(5)
+    raise Stop("Goal workflows remain active; no overlapping worker launch")
+
+
 def refresh_guard(number, head, review_id, *, require_stop=True):
+    wait_for_goal_idle(number, head)
     pull = gh(f"repos/{REPO}/pulls/{number}")
     if not eligible(pull, require_stop=require_stop) or pull["head"]["sha"] != head:
         raise Stop("PR changed during supervisor assessment")

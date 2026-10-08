@@ -63,7 +63,7 @@ class Gates(unittest.TestCase):
 
     def test_changed_head_and_active_worker_block_dispatch(self):
         for changed in [dict(PULL, head={'sha': 'b' * 40, 'repo': {'full_name': s.REPO}}), PULL]:
-            with patch.object(s, 'gh', return_value=changed), patch.object(s, 'pages', return_value=[REVIEW]), patch.object(s, 'active_goal_work', return_value=True):
+            with patch.object(s, 'gh', return_value=changed), patch.object(s, 'pages', return_value=[REVIEW]), patch.object(s, 'active_goal_work', return_value=True), patch.object(s.time, 'sleep'):
                 with self.assertRaises(s.Stop):
                     s.refresh_guard(11, HEAD, 4)
 
@@ -185,9 +185,19 @@ class Controller(unittest.TestCase):
         self.assertFalse(s.eligible(pull))
         self.assertTrue(s.eligible(pull, require_stop=False))
         pull['head']['sha'] = 'b' * 40
-        with patch.object(s, 'gh', return_value=pull):
+        with patch.object(s, 'gh', return_value=pull), patch.object(s, 'wait_for_goal_idle'):
             with self.assertRaises(s.Stop):
                 s.refresh_guard(11, HEAD, 4, require_stop=False)
+
+    def test_own_comment_workflows_settle_before_final_guard(self):
+        with patch.object(s, 'active_goal_work', side_effect=[True, True, False, False]), patch.object(s.time, 'sleep') as sleep, patch.object(s, 'gh', return_value=PULL), patch.object(s, 'pages', return_value=[REVIEW]):
+            s.refresh_guard(11, HEAD, 4)
+            self.assertEqual(sleep.call_count, 2)
+
+    def test_persistent_active_work_never_allows_launch(self):
+        with patch.object(s, 'active_goal_work', return_value=True), patch.object(s.time, 'sleep'):
+            with self.assertRaises(s.Stop):
+                s.wait_for_goal_idle(11, HEAD)
 
     def test_review_recovery_uses_trusted_marker_without_duplicate_request(self):
         state = {'completed_head': HEAD, 'phase': 'review_reserved'}
