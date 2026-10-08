@@ -39,6 +39,7 @@ jobs:
       - name: Assess stopped goal PRs
         env:
           GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SUPERVISOR_MAX_CHECKPOINTS: '3'
           PREFLIGHT_ONLY: ${{ inputs.preflight_only }}

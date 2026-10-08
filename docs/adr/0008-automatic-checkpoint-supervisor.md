@@ -28,8 +28,11 @@ The model returns only `resume` (with a specific corrective approach/tests) or
 `escalate` (with a concrete decision requiring Patrick). It cannot merge, issue
 tool calls, choose API endpoints, change budgets, set repository secrets, or run
 commands. A deterministic controller validates the exact head and newest Codex
-review again, durably records the assessment, then resumes just one exact-head
-review-launch job. This reuses the existing Cursor/CI/independent-review loop.
+review again, durably records the assessment, then directly launches one deterministic Cursor worker with the actual
+assessment and correction in its payload. The stop label remains until completion
+to block existing review-event launchers. Read-only scheduled reconciliation
+recovers the same worker, verifies an advancing descendant commit and requests
+independent review. Review requests carry a trusted marker for idempotent recovery.
 A model assessment is not an independent clean code review or permission to
 merge. Existing exact-head merge gates remain unchanged.
 
@@ -49,15 +52,18 @@ supervisor work. Retain reservations after ambiguity; never automatically repeat
 an uncertain billed request or worker dispatch. Global workflow concurrency is
 serialized and non-cancelling. A stale head/review or active goal job blocks
 resumption. A failed durable assessment write cannot remove the stop label.
-The controller reserves dispatch before removing the label or rerunning a job.
-A failure in this gap stops conservatively for operator reconciliation rather
-than potentially launching another worker. There is no retry of ambiguous writes.
+The controller reserves dispatch and a stable agent identity before worker
+creation. Ambiguous creates are reconciled through that identity, never replayed.
+A separate launch reservation after the resume marker consumes one worker cycle
+even if the create response is lost. Unresolved transport failures remain visible
+in Actions; recovery reads can run again without another billed create.
 
 The supervisor itself cannot silently enable or change secrets. The secret
 presence preflight executes no PR code and prints no values. Live operation
 requires `OPENAI_API_KEY` and owner-identity `GOAL_GITHUB_TOKEN` with issue/comment,
-label, PR-read and Actions-rerun permissions. Cursor uses its existing key through
-the existing workflow; the supervisor does not receive that key.
+label and PR-read permissions, and the existing `CURSOR_API_KEY`. No
+pull-request-controlled workflow receives these secrets. Preflight runs only
+from the deployed default-branch workflow.
 
 ## Security and operational consequences
 

@@ -99,7 +99,7 @@ class Controller(unittest.TestCase):
         context = [patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged),
                    patch.object(s, 'active_goal_work', return_value=False),
                    patch.object(s, 'evidence_for', return_value={'head': HEAD}),
-                   patch.object(s, 'retry_job', return_value=200), patch.object(s, 'refresh_guard'),
+                   patch.object(s, 'cursor', return_value={'agent': {'id': s.worker_payload(11, HEAD, 4, DECISION)['agentId']}, 'run': {'id': 'run-1'}}), patch.object(s, 'refresh_guard'),
                    patch.object(s, 'assess', return_value=(decision or DECISION, {'input_tokens': 100}))]
         with context[0], context[1], context[2], context[3], context[4], context[5], context[6] as model:
             error = None
@@ -116,19 +116,38 @@ class Controller(unittest.TestCase):
         self.assertIn('"phase":"reserved"', writes[0][2]['body'])
         self.assertIn('<!-- tremelay-human-resume -->', writes[1][2]['body'])
         self.assertIn('"phase":"dispatch_reserved"', writes[2][2]['body'])
-        self.assertEqual(writes[3][1], 'DELETE')
-        self.assertEqual(writes[4][:2], ('repos/' + s.REPO + '/actions/jobs/200/rerun', 'POST'))
+        self.assertIn('Cursor remediation round 1', writes[3][2]['body'])
+        self.assertFalse(any(method == 'DELETE' for _, method, _ in writes))
+        self.assertIn('"phase":"working"', writes[4][2]['body'])
 
     def test_failed_assessment_patch_does_not_clear_stop_or_launch(self):
         writes, _, error = self.run_controller(failure=lambda p, m, d: m == 'PATCH')
         self.assertIsInstance(error, s.Stop)
         self.assertFalse(any(m == 'DELETE' or p.endswith('/rerun') for p, m, d in writes))
 
-    def test_ambiguous_dispatch_keeps_claim_and_does_not_retry(self):
-        writes, _, error = self.run_controller(failure=lambda p, m, d: p.endswith('/rerun'))
-        self.assertIsInstance(error, s.Stop)
-        self.assertEqual(sum(p.endswith('/rerun') for p, m, d in writes), 1)
-        self.assertIn('"phase":"dispatch_reserved"', writes[2][2]['body'])
+    def test_worker_payload_contains_actual_supervisor_correction(self):
+        payload = s.worker_payload(11, HEAD, 4, DECISION)
+        self.assertIn(DECISION['correction'], payload['prompt']['text'])
+        self.assertIn(DECISION['assessment'], payload['prompt']['text'])
+        self.assertEqual(payload['repos'][0]['prUrl'], 'https://github.com/' + s.REPO + '/pull/11')
+        self.assertEqual(payload, s.worker_payload(11, HEAD, 4, DECISION))
+
+    def test_recovery_never_reposts_create_after_ambiguous_launch(self):
+        state = {'phase': 'dispatch_reserved', 'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
+                 'time': s.datetime.now(s.timezone.utc).isoformat(), 'head': HEAD}
+        comment = {'id': 100, 'body': s.state_body(state, 'assessment')}
+        with patch.object(s, 'cursor', side_effect=[{'id': state['agent_id'], 'latestRunId': 'run-1'}, {'status': 'RUNNING'}]) as api, patch.object(s, 'update_state'):
+            s.recover_worker(PULL, comment, state)
+            self.assertEqual(state['phase'], 'working')
+            self.assertTrue(all(not call.kwargs for call in api.call_args_list))
+
+    def test_noop_worker_does_not_clear_stop_or_request_review(self):
+        state = {'phase': 'working', 'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
+                 'run_id': 'run-1', 'time': s.datetime.now(s.timezone.utc).isoformat(), 'head': HEAD}
+        with patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'FINISHED'}]), patch.object(s, 'gh', side_effect=[PULL, {'status': 'identical'}]) as api, patch.object(s, 'update_state'):
+            s.recover_worker(PULL, {'id': 100}, state)
+            self.assertEqual(state['phase'], 'escalate')
+            self.assertTrue(all(not call.kwargs for call in api.call_args_list))
 
     def test_escalation_records_decision_without_removing_stop(self):
         writes, _, error = self.run_controller(decision=dict(DECISION, decision='escalate', reason_for_user='Change goal scope?'))
@@ -170,12 +189,35 @@ class Controller(unittest.TestCase):
             with self.assertRaises(s.Stop):
                 s.refresh_guard(11, HEAD, 4, require_stop=False)
 
+    def test_review_recovery_uses_trusted_marker_without_duplicate_request(self):
+        state = {'completed_head': HEAD, 'phase': 'review_reserved'}
+        marker = f'<!-- tremelay-supervisor-review:{HEAD} -->'
+        with patch.object(s, 'gh', return_value=PULL) as api, patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'pages', return_value=[{'user': {'login': s.AUTHOR}, 'body': marker}]), patch.object(s, 'update_state'):
+            s.finish_review(PULL, {'id': 100}, state)
+            self.assertFalse(any(c.kwargs.get('method') == 'POST' for c in api.call_args_list))
+            self.assertEqual(state['phase'], 'completed')
+
+    def test_forged_review_marker_cannot_suppress_independent_review(self):
+        state = {'completed_head': HEAD, 'phase': 'review_reserved'}
+        marker = f'<!-- tremelay-supervisor-review:{HEAD} -->'
+        with patch.object(s, 'gh', return_value=PULL) as api, patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'pages', return_value=[{'user': {'login': 'outsider'}, 'body': marker}]), patch.object(s, 'update_state'):
+            s.finish_review(PULL, {'id': 100}, state)
+            self.assertEqual(sum(c.kwargs.get('method') == 'POST' for c in api.call_args_list), 1)
+
+    def test_invalid_cursor_identity_blocks_reconciliation(self):
+        with patch.object(s, 'cursor') as api:
+            with self.assertRaises(s.Stop):
+                s.recover_worker(PULL, {'id': 100}, {'agent_id': '../other-account'})
+            api.assert_not_called()
+
     def test_workflow_uses_trusted_main_and_serializes_controller(self):
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/checkpoint-supervisor.yml').read_text()
         self.assertIn('ref: main', text)
         self.assertIn('cancel-in-progress: false', text)
         self.assertNotIn('pull_request_target', text)
-        self.assertNotIn('CURSOR_API_KEY', text)
+        self.assertIn('CURSOR_API_KEY', text)
+        self.assertNotIn('pull_request:', text)
+        self.assertFalse((Path(__file__).resolve().parents[1] / '.github/workflows/supervisor-preflight.yml').exists())
 
 
 if __name__ == '__main__':

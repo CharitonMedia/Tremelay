@@ -8,6 +8,7 @@ ambiguous API call or dispatch is never automatically replayed.
 from __future__ import annotations
 
 import argparse
+import uuid
 import base64
 from datetime import datetime, timezone
 import json
@@ -149,7 +150,7 @@ def validate_decision(decision, head):
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise Stop("OpenAI redirect refused")
+        raise Stop("Credential-bearing API redirect refused")
 
 
 def assess(evidence, key):
@@ -228,24 +229,112 @@ def evidence_for(pull, review, comments):
             "sources": sources, "diff": files}
 
 
-def retry_job(number, head):
-    # Rerun just the current exact-head review-launch job. Never rerun every job,
-    # never use a stale head's finding, and never feed the model an action handle.
-    runs = gh(f"repos/{REPO}/actions/workflows/goal.yml/runs?per_page=100")["workflow_runs"]
-    for run in runs:
-        if run["status"] != "completed" or run.get("event") not in {"pull_request_review", "pull_request_review_comment", "issue_comment"}:
-            continue
-        if run.get("head_sha") != head:
-            # issue_comment workflows execute main: identify PR via check step
-            # data is not reliably in the REST run. Prefer PR review events.
-            continue
-        if not any(pr.get("number") == number for pr in run.get("pull_requests", [])):
-            continue
-        jobs = gh(f"repos/{REPO}/actions/runs/{run['id']}/jobs?per_page=100")["jobs"]
-        for job in jobs:
-            if job["name"] == "review-launch" and job["status"] == "completed":
-                return job["id"]
-    raise Stop("No exact-head review-launch job available")
+def cursor(path, *, payload=None):
+    key = os.environ.get("CURSOR_API_KEY")
+    if not key:
+        raise Stop("Missing required repository secret: CURSOR_API_KEY")
+    request = urllib.request.Request("https://api.cursor.com/v1/agents" + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Authorization": "Basic " + base64.b64encode((key + ":").encode()).decode(),
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response:
+            return json.load(response)
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        raise Stop("Cursor request failed or was ambiguous; reconcile without another launch") from None
+
+
+def worker_payload(number, head, review_id, decision):
+    agent_id = "bc-" + str(uuid.uuid5(uuid.NAMESPACE_URL,
+        f"supervisor:{REPO}|pr:{number}|head:{head}|review:{review_id}"))
+    prompt = (f"Fix PR #{number} on its current branch, starting at reviewed head {head}. "
+              "Read AGENTS.md, VISION.md, SECURITY_INVARIANTS.md, THREAT_MODEL.md and ADRs. "
+              "Implement this delegated supervisor correction and required regression tests. "
+              "Preserve the security contract. Do not merge, create another PR, change automation "
+              "controls, or request/submit a review. Commit and push the correction on this branch. "
+              "The external controller will request independent exact-head review.\n\n"
+              "Supervisor assessment:\n" + decision["assessment"] +
+              "\n\nRequired correction:\n" + decision["correction"])
+    return {"agentId": agent_id, "name": f"Supervisor correction PR #{number}",
+            "prompt": {"text": prompt},
+            "repos": [{"url": f"https://github.com/{REPO}",
+                       "prUrl": f"https://github.com/{REPO}/pull/{number}"}],
+            "workOnCurrentBranch": True, "autoCreatePR": False, "skipReviewerRequest": True}
+
+
+def update_state(comment, state, text=None):
+    if text is None:
+        text = comment["body"].split("\n\n" + MARKER)[0]
+    gh(f"repos/{REPO}/issues/comments/{comment['id']}", method="PATCH",
+       data={"body": state_body(state, text)})
+
+
+def finish_review(pull, comment, state):
+    number, head = pull["number"], state["completed_head"]
+    fresh = gh(f"repos/{REPO}/pulls/{number}")
+    if not eligible(fresh, require_stop=False) or fresh["head"]["sha"] != head:
+        raise Stop("PR changed before independent review request")
+    if active_goal_work(number, head):
+        return
+    if "human-review-required" in labels(fresh):
+        gh(f"repos/{REPO}/issues/{number}/labels/human-review-required", method="DELETE")
+    fresh = gh(f"repos/{REPO}/pulls/{number}")
+    if not eligible(fresh, require_stop=False) or fresh["head"]["sha"] != head:
+        raise Stop("PR changed before independent review request")
+    marker = f"<!-- tremelay-supervisor-review:{head} -->"
+    comments = pages(f"repos/{REPO}/issues/{number}/comments")
+    if not any(c.get("user", {}).get("login") == AUTHOR and marker in (c.get("body") or "") for c in comments):
+        gh(f"repos/{REPO}/issues/{number}/comments", method="POST",
+           data={"body": f"@codex review\n\nSupervisor worker completed at `{head}`. Independent exact-head review required.\n\n{marker}"})
+    state["phase"] = "completed"
+    update_state(comment, state)
+    print(f"PR #{number}: correction pushed; independent review requested")
+
+
+def recover_worker(pull, comment, state):
+    """Read-only reconciliation of a reserved/active launch, never another POST."""
+    number = pull["number"]
+    agent_id = state["agent_id"]
+    if not re.fullmatch(r"bc-[0-9a-f-]{36}", agent_id):
+        raise Stop("Invalid trusted worker identity")
+    agent = cursor("/" + agent_id)
+    if agent.get("id") != agent_id:
+        raise Stop("Cursor returned a different worker identity")
+    run_id = state.get("run_id") or agent.get("latestRunId")
+    if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+        raise Stop("Cannot reconcile worker run identity")
+    state.update(phase="working", run_id=run_id)
+    result = cursor(f"/{agent_id}/runs/{run_id}")
+    status = result.get("status")
+    age = datetime.now(timezone.utc) - datetime.fromisoformat(state["time"])
+    if status not in {"FINISHED", "ERROR", "CANCELLED", "EXPIRED"}:
+        if age.total_seconds() > 6 * 3600:
+            state["phase"] = "escalate"
+            update_state(comment, state, "Worker exceeded six hours. Input required: reconcile the existing Cursor worker before authorizing further launches.")
+        else:
+            update_state(comment, state)
+            print(f"PR #{number}: Cursor worker is {status}; no duplicate launch")
+        return
+    if status != "FINISHED":
+        state["phase"] = "escalate"
+        update_state(comment, state, f"Cursor worker ended {status}. Input required: resolve the worker service failure; no duplicate launch was made.")
+        return
+    current = gh(f"repos/{REPO}/pulls/{number}")
+    if not eligible(current, require_stop=False):
+        raise Stop("PR no longer eligible for worker completion")
+    head = current["head"]["sha"]
+    comparison = gh(f"repos/{REPO}/compare/{state['head']}...{head}")
+    if head == state["head"] or comparison.get("status") != "ahead":
+        state["phase"] = "escalate"
+        update_state(comment, state, "Worker finished without an advancing correction. Input required: reconcile the worker output before further work.")
+        return
+    if active_goal_work(number, head):
+        print(f"PR #{number}: waiting for goal workflow before independent review")
+        return
+    # Reserve the review request before its write; repeated wakes cannot post it twice.
+    state.update(phase="review_reserved", completed_head=head)
+    update_state(comment, state)
+    finish_review(current, comment, state)
 
 
 def active_goal_work(number, head):
@@ -290,11 +379,10 @@ def run_one(pull, key, max_checkpoints):
         print(f"PR #{number}: no exact-head inline findings; no automatic resume")
         return
     evidence = evidence_for(pull, review, comments)
-    job = retry_job(number, head)
     # Check before reserving budget or asking the model.
     refresh_guard(number, head, review["id"])
     state = {"head": head, "review": review["id"], "phase": "reserved", "model": MODEL,
-             "job": job, "time": datetime.now(timezone.utc).isoformat()}
+             "time": datetime.now(timezone.utc).isoformat()}
     claim = gh(prefix + "/comments", method="POST", data={"body": state_body(state, "Automatic supervisor checkpoint reserved. Model: GPT-6.1 Sol / high. A reserved assessment consumes budget even on failure.")})
     try:
         decision, usage = assess(evidence, key)
@@ -312,16 +400,27 @@ def run_one(pull, key, max_checkpoints):
             print(f"PR #{number}: escalated; see checkpoint comment")
             return
         refresh_guard(number, head, review["id"])
-        # Reserve dispatch BEFORE mutation. On an ambiguous dispatch, retain the
-        # claim and stop; recovery never launches another agent for this head.
-        state["phase"] = "dispatch_reserved"
-        gh(f"repos/{REPO}/issues/comments/{claim['id']}", method="PATCH", data={"body": state_body(state, text)})
-        gh(prefix + "/labels/human-review-required", method="DELETE")
-        refresh_guard(number, head, review["id"], require_stop=False)
-        gh(f"repos/{REPO}/actions/jobs/{job}/rerun", method="POST", data={})
-        state["phase"] = "dispatched"
-        gh(f"repos/{REPO}/issues/comments/{claim['id']}", method="PATCH", data={"body": state_body(state, text)})
-        print(f"PR #{number}: supervisor resumed job {job}; no merge performed")
+        # Keep the stop label until this worker finishes; existing review-event
+        # launchers cannot race this direct, plan-bearing launch.
+        payload = worker_payload(number, head, review["id"], decision)
+        state.update(phase="dispatch_reserved", agent_id=payload["agentId"])
+        update_state(claim, state, text)
+        # A separate comment AFTER the resume marker counts this worker in the
+        # existing three-cycle allowance, even if the create response is lost.
+        gh(prefix + "/comments", method="POST", data={"body":
+            "Cursor remediation round 1: supervisor worker launch reserved.\n\n"
+            f"Agent: `{payload['agentId']}`. Correction is recorded above. "
+            "An ambiguous create is reconciled by this identity, never replayed."})
+        refresh_guard(number, head, review["id"])
+        result = cursor("", payload=payload)
+        if result.get("agent", {}).get("id") != payload["agentId"]:
+            raise Stop("Cursor create returned a different worker identity")
+        run_id = result.get("run", {}).get("id")
+        if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+            raise Stop("Cursor create did not return a valid run identity")
+        state.update(phase="working", run_id=run_id)
+        update_state(claim, state, text)
+        print(f"PR #{number}: supervisor correction worker started; no merge performed")
     except Stop:
         # Do not erase the reservation or blindly retry. The failure is visible
         # in Actions; no response/body that could contain credentials is logged.
@@ -335,7 +434,7 @@ def main():
     args = parser.parse_args()
     if os.environ.get("GITHUB_REPOSITORY") != REPO:
         raise Stop("Supervisor repository is not authorized")
-    for name in ("GH_TOKEN", "OPENAI_API_KEY"):
+    for name in ("GH_TOKEN", "OPENAI_API_KEY", "CURSOR_API_KEY"):
         if not os.environ.get(name):
             raise Stop(f"Missing required repository secret: {name}")
     if gh("user").get("login") != AUTHOR:
@@ -348,8 +447,22 @@ def main():
         return 0
     pulls = pages(f"repos/{REPO}/pulls?state=open")
     for pull in pulls:
-        if eligible(pull):
-            run_one(pull, os.environ["OPENAI_API_KEY"], int(raw_limit))
+        if not eligible(pull, require_stop=False):
+            continue
+        states = records(pages(f"repos/{REPO}/issues/{pull['number']}/comments"))
+        active = [(c, st) for c, st in states if st.get("phase") in {"dispatch_reserved", "working", "review_reserved"}]
+        try:
+            if active:
+                comment, state = active[-1]
+                if state["phase"] == "review_reserved":
+                    finish_review(pull, comment, state)
+                else:
+                    recover_worker(pull, comment, state)
+            elif eligible(pull):
+                run_one(pull, os.environ["OPENAI_API_KEY"], int(raw_limit))
+        except Stop as error:
+            print(f"PR #{pull['number']}: {error}", file=sys.stderr)
+            raise
     return 0
 
 
