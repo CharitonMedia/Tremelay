@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -108,7 +109,7 @@ func (s *Session) classifyIncoming(ev auditEvent, agents []agentRecord, grants [
 		return base
 	}
 	if ev.Action == actionBroker && ordinaryBrokerDenial(ev.Result) && safeID(ev.AgentID) != "" {
-		if ev.Result == resultDeniedAgent && agentSuspendedBefore(s.audit, ev.AgentID, ev.Seq, agents, grants) {
+		if ev.Result == resultDeniedAgent && s.incomingAgentSuspended(ev.AgentID, agents, grants) {
 			return base
 		}
 		if s.incomingDenialCount(ev) >= detectionThreshold {
@@ -131,6 +132,82 @@ func (s *Session) incomingDenialCount(ev auditEvent) int {
 	}
 	w.add(ev.Result, ev.Seq)
 	return w.count
+}
+
+// suspensionIndex retains facts, not a cached classification: legacy rows still
+// depend on the current authenticated agent/grant state. Repeated rows collapse
+// to one entry per agent/grant pair, so denial traffic cannot grow this index.
+// It is rebuilt once on unlock and extended only after a successful commit.
+type suspensionIndex struct {
+	modern  map[string]bool
+	legacy  map[string]map[string]bool
+	revoked map[string]bool
+}
+
+// suspensionApplyVisits measures rebuild/append work for regression tests.
+var suspensionApplyVisits atomic.Int64
+
+func newSuspensionIndex() *suspensionIndex {
+	return &suspensionIndex{map[string]bool{}, map[string]map[string]bool{}, map[string]bool{}}
+}
+
+func suspensionFromAudit(events []auditEvent) *suspensionIndex {
+	idx := newSuspensionIndex()
+	for _, ev := range events {
+		idx.apply(events, ev)
+	}
+	return idx
+}
+
+func (idx *suspensionIndex) apply(events []auditEvent, ev auditEvent) {
+	suspensionApplyVisits.Add(1)
+	if ev.Action == actionGrantRevoke && ev.Result == resultAllowed {
+		idx.revoked[ev.GrantID] = true
+	}
+	if ev.Action != actionContain || safeID(ev.AgentID) == "" {
+		return
+	}
+	if ev.Result == resultAgentSuspended {
+		idx.modern[ev.AgentID] = true
+		return
+	}
+	if ev.Result != resultSuspended || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq || ev.RefSeq > uint64(len(events)) {
+		return
+	}
+	// Authenticated chain sequences are contiguous. Resolve the legacy source
+	// directly instead of scanning the prefix for every containment row.
+	src := events[ev.RefSeq-1]
+	if src.Seq != ev.RefSeq || src.AgentID != ev.AgentID {
+		return
+	}
+	grantID := ev.GrantID
+	if grantID == "" {
+		grantID = src.GrantID
+	}
+	if idx.legacy[ev.AgentID] == nil {
+		idx.legacy[ev.AgentID] = map[string]bool{}
+	}
+	idx.legacy[ev.AgentID][grantID] = true
+}
+
+func (s *Session) incomingAgentSuspended(agentID string, agents []agentRecord, grants []grantRecord) bool {
+	if s.suspensions == nil {
+		s.suspensions = suspensionFromAudit(s.audit)
+	}
+	idx := s.suspensions
+	if idx.modern[agentID] {
+		return true
+	}
+	candidates := idx.legacy[agentID]
+	if len(candidates) == 0 || agentRecordState(agents, agentID) != agentStateSuspended {
+		return false
+	}
+	for grantID := range candidates {
+		if grantID == "" || idx.revoked[grantID] || !grantRecordRevoked(grants, grantID) {
+			return true
+		}
+	}
+	return false
 }
 
 // agentSuspendedBefore reports a prior contain row that suspended this agent.

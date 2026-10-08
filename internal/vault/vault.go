@@ -261,6 +261,8 @@ type Session struct {
 	// once from the chain. A commit applies its new rows only after that
 	// commit succeeds. It is not part of the encrypted document.
 	notices map[uint64]noticeSrc
+	// suspensions contains durable containment and explicit-revocation facts.
+	suspensions *suspensionIndex
 	// notifier delivers high-risk alerts. Nil means delivery is not configured.
 	notifier Notifier
 	// policy chooses containment. The zero value notifies only and does not
@@ -321,11 +323,12 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 			WrapNonce:  wrapNonce,
 			WrappedDEK: wrapped,
 		},
-		creds:    []credential{},
-		notices:  map[uint64]noticeSrc{},
-		redactor: red,
-		logger:   logger,
-		db:       db,
+		creds:       []credential{},
+		notices:     map[uint64]noticeSrc{},
+		suspensions: newSuspensionIndex(),
+		redactor:    red,
+		logger:      logger,
+		db:          db,
 	}
 	if err := s.persistEvent(actionCreate, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -419,20 +422,21 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		red.Add(doc.Credentials[i].Secret)
 	}
 	s := &Session{
-		path:      path,
-		id:        header.ID,
-		dek:       dek,
-		header:    header,
-		creds:     doc.Credentials,
-		agents:    doc.Agents,
-		grants:    doc.Grants,
-		audit:     events,
-		detection: doc.Detection,
-		denials:   idx,
-		notices:   noticeIndex(events),
-		redactor:  red,
-		logger:    logger,
-		db:        db,
+		path:        path,
+		id:          header.ID,
+		dek:         dek,
+		header:      header,
+		creds:       doc.Credentials,
+		agents:      doc.Agents,
+		grants:      doc.Grants,
+		audit:       events,
+		detection:   doc.Detection,
+		denials:     idx,
+		notices:     noticeIndex(events),
+		suspensions: suspensionFromAudit(events),
+		redactor:    red,
+		logger:      logger,
+		db:          db,
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -463,6 +467,7 @@ func (s *Session) Lock() {
 	s.detection = detectionState{}
 	s.denials = nil
 	s.notices = nil
+	s.suspensions = nil
 	s.notifier = nil
 	s.responding = false
 	if s.redactor != nil {
@@ -713,6 +718,9 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	if s.notices == nil {
 		s.notices = noticeIndex(s.audit)
 	}
+	if s.suspensions == nil {
+		s.suspensions = suspensionFromAudit(s.audit)
+	}
 	s.audit = append(s.audit, events...)
 	s.creds = creds
 	s.agents = agents
@@ -721,6 +729,7 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	s.denials = nextDenials
 	for _, row := range events {
 		applyNotice(s.notices, row)
+		s.suspensions.apply(s.audit, row)
 	}
 	s.afterCommit(events[0])
 	return nil
