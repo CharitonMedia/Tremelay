@@ -52,8 +52,13 @@ supervisor work. Retain reservations after ambiguity; never automatically repeat
 an uncertain billed request or worker dispatch. Global workflow concurrency is
 serialized and non-cancelling. A stale head/review or active goal job blocks
 resumption. A failed durable assessment write cannot remove the stop label.
-The controller reserves dispatch and a stable agent identity before worker
-creation. Ambiguous creates are reconciled through that identity, never replayed.
+A completed resume assessment is persisted as `dispatch_ready` before idle
+checks; scheduled recovery may retry those checks without another model call.
+The controller reserves dispatch and a stable agent identity only after the idle
+gate succeeds. After reservation, it checks the live head/review/stop without
+waiting for its own comment-generated goal runs, which cannot launch while the
+stop label is held. Reserved creates remain GET-only during recovery, even if
+never accepted. Ambiguous creates are reconciled through that identity, never replayed.
 A separate launch reservation after the resume marker consumes one worker cycle
 even if the create response is lost. Unresolved transport failures remain visible
 in Actions; recovery reads can run again without another billed create.

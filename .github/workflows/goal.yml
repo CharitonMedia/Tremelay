@@ -321,7 +321,8 @@ jobs:
             if [ "$existing" != "yes" ]; then
               gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped at the active remediation circuit breaker." --force
               gh pr edit "$PR_NUMBER" --add-label "human-review-required"
-              gh pr comment "$PR_NUMBER" --body "Automation stopped after ${max_cycles} implementation/remediation cycles for this supervised segment. A documented supervisor assessment is required before another Cursor run. The implementation worker must not authorize its own further cycles. Latest head: \`${head}\`. Review the unresolved Codex/CI findings and resume only after that assessment.\n\n${marker}"
+              python scripts/checkpoint_stop.py --head "$head" --comments cycle_comments.json --output checkpoint_stop.md
+              gh pr comment "$PR_NUMBER" --body-file checkpoint_stop.md
             fi
           else
             echo "allowed=true" >> "$GITHUB_OUTPUT"

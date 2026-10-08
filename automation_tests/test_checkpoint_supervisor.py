@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import checkpoint_supervisor as s
 import codex_cursor_remediation as generic
 import goal_agent_request as goal
+import checkpoint_stop as stop
 
 HEAD = 'a' * 40
 PULL = {'number': 11, 'state': 'open', 'draft': False,
@@ -43,6 +44,12 @@ class Gates(unittest.TestCase):
         pending = dict(newer, id=7, state='PENDING')
         forged = dict(newer, id=8, user={'login': 'attacker'})
         self.assertEqual(s.newest_review([REVIEW, newer, stale, pending, forged], HEAD)['id'], 5)
+
+    def test_newer_approval_or_dismissal_supersedes_old_findings(self):
+        for state in ['APPROVED', 'DISMISSED']:
+            latest = dict(REVIEW, id=9, state=state, submitted_at='2026-10-08T06:00:00Z')
+            self.assertIsNone(s.newest_review([REVIEW, latest], HEAD))
+            self.assertIsNone(s.newest_review([dict(REVIEW, state=state)], HEAD))
 
     def test_untrusted_checkpoint_comment_cannot_claim_or_exhaust_budget(self):
         body = s.state_body({'head': HEAD, 'review': 4, 'phase': 'reserved'}, 'Claim')
@@ -124,6 +131,63 @@ class Controller(unittest.TestCase):
         self.assertIn('Cursor remediation round 1', writes[3][2]['body'])
         self.assertFalse(any(method == 'DELETE' for _, method, _ in writes))
         self.assertIn('"phase":"working"', writes[4][2]['body'])
+
+    def test_idle_timeout_preserves_paid_decision_and_recovers_one_first_create(self):
+        state = {'phase': 'dispatch_ready', 'head': HEAD, 'review': 4, 'decision': DECISION}
+        comment = {'id': 100, 'body': s.state_body(state, 'Recorded assessment')}
+        with patch.object(s, 'active_goal_work', return_value=True), patch.object(s.time, 'sleep'), patch.object(s, 'cursor') as api, patch.object(s, 'update_state') as write:
+            with self.assertRaises(s.Stop):
+                s.dispatch_ready(PULL, comment, state)
+            self.assertEqual(state['phase'], 'dispatch_ready')
+            api.assert_not_called()
+            write.assert_not_called()
+        # Next wake finds real work idle. The reservation's comment creates a
+        # queued goal run, but the final freshness guard must not wait on it.
+        payload = s.worker_payload(11, HEAD, 4, DECISION)
+        with patch.object(s, 'wait_for_goal_idle') as idle, patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'gh', return_value=PULL), patch.object(s, 'pages', return_value=[REVIEW]), patch.object(s, 'update_state'), patch.object(s, 'assess') as model, patch.object(s, 'cursor', return_value={'agent': {'id': payload['agentId']}, 'run': {'id': 'run-1'}}) as api:
+            s.dispatch_ready(PULL, comment, state)
+            idle.assert_called_once()
+            self.assertEqual(api.call_count, 1)
+            self.assertEqual(state['phase'], 'working')
+            model.assert_not_called()
+
+    def test_record_assessment_before_dispatch_idle_guard(self):
+        with patch.object(s, 'dispatch_ready', side_effect=s.Stop('Queued goal run')):
+            writes, model, error = self.run_controller()
+        self.assertIsInstance(error, s.Stop)
+        self.assertEqual(model.call_count, 1)
+        body = writes[-1][2]['body']
+        self.assertIn('"phase":"dispatch_ready"', body)
+        state = s.records([{'user': {'login': s.AUTHOR}, 'body': body}])[0][1]
+        self.assertEqual(state['decision'], DECISION)
+        self.assertEqual(len(writes), 2)
+
+    def test_post_reservation_head_change_never_posts_create(self):
+        state = {'phase': 'dispatch_ready', 'head': HEAD, 'review': 4, 'decision': DECISION}
+        comment = {'id': 100, 'body': s.state_body(state, 'Recorded assessment')}
+        with patch.object(s, 'refresh_guard', side_effect=[None, s.Stop('Moved head')]), patch.object(s, 'gh'), patch.object(s, 'update_state'), patch.object(s, 'cursor') as api:
+            with self.assertRaises(s.Stop):
+                s.dispatch_ready(PULL, comment, state)
+            self.assertEqual(state['phase'], 'dispatch_reserved')
+            api.assert_not_called()
+
+    def test_actual_checkpoint_stop_command_contains_attempts_findings_and_ci(self):
+        comments = [
+            {'id': 1, 'user': {'login': s.AUTHOR}, 'body': 'A cloud agent is working through the review findings: old'},
+            {'id': 2, 'user': {'login': s.AUTHOR}, 'body': goal.HUMAN_RESUME_MARKER},
+        ] + [{'id': i, 'html_url': f'https://example.test/attempt/{i}', 'body': f'Cursor remediation round {i}', 'user': {'login': s.AUTHOR}} for i in [3,4,5]]
+        findings = [{'path': 'risk.go', 'body': 'P1 suspension scan must use a derived index', 'html_url': 'https://example.test/review/4'}]
+        runs = [{'id': 77, 'name': 'CI', 'status': 'completed', 'conclusion': 'failure', 'html_url': 'https://example.test/ci/77'}]
+        with tempfile.TemporaryDirectory() as directory:
+            source, output = Path(directory)/'comments.json', Path(directory)/'stop.md'
+            source.write_text(json.dumps([comments]))
+            with patch.object(sys, 'argv', ['checkpoint_stop.py', '--head', HEAD, '--comments', str(source), '--output', str(output)]), patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'PR_NUMBER': '11'}), patch.object(stop, 'pages', side_effect=[[REVIEW], findings]), patch.object(stop, 'gh', return_value={'workflow_runs': runs}):
+                stop.main()
+            body = output.read_text()
+            self.assertNotIn('findings: old', body)
+            self.assertIn('3 counted attempts', body)
+            for token in ['attempt/3', 'attempt/4', 'attempt/5', findings[0]['body'], HEAD, 'failure', 'ci/77', 'independent supervisor assessment', 'claims do not prove']:
+                self.assertIn(token, body)
 
     def test_failed_assessment_patch_does_not_clear_stop_or_launch(self):
         writes, _, error = self.run_controller(failure=lambda p, m, d: m == 'PATCH')

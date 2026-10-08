@@ -121,7 +121,10 @@ def records(comments):
 def newest_review(reviews, head):
     matching = [r for r in reviews if r.get("user", {}).get("login") in CODEX
                 and r.get("commit_id") == head and r.get("state") != "PENDING"]
-    return max(matching, key=lambda r: (r.get("submitted_at") or "", r["id"]), default=None)
+    latest = max(matching, key=lambda r: (r.get("submitted_at") or "", r["id"]), default=None)
+    # A later approval/dismissal supersedes earlier feedback. Never fall back
+    # to an older actionable review after the newest review resolves it.
+    return latest if latest and latest.get("state") in {"COMMENTED", "CHANGES_REQUESTED"} else None
 
 
 def state_body(state, text):
@@ -359,14 +362,48 @@ def wait_for_goal_idle(number, head):
     raise Stop("Goal workflows remain active; no overlapping worker launch")
 
 
-def refresh_guard(number, head, review_id, *, require_stop=True):
-    wait_for_goal_idle(number, head)
+def refresh_guard(number, head, review_id, *, require_stop=True, check_activity=True):
+    if check_activity:
+        wait_for_goal_idle(number, head)
     pull = gh(f"repos/{REPO}/pulls/{number}")
     if not eligible(pull, require_stop=require_stop) or pull["head"]["sha"] != head:
         raise Stop("PR changed during supervisor assessment")
     current = newest_review(pages(f"repos/{REPO}/pulls/{number}/reviews"), head)
-    if current is None or current["id"] != review_id or active_goal_work(number, head):
+    if current is None or current["id"] != review_id or (check_activity and active_goal_work(number, head)):
         raise Stop("Review changed or worker activity remains")
+
+
+def dispatch_ready(pull, comment, state):
+    """Resume a definitely unattempted create without another model call.
+
+    Idle timeouts leave dispatch_ready intact. Once dispatch_reserved is durable,
+    recovery is GET-only even if a later operation fails: never replay a create.
+    """
+    number, head, review_id = pull["number"], state["head"], state["review"]
+    decision = validate_decision(state["decision"], head)
+    if state.get("phase") != "dispatch_ready" or decision["decision"] != "resume":
+        raise Stop("Checkpoint is not ready for first dispatch")
+    refresh_guard(number, head, review_id)
+    payload = worker_payload(number, head, review_id, decision)
+    state.update(phase="dispatch_reserved", agent_id=payload["agentId"])
+    update_state(comment, state)
+    gh(f"repos/{REPO}/issues/{number}/comments", method="POST", data={"body":
+        "Cursor remediation round 1: supervisor worker launch reserved.\n\n"
+        f"Agent: `{payload['agentId']}`. Correction is recorded above. "
+        "An ambiguous create is reconciled by this identity, never replayed."})
+    # Stop label is still present and the repository was idle immediately before
+    # reserving. These writes create goal runs that cannot launch while stopped.
+    # Recheck head/review/stop without waiting for our own newly queued runs.
+    refresh_guard(number, head, review_id, check_activity=False)
+    result = cursor("", payload=payload)
+    if result.get("agent", {}).get("id") != payload["agentId"]:
+        raise Stop("Cursor create returned a different worker identity")
+    run_id = result.get("run", {}).get("id")
+    if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+        raise Stop("Cursor create did not return a valid run identity")
+    state.update(phase="working", run_id=run_id)
+    update_state(comment, state)
+    print(f"PR #{number}: supervisor correction worker started; no merge performed")
 
 
 def run_one(pull, key, max_checkpoints):
@@ -401,8 +438,10 @@ def run_one(pull, key, max_checkpoints):
     claim = gh(prefix + "/comments", method="POST", data={"body": state_body(state, "Automatic supervisor checkpoint reserved. Model: GPT-6.1 Sol / high. A reserved assessment consumes budget even on failure.")})
     try:
         decision, usage = assess(evidence, key)
-        refresh_guard(number, head, review["id"])
-        state.update(phase=decision["decision"], usage=usage)
+        # Persist a completed assessment before any idle wait. A queued own
+        # comment run must not strand a paid assessment as an ambiguous call.
+        state.update(phase="dispatch_ready" if decision["decision"] == "resume" else "escalate",
+                     usage=usage, decision=decision)
         text = (f"Automatic supervisor assessment of `{head}`: **{decision['decision']}**.\n\n"
                 + decision["assessment"] + "\n\nCorrection:\n" + decision["correction"])
         if decision["decision"] == "escalate":
@@ -414,28 +453,7 @@ def run_one(pull, key, max_checkpoints):
         if decision["decision"] != "resume":
             print(f"PR #{number}: escalated; see checkpoint comment")
             return
-        refresh_guard(number, head, review["id"])
-        # Keep the stop label until this worker finishes; existing review-event
-        # launchers cannot race this direct, plan-bearing launch.
-        payload = worker_payload(number, head, review["id"], decision)
-        state.update(phase="dispatch_reserved", agent_id=payload["agentId"])
-        update_state(claim, state, text)
-        # A separate comment AFTER the resume marker counts this worker in the
-        # existing three-cycle allowance, even if the create response is lost.
-        gh(prefix + "/comments", method="POST", data={"body":
-            "Cursor remediation round 1: supervisor worker launch reserved.\n\n"
-            f"Agent: `{payload['agentId']}`. Correction is recorded above. "
-            "An ambiguous create is reconciled by this identity, never replayed."})
-        refresh_guard(number, head, review["id"])
-        result = cursor("", payload=payload)
-        if result.get("agent", {}).get("id") != payload["agentId"]:
-            raise Stop("Cursor create returned a different worker identity")
-        run_id = result.get("run", {}).get("id")
-        if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
-            raise Stop("Cursor create did not return a valid run identity")
-        state.update(phase="working", run_id=run_id)
-        update_state(claim, state, text)
-        print(f"PR #{number}: supervisor correction worker started; no merge performed")
+        dispatch_ready(pull, {"id": claim["id"], "body": state_body(state, text)}, state)
     except Stop:
         # Do not erase the reservation or blindly retry. The failure is visible
         # in Actions; no response/body that could contain credentials is logged.
@@ -465,11 +483,13 @@ def main():
         if not eligible(pull, require_stop=False):
             continue
         states = records(pages(f"repos/{REPO}/issues/{pull['number']}/comments"))
-        active = [(c, st) for c, st in states if st.get("phase") in {"dispatch_reserved", "working", "review_reserved"}]
+        active = [(c, st) for c, st in states if st.get("phase") in {"dispatch_ready", "dispatch_reserved", "working", "review_reserved"}]
         try:
             if active:
                 comment, state = active[-1]
-                if state["phase"] == "review_reserved":
+                if state["phase"] == "dispatch_ready":
+                    dispatch_ready(pull, comment, state)
+                elif state["phase"] == "review_reserved":
                     finish_review(pull, comment, state)
                 else:
                     recover_worker(pull, comment, state)
