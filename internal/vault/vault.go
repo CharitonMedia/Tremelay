@@ -662,9 +662,6 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 			return err
 		}
 	}
-	nextAuditLog := make([]auditEvent, len(s.audit)+len(events))
-	copy(nextAuditLog, s.audit)
-	copy(nextAuditLog[len(s.audit):], events)
 	base := s.denials
 	if base == nil {
 		base = indexFromAudit(s.audit)
@@ -702,7 +699,10 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 		return err
 	}
 	s.header = h
-	s.audit = nextAuditLog
+	// Append only after the transaction succeeds. A failed commit leaves the
+	// prefix in place, and append grows the backing array instead of copying
+	// it on every row.
+	s.audit = append(s.audit, events...)
 	s.creds = creds
 	s.agents = agents
 	s.grants = grants

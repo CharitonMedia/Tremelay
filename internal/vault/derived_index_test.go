@@ -116,6 +116,87 @@ func brokerRow(agentID, result string) auditEvent {
 	}
 }
 
+func TestCommitAppendsAuditSuffix(t *testing.T) {
+	_, _, session := mustCreate(t, nil)
+	t.Cleanup(session.Lock)
+	for cap(session.audit)-len(session.audit) < 1 {
+		if err := session.persistEvent(actionList, "", "", resultAllowed); err != nil {
+			t.Fatal(err)
+		}
+		if len(session.audit) > 64 {
+			t.Fatal("audit slice did not keep spare capacity")
+		}
+	}
+	prefix := &session.audit[0]
+	before := len(session.audit)
+	session.commitFault = func() error { return errors.New("full") }
+	if err := session.persistEvent(actionList, "", "", resultAllowed); err == nil {
+		t.Fatal("faulted commit succeeded")
+	}
+	session.commitFault = nil
+	if len(session.audit) != before || &session.audit[0] != prefix {
+		t.Fatal("failed commit rebuilt the audit prefix")
+	}
+	if err := session.persistEvent(actionList, "", "", resultAllowed); err != nil {
+		t.Fatal(err)
+	}
+	if len(session.audit) != before+1 || &session.audit[0] != prefix {
+		t.Fatal("commit rebuilt the audit prefix")
+	}
+}
+
+func TestAlertCommitAppendsAuditSuffix(t *testing.T) {
+	_, _, session := mustCreate(t, nil)
+	t.Cleanup(session.Lock)
+	for cap(session.audit)-len(session.audit) < 2 {
+		if err := session.persistEvent(actionGet, "", "", resultAllowed); err != nil {
+			t.Fatal(err)
+		}
+		if len(session.audit) > 80 {
+			t.Fatal("audit slice did not keep spare capacity")
+		}
+	}
+	prefix := &session.audit[0]
+	before := len(session.audit)
+	if err := session.writeAudit(auditEvent{
+		Action: actionBroker, Result: resultDeniedSSRF,
+	}, session.creds, session.agents, session.grants); err != nil {
+		t.Fatal(err)
+	}
+	if &session.audit[0] != prefix {
+		t.Fatal("alert commit rebuilt the audit prefix")
+	}
+	if len(session.audit) != before+2 {
+		t.Fatalf("alert appended %d rows", len(session.audit)-before)
+	}
+}
+
+func TestIncomingClassMatchesChain(t *testing.T) {
+	_, _, session := mustCreate(t, nil)
+	t.Cleanup(session.Lock)
+	id := strings.Repeat("a1", 16)
+	check := func(want Classification) {
+		t.Helper()
+		ev, err := nextAudit(session.audit, session.id, brokerRow(id, resultDeniedMissing))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := session.classifyIncoming(ev, session.agents, session.grants)
+		chain := append(append([]auditEvent{}, session.audit...), ev)
+		full := classifyState(chain, ev, session.agents, session.grants)
+		if got != full || got != want {
+			t.Fatalf("incoming %+v chain %+v want %+v", got, full, want)
+		}
+		if err := session.writeAudit(brokerRow(id, resultDeniedMissing), session.creds, session.agents, session.grants); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ordinary := Classification{Class: ClassExpectedDenial, Severity: SeverityLow}
+	check(ordinary)
+	check(ordinary)
+	check(Classification{Class: ClassRepeatedDenial, Severity: SeverityHigh})
+}
+
 func TestNoticeIndexMatchesScans(t *testing.T) {
 	events := []auditEvent{
 		{Seq: 1, Action: actionBroker, Result: resultDeniedSSRF},

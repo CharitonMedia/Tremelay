@@ -178,10 +178,7 @@ func (s *Session) afterCommit(ev auditEvent) {
 // suspension, to the same commit as ev. Notification transport is not part of
 // that commit. A row that is not an alert is returned unchanged.
 func (s *Session) withResponse(ev auditEvent, creds []credential, agents []agentRecord, grants []grantRecord) ([]auditEvent, []credential, []agentRecord, []grantRecord, error) {
-	chain := make([]auditEvent, len(s.audit)+1)
-	copy(chain, s.audit)
-	chain[len(s.audit)] = ev
-	class := classifyState(chain, ev, agents, grants)
+	class := s.classifyIncoming(ev, agents, grants)
 	if !class.alert() {
 		return []auditEvent{ev}, creds, agents, grants, nil
 	}
@@ -189,20 +186,21 @@ func (s *Session) withResponse(ev auditEvent, creds []credential, agents []agent
 	if s.policy.High == ContainFlag {
 		decision = resultDecisionFlag
 	}
+	// Hash the response off ev. nextAudit reads only the previous row, so the
+	// existing chain is not copied to link these new rows.
+	out := []auditEvent{ev}
 	var err error
-	chain, err = appendHashed(chain, s.id, noticePartial(actionRespond, decision, ev, class))
+	out, err = appendHashed(out, s.id, noticePartial(actionRespond, decision, ev, class))
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 	nextAgents, nextGrants, containResult, ok := planContainment(s.policy, ev, agents, grants)
 	if ok {
-		chain, err = appendHashed(chain, s.id, noticePartial(actionContain, containResult, ev, class))
+		out, err = appendHashed(out, s.id, noticePartial(actionContain, containResult, ev, class))
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
 	}
-	out := make([]auditEvent, len(chain)-len(s.audit))
-	copy(out, chain[len(s.audit):])
 	return out, creds, nextAgents, nextGrants, nil
 }
 

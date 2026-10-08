@@ -99,6 +99,40 @@ func classifyState(events []auditEvent, ev auditEvent, agents []agentRecord, gra
 	return base
 }
 
+// classifyIncoming classifies ev as the next row after the session chain.
+// The denial count is the derived index plus ev. Audit views still classify
+// stored rows from the chain, so an agent omitted from the mirror stays visible.
+func (s *Session) classifyIncoming(ev auditEvent, agents []agentRecord, grants []grantRecord) Classification {
+	base := baseClass(ev)
+	if base.alert() {
+		return base
+	}
+	if ev.Action == actionBroker && ordinaryBrokerDenial(ev.Result) && safeID(ev.AgentID) != "" {
+		if ev.Result == resultDeniedAgent && agentSuspendedBefore(s.audit, ev.AgentID, ev.Seq, agents, grants) {
+			return base
+		}
+		if s.incomingDenialCount(ev) >= detectionThreshold {
+			return Classification{Class: ClassRepeatedDenial, Severity: SeverityHigh}
+		}
+	}
+	return base
+}
+
+func (s *Session) incomingDenialCount(ev auditEvent) int {
+	idx := s.denials
+	if idx == nil {
+		idx = indexFromAudit(s.audit)
+	}
+	w := denialWindow{}
+	if idx != nil && idx.byID != nil {
+		if existing := idx.byID[ev.AgentID]; existing != nil {
+			w = *existing
+		}
+	}
+	w.add(ev.Result, ev.Seq)
+	return w.count
+}
+
 // agentSuspendedBefore reports a prior contain row that suspended this agent.
 // Grant suspension stays resultSuspended and does not match. A legacy agent
 // suspension used that same result; the source reference plus the authenticated
