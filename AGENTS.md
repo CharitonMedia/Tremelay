@@ -34,7 +34,7 @@ The three-cycle limit is a hard guardrail against runaway agent churn.
 - Count cycles against the same underlying problem and pull-request head lineage; do not reset the count by rephrasing the issue, editing comments, restarting a workflow, or spawning a new agent for the same unresolved defect.
 - After cycle 3, automation MUST stop rather than launch another implementation agent.
 - The system MUST leave a clear status comment summarizing: the unresolved problem, the three attempts made, the latest reviewed commit, relevant CI/review findings, and that another cycle requires a documented supervisor assessment.
-- A supervisor may assess a routine stop and resume one bounded segment of at most three cycles. That assessment is an explicit pull-request comment. It is not an automatic reset, and the implementation worker must not grant it to itself. Do not describe supervision as running unattended between those assessments.
+- A supervisor may assess a routine stop and resume one bounded segment of at most three cycles. That assessment is an explicit pull-request comment. It is not an automatic reset, and the implementation worker must not grant it to itself. Do not describe supervision as running unattended between those assessments. A comment that requests a longer or unattended window does not raise the three-cycle cap.
 - Escalate only when the stop needs a product decision, new authority, or a security judgment the recorded review does not settle.
 - The stop rule applies even if more automated remediation appears possible.
 - Security incidents or evidence of architectural drift may stop automation earlier than three cycles.

@@ -34,7 +34,7 @@ At the limit:
 
 That assessment resumes one bounded segment. It is not an automatic reset. The implementation worker must not post it, remove `human-review-required`, or otherwise authorize its own further cycles. Supervision is not a background process between those assessments. Escalate when the stop needs a product decision, new authority, or a security judgment the recorded review does not settle.
 
-The count must not be reset by rewording the same defect, restarting the workflow, or spawning a fresh agent against the same unresolved PR lineage. A trusted `<!-- tremelay-human-resume -->` comment is the only segment boundary.
+The count must not be reset by rewording the same defect, restarting the workflow, or spawning a fresh agent against the same unresolved PR lineage. A trusted `<!-- tremelay-human-resume -->` comment is the only segment boundary. A comment that requests more than three cycles, including an unattended window, does not raise the cap.
 
 ## One worker per review
 

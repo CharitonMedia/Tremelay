@@ -14,7 +14,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from complete_codex_clean_review import is_terminal_clean_review, reviewed_commit
@@ -762,8 +762,8 @@ CYCLE_COUNT_MARKERS = (
     "<!-- goal-review-claim ",
 )
 HUMAN_RESUME_MARKER = "<!-- tremelay-human-resume -->"
-UNATTENDED_WINDOW_MARKER = "<!-- tremelay-unattended-window hours:6 max-cycles:9 -->"
 TRUSTED_AUTOMATION_LOGIN = "pattalkslaw-del"
+CYCLE_LIMIT = 3
 _CLAIM_MARKER_RE = re.compile(
     r"^<!-- goal-review-claim review:[0-9]+ head:[0-9a-f]{40} -->$"
 )
@@ -807,37 +807,22 @@ def accepted_launch_body(url: str, marker: str) -> str:
     return f"A cloud agent is working through the review findings: {url.strip()}\n\n{marker}\n"
 
 
-def cycle_budget(comments: list | None, *, now: datetime | None = None) -> tuple[int, int]:
+def cycle_budget(comments: list | None) -> tuple[int, int]:
     """Return (cycles since the last supervisor resume, cycle limit).
 
-    A trusted resume comment starts a new segment. A trusted unattended-window
-    comment raises the limit to nine for six hours. Claim comments count as
-    soon as they are posted.
+    A trusted resume comment starts a new segment. The limit stays three.
+    An unattended-window comment does not raise it, whoever posts it.
+    Claim comments count as soon as they are posted.
     """
-    if now is None:
-        now = datetime.now(timezone.utc)
     start = 0
-    limit = 3
     for i, comment in enumerate(comments or []):
         if not isinstance(comment, dict):
             continue
         if _actor_login(comment).casefold() != TRUSTED_AUTOMATION_LOGIN:
             continue
         body = comment.get("body") or ""
-        if not isinstance(body, str):
-            continue
-        if HUMAN_RESUME_MARKER in body:
+        if isinstance(body, str) and HUMAN_RESUME_MARKER in body:
             start = i + 1
-        if UNATTENDED_WINDOW_MARKER in body:
-            raw = comment.get("created_at") or ""
-            if not isinstance(raw, str):
-                continue
-            try:
-                created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if created <= now < created + timedelta(hours=6):
-                limit = 9
     count = 0
     for comment in (comments or [])[start:]:
         if not isinstance(comment, dict):
@@ -845,7 +830,7 @@ def cycle_budget(comments: list | None, *, now: datetime | None = None) -> tuple
         body = comment.get("body") or ""
         if isinstance(body, str) and comment_counts_cycle(body):
             count += 1
-    return count, limit
+    return count, CYCLE_LIMIT
 
 
 def _summary_commit(body: str) -> str | None:
@@ -1261,10 +1246,9 @@ def _self_check() -> None:
         pass
     else:
         raise SystemExit("short claim marker was accepted")
-    now = datetime(2026, 10, 8, 12, tzinfo=timezone.utc)
     trusted = "pattalkslaw-del"
     reservation_comment = {"user": {"login": trusted}, "body": reservation}
-    count, limit = cycle_budget([reservation_comment], now=now)
+    count, limit = cycle_budget([reservation_comment])
     if count != 1 or limit != 3:
         raise SystemExit(f"one reserved launch counted {count} limit {limit}")
     resumed = [
@@ -1273,32 +1257,36 @@ def _self_check() -> None:
         {"user": {"login": trusted}, "body": "<!-- tremelay-human-resume -->\nassessment"},
         reservation_comment,
     ]
-    count, limit = cycle_budget(resumed, now=now)
+    count, limit = cycle_budget(resumed)
     if count != 1 or limit != 3:
         raise SystemExit(f"resume did not start a segment: {count} {limit}")
     ignored = [
         {"user": {"login": "someone-else"}, "body": "<!-- tremelay-human-resume -->"},
         reservation_comment,
     ]
-    count, _limit = cycle_budget(ignored, now=now)
+    count, _limit = cycle_budget(ignored)
     if count != 1:
         raise SystemExit(f"untrusted resume reset the count: {count}")
-    window = [{
-        "user": {"login": trusted},
-        "created_at": "2026-10-08T11:00:00Z",
-        "body": "<!-- tremelay-unattended-window hours:6 max-cycles:9 -->",
-    }]
-    _count, limit = cycle_budget(window, now=now)
-    if limit != 9:
-        raise SystemExit(f"open window limit {limit}")
-    expired = [{
-        "user": {"login": trusted},
-        "created_at": "2026-10-07T11:00:00Z",
-        "body": "<!-- tremelay-unattended-window hours:6 max-cycles:9 -->",
-    }]
-    _count, limit = cycle_budget(expired, now=now)
+    window = "<!-- tremelay-unattended-window hours:6 max-cycles:9 -->"
+    bypass = [
+        {"user": {"login": trusted}, "created_at": "2026-10-08T11:00:00Z", "body": window},
+        reservation_comment,
+        reservation_comment,
+        reservation_comment,
+    ]
+    count, limit = cycle_budget(bypass)
+    if count != 3 or limit != 3:
+        raise SystemExit(f"unattended window raised the cap: {count} {limit}")
+    count, limit = cycle_budget(bypass + [reservation_comment])
+    if count != 4 or limit != 3:
+        raise SystemExit(f"fourth cycle left the three-cycle cap: {count} {limit}")
+    stranger = [
+        {"user": {"login": "someone-else"}, "created_at": "2026-10-08T11:00:00Z", "body": window},
+        reservation_comment,
+    ]
+    _, limit = cycle_budget(stranger)
     if limit != 3:
-        raise SystemExit(f"expired window limit {limit}")
+        raise SystemExit(f"untrusted window raised the cap: {limit}")
     # A failed PATCH leaves the reservation in place. It still counts once,
     # and review, inline, and summary events for that head stay owned.
     owned_comments = [reservation_comment]

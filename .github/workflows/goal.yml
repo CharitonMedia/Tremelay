@@ -302,6 +302,7 @@ jobs:
         run: |
           set -euo pipefail
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > cycle_comments.json
+          # cycle-budget always reports 3. A comment cannot raise that cap.
           read -r count max_cycles < <(python scripts/goal_agent_request.py cycle-budget --comments cycle_comments.json)
           echo "count=${count}" >> "$GITHUB_OUTPUT"
           echo "max_cycles=${max_cycles}" >> "$GITHUB_OUTPUT"
