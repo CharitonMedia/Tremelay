@@ -24,7 +24,7 @@ Before changing credential, authorization, network, audit, identity, cryptograph
 8. Changes affecting trust boundaries require an ADR.
 9. If a goal conflicts with the threat model or security invariants, stop implementation of that portion and document the conflict.
 10. Prefer the smallest implementation that satisfies the acceptance criteria.
-11. Automated build/review remediation is limited to three cycles for the same problem or PR head lineage. After three unsuccessful Cursor↔review cycles, stop automation. Another segment requires a documented supervisor assessment. The implementation worker must not authorize its own further cycles.
+11. Automated build/review remediation is limited to three cycles for the same problem or PR head lineage. After three unsuccessful Cursor↔review cycles, stop the worker loop for a documented independent supervisor assessment before further implementation. Patrick has delegated routine checkpoint decisions to the supervising assistant.
 
 ## Three-cycle stop rule
 
@@ -33,9 +33,9 @@ The three-cycle limit is a hard guardrail against runaway agent churn.
 - A cycle means one implementation/remediation attempt followed by automated review or verification that identifies unresolved work.
 - Count cycles against the same underlying problem and pull-request head lineage; do not reset the count by rephrasing the issue, editing comments, restarting a workflow, or spawning a new agent for the same unresolved defect.
 - After cycle 3, automation MUST stop rather than launch another implementation agent.
-- The system MUST leave a clear status comment summarizing: the unresolved problem, the three attempts made, the latest reviewed commit, relevant CI/review findings, and that another cycle requires a documented supervisor assessment.
-- A supervisor may assess a routine stop and resume one bounded segment of at most three cycles. That assessment is an explicit pull-request comment. It is not an automatic reset, and the implementation worker must not grant it to itself. Do not describe supervision as running unattended between those assessments. A comment that requests a longer or unattended window does not raise the three-cycle cap.
-- Escalate only when the stop needs a product decision, new authority, or a security judgment the recorded review does not settle.
+- The system MUST leave a clear status comment summarizing: the unresolved problem, the three attempts made, the latest reviewed commit, relevant CI/review findings, and that an independent supervisor assessment is required.
+- Resumption requires a documented assessment by Patrick or his delegated supervising assistant. The deployed checkpoint supervisor may authorize routine corrections within the approved goal and security contract, up to its separate total checkpoint budget. Implementation workers may not authorize their own resumption.
+- Escalate genuine product, scope, authority, security-contract, or exhausted-resource decisions to Patrick. Do not request repeated human permission for routine defects. The three-cycle worker checkpoint remains in force; there is no unattended nine-cycle exception.
 - The stop rule applies even if more automated remediation appears possible.
 - Security incidents or evidence of architectural drift may stop automation earlier than three cycles.
 

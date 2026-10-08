@@ -198,7 +198,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: goal-publish-${{ github.ref_name }}
-      cancel-in-progress: true
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -280,7 +280,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: goal-review-${{ github.event.pull_request.number || github.event.issue.number }}
-      cancel-in-progress: true
+      cancel-in-progress: false
     outputs:
       launch: ${{ steps.claim.outputs.launch }}
       agent_id: ${{ steps.launch.outputs.agent_id }}
@@ -321,7 +321,8 @@ jobs:
             if [ "$existing" != "yes" ]; then
               gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped at the active remediation circuit breaker." --force
               gh pr edit "$PR_NUMBER" --add-label "human-review-required"
-              gh pr comment "$PR_NUMBER" --body "Automation stopped after ${max_cycles} implementation/remediation cycles for this supervised segment. A documented supervisor assessment is required before another Cursor run. The implementation worker must not authorize its own further cycles. Latest head: \`${head}\`. Review the unresolved Codex/CI findings and resume only after that assessment.\n\n${marker}"
+              python scripts/checkpoint_stop.py --head "$head" --comments cycle_comments.json --output checkpoint_stop.md
+              gh pr comment "$PR_NUMBER" --body-file checkpoint_stop.md
             fi
           else
             echo "allowed=true" >> "$GITHUB_OUTPUT"
@@ -393,12 +394,13 @@ jobs:
           set -euo pipefail
           number="${{ github.event.pull_request.number || github.event.issue.number }}"
           if [ -z "${GOAL_GITHUB_TOKEN:-}" ] || [ -z "${{ steps.marker_identity.outputs.login }}" ]; then
-            echo "launch=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "Approved automation identity is required."
+            exit 1
           fi
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > live_pull.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews?per_page=100" > reviews.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${number}/comments?per_page=100" > comments.json
-          python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("ownership.json", "w"))'
+          python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"pull": json.load(open("live_pull.json")), "reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("ownership.json", "w"))'
           python scripts/goal_agent_request.py review-claim --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --state ownership.json --trusted-login "${{ steps.marker_identity.outputs.login }}" --out claim.json
           status=$(python -c 'import json; print(json.load(open("claim.json"))["status"])')
           if [ "$status" = "free" ]; then
@@ -422,7 +424,17 @@ jobs:
             gh pr comment "$number" --body "Review findings were not sent to a cloud agent because \`CURSOR_API_KEY\` is not set on this repository."
             exit 1
           fi
+          stopped=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" --jq '.labels[] | select(.name == "human-review-required") | .name')
+          if [ -n "$stopped" ]; then
+            echo "Checkpoint worker still owns this stopped PR; no review worker launch."
+            exit 1
+          fi
           before=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
+          expected=$(python -c 'import json; print(json.load(open("claim.json"))["head"])')
+          if [ "$before" != "$expected" ]; then
+            echo "Review head moved before launch; no stale worker launch."
+            exit 1
+          fi
           marker=$(python -c 'import json; print(json.load(open("claim.json"))["marker"])')
           if [ -z "$marker" ]; then
             echo "Refusing to launch without a stable review/head claim."
@@ -481,6 +493,12 @@ jobs:
           claim_id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${number}/comments" -f body="$claim_body" --jq .id)
           if [ -z "$claim_id" ]; then
             echo "Launch reservation was not recorded."
+            exit 1
+          fi
+          # Recheck open/head/stop immediately before create, after the durable claim.
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > precreate_pull.json
+          if ! python -c 'import json,sys; p=json.load(open("precreate_pull.json")); c=json.load(open("claim.json")); sys.exit(0 if p["state"]=="open" and p["head"]["sha"]==c["head"] and "human-review-required" not in {l["name"] for l in p["labels"]} else 1)'; then
+            echo "PR closed, moved, or stopped before Cursor create; refusing launch."
             exit 1
           fi
           set +e
