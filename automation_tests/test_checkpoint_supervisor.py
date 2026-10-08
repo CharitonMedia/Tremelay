@@ -2,6 +2,9 @@ import copy
 import json
 from pathlib import Path
 import sys
+import subprocess
+import tempfile
+import shlex
 import unittest
 from unittest.mock import patch
 
@@ -235,8 +238,45 @@ class Controller(unittest.TestCase):
         self.assertEqual(goal.review_launch_decision(event, 'pull_request_review', pull=live)['status'], 'blocked')
         live['labels'] = [{'name': 'goal'}]
         self.assertEqual(goal.review_launch_decision(event, 'pull_request_review', pull=live)['status'], 'free')
+        live['state'] = 'closed'
+        self.assertEqual(goal.review_launch_decision(event, 'pull_request_review', pull=live)['status'], 'blocked')
+        live['state'] = 'open'
         live['head']['sha'] = 'b' * 40
         self.assertEqual(goal.review_launch_decision(event, 'pull_request_review', pull=live)['status'], 'blocked')
+
+    def test_actual_workflow_state_builders_execute_in_the_correct_jobs(self):
+        root = Path(__file__).resolve().parents[1]
+        lines = (root / '.github/workflows/goal.yml').read_text().splitlines()
+        commands = {name: next(line.strip() for line in lines if 'python -c' in line and f'open("{name}"' in line)
+                    for name in ['review_state.json', 'ownership.json']}
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            (tmp / 'scripts').symlink_to(root / 'scripts', target_is_directory=True)
+            (tmp / 'reviews.json').write_text(json.dumps([[REVIEW]]))
+            (tmp / 'comments.json').write_text('[]')
+            result = subprocess.run(shlex.split(commands['review_state.json']), cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('pull', json.loads((tmp / 'review_state.json').read_text()))
+            (tmp / 'live_pull.json').write_text(json.dumps(PULL))
+            result = subprocess.run(shlex.split(commands['ownership.json']), cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads((tmp / 'ownership.json').read_text())['pull'], PULL)
+
+    def test_actual_precreate_guard_refuses_closed_stopped_or_moved_pr(self):
+        root = Path(__file__).resolve().parents[1]
+        line = next(line.strip() for line in (root / '.github/workflows/goal.yml').read_text().splitlines()
+                    if line.strip().startswith('if ! python -c') and 'precreate_pull.json' in line)
+        command = shlex.split(line[len('if ! '):].removesuffix('; then'))
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            (tmp / 'claim.json').write_text(json.dumps({'head': HEAD}))
+            live = copy.deepcopy(PULL)
+            live['labels'] = [{'name': 'goal'}]
+            for modification, expected in [({}, 0), ({'state': 'closed'}, 1),
+                    ({'labels': PULL['labels']}, 1), ({'head': {'sha': 'b' * 40}}, 1)]:
+                (tmp / 'precreate_pull.json').write_text(json.dumps(dict(live, **modification)))
+                result = subprocess.run(command, cwd=tmp, capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
 
     def test_generic_loop_cannot_launch_goal_or_stopped_pr(self):
         event = {'action': 'submitted', 'review': REVIEW}

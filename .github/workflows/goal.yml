@@ -232,7 +232,7 @@ jobs:
           if [ -n "$number" ]; then
             gh api --paginate --slurp "repos/{owner}/{repo}/pulls/${number}/reviews" > reviews.json
             gh api --paginate --slurp "repos/{owner}/{repo}/issues/${number}/comments" > comments.json
-            python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"pull": json.load(open("live_pull.json")), "reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("review_state.json", "w"))'
+            python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("review_state.json", "w"))'
             if [ "$(python scripts/goal_agent_request.py head-already-reviewed --head "$head" --state review_state.json)" = "yes" ]; then
               changed="--head-accepted"
             fi
@@ -399,7 +399,7 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > live_pull.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews?per_page=100" > reviews.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${number}/comments?per_page=100" > comments.json
-          python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("ownership.json", "w"))'
+          python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"pull": json.load(open("live_pull.json")), "reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("ownership.json", "w"))'
           python scripts/goal_agent_request.py review-claim --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --state ownership.json --trusted-login "${{ steps.marker_identity.outputs.login }}" --out claim.json
           status=$(python -c 'import json; print(json.load(open("claim.json"))["status"])')
           if [ "$status" = "free" ]; then
@@ -492,6 +492,12 @@ jobs:
           claim_id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${number}/comments" -f body="$claim_body" --jq .id)
           if [ -z "$claim_id" ]; then
             echo "Launch reservation was not recorded."
+            exit 1
+          fi
+          # Recheck open/head/stop immediately before create, after the durable claim.
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > precreate_pull.json
+          if ! python -c 'import json,sys; p=json.load(open("precreate_pull.json")); c=json.load(open("claim.json")); sys.exit(0 if p["state"]=="open" and p["head"]["sha"]==c["head"] and "human-review-required" not in {l["name"] for l in p["labels"]} else 1)'; then
+            echo "PR closed, moved, or stopped before Cursor create; refusing launch."
             exit 1
           fi
           set +e
