@@ -138,6 +138,7 @@ func (s *Session) incomingDenialCount(ev auditEvent) int {
 // suspension used that same result; the source reference plus the authenticated
 // agent and grant state tell those rows apart without rewriting the hash.
 func agentSuspendedBefore(events []auditEvent, agentID string, seq uint64, agents []agentRecord, grants []grantRecord) bool {
+	auditPrefixScans += len(events)
 	if safeID(agentID) == "" {
 		return false
 	}
@@ -281,7 +282,12 @@ func brokerDenialResult(result string) bool {
 	}
 }
 
+// auditPrefixScans counts rows read by a per-event denial or suspension walk.
+// AuditHistory classifies from one forward index and leaves this at zero.
+var auditPrefixScans int
+
 func brokerDenialCount(events []auditEvent, agentID string, through uint64) int {
+	auditPrefixScans += len(events)
 	var w denialWindow
 	for _, row := range events {
 		if row.Seq > through {
@@ -367,6 +373,11 @@ func (idx *detectionIndex) clone() *detectionIndex {
 
 func (idx *detectionIndex) apply(ev auditEvent) {
 	detectionApplyVisits++
+	idx.observe(ev)
+}
+
+// observe updates the lookback without counting a commit or unlock visit.
+func (idx *detectionIndex) observe(ev auditEvent) {
 	if idx == nil || ev.Action != actionBroker || safeID(ev.AgentID) == "" {
 		return
 	}
@@ -532,40 +543,86 @@ func (s *Session) AuditHistory(f AuditFilter) ([]AuditRecord, error) {
 	if limit > auditPageMax {
 		limit = auditPageMax
 	}
+	// Credential, agent, and action filters run on the raw row. Class still
+	// needs the denial window, so one forward index classifies the rows that
+	// remain. A per-row chain walk would be quadratic in broker denials.
+	idx := newDetectionIndex()
+	suspended := map[string]bool{}
 	var out []AuditRecord
 	for _, ev := range s.audit {
-		if ev.Seq <= f.AfterSeq {
-			continue
+		idx.observe(ev)
+		if ev.Seq > f.AfterSeq && auditFieldMatch(ev, f) {
+			class := classifyIndexed(idx, suspended, ev)
+			if f.Class == "" || class.Class == f.Class {
+				ts, ok := canonicalAuditTime(ev.Time)
+				if !ok {
+					return nil, ErrAudit
+				}
+				if (f.Since.IsZero() || !ts.Before(f.Since.UTC())) && (f.Until.IsZero() || !ts.After(f.Until.UTC())) {
+					out = append(out, auditRecordClass(ev, class))
+					if len(out) == limit {
+						break
+					}
+				}
+			}
 		}
-		rec := auditRecord(s.audit, ev, s.agents, s.grants)
-		if f.CredentialID != "" && rec.CredentialID != f.CredentialID {
-			continue
-		}
-		if f.AgentID != "" && rec.AgentID != f.AgentID {
-			continue
-		}
-		if f.Action != "" && rec.Action != f.Action {
-			continue
-		}
-		if f.Class != "" && rec.Class != f.Class {
-			continue
-		}
-		ts, ok := canonicalAuditTime(ev.Time)
-		if !ok {
-			return nil, ErrAudit
-		}
-		if !f.Since.IsZero() && ts.Before(f.Since.UTC()) {
-			continue
-		}
-		if !f.Until.IsZero() && ts.After(f.Until.UTC()) {
-			continue
-		}
-		out = append(out, rec)
-		if len(out) == limit {
-			break
-		}
+		noteAgentSuspension(suspended, s.audit, ev, s.agents, s.grants)
 	}
 	return out, nil
+}
+
+func auditFieldMatch(ev auditEvent, f AuditFilter) bool {
+	if f.CredentialID != "" && ev.CredID != f.CredentialID {
+		return false
+	}
+	if f.AgentID != "" && ev.AgentID != f.AgentID {
+		return false
+	}
+	if f.Action != "" && ev.Action != f.Action {
+		return false
+	}
+	return true
+}
+
+// classifyIndexed classifies ev after it has been observed.
+// suspended holds agents suspended by an earlier contain row.
+func classifyIndexed(idx *detectionIndex, suspended map[string]bool, ev auditEvent) Classification {
+	base := baseClass(ev)
+	if base.alert() {
+		return base
+	}
+	if ev.Action != actionBroker || !ordinaryBrokerDenial(ev.Result) || safeID(ev.AgentID) == "" {
+		return base
+	}
+	if ev.Result == resultDeniedAgent && suspended[ev.AgentID] {
+		return base
+	}
+	n := 0
+	if idx != nil && idx.byID != nil {
+		if w := idx.byID[ev.AgentID]; w != nil {
+			n = w.count
+		}
+	}
+	if n >= detectionThreshold {
+		return Classification{Class: ClassRepeatedDenial, Severity: SeverityHigh}
+	}
+	return base
+}
+
+// noteAgentSuspension records a contain row that later denials must treat as
+// an agent suspension. The current row is not suspended by itself.
+func noteAgentSuspension(suspended map[string]bool, events []auditEvent, ev auditEvent, agents []agentRecord, grants []grantRecord) {
+	if ev.Action != actionContain || ev.AgentID == "" {
+		return
+	}
+	switch ev.Result {
+	case resultAgentSuspended:
+		suspended[ev.AgentID] = true
+	case resultSuspended:
+		if legacyAgentSuspension(events, ev, agents, grants) {
+			suspended[ev.AgentID] = true
+		}
+	}
 }
 
 // AuditBySeq returns the verified row for seq.
@@ -605,7 +662,10 @@ func (s *Session) verified() error {
 }
 
 func auditRecord(events []auditEvent, ev auditEvent, agents []agentRecord, grants []grantRecord) AuditRecord {
-	class := classifyState(events, ev, agents, grants)
+	return auditRecordClass(ev, classifyState(events, ev, agents, grants))
+}
+
+func auditRecordClass(ev auditEvent, class Classification) AuditRecord {
 	return AuditRecord{
 		Seq:            ev.Seq,
 		Time:           ev.Time,

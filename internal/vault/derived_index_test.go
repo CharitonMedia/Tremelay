@@ -171,6 +171,77 @@ func TestAlertCommitAppendsAuditSuffix(t *testing.T) {
 	}
 }
 
+func TestAuditHistoryDoesNotRescanDenials(t *testing.T) {
+	_, _, session := mustCreate(t, nil)
+	t.Cleanup(session.Lock)
+	noise := strings.Repeat("ab", 16)
+	for i := 0; i < 40; i++ {
+		if err := session.writeAudit(brokerRow(noise, resultDeniedMissing), session.creds, session.agents, session.grants); err != nil {
+			t.Fatal(err)
+		}
+	}
+	agent, err := session.CreateAgent("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := agent.ID
+	if err := session.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := session.writeAudit(brokerRow(target, resultDeniedMissing), session.creds, session.agents, session.grants); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := session.writeAudit(brokerRow(target, resultDeniedAgent), session.creds, session.agents, session.grants); err != nil {
+			t.Fatal(err)
+		}
+	}
+	auditPrefixScans = 0
+	var got []AuditRecord
+	after := uint64(0)
+	for {
+		page, err := session.AuditHistory(AuditFilter{AfterSeq: after, Limit: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		got = append(got, page...)
+		after = page[len(page)-1].Seq
+	}
+	if auditPrefixScans != 0 {
+		t.Fatalf("history walked %d prefix rows", auditPrefixScans)
+	}
+	if len(got) != len(session.audit) {
+		t.Fatalf("history returned %d rows, chain has %d", len(got), len(session.audit))
+	}
+	for i, rec := range got {
+		ev := session.audit[i]
+		want := classifyState(session.audit, ev, session.agents, session.grants)
+		if rec.Seq != ev.Seq || rec.Class != want.Class || rec.Severity != want.Severity {
+			t.Fatalf("seq %d got %s/%s want %s/%s", ev.Seq, rec.Class, rec.Severity, want.Class, want.Severity)
+		}
+	}
+	auditPrefixScans = 0
+	miss, err := session.AuditHistory(AuditFilter{AgentID: strings.Repeat("ff", 16), Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(miss) != 0 || auditPrefixScans != 0 {
+		t.Fatalf("nonmatching filter returned %d and walked %d", len(miss), auditPrefixScans)
+	}
+	page, err := session.AuditHistory(AuditFilter{AgentID: target, Action: actionBroker, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 6 || page[2].Class != ClassRepeatedDenial || page[2].Result != resultDeniedMissing || page[3].Class != ClassExpectedDenial || page[3].Result != resultDeniedAgent {
+		t.Fatalf("target page %+v", page)
+	}
+}
+
 func TestIncomingClassMatchesChain(t *testing.T) {
 	_, _, session := mustCreate(t, nil)
 	t.Cleanup(session.Lock)
