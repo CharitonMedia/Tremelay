@@ -1,0 +1,51 @@
+name: Checkpoint Supervisor
+
+on:
+  workflow_run:
+    workflows: [goal, CI, Test Linux, Test Windows]
+    types: [completed]
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      preflight_only:
+        description: Verify setup without a model call or restart
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One controller owns checkpoint reservations across all event types. Never
+# cancel a controller between accepting a model/dispatch and recording it.
+concurrency:
+  group: tremelay-checkpoint-supervisor
+  cancel-in-progress: false
+
+jobs:
+  supervise:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify supervisor controller tests
+        run: python -m unittest discover -s automation_tests -p 'test_checkpoint_supervisor.py'
+      - name: Assess stopped goal PRs
+        env:
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SUPERVISOR_MAX_CHECKPOINTS: '3'
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
+        run: |
+          set -euo pipefail
+          if [ "$PREFLIGHT_ONLY" = "true" ]; then
+            python scripts/checkpoint_supervisor.py --preflight
+          else
+            python scripts/checkpoint_supervisor.py
+          fi
