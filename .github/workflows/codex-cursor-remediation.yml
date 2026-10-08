@@ -98,29 +98,8 @@ jobs:
         id: plan
         run: |
           set -euo pipefail
-          max_rounds=$(python - <<'PY'
-          import json
-          from datetime import datetime, timedelta, timezone
-          pages=json.load(open("issue_comments.json", encoding="utf-8"))
-          comments=[c for page in pages for c in page]
-          marker="<!-- tremelay-unattended-window hours:6 max-cycles:9 -->"
-          now=datetime.now(timezone.utc)
-          limit=3
-          for c in comments:
-              if (c.get("user") or {}).get("login","").casefold()!="pattalkslaw-del":
-                  continue
-              if marker not in (c.get("body") or ""):
-                  continue
-              raw=c.get("created_at") or ""
-              try:
-                  created=datetime.fromisoformat(raw.replace("Z","+00:00"))
-              except ValueError:
-                  continue
-              if created <= now < created + timedelta(hours=6):
-                  limit=9
-          print(limit)
-          PY
-          )
+          # Three cycles per segment. A comment cannot raise this.
+          max_rounds=3
           python scripts/codex_cursor_remediation.py build --event normalized_event.json --pull pull.json --review-comments review_comments.json --issue-comments issue_comments.json --out plan.json --max-rounds "$max_rounds" --repo-url "https://github.com/${GITHUB_REPOSITORY}" --trusted-marker-login "${{ steps.marker_identity.outputs.login }}"
           action=$(python -c 'import json; print(json.load(open("plan.json"))["action"])')
           reason=$(python -c 'import json; print(json.load(open("plan.json")).get("reason", ""))')
@@ -144,7 +123,7 @@ jobs:
           if [[ "$REASON" == *"circuit breaker reached ${LIMIT} rounds"* ]]; then
             gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped at the active remediation circuit breaker." --force
             gh pr edit "$PR_NUMBER" --add-label human-review-required
-            gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped after ${LIMIT} remediation cycles. Human review is required before another agent run. Reason: ${REASON}"
+            gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped after ${LIMIT} remediation cycles. A documented supervisor assessment is required before another agent run. The implementation worker must not authorize its own further cycles. Reason: ${REASON}"
           else
             gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped: ${REASON}"
           fi

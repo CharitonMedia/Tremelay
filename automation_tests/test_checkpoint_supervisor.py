@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import checkpoint_supervisor as s
+import codex_cursor_remediation as generic
 
 HEAD = 'a' * 40
 PULL = {'number': 11, 'state': 'open', 'draft': False,
@@ -226,6 +227,14 @@ class Controller(unittest.TestCase):
             with self.assertRaises(s.Stop):
                 s.recover_worker(PULL, {'id': 100}, {'agent_id': '../other-account'})
             api.assert_not_called()
+
+    def test_generic_loop_cannot_launch_goal_or_stopped_pr(self):
+        event = {'action': 'submitted', 'review': REVIEW}
+        for label in ['goal', 'human-review-required']:
+            pull = copy.deepcopy(PULL)
+            pull['labels'] = [{'name': label}, {'name': 'codex-cursor-loop'}]
+            plan = generic.build_plan(event, pull, [], [])
+            self.assertEqual(plan['action'], 'skip')
 
     def test_workflow_uses_trusted_main_and_serializes_controller(self):
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/checkpoint-supervisor.yml').read_text()

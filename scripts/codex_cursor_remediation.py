@@ -232,6 +232,13 @@ def build_plan(
     if not isinstance(review, dict) or not _is_codex(_actor_login(review)):
         return {"action": "skip", "reason": "review is not from Codex"}
 
+    # Goal PRs have a single worker owner: goal.yml plus its checkpoint supervisor.
+    # Opting into the separate generic loop must not create a second launcher.
+    if "goal" in _label_names(pull):
+        return {"action": "skip", "reason": "goal PR is owned by the goal workflow"}
+    if "human-review-required" in _label_names(pull):
+        return {"action": "skip", "reason": "independent supervisor assessment required"}
+
     if LOOP_LABEL not in _label_names(pull):
         return {"action": "skip", "reason": f"pull request lacks {LOOP_LABEL} label"}
 
