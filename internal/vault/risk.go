@@ -78,6 +78,10 @@ func knownClass(class string) bool {
 }
 
 func classify(events []auditEvent, ev auditEvent) Classification {
+	return classifyState(events, ev, nil, nil)
+}
+
+func classifyState(events []auditEvent, ev auditEvent, agents []agentRecord, grants []grantRecord) Classification {
 	base := baseClass(ev)
 	if base.alert() {
 		return base
@@ -85,7 +89,7 @@ func classify(events []auditEvent, ev auditEvent) Classification {
 	if ev.Action == actionBroker && ordinaryBrokerDenial(ev.Result) && safeID(ev.AgentID) != "" {
 		// A denial after ContainSuspendAgent stays ordinary. The mirror still
 		// counts the row. An active agent's denials still promote.
-		if ev.Result == resultDeniedAgent && agentSuspendedBefore(events, ev.AgentID, ev.Seq) {
+		if ev.Result == resultDeniedAgent && agentSuspendedBefore(events, ev.AgentID, ev.Seq, agents, grants) {
 			return base
 		}
 		if brokerDenialCount(events, ev.AgentID, ev.Seq) >= detectionThreshold {
@@ -96,13 +100,92 @@ func classify(events []auditEvent, ev auditEvent) Classification {
 }
 
 // agentSuspendedBefore reports a prior contain row that suspended this agent.
-// A grant suspension uses resultSuspended and does not match.
-func agentSuspendedBefore(events []auditEvent, agentID string, seq uint64) bool {
+// Grant suspension stays resultSuspended and does not match. A legacy agent
+// suspension used that same result; the source reference plus the authenticated
+// agent and grant state tell those rows apart without rewriting the hash.
+func agentSuspendedBefore(events []auditEvent, agentID string, seq uint64, agents []agentRecord, grants []grantRecord) bool {
+	if safeID(agentID) == "" {
+		return false
+	}
 	for _, row := range events {
 		if seq != 0 && row.Seq >= seq {
 			break
 		}
-		if row.Action == actionContain && row.Result == resultAgentSuspended && row.AgentID == agentID {
+		if row.Action != actionContain || row.AgentID != agentID {
+			continue
+		}
+		switch row.Result {
+		case resultAgentSuspended:
+			return true
+		case resultSuspended:
+			if legacyAgentSuspension(events, row, agents, grants) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// legacyAgentSuspension is a contain/suspended row written before the
+// agent_suspended result existed. It counts only when RefSeq names an earlier
+// event for this agent and the authenticated agent is suspended. A revoked
+// grant with no grant_revoke action is a grant suspension, including when the
+// row also names the agent.
+//
+// ponytail: a later contain/suspended that revokes the same grant id can mask
+// an earlier legacy agent row. Upgrade path is the agent_suspended result
+// current writes already append; the published hash is not rewritten.
+func legacyAgentSuspension(events []auditEvent, row auditEvent, agents []agentRecord, grants []grantRecord) bool {
+	if row.RefSeq == 0 || row.RefSeq >= row.Seq || row.AgentID == "" {
+		return false
+	}
+	src, ok := eventBySeq(events, row.RefSeq)
+	if !ok || src.AgentID != row.AgentID {
+		return false
+	}
+	if agentRecordState(agents, row.AgentID) != agentStateSuspended {
+		return false
+	}
+	grantID := row.GrantID
+	if grantID == "" {
+		grantID = src.GrantID
+	}
+	if grantID != "" && grantRecordRevoked(grants, grantID) && !grantRevokedByAction(events, grantID) {
+		return false
+	}
+	return true
+}
+
+func eventBySeq(events []auditEvent, seq uint64) (auditEvent, bool) {
+	for _, ev := range events {
+		if ev.Seq == seq {
+			return ev, true
+		}
+	}
+	return auditEvent{}, false
+}
+
+func agentRecordState(agents []agentRecord, id string) string {
+	for _, a := range agents {
+		if a.ID == id {
+			return a.State
+		}
+	}
+	return ""
+}
+
+func grantRecordRevoked(grants []grantRecord, id string) bool {
+	for _, g := range grants {
+		if g.ID == id {
+			return g.RevokedAt != nil
+		}
+	}
+	return false
+}
+
+func grantRevokedByAction(events []auditEvent, grantID string) bool {
+	for _, ev := range events {
+		if ev.Action == actionGrantRevoke && ev.GrantID == grantID && ev.Result == resultAllowed {
 			return true
 		}
 	}
@@ -361,7 +444,7 @@ func (s *Session) AuditHistory(f AuditFilter) ([]AuditRecord, error) {
 		if ev.Seq <= f.AfterSeq {
 			continue
 		}
-		rec := auditRecord(s.audit, ev)
+		rec := auditRecord(s.audit, ev, s.agents, s.grants)
 		if f.CredentialID != "" && rec.CredentialID != f.CredentialID {
 			continue
 		}
@@ -412,7 +495,7 @@ func (s *Session) AuditBySeq(seq uint64, hash string) (AuditRecord, error) {
 	if hash != "" && hash != ev.Hash {
 		return AuditRecord{}, ErrAudit
 	}
-	return auditRecord(s.audit, ev), nil
+	return auditRecord(s.audit, ev, s.agents, s.grants), nil
 }
 
 func (s *Session) verified() error {
@@ -425,8 +508,8 @@ func (s *Session) verified() error {
 	return nil
 }
 
-func auditRecord(events []auditEvent, ev auditEvent) AuditRecord {
-	class := classify(events, ev)
+func auditRecord(events []auditEvent, ev auditEvent, agents []agentRecord, grants []grantRecord) AuditRecord {
+	class := classifyState(events, ev, agents, grants)
 	return AuditRecord{
 		Seq:            ev.Seq,
 		Time:           ev.Time,

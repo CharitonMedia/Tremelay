@@ -141,7 +141,7 @@ func (s *Session) DeliverPending() error {
 		if noticeAction(ev.Action) || !notifyChosen(s.audit, ev.Seq) {
 			continue
 		}
-		class := classify(s.audit, ev)
+		class := classifyState(s.audit, ev, s.agents, s.grants)
 		if !class.alert() {
 			continue
 		}
@@ -161,7 +161,7 @@ func (s *Session) afterCommit(ev auditEvent) {
 	if s == nil || s.responding || noticeAction(ev.Action) || !notifyChosen(s.audit, ev.Seq) {
 		return
 	}
-	class := classify(s.audit, ev)
+	class := classifyState(s.audit, ev, s.agents, s.grants)
 	if !class.alert() {
 		return
 	}
@@ -179,7 +179,7 @@ func (s *Session) withResponse(ev auditEvent, creds []credential, agents []agent
 	chain := make([]auditEvent, len(s.audit)+1)
 	copy(chain, s.audit)
 	chain[len(s.audit)] = ev
-	class := classify(chain, ev)
+	class := classifyState(chain, ev, agents, grants)
 	if !class.alert() {
 		return []auditEvent{ev}, creds, agents, grants, nil
 	}
@@ -323,11 +323,27 @@ func notificationFrom(ev auditEvent, class Classification) Notification {
 	}
 }
 
+// notifyAttempts counts deliveries for one source. Each attempted row is one
+// try. A failed or delivered row with no unmatched attempted row ahead of it
+// is a legacy try from before reservations existed. A modern outcome pairs
+// with its reservation and is not a second try.
 func notifyAttempts(events []auditEvent, ref uint64) int {
 	n := 0
+	pending := 0
 	for _, ev := range events {
-		if ev.Action == actionNotify && ev.RefSeq == ref && ev.Result == resultAttempted {
+		if ev.Action != actionNotify || ev.RefSeq != ref {
+			continue
+		}
+		switch ev.Result {
+		case resultAttempted:
 			n++
+			pending++
+		case resultFailed, resultDelivered:
+			if pending > 0 {
+				pending--
+			} else {
+				n++
+			}
 		}
 	}
 	return n

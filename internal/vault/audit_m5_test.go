@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1349,6 +1350,360 @@ func TestLegacyDecisionDoesNotUsePolicy(t *testing.T) {
 	decidedNotify := append(chain, auditEvent{Action: actionRespond, Result: resultDecisionNotify, RefSeq: src.Seq})
 	if !notifyChosen(decidedNotify, src.Seq) {
 		t.Fatal("notify decision was suppressed")
+	}
+}
+
+func TestLegacyNotifyAttemptAndAgentSuspension(t *testing.T) {
+	const ref = uint64(2)
+	legacyFailed := []auditEvent{{Action: actionNotify, Result: resultFailed, RefSeq: ref}}
+	if notifyAttempts(legacyFailed, ref) != 1 {
+		t.Fatalf("legacy failed counted %d", notifyAttempts(legacyFailed, ref))
+	}
+	modern := []auditEvent{
+		{Action: actionNotify, Result: resultAttempted, RefSeq: ref},
+		{Action: actionNotify, Result: resultFailed, RefSeq: ref},
+	}
+	if notifyAttempts(modern, ref) != 1 {
+		t.Fatalf("modern pair counted %d", notifyAttempts(modern, ref))
+	}
+	mixed := append(append([]auditEvent{}, legacyFailed...), modern...)
+	if notifyAttempts(mixed, ref) != 2 {
+		t.Fatalf("legacy plus modern counted %d", notifyAttempts(mixed, ref))
+	}
+	delivered := []auditEvent{
+		{Action: actionNotify, Result: resultAttempted, RefSeq: ref},
+		{Action: actionNotify, Result: resultDelivered, RefSeq: ref},
+	}
+	if notifyAttempts(delivered, ref) != 1 {
+		t.Fatalf("delivered pair counted %d", notifyAttempts(delivered, ref))
+	}
+
+	agent := strings.Repeat("ab", 16)
+	grant := strings.Repeat("cd", 16)
+	suspendedAgents := []agentRecord{{ID: agent, State: agentStateSuspended}}
+	activeAgents := []agentRecord{{ID: agent, State: agentStateActive}}
+	revokedAt := time.Now().UTC()
+	revoked := []grantRecord{{ID: grant, AgentID: agent, RevokedAt: &revokedAt}}
+	legacy := []auditEvent{
+		{Seq: 1, Action: actionBroker, Result: resultDeniedSSRF, AgentID: agent},
+		{Seq: 2, Action: actionContain, Result: resultSuspended, AgentID: agent, Class: ClassSSRF, RefSeq: 1},
+	}
+	for i := 0; i < detectionLookback; i++ {
+		legacy = append(legacy, auditEvent{Seq: uint64(len(legacy) + 1), Action: actionBroker, Result: resultDeniedAgent, AgentID: agent})
+	}
+	if got := classifyState(legacy, legacy[len(legacy)-1], suspendedAgents, nil); got.Class != ClassExpectedDenial || got.Severity != SeverityLow {
+		t.Fatalf("legacy suspension %+v", got)
+	}
+	withGrant := []auditEvent{
+		{Seq: 1, Action: actionBroker, Result: resultDeniedSSRF, AgentID: agent, GrantID: grant},
+		{Seq: 2, Action: actionContain, Result: resultSuspended, AgentID: agent, GrantID: grant, Class: ClassSSRF, RefSeq: 1},
+	}
+	for i := 0; i < detectionThreshold; i++ {
+		withGrant = append(withGrant, auditEvent{Seq: uint64(len(withGrant) + 1), Action: actionBroker, Result: resultDeniedAgent, AgentID: agent})
+	}
+	if classifyState(withGrant, withGrant[len(withGrant)-1], suspendedAgents, nil).Class != ClassExpectedDenial {
+		t.Fatal("active grant on a legacy agent row suppressed nothing")
+	}
+	grantOnly := []auditEvent{
+		{Seq: 1, Action: actionBroker, Result: resultDeniedMethod, AgentID: agent, GrantID: grant},
+		{Seq: 2, Action: actionContain, Result: resultSuspended, AgentID: agent, GrantID: grant, Class: ClassPolicyViolation, RefSeq: 1},
+	}
+	for i := 0; i < detectionThreshold; i++ {
+		grantOnly = append(grantOnly, auditEvent{Seq: uint64(len(grantOnly) + 1), Action: actionBroker, Result: resultDeniedAgent, AgentID: agent})
+	}
+	if classifyState(grantOnly, grantOnly[len(grantOnly)-1], activeAgents, revoked).Class != ClassRepeatedDenial {
+		t.Fatal("grant-only suspension hid an active agent")
+	}
+	if classifyState(grantOnly, grantOnly[len(grantOnly)-1], suspendedAgents, revoked).Class != ClassRepeatedDenial {
+		t.Fatal("revoked grant row counted as an agent suspension")
+	}
+	modernHold := append([]auditEvent{}, legacy[0], auditEvent{Seq: 2, Action: actionContain, Result: resultAgentSuspended, AgentID: agent, Class: ClassSSRF, RefSeq: 1})
+	modernHold = append(modernHold, legacy[2:]...)
+	if classify(modernHold, modernHold[len(modernHold)-1]).Class != ClassExpectedDenial {
+		t.Fatal("modern agent_suspended control regressed")
+	}
+}
+
+func TestLegacyVaultRetryCapAndSuspension(t *testing.T) {
+	t.Run("notify cap", func(t *testing.T) {
+		e := newBrokerEnv(t)
+		sink := &MemoryNotifier{}
+		if err := e.session.SetNotifier(sink); err != nil {
+			t.Fatal(err)
+		}
+		sink.Fail(errors.New("down"))
+		e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+		var security auditEvent
+		for _, ev := range e.session.audit {
+			if ev.Action == actionBroker && ev.Result == resultDeniedSSRF {
+				security = ev
+			}
+		}
+		if security.Seq == 0 {
+			t.Fatal("missing trigger")
+		}
+		before := append([]auditEvent{}, e.session.audit...)
+		if notifyAttempts(before, security.Seq) != 1 {
+			t.Fatalf("modern control %d", notifyAttempts(before, security.Seq))
+		}
+		keptHash := security.Hash
+		legacy := dropAuditResult(t, before, actionNotify, resultAttempted)
+		for _, ev := range legacy {
+			if ev.Action == actionBroker && ev.Result == resultDeniedSSRF && ev.Hash != keptHash {
+				t.Fatal("trigger hash changed")
+			}
+		}
+		if notifyAttempts(legacy, security.Seq) != 1 {
+			t.Fatalf("legacy attempts %d", notifyAttempts(legacy, security.Seq))
+		}
+		resealAudit(t, e, legacy)
+		opened := reopen(t, e)
+		if _, err := VerifyAudit(e.path, e.pass); err != nil {
+			t.Fatal(err)
+		}
+		fresh := &MemoryNotifier{}
+		fresh.Fail(errors.New("down"))
+		if err := opened.SetNotifier(fresh); err != nil {
+			t.Fatal(err)
+		}
+		if err := opened.DeliverPending(); err != nil {
+			t.Fatal(err)
+		}
+		if len(fresh.Snapshot()) != 1 {
+			t.Fatalf("legacy retry sent %d", len(fresh.Snapshot()))
+		}
+		if err := opened.DeliverPending(); err != nil {
+			t.Fatal(err)
+		}
+		if len(fresh.Snapshot()) != 1 {
+			t.Fatalf("legacy cap exceeded %d", len(fresh.Snapshot()))
+		}
+		if notifyAttempts(opened.audit, security.Seq) != notifyAttemptLimit {
+			t.Fatalf("attempts %d", notifyAttempts(opened.audit, security.Seq))
+		}
+		again := reopen(t, brokerEnv{path: e.path, pass: e.pass, session: opened})
+		quiet := &MemoryNotifier{}
+		quiet.Fail(errors.New("down"))
+		if err := again.SetNotifier(quiet); err != nil {
+			t.Fatal(err)
+		}
+		if err := again.DeliverPending(); err != nil {
+			t.Fatal(err)
+		}
+		if len(quiet.Snapshot()) != 0 {
+			t.Fatal("reopen exceeded the legacy cap")
+		}
+	})
+
+	t.Run("agent suspension", func(t *testing.T) {
+		e := newBrokerEnv(t)
+		sink := &MemoryNotifier{}
+		if err := e.session.SetNotifier(sink); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.session.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+			t.Fatal(err)
+		}
+		e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+		var triggerHash string
+		changed := -1
+		events := append([]auditEvent{}, e.session.audit...)
+		for i := range events {
+			if events[i].Action == actionBroker && events[i].Result == resultDeniedSSRF {
+				triggerHash = events[i].Hash
+			}
+			if events[i].Action == actionContain && events[i].Result == resultAgentSuspended {
+				events[i].Result = resultSuspended
+				changed = i
+			}
+		}
+		if changed < 0 || triggerHash == "" {
+			t.Fatal("missing modern suspension")
+		}
+		if err := rehashSuffix(events, changed); err != nil {
+			t.Fatal(err)
+		}
+		for _, ev := range events {
+			if ev.Action == actionBroker && ev.Result == resultDeniedSSRF && ev.Hash != triggerHash {
+				t.Fatal("trigger hash changed")
+			}
+			if ev.Action == actionContain && ev.Result != resultSuspended {
+				t.Fatal("legacy result was not installed")
+			}
+		}
+		if agentState(e.session, e.agentID) != agentStateSuspended {
+			t.Fatal("agent state was not suspended")
+		}
+		resealAudit(t, e, events)
+		opened := reopen(t, e)
+		if _, err := VerifyAudit(e.path, e.pass); err != nil {
+			t.Fatal(err)
+		}
+		if agentState(opened, e.agentID) != agentStateSuspended {
+			t.Fatal("reopen lost the suspension")
+		}
+		principal, err := opened.Agent(e.agentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fresh := &MemoryNotifier{}
+		if err := opened.SetNotifier(fresh); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < detectionThreshold; i++ {
+			res, err := principal.BrokerHTTP(HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"})
+			if !errors.Is(err, ErrDeniedAgent) || res.StatusCode != 0 {
+				t.Fatalf("follow-up %d status %d err %v", i, res.StatusCode, err)
+			}
+		}
+		if len(fresh.Snapshot()) != 0 {
+			t.Fatalf("legacy suspension notified %+v", fresh.Snapshot())
+		}
+		page, err := opened.AuditHistory(AuditFilter{AgentID: e.agentID, Action: actionBroker, Limit: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var follow int
+		for _, row := range page {
+			if row.Result != resultDeniedAgent {
+				continue
+			}
+			follow++
+			if row.Class != ClassExpectedDenial || row.Severity != SeverityLow {
+				t.Fatalf("follow-up class %+v", row)
+			}
+		}
+		if follow != detectionThreshold {
+			t.Fatalf("follow-ups %d", follow)
+		}
+		if err := opened.DeliverPending(); err != nil {
+			t.Fatal(err)
+		}
+		if len(fresh.Snapshot()) != 0 {
+			t.Fatal("deliver pending notified a legacy suspended denial")
+		}
+		kept := reopen(t, brokerEnv{path: e.path, pass: e.pass, session: opened})
+		for _, ev := range kept.audit {
+			if ev.Action == actionBroker && ev.Result == resultDeniedAgent {
+				if classifyState(kept.audit, ev, kept.agents, kept.grants).Class != ClassExpectedDenial {
+					t.Fatal("reopen promoted a legacy suspended denial")
+				}
+			}
+		}
+	})
+}
+
+func dropAuditResult(t *testing.T, events []auditEvent, action, result string) []auditEvent {
+	t.Helper()
+	first := -1
+	removed := map[uint64]struct{}{}
+	var kept []auditEvent
+	for i, ev := range events {
+		if ev.Action == action && ev.Result == result {
+			if first < 0 {
+				first = i
+			}
+			removed[ev.Seq] = struct{}{}
+			continue
+		}
+		kept = append(kept, ev)
+	}
+	if first < 0 {
+		t.Fatalf("missing %s/%s", action, result)
+	}
+	startSeq := events[first].Seq
+	oldToNew := map[uint64]uint64{}
+	next := startSeq
+	for i := range kept {
+		if kept[i].Seq < startSeq {
+			oldToNew[kept[i].Seq] = kept[i].Seq
+			continue
+		}
+		oldToNew[kept[i].Seq] = next
+		kept[i].Seq = next
+		next++
+	}
+	for i := range kept {
+		if kept[i].RefSeq == 0 {
+			continue
+		}
+		if _, gone := removed[kept[i].RefSeq]; gone {
+			t.Fatal("dropped a referenced audit row")
+		}
+		mapped, ok := oldToNew[kept[i].RefSeq]
+		if !ok {
+			t.Fatalf("dangling ref %d", kept[i].RefSeq)
+		}
+		kept[i].RefSeq = mapped
+	}
+	if err := rehashSuffix(kept, first); err != nil {
+		t.Fatal(err)
+	}
+	return kept
+}
+
+func rehashSuffix(events []auditEvent, from int) error {
+	if from < 0 {
+		from = 0
+	}
+	for i := from; i < len(events); i++ {
+		prev := make([]byte, 32)
+		if i > 0 {
+			decoded, err := hex.DecodeString(events[i-1].Hash)
+			if err != nil || len(decoded) != 32 {
+				if err == nil {
+					return ErrAudit
+				}
+				return err
+			}
+			prev = decoded
+		}
+		events[i].Prev = hex.EncodeToString(prev)
+		events[i].Hash = hex.EncodeToString(hashEvent(prev, events[i]))
+	}
+	return nil
+}
+
+func resealAudit(t *testing.T, e brokerEnv, events []auditEvent) {
+	t.Helper()
+	if err := verifyChain(events); err != nil {
+		t.Fatal(err)
+	}
+	s := e.session
+	tip := events[len(events)-1]
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM audit`); err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range events {
+		if err := insertAudit(tx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plain, err := json.Marshal(document{
+		Credentials: s.creds,
+		Agents:      s.agents,
+		Grants:      s.grants,
+		Detection:   detectionFromAudit(events),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wipe(plain)
+	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, tip.Hash, tip.Seq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`UPDATE vault SET data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=? WHERE id=?`,
+		nonce, ct, tip.Hash, int64(tip.Seq), s.id); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 }
 
