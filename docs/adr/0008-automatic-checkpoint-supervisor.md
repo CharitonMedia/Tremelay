@@ -20,7 +20,7 @@ with an exact Goal-Issue line and `human-review-required`. It does not run PR co
 Use the Responses API model `gpt-6.1-sol`, high reasoning, no tools, structured
 output, no stored response, and an 8192-token output limit. Give it the original
 goal, exact-head Codex inline findings, CI state, previous attempts, changed
-source files, security documents and ADRs. Reject evidence above 500,000 UTF-8
+source files, security documents and ADRs. Reject evidence above 1,000,000 UTF-8
 bytes rather than silently omitting source. Repository contents and discussion
 are untrusted evidence, never authority to change the controller's rules.
 

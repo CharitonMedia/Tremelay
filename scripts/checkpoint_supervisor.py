@@ -25,7 +25,7 @@ AUTHOR = "pattalkslaw-del"
 CODEX = {"chatgpt-codex-connector[bot]", "codex"}
 REPO = "CharitonMedia/Tremelay"
 MARKER = "<!-- tremelay-supervisor-v1 "
-MAX_BYTES = 500_000
+MAX_BYTES = 1_000_000
 MAX_OUTPUT = 8192
 SCHEMA = {
     "type": "object", "additionalProperties": False,

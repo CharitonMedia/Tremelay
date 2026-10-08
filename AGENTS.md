@@ -33,7 +33,7 @@ The three-cycle limit is a hard guardrail against runaway agent churn.
 - A cycle means one implementation/remediation attempt followed by automated review or verification that identifies unresolved work.
 - Count cycles against the same underlying problem and pull-request head lineage; do not reset the count by rephrasing the issue, editing comments, restarting a workflow, or spawning a new agent for the same unresolved defect.
 - After cycle 3, automation MUST stop rather than launch another implementation agent.
-- The system MUST leave a clear status comment summarizing: the unresolved problem, the three attempts made, the latest reviewed commit, relevant CI/review findings, and that human review is required.
+- The system MUST leave a clear status comment summarizing: the unresolved problem, the three attempts made, the latest reviewed commit, relevant CI/review findings, and that an independent supervisor assessment is required.
 - Resumption requires a documented assessment by Patrick or his delegated supervising assistant. The deployed checkpoint supervisor may authorize routine corrections within the approved goal and security contract, up to its separate total checkpoint budget. Implementation workers may not authorize their own resumption.
 - Escalate genuine product, scope, authority, security-contract, or exhausted-resource decisions to Patrick. Do not request repeated human permission for routine defects. The three-cycle worker checkpoint remains in force; there is no unattended nine-cycle exception.
 - The stop rule applies even if more automated remediation appears possible.
