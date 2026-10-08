@@ -34,6 +34,12 @@ At the limit:
 
 The count must not be reset by rewording the same defect, restarting the workflow, or spawning a fresh agent against the same unresolved PR lineage.
 
+## One worker per review
+
+A Codex review arrives as a review event, one or more inline comments, and a summary comment. Those events share one launch claim: `review id` plus the full reviewed head. The trusted automation identity posts that claim before it creates a cloud agent. A later event for the same review and head does not start another worker. Cancellation after the worker is accepted, or while the create call has not settled, keeps the claim. A create call that fails with a definitive client error deletes the claim so a later event can launch. A different head is a different claim.
+
+`pull_request_review`, `pull_request_review_comment`, and `issue_comment` run the workflow file and the checked-out scripts from the default branch. This dedupe is inactive until that change is on `main`. Merging the pull request is what deploys it. The circuit breaker, trusted identity, exact-head review, no-op stop, and the ban on automatic merge stay in place.
+
 ## CI
 
-Tremelay runs general Go CI plus dedicated `Test Linux` and `Test Windows` workflows used by exact-head review orchestration. CI also verifies the pinned Ponytail Cursor rule and compiles the Python automation helpers.
+Tremelay runs general Go CI plus dedicated `Test Linux` and `Test Windows` workflows used by exact-head review orchestration. CI also verifies the pinned Ponytail Cursor rule, compiles the Python automation helpers, and runs `goal_agent_request.py self-check`.

@@ -282,7 +282,7 @@ jobs:
       group: goal-review-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: true
     outputs:
-      launch: ${{ steps.build.outputs.launch }}
+      launch: ${{ steps.claim.outputs.launch }}
       agent_id: ${{ steps.launch.outputs.agent_id }}
       run_id: ${{ steps.launch.outputs.run_id }}
       before_sha: ${{ steps.launch.outputs.before_sha }}
@@ -396,9 +396,51 @@ jobs:
             fi
             exit "$code"
           fi
+      - name: Resolve trusted automation identity
+        id: marker_identity
+        if: steps.build.outputs.launch == 'true'
+        env:
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GOAL_GITHUB_TOKEN:-}" ]; then
+            echo "login=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          login=$(gh api user --jq .login)
+          if [ -z "$login" ]; then
+            echo "Could not resolve GOAL_GITHUB_TOKEN identity."
+            exit 1
+          fi
+          echo "login=$login" >> "$GITHUB_OUTPUT"
+      - name: Check review launch ownership
+        id: claim
+        if: steps.build.outputs.launch == 'true'
+        env:
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          number="${{ github.event.pull_request.number || github.event.issue.number }}"
+          if [ -z "${GOAL_GITHUB_TOKEN:-}" ] || [ -z "${{ steps.marker_identity.outputs.login }}" ]; then
+            echo "launch=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews?per_page=100" > reviews.json
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${number}/comments?per_page=100" > comments.json
+          python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("ownership.json", "w"))'
+          python scripts/goal_agent_request.py review-claim --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --state ownership.json --trusted-login "${{ steps.marker_identity.outputs.login }}" --out claim.json
+          status=$(python -c 'import json; print(json.load(open("claim.json"))["status"])')
+          if [ "$status" = "free" ]; then
+            echo "launch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "launch=false" >> "$GITHUB_OUTPUT"
+            echo "Not launching another worker for this review (status ${status})."
+          fi
       - name: Launch Cloud Agent
         id: launch
-        if: steps.build.outputs.launch == 'true'
+        if: steps.claim.outputs.launch == 'true'
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
@@ -412,15 +454,53 @@ jobs:
             exit 1
           fi
           before=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
-          curl --fail-with-body -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json https://api.cursor.com/v1/agents > response.json
+          marker=$(python -c 'import json; print(json.load(open("claim.json"))["marker"])')
+          claim_id=""
+          accepted=false
+          settled=false
+          release_claim() {
+            if [ -z "$claim_id" ]; then
+              return 0
+            fi
+            decision=$(python scripts/goal_agent_request.py claim-release --accepted "$accepted" --settled "$settled")
+            if [ "$decision" = "delete" ]; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" >/dev/null 2>&1 || true
+            fi
+          }
+          trap release_claim EXIT
+          trap 'exit 1' TERM INT
+          if [ -n "$marker" ]; then
+            claim_body=$(printf 'Cursor review launch claimed.\n\n%s' "$marker")
+            claim_id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${number}/comments" -f body="$claim_body" --jq .id)
+          fi
+          set +e
+          http_code=$(curl -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json -o response.json -w '%{http_code}' https://api.cursor.com/v1/agents)
+          curl_status=$?
+          set -e
+          if [ "$curl_status" -ne 0 ]; then
+            echo "Cursor create did not settle (curl ${curl_status}). Keeping the launch claim."
+            exit 1
+          fi
+          settled=true
+          if ! [[ "$http_code" =~ ^2 ]]; then
+            echo "Cursor rejected create with HTTP ${http_code}."
+            cat response.json || true
+            exit 1
+          fi
+          accepted=true
           url=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["url"])')
           agent_id=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["id"])')
           run_id=$(python -c 'import json; print(json.load(open("response.json"))["run"]["id"])')
-          gh pr comment "$number" --body "A cloud agent is working through the review findings: ${url}"
           echo "agent_id=${agent_id}" >> "$GITHUB_OUTPUT"
           echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
           echo "before_sha=${before}" >> "$GITHUB_OUTPUT"
           echo "pr_number=${number}" >> "$GITHUB_OUTPUT"
+          started_body=$(printf 'A cloud agent is working through the review findings: %s\n\n%s' "$url" "$marker")
+          if [ -n "$claim_id" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" -f body="$started_body" >/dev/null || true
+          else
+            gh pr comment "$number" --body "$started_body" || true
+          fi
 
   request-codex:
     needs: review-launch

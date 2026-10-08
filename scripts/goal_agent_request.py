@@ -745,6 +745,235 @@ def _cmd_codex_rereview(args: argparse.Namespace) -> int:
     return 0
 
 
+def review_claim_marker(review_id: int | str, head_sha: str) -> str:
+    """Stable ownership marker for one Codex review of one head."""
+    return f"<!-- goal-review-claim review:{review_id} head:{head_sha.strip().lower()} -->"
+
+
+def _summary_commit(body: str) -> str | None:
+    named = reviewed_commit(body)
+    if named:
+        return named
+    found = re.findall(r"`([0-9a-fA-F]{7,40})`", body or "")
+    if not found:
+        return None
+    return found[-1]
+
+
+def review_launch_identity(
+    event: dict,
+    event_name: str,
+    reviews: list | None = None,
+) -> tuple[str, str] | None:
+    """Review id and full head shared by a review, an inline comment, and a summary.
+
+    Returns None when this event cannot be bound to one review of one commit.
+    """
+    if event_name == "pull_request_review":
+        review = event.get("review") or {}
+        return _identity_from_review(review)
+    if event_name == "pull_request_review_comment":
+        comment = event.get("comment") or {}
+        review_id = comment.get("pull_request_review_id")
+        head = comment.get("commit_id") or comment.get("commitId")
+        if review_id is None or not isinstance(head, str):
+            return None
+        return _full_identity(review_id, head)
+    if event_name == "issue_comment":
+        body = ((event.get("comment") or {}).get("body") or "")
+        if "<!-- codex-pull-request-review-summary -->" not in body:
+            return None
+        short = _summary_commit(body)
+        if not short:
+            return None
+        for review in reviews or []:
+            if not isinstance(review, dict) or not _is_codex_login(_actor_login(review)):
+                continue
+            full = _review_commit(review)
+            if not _commits_match(short, full):
+                continue
+            found = _identity_from_review(review)
+            if found is not None:
+                return found
+        return None
+    return None
+
+
+def _identity_from_review(review: dict) -> tuple[str, str] | None:
+    return _full_identity(review.get("id"), _review_commit(review))
+
+
+def _full_identity(review_id: object, head: object) -> tuple[str, str] | None:
+    if not isinstance(review_id, (int, str)) or str(review_id).strip() == "":
+        return None
+    if not isinstance(head, str) or len(head.strip()) != 40:
+        return None
+    return str(review_id).strip(), head.strip().lower()
+
+
+def review_claim_owned(
+    comments: list | None,
+    review_id: str,
+    head_sha: str,
+    trusted_login: str,
+) -> bool:
+    """True when the trusted automation identity already claimed this review and head."""
+    trusted = (trusted_login or "").strip().casefold()
+    if not trusted:
+        return False
+    marker = review_claim_marker(review_id, head_sha)
+    for comment in comments or []:
+        if not isinstance(comment, dict):
+            continue
+        login = ((comment.get("user") or {}).get("login") or "").casefold()
+        if login != trusted:
+            continue
+        if marker in (comment.get("body") or ""):
+            return True
+    return False
+
+
+def review_launch_decision(
+    event: dict,
+    event_name: str,
+    *,
+    reviews: list | None = None,
+    comments: list | None = None,
+    trusted_login: str = "",
+) -> dict:
+    """Whether this event may start a worker for its review and head."""
+    identity = review_launch_identity(event, event_name, reviews)
+    if identity is None:
+        return {"status": "unbound", "owned": False, "marker": "", "review_id": "", "head": ""}
+    review_id, head = identity
+    marker = review_claim_marker(review_id, head)
+    owned = review_claim_owned(comments, review_id, head, trusted_login)
+    return {
+        "status": "owned" if owned else "free",
+        "owned": owned,
+        "marker": marker,
+        "review_id": review_id,
+        "head": head,
+    }
+
+
+def claim_survives_cancel(*, accepted: bool, create_settled: bool) -> bool:
+    """A cancelled run keeps the claim once a worker was accepted or the create is unknown.
+
+    A settled rejection deletes the claim so a later event can launch. Cancellation
+    while the create call is in flight keeps the claim and does not start a replacement.
+    """
+    if accepted:
+        return True
+    return not create_settled
+
+
+def _cmd_review_claim(args: argparse.Namespace) -> int:
+    event = json.loads(Path(args.event).read_text(encoding="utf-8"))
+    state = _load_json(args.state) or {}
+    decision = review_launch_decision(
+        event,
+        args.event_name,
+        reviews=state.get("reviews") or [],
+        comments=state.get("comments") or [],
+        trusted_login=args.trusted_login or "",
+    )
+    Path(args.out).write_text(json.dumps(decision) + "\n", encoding="utf-8")
+    return 0
+
+
+def _cmd_claim_release(args: argparse.Namespace) -> int:
+    accepted = args.accepted == "true"
+    settled = args.settled == "true"
+    print("keep" if claim_survives_cancel(accepted=accepted, create_settled=settled) else "delete")
+    return 0
+
+
+def _cmd_self_check(_args: argparse.Namespace) -> int:
+    _self_check()
+    print("ok")
+    return 0
+
+
+def _self_check() -> None:
+    head = "a" * 40
+    other = "b" * 40
+    review_id = 5449353687
+    review = {
+        "id": review_id,
+        "commit_id": head,
+        "state": "COMMENTED",
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+    }
+    review_event = {"action": "submitted", "review": review}
+    comment_event = {
+        "action": "created",
+        "comment": {
+            "pull_request_review_id": review_id,
+            "commit_id": head.upper(),
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+        },
+    }
+    summary_event = {
+        "action": "created",
+        "comment": {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "<!-- codex-pull-request-review-summary -->\n"
+                "| Review | Status | Commit |\n"
+                "| --- | --- | --- |\n"
+                "| Code Review | ✅ **Completed** | `aaaaaaaa` |\n"
+            ),
+        },
+    }
+    reviews = [review]
+    identities = [
+        review_launch_identity(review_event, "pull_request_review", reviews),
+        review_launch_identity(comment_event, "pull_request_review_comment", reviews),
+        review_launch_identity(summary_event, "issue_comment", reviews),
+    ]
+    if any(item is None for item in identities) or len(set(identities)) != 1:
+        raise SystemExit(f"review identity diverged: {identities}")
+    marker = review_claim_marker(review_id, head)
+    trusted = "pattalkslaw-del"
+    comments = [{"user": {"login": trusted}, "body": "claimed\n\n" + marker}]
+    if not review_claim_owned(comments, str(review_id), head, trusted):
+        raise SystemExit("trusted claim was not honored")
+    if review_claim_owned(comments, str(review_id), other, trusted):
+        raise SystemExit("claim matched a different head")
+    forged = [{"user": {"login": "someone-else"}, "body": marker}]
+    if review_claim_owned(forged, str(review_id), head, trusted):
+        raise SystemExit("untrusted claim was honored")
+    if review_claim_owned(comments, str(review_id), head, ""):
+        raise SystemExit("empty trusted login honored a claim")
+    owned = review_launch_decision(
+        comment_event,
+        "pull_request_review_comment",
+        reviews=reviews,
+        comments=comments,
+        trusted_login=trusted,
+    )
+    if not owned["owned"] or owned["marker"] != marker:
+        raise SystemExit(f"inline comment did not see the review claim: {owned}")
+    free = review_launch_decision(
+        summary_event,
+        "issue_comment",
+        reviews=reviews,
+        comments=[],
+        trusted_login=trusted,
+    )
+    if free["owned"] or free["status"] != "free" or free["marker"] != marker:
+        raise SystemExit(f"summary was not a free launch of the same review: {free}")
+    if review_launch_identity(summary_event, "issue_comment", []) is not None:
+        raise SystemExit("summary bound without a review list")
+    if not claim_survives_cancel(accepted=True, create_settled=True):
+        raise SystemExit("accepted worker lost its claim")
+    if not claim_survives_cancel(accepted=False, create_settled=False):
+        raise SystemExit("unsettled create lost its claim")
+    if claim_survives_cancel(accepted=False, create_settled=True):
+        raise SystemExit("settled rejection kept its claim")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -786,6 +1015,22 @@ def main(argv: list[str] | None = None) -> int:
     rereview.add_argument("--after", required=True)
     rereview.add_argument("--reviews")
     rereview.set_defaults(func=_cmd_codex_rereview)
+
+    claim = sub.add_parser("review-claim")
+    claim.add_argument("--event", required=True)
+    claim.add_argument("--event-name", required=True)
+    claim.add_argument("--state", required=True)
+    claim.add_argument("--trusted-login", default="")
+    claim.add_argument("--out", required=True)
+    claim.set_defaults(func=_cmd_review_claim)
+
+    release = sub.add_parser("claim-release")
+    release.add_argument("--accepted", required=True, choices=("true", "false"))
+    release.add_argument("--settled", required=True, choices=("true", "false"))
+    release.set_defaults(func=_cmd_claim_release)
+
+    check = sub.add_parser("self-check")
+    check.set_defaults(func=_cmd_self_check)
 
     args = parser.parse_args(argv)
     return args.func(args)
