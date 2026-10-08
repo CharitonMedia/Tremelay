@@ -431,14 +431,49 @@ jobs:
           claim_id=""
           accepted=false
           settled=false
+          # A released reservation is gone, or its body no longer owns the review.
+          # 404 counts: a previous attempt already deleted the comment.
+          claim_http() {
+            local method=$1
+            local payload=${2:-}
+            local raw status
+            if [ "$method" = "PATCH" ]; then
+              raw=$(gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" -f body="$payload" --include 2>/dev/null || true)
+            else
+              raw=$(gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" --include 2>/dev/null || true)
+            fi
+            status=$(printf '%s\n' "$raw" | awk 'NR==1 { print $2; exit }')
+            case "$status" in
+              200|201|204|404) return 0 ;;
+            esac
+            return 1
+          }
           release_claim() {
+            local decision released attempt
             if [ -z "$claim_id" ]; then
               return 0
             fi
             decision=$(python scripts/goal_agent_request.py claim-release --accepted "$accepted" --settled "$settled")
-            if [ "$decision" = "delete" ]; then
-              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" >/dev/null 2>&1 || true
+            if [ "$decision" != "delete" ]; then
+              return 0
             fi
+            # A 4xx rejection did not start a worker. Delete the reservation.
+            # If GitHub still has the comment, replace the body so it neither
+            # owns the review nor counts as a cycle. A failed release stays failed.
+            released=$(python scripts/goal_agent_request.py released-body)
+            attempt=1
+            while [ "$attempt" -le 3 ]; do
+              if claim_http DELETE; then
+                return 0
+              fi
+              if claim_http PATCH "$released"; then
+                return 0
+              fi
+              sleep "$attempt"
+              attempt=$((attempt + 1))
+            done
+            echo "Rejected launch reservation ${claim_id} was not released." >&2
+            return 1
           }
           trap release_claim EXIT
           trap 'exit 1' TERM INT

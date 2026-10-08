@@ -791,6 +791,18 @@ def reservation_body(marker: str) -> str:
     )
 
 
+def released_body() -> str:
+    """Replacement body when a rejected create cannot be deleted.
+
+    The comment stays on the pull request, but it no longer contains a cycle
+    phrase or the claim marker, so it neither owns the review nor counts.
+    """
+    return (
+        "Cursor rejected this review launch before a worker was created. "
+        "The reservation was released.\n"
+    )
+
+
 def accepted_launch_body(url: str, marker: str) -> str:
     """Replacement body after Cursor accepts the worker.
 
@@ -1043,6 +1055,11 @@ def _cmd_accepted_body(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_released_body(_args: argparse.Namespace) -> int:
+    print(released_body(), end="")
+    return 0
+
+
 def _cmd_cycle_budget(args: argparse.Namespace) -> int:
     raw = _load_json(args.comments)
     count, limit = cycle_budget(flatten_pages(raw))
@@ -1251,6 +1268,19 @@ def _self_check() -> None:
     count, limit = cycle_budget([reservation_comment])
     if count != 1 or limit != 3:
         raise SystemExit(f"one reserved launch counted {count} limit {limit}")
+    released = released_body()
+    if comment_counts_cycle(released) or review_claim_marker(review_id, head) in released:
+        raise SystemExit("released reservation still counts or owns the review")
+    if review_claim_owned(
+        [{"user": {"login": trusted}, "body": released}],
+        str(review_id),
+        head,
+        trusted,
+    ):
+        raise SystemExit("released reservation still owns the review")
+    count, limit = cycle_budget([{"user": {"login": trusted}, "body": released}])
+    if count != 0 or limit != 3:
+        raise SystemExit(f"released reservation counted {count} limit {limit}")
     resumed = [
         {"user": {"login": trusted}, "body": "A cloud agent is working through the review findings: https://example"},
         {"user": {"login": trusted}, "body": "A cloud agent is working through the review findings: https://example"},
@@ -1380,6 +1410,9 @@ def main(argv: list[str] | None = None) -> int:
     accepted.add_argument("--url", required=True)
     accepted.add_argument("--marker", required=True)
     accepted.set_defaults(func=_cmd_accepted_body)
+
+    released = sub.add_parser("released-body")
+    released.set_defaults(func=_cmd_released_body)
 
     budget = sub.add_parser("cycle-budget")
     budget.add_argument("--comments", required=True)
