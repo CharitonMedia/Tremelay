@@ -857,11 +857,30 @@ def review_launch_decision(
     }
 
 
+def create_outcome(http_code: str) -> str:
+    """Classify a Cursor create HTTP status.
+
+    accept: 2xx, the worker exists.
+    reject: 4xx, the server refused and did not create a worker.
+    ambiguous: 5xx, redirects, and any other status. The worker may exist.
+    """
+    code = (http_code or "").strip()
+    if len(code) == 3 and code.isdigit():
+        if code[0] == "2":
+            return "accept"
+        if code[0] == "4":
+            return "reject"
+    return "ambiguous"
+
+
 def claim_survives_cancel(*, accepted: bool, create_settled: bool) -> bool:
     """A cancelled run keeps the claim once a worker was accepted or the create is unknown.
 
-    A settled rejection deletes the claim so a later event can launch. Cancellation
-    while the create call is in flight keeps the claim and does not start a replacement.
+    create_settled is true only for a definitive outcome: the worker was accepted,
+    or the server returned a 4xx client rejection. A 5xx or other ambiguous HTTP
+    status is not settled. A settled rejection deletes the claim so a later event
+    can launch. Cancellation while the create call is in flight keeps the claim
+    and does not start a replacement.
     """
     if accepted:
         return True
@@ -886,6 +905,11 @@ def _cmd_claim_release(args: argparse.Namespace) -> int:
     accepted = args.accepted == "true"
     settled = args.settled == "true"
     print("keep" if claim_survives_cancel(accepted=accepted, create_settled=settled) else "delete")
+    return 0
+
+
+def _cmd_create_outcome(args: argparse.Namespace) -> int:
+    print(create_outcome(args.http_code))
     return 0
 
 
@@ -972,6 +996,28 @@ def _self_check() -> None:
         raise SystemExit("unsettled create lost its claim")
     if claim_survives_cancel(accepted=False, create_settled=True):
         raise SystemExit("settled rejection kept its claim")
+    outcomes = {
+        "200": "accept",
+        "201": "accept",
+        "400": "reject",
+        "401": "reject",
+        "409": "reject",
+        "422": "reject",
+        "429": "reject",
+        " 404 ": "reject",
+        "500": "ambiguous",
+        "502": "ambiguous",
+        "503": "ambiguous",
+        "302": "ambiguous",
+        "000": "ambiguous",
+        "": "ambiguous",
+        "99": "ambiguous",
+        "2000": "ambiguous",
+    }
+    for code, want in outcomes.items():
+        got = create_outcome(code)
+        if got != want:
+            raise SystemExit(f"create outcome {code!r}: {got} != {want}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1028,6 +1074,10 @@ def main(argv: list[str] | None = None) -> int:
     release.add_argument("--accepted", required=True, choices=("true", "false"))
     release.add_argument("--settled", required=True, choices=("true", "false"))
     release.set_defaults(func=_cmd_claim_release)
+
+    outcome = sub.add_parser("create-outcome")
+    outcome.add_argument("--http-code", required=True)
+    outcome.set_defaults(func=_cmd_create_outcome)
 
     check = sub.add_parser("self-check")
     check.set_defaults(func=_cmd_self_check)

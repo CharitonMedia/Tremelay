@@ -481,13 +481,24 @@ jobs:
             echo "Cursor create did not settle (curl ${curl_status}). Keeping the launch claim."
             exit 1
           fi
-          settled=true
-          if ! [[ "$http_code" =~ ^2 ]]; then
-            echo "Cursor rejected create with HTTP ${http_code}."
-            cat response.json || true
-            exit 1
-          fi
-          accepted=true
+          outcome=$(python scripts/goal_agent_request.py create-outcome --http-code "$http_code")
+          case "$outcome" in
+            accept)
+              settled=true
+              accepted=true
+              ;;
+            reject)
+              settled=true
+              echo "Cursor rejected create with HTTP ${http_code}."
+              cat response.json || true
+              exit 1
+              ;;
+            *)
+              echo "Cursor create HTTP ${http_code} is ambiguous. Keeping the launch claim."
+              cat response.json || true
+              exit 1
+              ;;
+          esac
           url=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["url"])')
           agent_id=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["id"])')
           run_id=$(python -c 'import json; print(json.load(open("response.json"))["run"]["id"])')

@@ -36,7 +36,7 @@ The count must not be reset by rewording the same defect, restarting the workflo
 
 ## One worker per review
 
-A Codex review arrives as a review event, one or more inline comments, and a summary comment. Those events share one launch claim: `review id` plus the full reviewed head. The trusted automation identity posts that claim before it creates a cloud agent. A later event for the same review and head does not start another worker. Cancellation after the worker is accepted, or while the create call has not settled, keeps the claim. A create call that fails with a definitive client error deletes the claim so a later event can launch. A different head is a different claim.
+A Codex review arrives as a review event, one or more inline comments, and a summary comment. Those events share one launch claim: `review id` plus the full reviewed head. The trusted automation identity posts that claim before it creates a cloud agent. A later event for the same review and head does not start another worker. Cancellation after the worker is accepted, or while the create call has not settled, keeps the claim. A definitive client rejection (HTTP 4xx) deletes the claim so a later event can launch. An HTTP 5xx or any other non-definitive status keeps the claim. A different head is a different claim.
 
 `pull_request_review`, `pull_request_review_comment`, and `issue_comment` run the workflow file and the checked-out scripts from the default branch. This dedupe is inactive until that change is on `main`. Merging the pull request is what deploys it. The circuit breaker, trusted identity, exact-head review, no-op stop, and the ban on automatic merge stay in place.
 
