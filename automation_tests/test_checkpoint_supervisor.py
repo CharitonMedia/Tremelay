@@ -249,11 +249,33 @@ class Controller(unittest.TestCase):
     def test_unattributed_main_comment_run_blocks_resumption(self):
         runs = {"workflow_runs": [{"status": "in_progress", "head_sha": "b" * 40,
                                   "event": "issue_comment", "pull_requests": []}]}
-        with patch.object(s, 'gh', return_value=runs):
+        with patch.object(s, 'gh', return_value=[runs]):
             self.assertTrue(s.active_goal_work(11, HEAD))
         runs["workflow_runs"][0]["status"] = "completed"
-        with patch.object(s, 'gh', return_value=runs):
+        with patch.object(s, 'gh', return_value=[runs]):
             self.assertFalse(s.active_goal_work(11, HEAD))
+
+    def test_idle_gate_sees_active_worker_beyond_first_hundred_runs(self):
+        pages = [{'workflow_runs': [{'status': 'completed'} for _ in range(100)]},
+                 {'workflow_runs': [{'status': 'in_progress'}]}]
+        with patch.object(s, 'gh', return_value=pages) as api:
+            self.assertTrue(s.active_goal_work(11, HEAD))
+            self.assertTrue(api.call_args.kwargs['paginate'])
+
+    def test_failed_pr_reconciliation_does_not_starve_later_checkpoints(self):
+        state = {'phase': 'dispatch_reserved', 'head': HEAD, 'review': 4}
+        claim = {'user': {'login': s.AUTHOR}, 'body': s.state_body(state, 'Claim')}
+        next_pull = dict(PULL, number=13)
+        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3'}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', return_value={'login': s.AUTHOR}), patch.object(s, 'pages', side_effect=[[PULL, next_pull], [claim], []]), patch.object(s, 'recover_worker', side_effect=s.Stop('No accepted worker')), patch.object(s, 'run_one') as assess:
+            self.assertEqual(s.main(), 1)
+            self.assertEqual(assess.call_args.args[0]['number'], 13)
+
+    def test_oversized_checkpoint_keeps_durable_bounded_summary_with_links(self):
+        finding = {'path': 'risk.go', 'body': 'P1 derived suspension index required ' + 'x' * 62000, 'html_url': 'https://example.test/finding'}
+        body = stop.stop_body(HEAD, [], dict(REVIEW, html_url='https://example.test/review'), [finding], [])
+        self.assertLess(len(body), 60000)
+        for value in [HEAD, 'independent supervisor assessment', 'P1 derived suspension', 'https://example.test/review', 'https://example.test/finding', 'tremelay-cycle-stop']:
+            self.assertIn(value, body)
 
     def test_final_guard_allows_own_label_removal_but_not_other_changes(self):
         pull = copy.deepcopy(PULL)

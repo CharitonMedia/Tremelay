@@ -344,7 +344,8 @@ def recover_worker(pull, comment, state):
 
 
 def active_goal_work(number, head):
-    runs = gh(f"repos/{REPO}/actions/workflows/goal.yml/runs?per_page=100")["workflow_runs"]
+    run_pages = gh(f"repos/{REPO}/actions/workflows/goal.yml/runs?per_page=100", paginate=True)
+    runs = [run for page in run_pages for run in page["workflow_runs"]]
     # issue_comment runs execute main and often omit pull_requests. Conservatively
     # wait for ALL active goal jobs so an unattributed request-codex/launch job
     # cannot be mistaken for an idle worker. This is a repository-wide idle gate.
@@ -479,12 +480,13 @@ def main():
         print("Supervisor secrets present; owner identity verified. No model call or restart performed.")
         return 0
     pulls = pages(f"repos/{REPO}/pulls?state=open")
+    failed = False
     for pull in pulls:
         if not eligible(pull, require_stop=False):
             continue
-        states = records(pages(f"repos/{REPO}/issues/{pull['number']}/comments"))
-        active = [(c, st) for c, st in states if st.get("phase") in {"dispatch_ready", "dispatch_reserved", "working", "review_reserved"}]
         try:
+            states = records(pages(f"repos/{REPO}/issues/{pull['number']}/comments"))
+            active = [(c, st) for c, st in states if st.get("phase") in {"dispatch_ready", "dispatch_reserved", "working", "review_reserved"}]
             if active:
                 comment, state = active[-1]
                 if state["phase"] == "dispatch_ready":
@@ -497,8 +499,10 @@ def main():
                 run_one(pull, os.environ["OPENAI_API_KEY"], int(raw_limit))
         except Stop as error:
             print(f"PR #{pull['number']}: {error}", file=sys.stderr)
-            raise
-    return 0
+            failed = True
+            # One ambiguous claim must not starve unrelated stopped PRs. Its
+            # state is retained; Actions still reports failure after the scan.
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

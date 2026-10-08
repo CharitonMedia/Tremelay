@@ -37,7 +37,22 @@ def stop_body(head, comments, review, findings, runs):
     lines += ['', f'<!-- tremelay-cycle-stop head:{head} limit:{CYCLE_LIMIT} -->']
     body = '\n'.join(lines)
     if len(body) > 60000:
-        raise ValueError('Checkpoint evidence exceeds comment bound; do not omit findings')
+        # A durable checkpoint must exist even for oversized evidence. All full
+        # material remains linked; this summary is not the model evidence input.
+        review_url = (review or {}).get('html_url') or f'https://github.com/{os.environ.get("GITHUB_REPOSITORY", "CharitonMedia/Tremelay")}/pull/{os.environ.get("PR_NUMBER", "11")}/files'
+        lines = [f'Automation stopped after {len(attempts)} counted attempts (limit {CYCLE_LIMIT}).',
+                 'A documented independent supervisor assessment is required before more implementation.',
+                 f'Latest head: `{head}`.', '', 'Counted attempts (claims do not prove accepted workers or progress):']
+        for index, comment in enumerate(attempts[:CYCLE_LIMIT], 1):
+            lines.append(f"{index}. {comment.get('html_url') or 'Comment ' + str(comment.get('id'))} — {(comment.get('body') or '')[:1000]}")
+        lines += ['', f'Unresolved review: {review_url}', f'{len(findings)} inline findings; first 20 summarized below. Follow review links for complete evidence.']
+        for finding in findings[:20]:
+            lines.append(f"{finding.get('path', '')[:300]}: {(finding.get('body') or '')[:1000]} — {finding.get('html_url') or review_url}")
+        lines += ['', f'CI: {len(runs)} exact-head runs; first 20 below. Full state is available in the PR checks.']
+        for run in runs[:20]:
+            lines.append(f"- {run['name'][:200]}: {run['status']} / {run.get('conclusion') or 'pending'} — {run.get('html_url') or run['id']}")
+        lines += ['', f'<!-- tremelay-cycle-stop head:{head} limit:{CYCLE_LIMIT} -->']
+        body = '\n'.join(lines)
     return body
 
 
