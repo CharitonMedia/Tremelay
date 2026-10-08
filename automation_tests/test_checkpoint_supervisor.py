@@ -151,6 +151,25 @@ class Controller(unittest.TestCase):
         writes, model, error = self.run_controller(previous=prior)
         self.assertEqual(writes, [])
 
+    def test_unattributed_main_comment_run_blocks_resumption(self):
+        runs = {"workflow_runs": [{"status": "in_progress", "head_sha": "b" * 40,
+                                  "event": "issue_comment", "pull_requests": []}]}
+        with patch.object(s, 'gh', return_value=runs):
+            self.assertTrue(s.active_goal_work(11, HEAD))
+        runs["workflow_runs"][0]["status"] = "completed"
+        with patch.object(s, 'gh', return_value=runs):
+            self.assertFalse(s.active_goal_work(11, HEAD))
+
+    def test_final_guard_allows_own_label_removal_but_not_other_changes(self):
+        pull = copy.deepcopy(PULL)
+        pull['labels'] = [{'name': 'goal'}]
+        self.assertFalse(s.eligible(pull))
+        self.assertTrue(s.eligible(pull, require_stop=False))
+        pull['head']['sha'] = 'b' * 40
+        with patch.object(s, 'gh', return_value=pull):
+            with self.assertRaises(s.Stop):
+                s.refresh_guard(11, HEAD, 4, require_stop=False)
+
     def test_workflow_uses_trusted_main_and_serializes_controller(self):
         text = (Path(__file__).resolve().parents[1] / '.github/workflows/checkpoint-supervisor.yml').read_text()
         self.assertIn('ref: main', text)

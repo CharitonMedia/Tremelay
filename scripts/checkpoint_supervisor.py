@@ -88,13 +88,13 @@ def labels(pull):
     return {label["name"] for label in pull.get("labels", [])}
 
 
-def eligible(pull):
+def eligible(pull, *, require_stop=True):
     return (pull.get("state") == "open" and not pull.get("draft")
             and pull.get("base", {}).get("ref") == "main"
             and pull.get("head", {}).get("repo", {}).get("full_name") == REPO
             and pull.get("user", {}).get("login") == AUTHOR
             and "goal" in labels(pull)
-            and "human-review-required" in labels(pull)
+            and (not require_stop or "human-review-required" in labels(pull))
             and re.search(r"^Goal-Issue: #[0-9]+$", pull.get("body") or "", re.M))
 
 
@@ -250,14 +250,15 @@ def retry_job(number, head):
 
 def active_goal_work(number, head):
     runs = gh(f"repos/{REPO}/actions/workflows/goal.yml/runs?per_page=100")["workflow_runs"]
-    return any(r["status"] != "completed" and (
-        r.get("head_sha") == head or any(p.get("number") == number for p in r.get("pull_requests", []))
-    ) for r in runs)
+    # issue_comment runs execute main and often omit pull_requests. Conservatively
+    # wait for ALL active goal jobs so an unattributed request-codex/launch job
+    # cannot be mistaken for an idle worker. This is a repository-wide idle gate.
+    return any(r["status"] != "completed" for r in runs)
 
 
-def refresh_guard(number, head, review_id):
+def refresh_guard(number, head, review_id, *, require_stop=True):
     pull = gh(f"repos/{REPO}/pulls/{number}")
-    if not eligible(pull) or pull["head"]["sha"] != head:
+    if not eligible(pull, require_stop=require_stop) or pull["head"]["sha"] != head:
         raise Stop("PR changed during supervisor assessment")
     current = newest_review(pages(f"repos/{REPO}/pulls/{number}/reviews"), head)
     if current is None or current["id"] != review_id or active_goal_work(number, head):
@@ -316,6 +317,7 @@ def run_one(pull, key, max_checkpoints):
         state["phase"] = "dispatch_reserved"
         gh(f"repos/{REPO}/issues/comments/{claim['id']}", method="PATCH", data={"body": state_body(state, text)})
         gh(prefix + "/labels/human-review-required", method="DELETE")
+        refresh_guard(number, head, review["id"], require_stop=False)
         gh(f"repos/{REPO}/actions/jobs/{job}/rerun", method="POST", data={})
         state["phase"] = "dispatched"
         gh(f"repos/{REPO}/issues/comments/{claim['id']}", method="PATCH", data={"body": state_body(state, text)})
