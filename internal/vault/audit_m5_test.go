@@ -175,6 +175,26 @@ func TestM5ChainIntegrity(t *testing.T) {
 	ref := append([]auditEvent{}, chain...)
 	ref[2].RefSeq = 99
 	reject("ref corruption", ref)
+	long := []auditEvent{create}
+	for i := 0; i < 16; i++ {
+		ev, err := nextAudit(long, id, auditEvent{
+			Action: actionBroker, Result: resultDeniedMissing, AgentID: agent, Operation: OpHTTPRequest,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		long = append(long, ev)
+	}
+	noteEarly, err := nextAudit(long, id, auditEvent{
+		Action: actionNotify, Result: resultAttempted, Class: ClassExpectedDenial, RefSeq: long[1].Seq,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	long = append(long, noteEarly)
+	if err := verifyChain(long); err != nil {
+		t.Fatal(err)
+	}
 	v1 := chain[0]
 	v1.Class = ClassSSRF
 	reject("v1 class", []auditEvent{v1})
@@ -660,6 +680,65 @@ func TestM5TruncationAndVersion(t *testing.T) {
 	}
 	if _, err := readAuditRows(db); !errors.Is(err, ErrAudit) {
 		t.Fatalf("deleted row %v", err)
+	}
+}
+
+func TestDetectionLookbackKeepsLatestBrokerRows(t *testing.T) {
+	agent := strings.Repeat("a", 32)
+	other := strings.Repeat("b", 32)
+	var events []auditEvent
+	seq := uint64(1)
+	push := func(id, result string) {
+		t.Helper()
+		events = append(events, auditEvent{Seq: seq, Action: actionBroker, Result: result, AgentID: id})
+		seq++
+	}
+	for i := 0; i < detectionLookback; i++ {
+		push(agent, resultDenied)
+	}
+	for i := 0; i < detectionLookback-1; i++ {
+		push(agent, resultAllowed)
+	}
+	push(agent, resultDeniedMissing)
+	push(other, resultDenied)
+	for i := 0; i < detectionLookback; i++ {
+		push(other, resultCompleted)
+	}
+	want := func(id string, through uint64) int {
+		t.Helper()
+		var rows []string
+		for _, ev := range events {
+			if ev.Seq > through {
+				break
+			}
+			if ev.Action == actionBroker && ev.AgentID == id {
+				rows = append(rows, ev.Result)
+			}
+		}
+		if len(rows) > detectionLookback {
+			rows = rows[len(rows)-detectionLookback:]
+		}
+		n := 0
+		for _, result := range rows {
+			if brokerDenialResult(result) {
+				n++
+			}
+		}
+		return n
+	}
+	if got := brokerDenialCount(events, agent, events[len(events)-1].Seq); got != 1 || got != want(agent, events[len(events)-1].Seq) {
+		t.Fatalf("agent count %d want %d", got, want(agent, events[len(events)-1].Seq))
+	}
+	otherDeniedAt := uint64(detectionLookback + (detectionLookback - 1) + 1 + 1)
+	if got := brokerDenialCount(events, other, otherDeniedAt); got != 1 || got != want(other, otherDeniedAt) {
+		t.Fatalf("other before successes %d", got)
+	}
+	if got := brokerDenialCount(events, other, events[len(events)-1].Seq); got != 0 || got != want(other, events[len(events)-1].Seq) {
+		t.Fatalf("other after successes %d", got)
+	}
+	got := detectionFromAudit(events)
+	if len(got.Denials) != 1 || got.Denials[0].AgentID != agent || got.Denials[0].N != 1 {
+		t.Fatalf("%+v", got.Denials)
 	}
 }
 

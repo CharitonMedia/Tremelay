@@ -270,17 +270,10 @@ func verifyLinked(events []auditEvent) error {
 		if ev.V != auditVersionFor(ev.Action) || ev.Seq != first.Seq+uint64(i) {
 			return ErrAudit
 		}
-		if noticeAction(ev.Action) {
-			found := false
-			for _, prevEv := range events[:i] {
-				if prevEv.Seq == ev.RefSeq {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return ErrAudit
-			}
+		// events[:i] are already contiguous from first.Seq, so the referenced
+		// row exists exactly when RefSeq falls in that prefix.
+		if noticeAction(ev.Action) && (ev.RefSeq < first.Seq || ev.RefSeq >= ev.Seq) {
+			return ErrAudit
 		}
 		if ev.VaultID != first.VaultID || !knownAction(ev.Action) {
 			return ErrAudit

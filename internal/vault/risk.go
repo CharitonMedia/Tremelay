@@ -248,29 +248,46 @@ func brokerDenialResult(result string) bool {
 }
 
 func brokerDenialCount(events []auditEvent, agentID string, through uint64) int {
-	var rows []auditEvent
+	var w denialWindow
 	for _, row := range events {
 		if row.Seq > through {
 			break
 		}
 		if row.Action == actionBroker && row.AgentID == agentID {
-			rows = append(rows, row)
+			w.add(row.Result, row.Seq)
 		}
 	}
-	return countBrokerDenials(rows)
+	return w.count
 }
 
-func countBrokerDenials(rows []auditEvent) int {
-	if len(rows) > detectionLookback {
-		rows = rows[len(rows)-detectionLookback:]
+// denialWindow is the last detectionLookback broker results for one agent.
+// commitState retallies after every audit write, so the window stays fixed
+// instead of copying that agent's history.
+type denialWindow struct {
+	deny  [detectionLookback]bool
+	n     int
+	next  int
+	count int
+	last  uint64
+}
+
+func (w *denialWindow) add(result string, seq uint64) {
+	if w.n == detectionLookback && w.deny[w.next] {
+		w.count--
 	}
-	n := 0
-	for _, ev := range rows {
-		if brokerDenialResult(ev.Result) {
-			n++
-		}
+	denial := brokerDenialResult(result)
+	w.deny[w.next] = denial
+	if denial {
+		w.count++
 	}
-	return n
+	w.next++
+	if w.next == detectionLookback {
+		w.next = 0
+	}
+	if w.n < detectionLookback {
+		w.n++
+	}
+	w.last = seq
 }
 
 type detectionState struct {
@@ -283,11 +300,7 @@ type denialSubject struct {
 }
 
 func detectionFromAudit(events []auditEvent) detectionState {
-	type tally struct {
-		rows []auditEvent
-		last uint64
-	}
-	grouped := map[string]*tally{}
+	grouped := map[string]*denialWindow{}
 	var order []string
 	for _, ev := range events {
 		if ev.Action != actionBroker || safeID(ev.AgentID) == "" {
@@ -295,12 +308,11 @@ func detectionFromAudit(events []auditEvent) detectionState {
 		}
 		g := grouped[ev.AgentID]
 		if g == nil {
-			g = &tally{}
+			g = &denialWindow{}
 			grouped[ev.AgentID] = g
 			order = append(order, ev.AgentID)
 		}
-		g.rows = append(g.rows, ev)
-		g.last = ev.Seq
+		g.add(ev.Result, ev.Seq)
 	}
 	type ranked struct {
 		denialSubject
@@ -309,11 +321,10 @@ func detectionFromAudit(events []auditEvent) detectionState {
 	var rankedDenials []ranked
 	for _, id := range order {
 		g := grouped[id]
-		n := countBrokerDenials(g.rows)
-		if n == 0 {
+		if g.count == 0 {
 			continue
 		}
-		rankedDenials = append(rankedDenials, ranked{denialSubject{AgentID: id, N: n}, g.last})
+		rankedDenials = append(rankedDenials, ranked{denialSubject{AgentID: id, N: g.count}, g.last})
 	}
 	if len(rankedDenials) > detectionMaxAgents {
 		slices.SortFunc(rankedDenials, func(a, b ranked) int {
