@@ -198,7 +198,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: goal-publish-${{ github.ref_name }}
-      cancel-in-progress: true
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -280,9 +280,9 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: goal-review-${{ github.event.pull_request.number || github.event.issue.number }}
-      cancel-in-progress: true
+      cancel-in-progress: false
     outputs:
-      launch: ${{ steps.build.outputs.launch }}
+      launch: ${{ steps.claim.outputs.launch }}
       agent_id: ${{ steps.launch.outputs.agent_id }}
       run_id: ${{ steps.launch.outputs.run_id }}
       before_sha: ${{ steps.launch.outputs.before_sha }}
@@ -302,39 +302,8 @@ jobs:
         run: |
           set -euo pipefail
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" > cycle_comments.json
-          read -r count max_cycles < <(python - <<'PY'
-          import json
-          from datetime import datetime, timedelta, timezone
-          pages=json.load(open("cycle_comments.json", encoding="utf-8"))
-          comments=[c for page in pages for c in page]
-          trusted="pattalkslaw-del"
-          resume="<!-- tremelay-human-resume -->"
-          window="<!-- tremelay-unattended-window hours:6 max-cycles:9 -->"
-          start=0
-          max_cycles=3
-          now=datetime.now(timezone.utc)
-          for i,c in enumerate(comments):
-              if (c.get("user") or {}).get("login","").casefold()!=trusted:
-                  continue
-              body=c.get("body") or ""
-              if resume in body:
-                  start=i+1
-              if window in body:
-                  raw=c.get("created_at") or ""
-                  try:
-                      created=datetime.fromisoformat(raw.replace("Z","+00:00"))
-                  except ValueError:
-                      continue
-                  if created <= now < created + timedelta(hours=6):
-                      max_cycles=9
-          markers=(
-              "A cloud agent is working through the review findings:",
-              "Cursor remediation round ",
-          )
-          count=sum(any(m in (c.get("body") or "") for m in markers) for c in comments[start:])
-          print(count, max_cycles)
-          PY
-          )
+          # cycle-budget always reports 3. A comment cannot raise that cap.
+          read -r count max_cycles < <(python scripts/goal_agent_request.py cycle-budget --comments cycle_comments.json)
           echo "count=${count}" >> "$GITHUB_OUTPUT"
           echo "max_cycles=${max_cycles}" >> "$GITHUB_OUTPUT"
           if [ "$count" -ge "$max_cycles" ]; then
@@ -352,7 +321,8 @@ jobs:
             if [ "$existing" != "yes" ]; then
               gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped at the active remediation circuit breaker." --force
               gh pr edit "$PR_NUMBER" --add-label "human-review-required"
-              gh pr comment "$PR_NUMBER" --body "Automation stopped after ${max_cycles} implementation/remediation cycles for this supervised segment. Human review is required before another Cursor run. Latest head: \`${head}\`. Review the unresolved Codex/CI findings and explicitly resume only after deciding the next approach.\n\n${marker}"
+              python scripts/checkpoint_stop.py --head "$head" --comments cycle_comments.json --output checkpoint_stop.md
+              gh pr comment "$PR_NUMBER" --body-file checkpoint_stop.md
             fi
           else
             echo "allowed=true" >> "$GITHUB_OUTPUT"
@@ -396,9 +366,52 @@ jobs:
             fi
             exit "$code"
           fi
+      - name: Resolve trusted automation identity
+        id: marker_identity
+        if: steps.build.outputs.launch == 'true'
+        env:
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GOAL_GITHUB_TOKEN:-}" ]; then
+            echo "login=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          login=$(gh api user --jq .login)
+          if [ -z "$login" ]; then
+            echo "Could not resolve GOAL_GITHUB_TOKEN identity."
+            exit 1
+          fi
+          echo "login=$login" >> "$GITHUB_OUTPUT"
+      - name: Check review launch ownership
+        id: claim
+        if: steps.build.outputs.launch == 'true'
+        env:
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          number="${{ github.event.pull_request.number || github.event.issue.number }}"
+          if [ -z "${GOAL_GITHUB_TOKEN:-}" ] || [ -z "${{ steps.marker_identity.outputs.login }}" ]; then
+            echo "Approved automation identity is required."
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > live_pull.json
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews?per_page=100" > reviews.json
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${number}/comments?per_page=100" > comments.json
+          python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"pull": json.load(open("live_pull.json")), "reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("ownership.json", "w"))'
+          python scripts/goal_agent_request.py review-claim --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --state ownership.json --trusted-login "${{ steps.marker_identity.outputs.login }}" --out claim.json
+          status=$(python -c 'import json; print(json.load(open("claim.json"))["status"])')
+          if [ "$status" = "free" ]; then
+            echo "launch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "launch=false" >> "$GITHUB_OUTPUT"
+            echo "Not launching another worker for this review (status ${status})."
+          fi
       - name: Launch Cloud Agent
         id: launch
-        if: steps.build.outputs.launch == 'true'
+        if: steps.claim.outputs.launch == 'true'
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
@@ -411,12 +424,117 @@ jobs:
             gh pr comment "$number" --body "Review findings were not sent to a cloud agent because \`CURSOR_API_KEY\` is not set on this repository."
             exit 1
           fi
+          stopped=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" --jq '.labels[] | select(.name == "human-review-required") | .name')
+          if [ -n "$stopped" ]; then
+            echo "Checkpoint worker still owns this stopped PR; no review worker launch."
+            exit 1
+          fi
           before=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
-          curl --fail-with-body -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json https://api.cursor.com/v1/agents > response.json
+          expected=$(python -c 'import json; print(json.load(open("claim.json"))["head"])')
+          if [ "$before" != "$expected" ]; then
+            echo "Review head moved before launch; no stale worker launch."
+            exit 1
+          fi
+          marker=$(python -c 'import json; print(json.load(open("claim.json"))["marker"])')
+          if [ -z "$marker" ]; then
+            echo "Refusing to launch without a stable review/head claim."
+            exit 1
+          fi
+          claim_id=""
+          accepted=false
+          settled=false
+          # A released reservation is gone, or its body no longer owns the review.
+          # 404 counts: a previous attempt already deleted the comment.
+          claim_http() {
+            local method=$1
+            local payload=${2:-}
+            local raw status
+            if [ "$method" = "PATCH" ]; then
+              raw=$(gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" -f body="$payload" --include 2>/dev/null || true)
+            else
+              raw=$(gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" --include 2>/dev/null || true)
+            fi
+            status=$(printf '%s\n' "$raw" | awk 'NR==1 { print $2; exit }')
+            case "$status" in
+              200|201|204|404) return 0 ;;
+            esac
+            return 1
+          }
+          release_claim() {
+            local decision released attempt
+            if [ -z "$claim_id" ]; then
+              return 0
+            fi
+            decision=$(python scripts/goal_agent_request.py claim-release --accepted "$accepted" --settled "$settled")
+            if [ "$decision" != "delete" ]; then
+              return 0
+            fi
+            # A 4xx rejection did not start a worker. Delete the reservation.
+            # If GitHub still has the comment, replace the body so it neither
+            # owns the review nor counts as a cycle. A failed release stays failed.
+            released=$(python scripts/goal_agent_request.py released-body)
+            attempt=1
+            while [ "$attempt" -le 3 ]; do
+              if claim_http DELETE; then
+                return 0
+              fi
+              if claim_http PATCH "$released"; then
+                return 0
+              fi
+              sleep "$attempt"
+              attempt=$((attempt + 1))
+            done
+            echo "Rejected launch reservation ${claim_id} was not released." >&2
+            return 1
+          }
+          trap release_claim EXIT
+          trap 'exit 1' TERM INT
+          claim_body=$(python scripts/goal_agent_request.py reservation-body --marker "$marker")
+          claim_id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${number}/comments" -f body="$claim_body" --jq .id)
+          if [ -z "$claim_id" ]; then
+            echo "Launch reservation was not recorded."
+            exit 1
+          fi
+          # Recheck open/head/stop immediately before create, after the durable claim.
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > precreate_pull.json
+          if ! python -c 'import json,sys; p=json.load(open("precreate_pull.json")); c=json.load(open("claim.json")); sys.exit(0 if p["state"]=="open" and p["head"]["sha"]==c["head"] and "human-review-required" not in {l["name"] for l in p["labels"]} else 1)'; then
+            echo "PR closed, moved, or stopped before Cursor create; refusing launch."
+            exit 1
+          fi
+          set +e
+          http_code=$(curl -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json -o response.json -w '%{http_code}' https://api.cursor.com/v1/agents)
+          curl_status=$?
+          set -e
+          if [ "$curl_status" -ne 0 ]; then
+            echo "Cursor create did not settle (curl ${curl_status}). Keeping the launch claim."
+            exit 1
+          fi
+          outcome=$(python scripts/goal_agent_request.py create-outcome --http-code "$http_code")
+          case "$outcome" in
+            accept)
+              settled=true
+              accepted=true
+              ;;
+            reject)
+              settled=true
+              echo "Cursor rejected create with HTTP ${http_code}."
+              cat response.json || true
+              exit 1
+              ;;
+            *)
+              echo "Cursor create HTTP ${http_code} is ambiguous. Keeping the launch claim."
+              cat response.json || true
+              exit 1
+              ;;
+          esac
           url=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["url"])')
           agent_id=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["id"])')
           run_id=$(python -c 'import json; print(json.load(open("response.json"))["run"]["id"])')
-          gh pr comment "$number" --body "A cloud agent is working through the review findings: ${url}"
+          started_body=$(python scripts/goal_agent_request.py accepted-body --url "$url" --marker "$marker")
+          # The reservation already counts. This PATCH records the agent URL in
+          # that same comment. It must succeed before the job continues; a
+          # failure leaves the counted claim in place and does not launch another worker.
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" -f body="$started_body" >/dev/null
           echo "agent_id=${agent_id}" >> "$GITHUB_OUTPUT"
           echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
           echo "before_sha=${before}" >> "$GITHUB_OUTPUT"
