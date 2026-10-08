@@ -144,7 +144,7 @@ jobs:
           if [[ "$REASON" == *"circuit breaker reached ${LIMIT} rounds"* ]]; then
             gh label create human-review-required --repo "$GITHUB_REPOSITORY" --color B60205 --description "Automation stopped at the active remediation circuit breaker." --force
             gh pr edit "$PR_NUMBER" --add-label human-review-required
-            gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped after ${LIMIT} remediation cycles. Human review is required before another agent run. Reason: ${REASON}"
+            gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped after ${LIMIT} remediation cycles. A documented supervisor assessment is required before another agent run. The implementation worker must not authorize its own further cycles. Reason: ${REASON}"
           else
             gh pr comment "$PR_NUMBER" --body "Codex-to-Cursor automation stopped: ${REASON}"
           fi
