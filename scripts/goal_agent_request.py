@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from complete_codex_clean_review import is_terminal_clean_review, reviewed_commit
@@ -234,6 +235,8 @@ def _review_prompt(*, number: int, url: str, event_text: str) -> str:
         "requests the next Codex review after your commits land.\n"
         "If you are blocked, comment once on the pull request with the blocker.\n"
         "If every legitimate finding is already fixed in the current diff, stop without another commit.\n"
+        "Do not post `<!-- tremelay-human-resume -->`, do not remove `human-review-required`, "
+        "and do not authorize another remediation cycle. A worker cannot clear the three-cycle stop.\n"
     )
 
 
@@ -745,6 +748,601 @@ def _cmd_codex_rereview(args: argparse.Namespace) -> int:
     return 0
 
 
+def review_claim_marker(review_id: int | str, head_sha: str) -> str:
+    """Stable ownership marker for one Codex review of one head."""
+    return f"<!-- goal-review-claim review:{review_id} head:{head_sha.strip().lower()} -->"
+
+
+# Phrases the circuit breaker counts. The stable claim marker counts even when
+# a later edit of the same comment fails, so an accepted launch cannot drop
+# out of the three-cycle limit.
+CYCLE_COUNT_MARKERS = (
+    "A cloud agent is working through the review findings:",
+    "Cursor remediation round ",
+    "<!-- goal-review-claim ",
+)
+HUMAN_RESUME_MARKER = "<!-- tremelay-human-resume -->"
+TRUSTED_AUTOMATION_LOGIN = "pattalkslaw-del"
+CYCLE_LIMIT = 3
+_CLAIM_MARKER_RE = re.compile(
+    r"^<!-- goal-review-claim review:[0-9]+ head:[0-9a-f]{40} -->$"
+)
+
+
+def comment_counts_cycle(body: str) -> bool:
+    text = body or ""
+    return any(marker in text for marker in CYCLE_COUNT_MARKERS)
+
+
+def reservation_body(marker: str) -> str:
+    """Comment posted before Cursor create.
+
+    The cycle phrase and the stable review/head marker are both in this first
+    body. A later PATCH that adds the agent URL is not what makes the launch
+    count.
+    """
+    marker = (marker or "").strip()
+    if not _CLAIM_MARKER_RE.fullmatch(marker):
+        raise ValueError("stable review/head marker required")
+    return (
+        "A cloud agent is working through the review findings:\n\n"
+        "Cursor review launch claimed.\n\n"
+        f"{marker}\n"
+    )
+
+
+def released_body() -> str:
+    """Replacement body when a rejected create cannot be deleted.
+
+    The comment stays on the pull request, but it no longer contains a cycle
+    phrase or the claim marker, so it neither owns the review nor counts.
+    """
+    return (
+        "Cursor rejected this review launch before a worker was created. "
+        "The reservation was released.\n"
+    )
+
+
+def accepted_launch_body(url: str, marker: str) -> str:
+    """Replacement body after Cursor accepts the worker.
+
+    The URL cannot carry a comment marker or a newline, so a create response
+    cannot reset the cycle count.
+    """
+    marker = (marker or "").strip()
+    if not _CLAIM_MARKER_RE.fullmatch(marker):
+        raise ValueError("stable review/head marker required")
+    if not isinstance(url, str) or url.strip() == "" or any(ch in url for ch in "\r\n<>"):
+        raise ValueError("agent url")
+    if "<!--" in url:
+        raise ValueError("agent url")
+    return f"A cloud agent is working through the review findings: {url.strip()}\n\n{marker}\n"
+
+
+def cycle_budget(comments: list | None) -> tuple[int, int]:
+    """Return (cycles since the last supervisor resume, cycle limit).
+
+    A trusted resume comment starts a new segment. The limit stays three.
+    An unattended-window comment does not raise it, whoever posts it.
+    Claim comments count as soon as they are posted.
+    """
+    start = 0
+    for i, comment in enumerate(comments or []):
+        if not isinstance(comment, dict):
+            continue
+        if _actor_login(comment).casefold() != TRUSTED_AUTOMATION_LOGIN:
+            continue
+        body = comment.get("body") or ""
+        if isinstance(body, str) and HUMAN_RESUME_MARKER in body:
+            start = i + 1
+    count = 0
+    for comment in (comments or [])[start:]:
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body") or ""
+        if isinstance(body, str) and comment_counts_cycle(body):
+            count += 1
+    return count, CYCLE_LIMIT
+
+
+def _summary_commit(body: str) -> str | None:
+    named = reviewed_commit(body)
+    if named:
+        return named
+    found = re.findall(r"`([0-9a-fA-F]{7,40})`", body or "")
+    if not found:
+        return None
+    return found[-1]
+
+
+# GitHub review states that have been submitted. PENDING is still a draft.
+_SUBMITTED_REVIEW_STATES = frozenset(
+    {"approved", "changes_requested", "commented", "dismissed"}
+)
+
+
+def _review_submitted_at(review: dict) -> datetime:
+    """UTC submission time. Missing or invalid times sort before any real time."""
+    raw = review.get("submitted_at") or review.get("submittedAt")
+    if not isinstance(raw, str) or raw.strip() == "":
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _newest_submitted_review(reviews: list | None, commit: str) -> dict | None:
+    """Newest submitted Codex review of this commit.
+
+    List-reviews is chronological, so a later index is newer when submitted_at
+    is missing or tied. A pending review is not a match.
+    """
+    chosen = None
+    chosen_key: tuple[datetime, int] | None = None
+    for index, review in enumerate(reviews or []):
+        if not isinstance(review, dict) or not _is_codex_login(_actor_login(review)):
+            continue
+        if _review_state(review) not in _SUBMITTED_REVIEW_STATES:
+            continue
+        if not _commits_match(commit, _review_commit(review)):
+            continue
+        if _identity_from_review(review) is None:
+            continue
+        key = (_review_submitted_at(review), index)
+        if chosen_key is None or key > chosen_key:
+            chosen = review
+            chosen_key = key
+    return chosen
+
+
+def review_launch_identity(
+    event: dict,
+    event_name: str,
+    reviews: list | None = None,
+) -> tuple[str, str] | None:
+    """Review id and full head shared by a review, an inline comment, and a summary.
+
+    A summary names a commit, not a review id. It binds to the newest submitted
+    Codex review of that commit, so a later review of an unchanged head does not
+    reuse an older claim. Returns None when the event cannot be bound.
+    """
+    if event_name == "pull_request_review":
+        review = event.get("review") or {}
+        return _identity_from_review(review)
+    if event_name == "pull_request_review_comment":
+        comment = event.get("comment") or {}
+        review_id = comment.get("pull_request_review_id")
+        head = comment.get("commit_id") or comment.get("commitId")
+        if review_id is None or not isinstance(head, str):
+            return None
+        return _full_identity(review_id, head)
+    if event_name == "issue_comment":
+        body = ((event.get("comment") or {}).get("body") or "")
+        if "<!-- codex-pull-request-review-summary -->" not in body:
+            return None
+        short = _summary_commit(body)
+        if not short:
+            return None
+        return _identity_from_review(_newest_submitted_review(reviews, short) or {})
+    return None
+
+
+def _identity_from_review(review: dict) -> tuple[str, str] | None:
+    return _full_identity(review.get("id"), _review_commit(review))
+
+
+def _full_identity(review_id: object, head: object) -> tuple[str, str] | None:
+    if not isinstance(review_id, (int, str)) or str(review_id).strip() == "":
+        return None
+    if not isinstance(head, str) or len(head.strip()) != 40:
+        return None
+    return str(review_id).strip(), head.strip().lower()
+
+
+def review_claim_owned(
+    comments: list | None,
+    review_id: str,
+    head_sha: str,
+    trusted_login: str,
+) -> bool:
+    """True when the trusted automation identity already claimed this review and head."""
+    trusted = (trusted_login or "").strip().casefold()
+    if not trusted:
+        return False
+    marker = review_claim_marker(review_id, head_sha)
+    for comment in comments or []:
+        if not isinstance(comment, dict):
+            continue
+        login = ((comment.get("user") or {}).get("login") or "").casefold()
+        if login != trusted:
+            continue
+        if marker in (comment.get("body") or ""):
+            return True
+    return False
+
+
+def review_launch_decision(
+    event: dict,
+    event_name: str,
+    *,
+    reviews: list | None = None,
+    comments: list | None = None,
+    trusted_login: str = "",
+) -> dict:
+    """Whether this event may start a worker for its review and head."""
+    identity = review_launch_identity(event, event_name, reviews)
+    if identity is None:
+        return {"status": "unbound", "owned": False, "marker": "", "review_id": "", "head": ""}
+    review_id, head = identity
+    marker = review_claim_marker(review_id, head)
+    owned = review_claim_owned(comments, review_id, head, trusted_login)
+    return {
+        "status": "owned" if owned else "free",
+        "owned": owned,
+        "marker": marker,
+        "review_id": review_id,
+        "head": head,
+    }
+
+
+def create_outcome(http_code: str) -> str:
+    """Classify a Cursor create HTTP status.
+
+    accept: 2xx, the worker exists.
+    reject: 4xx, the server refused and did not create a worker.
+    ambiguous: 5xx, redirects, and any other status. The worker may exist.
+    """
+    code = (http_code or "").strip()
+    if len(code) == 3 and code.isdigit():
+        if code[0] == "2":
+            return "accept"
+        if code[0] == "4":
+            return "reject"
+    return "ambiguous"
+
+
+def claim_survives_cancel(*, accepted: bool, create_settled: bool) -> bool:
+    """A cancelled run keeps the claim once a worker was accepted or the create is unknown.
+
+    create_settled is true only for a definitive outcome: the worker was accepted,
+    or the server returned a 4xx client rejection. A 5xx or other ambiguous HTTP
+    status is not settled. A settled rejection deletes the claim so a later event
+    can launch. Cancellation while the create call is in flight keeps the claim
+    and does not start a replacement.
+    """
+    if accepted:
+        return True
+    return not create_settled
+
+
+def _cmd_review_claim(args: argparse.Namespace) -> int:
+    event = json.loads(Path(args.event).read_text(encoding="utf-8"))
+    state = _load_json(args.state) or {}
+    decision = review_launch_decision(
+        event,
+        args.event_name,
+        reviews=state.get("reviews") or [],
+        comments=state.get("comments") or [],
+        trusted_login=args.trusted_login or "",
+    )
+    Path(args.out).write_text(json.dumps(decision) + "\n", encoding="utf-8")
+    return 0
+
+
+def _cmd_claim_release(args: argparse.Namespace) -> int:
+    accepted = args.accepted == "true"
+    settled = args.settled == "true"
+    print("keep" if claim_survives_cancel(accepted=accepted, create_settled=settled) else "delete")
+    return 0
+
+
+def _cmd_create_outcome(args: argparse.Namespace) -> int:
+    print(create_outcome(args.http_code))
+    return 0
+
+
+def _cmd_reservation_body(args: argparse.Namespace) -> int:
+    print(reservation_body(args.marker), end="")
+    return 0
+
+
+def _cmd_accepted_body(args: argparse.Namespace) -> int:
+    print(accepted_launch_body(args.url, args.marker), end="")
+    return 0
+
+
+def _cmd_released_body(_args: argparse.Namespace) -> int:
+    print(released_body(), end="")
+    return 0
+
+
+def _cmd_cycle_budget(args: argparse.Namespace) -> int:
+    raw = _load_json(args.comments)
+    count, limit = cycle_budget(flatten_pages(raw))
+    print(count, limit)
+    return 0
+
+
+def _cmd_self_check(_args: argparse.Namespace) -> int:
+    _self_check()
+    print("ok")
+    return 0
+
+
+def _self_check() -> None:
+    head = "a" * 40
+    other = "b" * 40
+    review_id = 5449353687
+    review = {
+        "id": review_id,
+        "commit_id": head,
+        "state": "COMMENTED",
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+    }
+    review_event = {"action": "submitted", "review": review}
+    comment_event = {
+        "action": "created",
+        "comment": {
+            "pull_request_review_id": review_id,
+            "commit_id": head.upper(),
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+        },
+    }
+    summary_event = {
+        "action": "created",
+        "comment": {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "<!-- codex-pull-request-review-summary -->\n"
+                "| Review | Status | Commit |\n"
+                "| --- | --- | --- |\n"
+                "| Code Review | ✅ **Completed** | `aaaaaaaa` |\n"
+            ),
+        },
+    }
+    reviews = [review]
+    identities = [
+        review_launch_identity(review_event, "pull_request_review", reviews),
+        review_launch_identity(comment_event, "pull_request_review_comment", reviews),
+        review_launch_identity(summary_event, "issue_comment", reviews),
+    ]
+    if any(item is None for item in identities) or len(set(identities)) != 1:
+        raise SystemExit(f"review identity diverged: {identities}")
+    marker = review_claim_marker(review_id, head)
+    trusted = "pattalkslaw-del"
+    comments = [{"user": {"login": trusted}, "body": "claimed\n\n" + marker}]
+    if not review_claim_owned(comments, str(review_id), head, trusted):
+        raise SystemExit("trusted claim was not honored")
+    if review_claim_owned(comments, str(review_id), other, trusted):
+        raise SystemExit("claim matched a different head")
+    forged = [{"user": {"login": "someone-else"}, "body": marker}]
+    if review_claim_owned(forged, str(review_id), head, trusted):
+        raise SystemExit("untrusted claim was honored")
+    if review_claim_owned(comments, str(review_id), head, ""):
+        raise SystemExit("empty trusted login honored a claim")
+    owned = review_launch_decision(
+        comment_event,
+        "pull_request_review_comment",
+        reviews=reviews,
+        comments=comments,
+        trusted_login=trusted,
+    )
+    if not owned["owned"] or owned["marker"] != marker:
+        raise SystemExit(f"inline comment did not see the review claim: {owned}")
+    free = review_launch_decision(
+        summary_event,
+        "issue_comment",
+        reviews=reviews,
+        comments=[],
+        trusted_login=trusted,
+    )
+    if free["owned"] or free["status"] != "free" or free["marker"] != marker:
+        raise SystemExit(f"summary was not a free launch of the same review: {free}")
+    if review_launch_identity(summary_event, "issue_comment", []) is not None:
+        raise SystemExit("summary bound without a review list")
+    older_id = 111
+    newer_id = 222
+    codex_user = {"login": "chatgpt-codex-connector[bot]"}
+    older = {
+        "id": older_id,
+        "commit_id": head,
+        "state": "COMMENTED",
+        "submitted_at": "2026-10-08T03:00:00Z",
+        "user": codex_user,
+    }
+    newer = {
+        "id": newer_id,
+        "commit_id": head,
+        "state": "COMMENTED",
+        "submitted_at": "2026-10-08T13:32:38.921967Z",
+        "user": codex_user,
+    }
+    pending = {
+        "id": 333,
+        "commit_id": head,
+        "state": "PENDING",
+        "submitted_at": "2026-10-08T23:00:00Z",
+        "user": codex_user,
+    }
+    stranger = {
+        "id": 444,
+        "commit_id": head,
+        "state": "COMMENTED",
+        "submitted_at": "2026-10-08T23:30:00Z",
+        "user": {"login": "someone-else"},
+    }
+    repeated = [older, newer, pending, stranger]
+    bound = review_launch_identity(summary_event, "issue_comment", repeated)
+    if bound != (str(newer_id), head):
+        raise SystemExit(f"summary bound the oldest review: {bound}")
+    reversed_bound = review_launch_identity(
+        summary_event, "issue_comment", list(reversed(repeated))
+    )
+    if reversed_bound != (str(newer_id), head):
+        raise SystemExit(f"summary ignored submitted_at: {reversed_bound}")
+    if review_launch_identity(summary_event, "issue_comment", [pending]) is not None:
+        raise SystemExit("pending review bound a summary")
+    untimed_older = dict(older, submitted_at="")
+    untimed_newer = dict(newer, id=555, submitted_at="")
+    untimed = review_launch_identity(
+        summary_event, "issue_comment", [untimed_older, untimed_newer]
+    )
+    if untimed != ("555", head):
+        raise SystemExit(f"chronological list did not pick the newest review: {untimed}")
+    old_claim = [{"user": {"login": trusted}, "body": review_claim_marker(older_id, head)}]
+    reused = review_launch_decision(
+        summary_event,
+        "issue_comment",
+        reviews=repeated,
+        comments=old_claim,
+        trusted_login=trusted,
+    )
+    if reused["owned"] or reused["review_id"] != str(newer_id):
+        raise SystemExit(f"old claim suppressed the newer review: {reused}")
+    held = review_launch_decision(
+        summary_event,
+        "issue_comment",
+        reviews=repeated,
+        comments=[{"user": {"login": trusted}, "body": review_claim_marker(newer_id, head)}],
+        trusted_login=trusted,
+    )
+    if not held["owned"] or held["review_id"] != str(newer_id):
+        raise SystemExit(f"newer claim did not own the summary: {held}")
+    if not claim_survives_cancel(accepted=True, create_settled=True):
+        raise SystemExit("accepted worker lost its claim")
+    if not claim_survives_cancel(accepted=False, create_settled=False):
+        raise SystemExit("unsettled create lost its claim")
+    if claim_survives_cancel(accepted=False, create_settled=True):
+        raise SystemExit("settled rejection kept its claim")
+    outcomes = {
+        "200": "accept",
+        "201": "accept",
+        "400": "reject",
+        "401": "reject",
+        "409": "reject",
+        "422": "reject",
+        "429": "reject",
+        " 404 ": "reject",
+        "500": "ambiguous",
+        "502": "ambiguous",
+        "503": "ambiguous",
+        "302": "ambiguous",
+        "000": "ambiguous",
+        "": "ambiguous",
+        "99": "ambiguous",
+        "2000": "ambiguous",
+    }
+    for code, want in outcomes.items():
+        got = create_outcome(code)
+        if got != want:
+            raise SystemExit(f"create outcome {code!r}: {got} != {want}")
+    marker = review_claim_marker(review_id, head)
+    reservation = reservation_body(marker)
+    if not comment_counts_cycle(reservation):
+        raise SystemExit("reservation does not count as a cycle")
+    if not comment_counts_cycle("Cursor review launch claimed.\n\n" + marker):
+        raise SystemExit("unpatched claim marker does not count")
+    if comment_counts_cycle("Cursor review launch claimed.\n"):
+        raise SystemExit("prose without a claim marker counted")
+    accepted = accepted_launch_body("https://cursor.com/agents/bc-1", marker)
+    if not comment_counts_cycle(accepted) or marker not in accepted:
+        raise SystemExit("accepted body dropped the claim")
+    try:
+        accepted_launch_body("https://cursor.com/agents/x\n<!-- tremelay-human-resume -->", marker)
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("newline url was accepted")
+    try:
+        reservation_body("<!-- goal-review-claim review:1 head:abcd -->")
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("short claim marker was accepted")
+    trusted = "pattalkslaw-del"
+    reservation_comment = {"user": {"login": trusted}, "body": reservation}
+    count, limit = cycle_budget([reservation_comment])
+    if count != 1 or limit != 3:
+        raise SystemExit(f"one reserved launch counted {count} limit {limit}")
+    released = released_body()
+    if comment_counts_cycle(released) or review_claim_marker(review_id, head) in released:
+        raise SystemExit("released reservation still counts or owns the review")
+    if review_claim_owned(
+        [{"user": {"login": trusted}, "body": released}],
+        str(review_id),
+        head,
+        trusted,
+    ):
+        raise SystemExit("released reservation still owns the review")
+    count, limit = cycle_budget([{"user": {"login": trusted}, "body": released}])
+    if count != 0 or limit != 3:
+        raise SystemExit(f"released reservation counted {count} limit {limit}")
+    resumed = [
+        {"user": {"login": trusted}, "body": "A cloud agent is working through the review findings: https://example"},
+        {"user": {"login": trusted}, "body": "A cloud agent is working through the review findings: https://example"},
+        {"user": {"login": trusted}, "body": "<!-- tremelay-human-resume -->\nassessment"},
+        reservation_comment,
+    ]
+    count, limit = cycle_budget(resumed)
+    if count != 1 or limit != 3:
+        raise SystemExit(f"resume did not start a segment: {count} {limit}")
+    ignored = [
+        {"user": {"login": "someone-else"}, "body": "<!-- tremelay-human-resume -->"},
+        reservation_comment,
+    ]
+    count, _limit = cycle_budget(ignored)
+    if count != 1:
+        raise SystemExit(f"untrusted resume reset the count: {count}")
+    window = "<!-- tremelay-unattended-window hours:6 max-cycles:9 -->"
+    bypass = [
+        {"user": {"login": trusted}, "created_at": "2026-10-08T11:00:00Z", "body": window},
+        reservation_comment,
+        reservation_comment,
+        reservation_comment,
+    ]
+    count, limit = cycle_budget(bypass)
+    if count != 3 or limit != 3:
+        raise SystemExit(f"unattended window raised the cap: {count} {limit}")
+    count, limit = cycle_budget(bypass + [reservation_comment])
+    if count != 4 or limit != 3:
+        raise SystemExit(f"fourth cycle left the three-cycle cap: {count} {limit}")
+    stranger = [
+        {"user": {"login": "someone-else"}, "created_at": "2026-10-08T11:00:00Z", "body": window},
+        reservation_comment,
+    ]
+    _, limit = cycle_budget(stranger)
+    if limit != 3:
+        raise SystemExit(f"untrusted window raised the cap: {limit}")
+    # A failed PATCH leaves the reservation in place. It still counts once,
+    # and review, inline, and summary events for that head stay owned.
+    owned_comments = [reservation_comment]
+    duplicate_events = (
+        ("pull_request_review", review_event),
+        ("pull_request_review_comment", comment_event),
+        ("issue_comment", summary_event),
+    )
+    for event_name, event in duplicate_events:
+        decision = review_launch_decision(
+            event,
+            event_name,
+            reviews=reviews,
+            comments=owned_comments,
+            trusted_login=trusted,
+        )
+        if decision["status"] != "owned" or not decision["owned"] or decision["marker"] != marker:
+            raise SystemExit(f"{event_name} relaunched an accepted claim: {decision}")
+    if create_outcome("500") != "ambiguous" or not claim_survives_cancel(accepted=False, create_settled=False):
+        raise SystemExit("ambiguous create dropped the claim")
+    if create_outcome("422") != "reject" or claim_survives_cancel(accepted=False, create_settled=True):
+        raise SystemExit("client rejection kept the claim")
+    if "<!-- tremelay-human-resume -->" not in _review_prompt(number=1, url="https://example", event_text=""):
+        raise SystemExit("worker prompt does not forbid self-resume")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -786,6 +1384,42 @@ def main(argv: list[str] | None = None) -> int:
     rereview.add_argument("--after", required=True)
     rereview.add_argument("--reviews")
     rereview.set_defaults(func=_cmd_codex_rereview)
+
+    claim = sub.add_parser("review-claim")
+    claim.add_argument("--event", required=True)
+    claim.add_argument("--event-name", required=True)
+    claim.add_argument("--state", required=True)
+    claim.add_argument("--trusted-login", default="")
+    claim.add_argument("--out", required=True)
+    claim.set_defaults(func=_cmd_review_claim)
+
+    release = sub.add_parser("claim-release")
+    release.add_argument("--accepted", required=True, choices=("true", "false"))
+    release.add_argument("--settled", required=True, choices=("true", "false"))
+    release.set_defaults(func=_cmd_claim_release)
+
+    outcome = sub.add_parser("create-outcome")
+    outcome.add_argument("--http-code", required=True)
+    outcome.set_defaults(func=_cmd_create_outcome)
+
+    reservation = sub.add_parser("reservation-body")
+    reservation.add_argument("--marker", required=True)
+    reservation.set_defaults(func=_cmd_reservation_body)
+
+    accepted = sub.add_parser("accepted-body")
+    accepted.add_argument("--url", required=True)
+    accepted.add_argument("--marker", required=True)
+    accepted.set_defaults(func=_cmd_accepted_body)
+
+    released = sub.add_parser("released-body")
+    released.set_defaults(func=_cmd_released_body)
+
+    budget = sub.add_parser("cycle-budget")
+    budget.add_argument("--comments", required=True)
+    budget.set_defaults(func=_cmd_cycle_budget)
+
+    check = sub.add_parser("self-check")
+    check.set_defaults(func=_cmd_self_check)
 
     args = parser.parse_args(argv)
     return args.func(args)

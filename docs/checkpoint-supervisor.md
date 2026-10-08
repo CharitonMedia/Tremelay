@@ -33,6 +33,11 @@ every fifteen minutes for missed checkpoints; GitHub can delay scheduled runs.
 Duplicate wakes share one serialized controller and the same trusted checkpoint
 claim. Rechecking without a checkpoint does not call the model.
 
+The existing review launcher also receives the stable review/head claim fixes
+from the M5 candidate, so repeated inline/summary events cannot create multiple
+workers for one review. Its fixed three-cycle allowance cannot be raised by a
+comment, and in-flight launch jobs are no longer cancelled by duplicate events.
+
 The total allowance is three automatic assessments per PR, including failed or
 ambiguous reservations. Each resume authorizes at most three worker cycles.
 This is a work allowance, not a global billing cap. An owner review is required

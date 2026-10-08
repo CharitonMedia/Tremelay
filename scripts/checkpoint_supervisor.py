@@ -304,6 +304,7 @@ def recover_worker(pull, comment, state):
     run_id = state.get("run_id") or agent.get("latestRunId")
     if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
         raise Stop("Cannot reconcile worker run identity")
+    needs_record = state.get("phase") != "working" or state.get("run_id") != run_id
     state.update(phase="working", run_id=run_id)
     result = cursor(f"/{agent_id}/runs/{run_id}")
     status = result.get("status")
@@ -313,7 +314,8 @@ def recover_worker(pull, comment, state):
             state["phase"] = "escalate"
             update_state(comment, state, "Worker exceeded six hours. Input required: reconcile the existing Cursor worker before authorizing further launches.")
         else:
-            update_state(comment, state)
+            if needs_record:
+                update_state(comment, state)
             print(f"PR #{number}: Cursor worker is {status}; no duplicate launch")
         return
     if status != "FINISHED":

@@ -141,6 +141,13 @@ class Controller(unittest.TestCase):
             self.assertEqual(state['phase'], 'working')
             self.assertTrue(all(not call.kwargs for call in api.call_args_list))
 
+    def test_already_recorded_running_worker_does_not_create_event_feedback(self):
+        state = {'phase': 'working', 'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
+                 'run_id': 'run-1', 'time': s.datetime.now(s.timezone.utc).isoformat(), 'head': HEAD}
+        with patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'RUNNING'}]), patch.object(s, 'update_state') as write:
+            s.recover_worker(PULL, {'id': 100}, state)
+            write.assert_not_called()
+
     def test_noop_worker_does_not_clear_stop_or_request_review(self):
         state = {'phase': 'working', 'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
                  'run_id': 'run-1', 'time': s.datetime.now(s.timezone.utc).isoformat(), 'head': HEAD}
