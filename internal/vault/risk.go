@@ -261,8 +261,6 @@ func brokerDenialCount(events []auditEvent, agentID string, through uint64) int 
 }
 
 // denialWindow is the last detectionLookback broker results for one agent.
-// commitState retallies after every audit write, so the window stays fixed
-// instead of copying that agent's history.
 type denialWindow struct {
 	deny  [detectionLookback]bool
 	n     int
@@ -299,32 +297,75 @@ type denialSubject struct {
 	N       int    `json:"n"`
 }
 
-func detectionFromAudit(events []auditEvent) detectionState {
-	grouped := map[string]*denialWindow{}
-	var order []string
-	for _, ev := range events {
-		if ev.Action != actionBroker || safeID(ev.AgentID) == "" {
+// detectionApplyVisits counts audit rows applied to a detection index.
+// A commit applies the new rows. Unlock and verify apply the chain once.
+var detectionApplyVisits int
+
+// detectionIndex is the derived lookback. It is rebuilt from the chain on
+// unlock and verify, then updated one new row at a time. The encrypted
+// mirror is published only after that row's commit succeeds.
+//
+// ponytail: one fixed window per broker agent in the chain, including agents
+// omitted from the 256-cap mirror. Upgrade path: rebuild a missing window
+// from a reverse scan of that agent instead of retaining every subject.
+type detectionIndex struct {
+	byID map[string]*denialWindow
+}
+
+func newDetectionIndex() *detectionIndex {
+	return &detectionIndex{byID: map[string]*denialWindow{}}
+}
+
+func (idx *detectionIndex) clone() *detectionIndex {
+	next := newDetectionIndex()
+	if idx == nil {
+		return next
+	}
+	for id, w := range idx.byID {
+		if w == nil {
 			continue
 		}
-		g := grouped[ev.AgentID]
-		if g == nil {
-			g = &denialWindow{}
-			grouped[ev.AgentID] = g
-			order = append(order, ev.AgentID)
-		}
-		g.add(ev.Result, ev.Seq)
+		cp := *w
+		next.byID[id] = &cp
+	}
+	return next
+}
+
+func (idx *detectionIndex) apply(ev auditEvent) {
+	detectionApplyVisits++
+	if idx == nil || ev.Action != actionBroker || safeID(ev.AgentID) == "" {
+		return
+	}
+	w := idx.byID[ev.AgentID]
+	if w == nil {
+		w = &denialWindow{}
+		idx.byID[ev.AgentID] = w
+	}
+	w.add(ev.Result, ev.Seq)
+}
+
+func indexFromAudit(events []auditEvent) *detectionIndex {
+	idx := newDetectionIndex()
+	for _, ev := range events {
+		idx.apply(ev)
+	}
+	return idx
+}
+
+func (idx *detectionIndex) state() detectionState {
+	if idx == nil || len(idx.byID) == 0 {
+		return detectionState{}
 	}
 	type ranked struct {
 		denialSubject
 		last uint64
 	}
-	var rankedDenials []ranked
-	for _, id := range order {
-		g := grouped[id]
-		if g.count == 0 {
+	rankedDenials := make([]ranked, 0, len(idx.byID))
+	for id, w := range idx.byID {
+		if w == nil || w.count == 0 {
 			continue
 		}
-		rankedDenials = append(rankedDenials, ranked{denialSubject{AgentID: id, N: g.count}, g.last})
+		rankedDenials = append(rankedDenials, ranked{denialSubject{AgentID: id, N: w.count}, w.last})
 	}
 	if len(rankedDenials) > detectionMaxAgents {
 		slices.SortFunc(rankedDenials, func(a, b ranked) int {
@@ -338,7 +379,7 @@ func detectionFromAudit(events []auditEvent) detectionState {
 		})
 		rankedDenials = rankedDenials[:detectionMaxAgents]
 	}
-	var denials []denialSubject
+	denials := make([]denialSubject, 0, len(rankedDenials))
 	for _, d := range rankedDenials {
 		denials = append(denials, d.denialSubject)
 	}
@@ -346,6 +387,10 @@ func detectionFromAudit(events []auditEvent) detectionState {
 		return strings.Compare(a.AgentID, b.AgentID)
 	})
 	return detectionState{Denials: denials}
+}
+
+func detectionFromAudit(events []auditEvent) detectionState {
+	return indexFromAudit(events).state()
 }
 
 func validateDetection(st detectionState) error {
@@ -384,11 +429,10 @@ func sealedDetection(plain []byte, events []auditEvent, stored detectionState) (
 	return stored, nil
 }
 
-func checkDetection(events []auditEvent, got detectionState) error {
+func matchDetection(want, got detectionState) error {
 	if err := validateDetection(got); err != nil {
 		return err
 	}
-	want := detectionFromAudit(events)
 	if err := validateDetection(want); err != nil {
 		return err
 	}
@@ -401,6 +445,10 @@ func checkDetection(events []auditEvent, got detectionState) error {
 		}
 	}
 	return nil
+}
+
+func checkDetection(events []auditEvent, got detectionState) error {
+	return matchDetection(detectionFromAudit(events), got)
 }
 
 // AuditRecord is one verified, secret-free audit row plus its risk class.
@@ -513,7 +561,10 @@ func (s *Session) verified() error {
 	if err := verifyChain(s.audit); err != nil {
 		return ErrAudit
 	}
-	if err := checkDetection(s.audit, s.detection); err != nil {
+	if s.denials == nil {
+		s.denials = indexFromAudit(s.audit)
+	}
+	if err := matchDetection(s.denials.state(), s.detection); err != nil {
 		return ErrAudit
 	}
 	return nil

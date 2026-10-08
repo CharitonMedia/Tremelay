@@ -253,6 +253,10 @@ type Session struct {
 	// detection is the encrypted mirror of broker-denial counts. The audit
 	// chain is authoritative; a mirror that disagrees fails closed.
 	detection detectionState
+	// denials is the derived lookback index for detection. Unlock builds it
+	// once from the chain. A commit updates it only after that commit
+	// succeeds, so a failed write leaves the previous mirror in place.
+	denials *detectionIndex
 	// notifier delivers high-risk alerts. Nil means delivery is not configured.
 	notifier Notifier
 	// policy chooses containment. The zero value notifies only and does not
@@ -399,7 +403,8 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		wipe(dek)
 		return nil, deny(err)
 	}
-	if err := checkDetection(events, doc.Detection); err != nil {
+	idx := indexFromAudit(events)
+	if err := matchDetection(idx.state(), doc.Detection); err != nil {
 		wipe(dek)
 		return nil, deny(ErrCorrupt)
 	}
@@ -418,6 +423,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		grants:    doc.Grants,
 		audit:     events,
 		detection: doc.Detection,
+		denials:   idx,
 		redactor:  red,
 		logger:    logger,
 		db:        db,
@@ -449,6 +455,7 @@ func (s *Session) Lock() {
 	s.grants = nil
 	s.audit = nil
 	s.detection = detectionState{}
+	s.denials = nil
 	s.notifier = nil
 	s.responding = false
 	if s.redactor != nil {
@@ -658,7 +665,15 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	nextAuditLog := make([]auditEvent, len(s.audit)+len(events))
 	copy(nextAuditLog, s.audit)
 	copy(nextAuditLog[len(s.audit):], events)
-	det := detectionFromAudit(nextAuditLog)
+	base := s.denials
+	if base == nil {
+		base = indexFromAudit(s.audit)
+	}
+	nextDenials := base.clone()
+	for _, ev := range events {
+		nextDenials.apply(ev)
+	}
+	det := nextDenials.state()
 	if err := validateDetection(det); err != nil {
 		return err
 	}
@@ -692,6 +707,7 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	s.agents = agents
 	s.grants = grants
 	s.detection = det
+	s.denials = nextDenials
 	s.afterCommit(events[0])
 	return nil
 }

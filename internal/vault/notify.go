@@ -133,19 +133,21 @@ func (s *Session) DeliverPending() error {
 	}
 	s.responding = true
 	defer func() { s.responding = false }()
+	idx := noticeIndex(s.audit)
 	sent := 0
 	for _, ev := range s.audit {
 		if sent >= notifyBatch {
 			break
 		}
-		if noticeAction(ev.Action) || !notifyChosen(s.audit, ev.Seq) {
+		st, ok := idx[ev.Seq]
+		if noticeAction(ev.Action) || !ok || !st.chosen() {
 			continue
 		}
 		class := classifyState(s.audit, ev, s.agents, s.grants)
 		if !class.alert() {
 			continue
 		}
-		if notifyDelivered(s.audit, ev.Seq) || notifyAttempts(s.audit, ev.Seq) >= notifyAttemptLimit {
+		if st.delivered || st.attempts >= notifyAttemptLimit {
 			continue
 		}
 		if err := s.deliverOne(ev, class); err != nil {
@@ -321,6 +323,68 @@ func notificationFrom(ev auditEvent, class Classification) Notification {
 		AuditSeq:     ev.Seq,
 		AuditHash:    ev.Hash,
 	}
+}
+
+// noticeIndexVisits counts audit rows read while building one notice index.
+// DeliverPending builds that index once per call.
+var noticeIndexVisits int
+
+type noticeSrc struct {
+	decision  string
+	attempts  int
+	pending   int
+	delivered bool
+	hasNotify bool
+}
+
+func (st noticeSrc) chosen() bool {
+	switch st.decision {
+	case resultDecisionNotify:
+		return true
+	case resultDecisionFlag:
+		return false
+	}
+	return st.hasNotify
+}
+
+// noticeIndex is one pass of per-source response and delivery state.
+// A respond row is the decision. A source sealed before that decision
+// existed is chosen only when a notify row already records delivery.
+// Attempt pairing matches notifyAttempts: a legacy outcome with no
+// reservation counts, and a modern outcome does not count twice.
+func noticeIndex(events []auditEvent) map[uint64]noticeSrc {
+	noticeIndexVisits += len(events)
+	out := make(map[uint64]noticeSrc, len(events))
+	for _, ev := range events {
+		if ev.RefSeq == 0 {
+			continue
+		}
+		st := out[ev.RefSeq]
+		switch ev.Action {
+		case actionRespond:
+			if st.decision == "" && (ev.Result == resultDecisionNotify || ev.Result == resultDecisionFlag) {
+				st.decision = ev.Result
+			}
+		case actionNotify:
+			st.hasNotify = true
+			switch ev.Result {
+			case resultAttempted:
+				st.attempts++
+				st.pending++
+			case resultFailed, resultDelivered:
+				if st.pending > 0 {
+					st.pending--
+				} else {
+					st.attempts++
+				}
+				if ev.Result == resultDelivered {
+					st.delivered = true
+				}
+			}
+		}
+		out[ev.RefSeq] = st
+	}
+	return out
 }
 
 // notifyAttempts counts deliveries for one source. Each attempted row is one

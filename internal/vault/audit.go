@@ -121,7 +121,7 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 	// document has no member; the chain supplies it. A stored member that
 	// does not match the chain is a failed verification, not a clean tip.
 	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
-	if err != nil || checkDetection(events, doc.Detection) != nil {
+	if err != nil || matchDetection(indexFromAudit(events).state(), doc.Detection) != nil {
 		return "", ErrAudit
 	}
 	return events[len(events)-1].Hash, nil
