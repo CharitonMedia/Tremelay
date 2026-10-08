@@ -858,6 +858,50 @@ def _summary_commit(body: str) -> str | None:
     return found[-1]
 
 
+# GitHub review states that have been submitted. PENDING is still a draft.
+_SUBMITTED_REVIEW_STATES = frozenset(
+    {"approved", "changes_requested", "commented", "dismissed"}
+)
+
+
+def _review_submitted_at(review: dict) -> datetime:
+    """UTC submission time. Missing or invalid times sort before any real time."""
+    raw = review.get("submitted_at") or review.get("submittedAt")
+    if not isinstance(raw, str) or raw.strip() == "":
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _newest_submitted_review(reviews: list | None, commit: str) -> dict | None:
+    """Newest submitted Codex review of this commit.
+
+    List-reviews is chronological, so a later index is newer when submitted_at
+    is missing or tied. A pending review is not a match.
+    """
+    chosen = None
+    chosen_key: tuple[datetime, int] | None = None
+    for index, review in enumerate(reviews or []):
+        if not isinstance(review, dict) or not _is_codex_login(_actor_login(review)):
+            continue
+        if _review_state(review) not in _SUBMITTED_REVIEW_STATES:
+            continue
+        if not _commits_match(commit, _review_commit(review)):
+            continue
+        if _identity_from_review(review) is None:
+            continue
+        key = (_review_submitted_at(review), index)
+        if chosen_key is None or key > chosen_key:
+            chosen = review
+            chosen_key = key
+    return chosen
+
+
 def review_launch_identity(
     event: dict,
     event_name: str,
@@ -865,7 +909,9 @@ def review_launch_identity(
 ) -> tuple[str, str] | None:
     """Review id and full head shared by a review, an inline comment, and a summary.
 
-    Returns None when this event cannot be bound to one review of one commit.
+    A summary names a commit, not a review id. It binds to the newest submitted
+    Codex review of that commit, so a later review of an unchanged head does not
+    reuse an older claim. Returns None when the event cannot be bound.
     """
     if event_name == "pull_request_review":
         review = event.get("review") or {}
@@ -884,16 +930,7 @@ def review_launch_identity(
         short = _summary_commit(body)
         if not short:
             return None
-        for review in reviews or []:
-            if not isinstance(review, dict) or not _is_codex_login(_actor_login(review)):
-                continue
-            full = _review_commit(review)
-            if not _commits_match(short, full):
-                continue
-            found = _identity_from_review(review)
-            if found is not None:
-                return found
-        return None
+        return _identity_from_review(_newest_submitted_review(reviews, short) or {})
     return None
 
 
@@ -1105,6 +1142,74 @@ def _self_check() -> None:
         raise SystemExit(f"summary was not a free launch of the same review: {free}")
     if review_launch_identity(summary_event, "issue_comment", []) is not None:
         raise SystemExit("summary bound without a review list")
+    older_id = 111
+    newer_id = 222
+    codex_user = {"login": "chatgpt-codex-connector[bot]"}
+    older = {
+        "id": older_id,
+        "commit_id": head,
+        "state": "COMMENTED",
+        "submitted_at": "2026-10-08T03:00:00Z",
+        "user": codex_user,
+    }
+    newer = {
+        "id": newer_id,
+        "commit_id": head,
+        "state": "COMMENTED",
+        "submitted_at": "2026-10-08T13:32:38.921967Z",
+        "user": codex_user,
+    }
+    pending = {
+        "id": 333,
+        "commit_id": head,
+        "state": "PENDING",
+        "submitted_at": "2026-10-08T23:00:00Z",
+        "user": codex_user,
+    }
+    stranger = {
+        "id": 444,
+        "commit_id": head,
+        "state": "COMMENTED",
+        "submitted_at": "2026-10-08T23:30:00Z",
+        "user": {"login": "someone-else"},
+    }
+    repeated = [older, newer, pending, stranger]
+    bound = review_launch_identity(summary_event, "issue_comment", repeated)
+    if bound != (str(newer_id), head):
+        raise SystemExit(f"summary bound the oldest review: {bound}")
+    reversed_bound = review_launch_identity(
+        summary_event, "issue_comment", list(reversed(repeated))
+    )
+    if reversed_bound != (str(newer_id), head):
+        raise SystemExit(f"summary ignored submitted_at: {reversed_bound}")
+    if review_launch_identity(summary_event, "issue_comment", [pending]) is not None:
+        raise SystemExit("pending review bound a summary")
+    untimed_older = dict(older, submitted_at="")
+    untimed_newer = dict(newer, id=555, submitted_at="")
+    untimed = review_launch_identity(
+        summary_event, "issue_comment", [untimed_older, untimed_newer]
+    )
+    if untimed != ("555", head):
+        raise SystemExit(f"chronological list did not pick the newest review: {untimed}")
+    old_claim = [{"user": {"login": trusted}, "body": review_claim_marker(older_id, head)}]
+    reused = review_launch_decision(
+        summary_event,
+        "issue_comment",
+        reviews=repeated,
+        comments=old_claim,
+        trusted_login=trusted,
+    )
+    if reused["owned"] or reused["review_id"] != str(newer_id):
+        raise SystemExit(f"old claim suppressed the newer review: {reused}")
+    held = review_launch_decision(
+        summary_event,
+        "issue_comment",
+        reviews=repeated,
+        comments=[{"user": {"login": trusted}, "body": review_claim_marker(newer_id, head)}],
+        trusted_login=trusted,
+    )
+    if not held["owned"] or held["review_id"] != str(newer_id):
+        raise SystemExit(f"newer claim did not own the summary: {held}")
     if not claim_survives_cancel(accepted=True, create_settled=True):
         raise SystemExit("accepted worker lost its claim")
     if not claim_survives_cancel(accepted=False, create_settled=False):
