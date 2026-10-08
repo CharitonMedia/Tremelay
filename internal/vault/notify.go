@@ -133,17 +133,19 @@ func (s *Session) DeliverPending() error {
 	}
 	s.responding = true
 	defer func() { s.responding = false }()
-	idx := noticeIndex(s.audit)
+	if s.notices == nil {
+		s.notices = noticeIndex(s.audit)
+	}
 	sent := 0
 	for _, ev := range s.audit {
 		if sent >= notifyBatch {
 			break
 		}
-		st, ok := idx[ev.Seq]
-		if noticeAction(ev.Action) || !ok || !st.chosen() {
+		st := s.notices[ev.Seq]
+		if noticeAction(ev.Action) || !st.chosen() {
 			continue
 		}
-		class := classifyState(s.audit, ev, s.agents, s.grants)
+		class := noticeAlertClass(ev, st)
 		if !class.alert() {
 			continue
 		}
@@ -160,10 +162,14 @@ func (s *Session) DeliverPending() error {
 }
 
 func (s *Session) afterCommit(ev auditEvent) {
-	if s == nil || s.responding || noticeAction(ev.Action) || !notifyChosen(s.audit, ev.Seq) {
+	if s == nil || s.responding || s.notifier == nil || noticeAction(ev.Action) {
 		return
 	}
-	class := classifyState(s.audit, ev, s.agents, s.grants)
+	st := s.notices[ev.Seq]
+	if !st.chosen() || st.delivered || st.attempts >= notifyAttemptLimit {
+		return
+	}
+	class := noticeAlertClass(ev, st)
 	if !class.alert() {
 		return
 	}
@@ -276,7 +282,8 @@ func (s *Session) deliverOne(src auditEvent, class Classification) error {
 	if s.notifier == nil {
 		return nil
 	}
-	if notifyDelivered(s.audit, src.Seq) || notifyAttempts(s.audit, src.Seq) >= notifyAttemptLimit {
+	st := s.notices[src.Seq]
+	if st.delivered || st.attempts >= notifyAttemptLimit {
 		return nil
 	}
 	// The attempt is durable before the sink runs. A crash or a failed outcome
@@ -323,12 +330,17 @@ func notificationFrom(ev auditEvent, class Classification) Notification {
 	}
 }
 
-// noticeIndexVisits counts audit rows read while building one notice index.
-// DeliverPending builds that index once per call.
-var noticeIndexVisits int
+// noticeApplyVisits counts audit rows applied to the notice index.
+// A commit applies its new rows. Unlock applies the chain once.
+var noticeApplyVisits int
+
+// noticeScanVisits counts rows read by a per-source chain scan.
+// Immediate delivery and DeliverPending use the index and leave this at zero.
+var noticeScanVisits int
 
 type noticeSrc struct {
 	decision  string
+	class     string
 	attempts  int
 	pending   int
 	delivered bool
@@ -351,38 +363,63 @@ func (st noticeSrc) chosen() bool {
 // Attempt pairing matches notifyAttempts: a legacy outcome with no
 // reservation counts, and a modern outcome does not count twice.
 func noticeIndex(events []auditEvent) map[uint64]noticeSrc {
-	noticeIndexVisits += len(events)
-	out := make(map[uint64]noticeSrc, len(events))
+	out := make(map[uint64]noticeSrc)
 	for _, ev := range events {
-		if ev.RefSeq == 0 {
-			continue
-		}
-		st := out[ev.RefSeq]
-		switch ev.Action {
-		case actionRespond:
-			if st.decision == "" && (ev.Result == resultDecisionNotify || ev.Result == resultDecisionFlag) {
-				st.decision = ev.Result
-			}
-		case actionNotify:
-			st.hasNotify = true
-			switch ev.Result {
-			case resultAttempted:
-				st.attempts++
-				st.pending++
-			case resultFailed, resultDelivered:
-				if st.pending > 0 {
-					st.pending--
-				} else {
-					st.attempts++
-				}
-				if ev.Result == resultDelivered {
-					st.delivered = true
-				}
-			}
-		}
-		out[ev.RefSeq] = st
+		applyNotice(out, ev)
 	}
 	return out
+}
+
+func applyNotice(idx map[uint64]noticeSrc, ev auditEvent) {
+	noticeApplyVisits++
+	if idx == nil || ev.RefSeq == 0 {
+		return
+	}
+	st := idx[ev.RefSeq]
+	switch ev.Action {
+	case actionRespond:
+		if st.decision == "" && (ev.Result == resultDecisionNotify || ev.Result == resultDecisionFlag) {
+			st.decision = ev.Result
+		}
+		if st.class == "" {
+			st.class = ev.Class
+		}
+	case actionNotify:
+		st.hasNotify = true
+		if st.class == "" {
+			st.class = ev.Class
+		}
+		switch ev.Result {
+		case resultAttempted:
+			st.attempts++
+			st.pending++
+		case resultFailed, resultDelivered:
+			if st.pending > 0 {
+				st.pending--
+			} else {
+				st.attempts++
+			}
+			if ev.Result == resultDelivered {
+				st.delivered = true
+			}
+		}
+	}
+	idx[ev.RefSeq] = st
+}
+
+// noticeAlertClass is the class already recorded for src.
+// A result that is itself high or critical needs no chain walk.
+// repeated_denial is the one promoted class, and the respond or notify
+// row already carries it.
+func noticeAlertClass(src auditEvent, st noticeSrc) Classification {
+	base := baseClass(src)
+	if base.alert() {
+		return base
+	}
+	if st.class == ClassRepeatedDenial {
+		return Classification{Class: ClassRepeatedDenial, Severity: SeverityHigh}
+	}
+	return base
 }
 
 // notifyAttempts counts deliveries for one source. Each attempted row is one
@@ -390,6 +427,7 @@ func noticeIndex(events []auditEvent) map[uint64]noticeSrc {
 // is a legacy try from before reservations existed. A modern outcome pairs
 // with its reservation and is not a second try.
 func notifyAttempts(events []auditEvent, ref uint64) int {
+	noticeScanVisits += len(events)
 	n := 0
 	pending := 0
 	for _, ev := range events {
@@ -412,6 +450,7 @@ func notifyAttempts(events []auditEvent, ref uint64) int {
 }
 
 func notifyDelivered(events []auditEvent, ref uint64) bool {
+	noticeScanVisits += len(events)
 	for _, ev := range events {
 		if ev.Action == actionNotify && ev.RefSeq == ref && ev.Result == resultDelivered {
 			return true
@@ -425,6 +464,7 @@ func notifyDelivered(events []auditEvent, ref uint64) bool {
 // a notify row already records that delivery was chosen. Current session
 // policy is not a substitute for either record.
 func notifyChosen(events []auditEvent, ref uint64) bool {
+	noticeScanVisits += len(events)
 	switch responseDecision(events, ref) {
 	case resultDecisionNotify:
 		return true

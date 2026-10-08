@@ -257,6 +257,10 @@ type Session struct {
 	// once from the chain. A commit updates it only after that commit
 	// succeeds, so a failed write leaves the previous mirror in place.
 	denials *detectionIndex
+	// notices is per-source response and delivery state. Unlock builds it
+	// once from the chain. A commit applies its new rows only after that
+	// commit succeeds. It is not part of the encrypted document.
+	notices map[uint64]noticeSrc
 	// notifier delivers high-risk alerts. Nil means delivery is not configured.
 	notifier Notifier
 	// policy chooses containment. The zero value notifies only and does not
@@ -318,6 +322,7 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 			WrappedDEK: wrapped,
 		},
 		creds:    []credential{},
+		notices:  map[uint64]noticeSrc{},
 		redactor: red,
 		logger:   logger,
 		db:       db,
@@ -424,6 +429,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		audit:     events,
 		detection: doc.Detection,
 		denials:   idx,
+		notices:   noticeIndex(events),
 		redactor:  red,
 		logger:    logger,
 		db:        db,
@@ -456,6 +462,7 @@ func (s *Session) Lock() {
 	s.audit = nil
 	s.detection = detectionState{}
 	s.denials = nil
+	s.notices = nil
 	s.notifier = nil
 	s.responding = false
 	if s.redactor != nil {
@@ -701,13 +708,20 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	s.header = h
 	// Append only after the transaction succeeds. A failed commit leaves the
 	// prefix in place, and append grows the backing array instead of copying
-	// it on every row.
+	// it on every row. The notice index follows the same commit: a failed
+	// write does not publish the rows that were not stored.
+	if s.notices == nil {
+		s.notices = noticeIndex(s.audit)
+	}
 	s.audit = append(s.audit, events...)
 	s.creds = creds
 	s.agents = agents
 	s.grants = grants
 	s.detection = det
 	s.denials = nextDenials
+	for _, row := range events {
+		applyNotice(s.notices, row)
+	}
 	s.afterCommit(events[0])
 	return nil
 }

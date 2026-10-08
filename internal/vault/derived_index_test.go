@@ -259,22 +259,163 @@ func TestDeliverPendingIndexesRoutineHistoryOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := len(session.audit)
-	noticeIndexVisits = 0
+	noticeScanVisits = 0
+	noticeApplyVisits = 0
 	if err := session.DeliverPending(); err != nil {
 		t.Fatal(err)
 	}
-	if noticeIndexVisits != before {
-		t.Fatalf("notice visits %d want one pass of %d", noticeIndexVisits, before)
+	if noticeScanVisits != 0 {
+		t.Fatalf("pending delivery scanned %d rows", noticeScanVisits)
+	}
+	wrote := len(session.audit) - before
+	if noticeApplyVisits != wrote {
+		t.Fatalf("pending delivery applied %d rows, wrote %d", noticeApplyVisits, wrote)
 	}
 	got := sink.Snapshot()
 	if len(got) != 1 || got[0].Result != resultDeniedOrigin {
 		t.Fatalf("delivered %+v", got)
 	}
-	noticeIndexVisits = 0
+	noticeScanVisits = 0
+	noticeApplyVisits = 0
 	if err := session.DeliverPending(); err != nil {
 		t.Fatal(err)
+	}
+	if noticeScanVisits != 0 || noticeApplyVisits != 0 {
+		t.Fatalf("second pass scanned %d applied %d", noticeScanVisits, noticeApplyVisits)
 	}
 	if len(sink.Snapshot()) != 1 {
 		t.Fatal("second pass sent another alert")
 	}
+}
+
+func TestSustainedHighRiskSkipsNoticeScan(t *testing.T) {
+	_, _, session := mustCreate(t, nil)
+	t.Cleanup(session.Lock)
+	writeSSRF := func() {
+		t.Helper()
+		if err := session.writeAudit(auditEvent{
+			Action: actionBroker, Result: resultDeniedSSRF,
+		}, session.creds, session.agents, session.grants); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		writeSSRF()
+	}
+	check := func() int {
+		t.Helper()
+		noticeScanVisits = 0
+		noticeApplyVisits = 0
+		before := len(session.audit)
+		writeSSRF()
+		wrote := len(session.audit) - before
+		if noticeScanVisits != 0 {
+			t.Fatalf("scanned %d rows after %d history", noticeScanVisits, before)
+		}
+		if noticeApplyVisits != wrote || wrote > 4 {
+			t.Fatalf("applied %d rows, wrote %d", noticeApplyVisits, wrote)
+		}
+		return wrote
+	}
+	if wrote := check(); wrote != 2 {
+		t.Fatalf("nil sink wrote %d rows", wrote)
+	}
+	sink := &MemoryNotifier{}
+	if err := session.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	if wrote := check(); wrote != 4 {
+		t.Fatalf("notifier wrote %d rows", wrote)
+	}
+	if len(sink.Snapshot()) != 1 || sink.Snapshot()[0].Class != ClassSSRF {
+		t.Fatalf("delivered %+v", sink.Snapshot())
+	}
+}
+
+func TestNoticeIndexRollbackAndReopen(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	if err := session.SetResponsePolicy(ResponsePolicy{High: ContainFlag}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.writeAudit(auditEvent{
+		Action: actionBroker, Result: resultDeniedSSRF,
+	}, session.creds, session.agents, session.grants); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.SetResponsePolicy(ResponsePolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.writeAudit(auditEvent{
+		Action: actionBroker, Result: resultDeniedOrigin,
+	}, session.creds, session.agents, session.grants); err != nil {
+		t.Fatal(err)
+	}
+	before := cloneNotices(session.notices)
+	beforeN := len(session.audit)
+	session.commitFault = func() error { return errors.New("full") }
+	if err := session.writeAudit(auditEvent{
+		Action: actionBroker, Result: resultDeniedRedirect,
+	}, session.creds, session.agents, session.grants); err == nil {
+		t.Fatal("faulted commit succeeded")
+	}
+	session.commitFault = nil
+	if len(session.audit) != beforeN || !reflect.DeepEqual(session.notices, before) {
+		t.Fatal("failed commit published notice state")
+	}
+	if err := session.writeAudit(auditEvent{
+		Action: actionBroker, Result: resultDeniedRedirect,
+	}, session.creds, session.agents, session.grants); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(session.notices, noticeIndex(session.audit)) {
+		t.Fatal("index diverged from the chain")
+	}
+	session.Lock()
+	noticeApplyVisits = 0
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(opened.Lock)
+	if noticeApplyVisits != len(opened.audit) {
+		t.Fatalf("rebuild visited %d rows for %d audit rows", noticeApplyVisits, len(opened.audit))
+	}
+	if !reflect.DeepEqual(opened.notices, noticeIndex(opened.audit)) {
+		t.Fatal("reopen index does not match the chain")
+	}
+	sink := &MemoryNotifier{}
+	if err := opened.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	noticeScanVisits = 0
+	if err := opened.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if noticeScanVisits != 0 {
+		t.Fatalf("reopen delivery scanned %d rows", noticeScanVisits)
+	}
+	var origin, redirect, ssrf int
+	for _, n := range sink.Snapshot() {
+		switch n.Result {
+		case resultDeniedOrigin:
+			origin++
+		case resultDeniedRedirect:
+			redirect++
+		case resultDeniedSSRF:
+			ssrf++
+		default:
+			t.Fatalf("unexpected alert %+v", n)
+		}
+	}
+	if origin != 1 || redirect != 1 || ssrf != 0 {
+		t.Fatalf("origin %d redirect %d ssrf %d", origin, redirect, ssrf)
+	}
+}
+
+func cloneNotices(in map[uint64]noticeSrc) map[uint64]noticeSrc {
+	out := make(map[uint64]noticeSrc, len(in))
+	for seq, st := range in {
+		out[seq] = st
+	}
+	return out
 }
