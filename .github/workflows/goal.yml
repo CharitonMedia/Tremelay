@@ -232,7 +232,7 @@ jobs:
           if [ -n "$number" ]; then
             gh api --paginate --slurp "repos/{owner}/{repo}/pulls/${number}/reviews" > reviews.json
             gh api --paginate --slurp "repos/{owner}/{repo}/issues/${number}/comments" > comments.json
-            python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("review_state.json", "w"))'
+            python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"pull": json.load(open("live_pull.json")), "reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("review_state.json", "w"))'
             if [ "$(python scripts/goal_agent_request.py head-already-reviewed --head "$head" --state review_state.json)" = "yes" ]; then
               changed="--head-accepted"
             fi
@@ -393,9 +393,10 @@ jobs:
           set -euo pipefail
           number="${{ github.event.pull_request.number || github.event.issue.number }}"
           if [ -z "${GOAL_GITHUB_TOKEN:-}" ] || [ -z "${{ steps.marker_identity.outputs.login }}" ]; then
-            echo "launch=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "Approved automation identity is required."
+            exit 1
           fi
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > live_pull.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews?per_page=100" > reviews.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${number}/comments?per_page=100" > comments.json
           python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("ownership.json", "w"))'
@@ -422,7 +423,17 @@ jobs:
             gh pr comment "$number" --body "Review findings were not sent to a cloud agent because \`CURSOR_API_KEY\` is not set on this repository."
             exit 1
           fi
+          stopped=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" --jq '.labels[] | select(.name == "human-review-required") | .name')
+          if [ -n "$stopped" ]; then
+            echo "Checkpoint worker still owns this stopped PR; no review worker launch."
+            exit 1
+          fi
           before=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
+          expected=$(python -c 'import json; print(json.load(open("claim.json"))["head"])')
+          if [ "$before" != "$expected" ]; then
+            echo "Review head moved before launch; no stale worker launch."
+            exit 1
+          fi
           marker=$(python -c 'import json; print(json.load(open("claim.json"))["marker"])')
           if [ -z "$marker" ]; then
             echo "Refusing to launch without a stable review/head claim."

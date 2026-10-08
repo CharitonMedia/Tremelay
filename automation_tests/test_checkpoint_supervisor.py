@@ -8,6 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import checkpoint_supervisor as s
 import codex_cursor_remediation as generic
+import goal_agent_request as goal
 
 HEAD = 'a' * 40
 PULL = {'number': 11, 'state': 'open', 'draft': False,
@@ -227,6 +228,15 @@ class Controller(unittest.TestCase):
             with self.assertRaises(s.Stop):
                 s.recover_worker(PULL, {'id': 100}, {'agent_id': '../other-account'})
             api.assert_not_called()
+
+    def test_goal_review_launch_checks_live_stop_and_exact_head(self):
+        event = {'review': REVIEW}
+        live = copy.deepcopy(PULL)
+        self.assertEqual(goal.review_launch_decision(event, 'pull_request_review', pull=live)['status'], 'blocked')
+        live['labels'] = [{'name': 'goal'}]
+        self.assertEqual(goal.review_launch_decision(event, 'pull_request_review', pull=live)['status'], 'free')
+        live['head']['sha'] = 'b' * 40
+        self.assertEqual(goal.review_launch_decision(event, 'pull_request_review', pull=live)['status'], 'blocked')
 
     def test_generic_loop_cannot_launch_goal_or_stopped_pr(self):
         event = {'action': 'submitted', 'review': REVIEW}

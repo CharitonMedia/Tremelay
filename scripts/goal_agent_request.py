@@ -162,6 +162,8 @@ def _review_payload(event: dict, event_name: str, repo_url: str) -> dict | None:
         return None
     if event_name != "issue_comment":
         pull = event.get("pull_request") or {}
+    if "human-review-required" in _label_names(pull):
+        return None
     if not _is_goal_pr(pull):
         return None
     url = pull.get("html_url") or pull.get("url")
@@ -972,12 +974,17 @@ def review_launch_decision(
     reviews: list | None = None,
     comments: list | None = None,
     trusted_login: str = "",
+    pull: dict | None = None,
 ) -> dict:
     """Whether this event may start a worker for its review and head."""
     identity = review_launch_identity(event, event_name, reviews)
     if identity is None:
         return {"status": "unbound", "owned": False, "marker": "", "review_id": "", "head": ""}
     review_id, head = identity
+    if pull is not None and ("human-review-required" in _label_names(pull)
+                             or ((pull.get("head") or {}).get("sha") != head)
+                             or pull.get("state") != "open"):
+        return {"status": "blocked", "owned": False, "marker": "", "review_id": review_id, "head": head}
     marker = review_claim_marker(review_id, head)
     owned = review_claim_owned(comments, review_id, head, trusted_login)
     return {
@@ -1028,6 +1035,7 @@ def _cmd_review_claim(args: argparse.Namespace) -> int:
         reviews=state.get("reviews") or [],
         comments=state.get("comments") or [],
         trusted_login=args.trusted_login or "",
+        pull=state.get("pull"),
     )
     Path(args.out).write_text(json.dumps(decision) + "\n", encoding="utf-8")
     return 0
