@@ -647,6 +647,34 @@ func TestNotifyReservesAttemptBeforeDelivery(t *testing.T) {
 	}
 }
 
+func TestDeliverPendingReturnsAuditWriteFailure(t *testing.T) {
+	e := newBrokerEnv(t)
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)
+	sink := &MemoryNotifier{}
+	if err := e.session.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	e.session.commitFault = func() error { return errors.New("full") }
+	if err := e.session.DeliverPending(); err == nil {
+		t.Fatal("pending delivery reported success while the attempt could not be stored")
+	}
+	if len(sink.Snapshot()) != 0 {
+		t.Fatal("sink ran without a durable attempt")
+	}
+	for _, ev := range e.session.audit {
+		if ev.Action == actionNotify {
+			t.Fatal("failed reservation was audited")
+		}
+	}
+	e.session.commitFault = nil
+	if err := e.session.DeliverPending(); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Snapshot()) != 1 || sink.Snapshot()[0].Class != ClassSSRF {
+		t.Fatalf("pending %+v", sink.Snapshot())
+	}
+}
+
 func TestM5TruncationAndVersion(t *testing.T) {
 	e := newBrokerEnv(t)
 	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://127.0.0.1/latest"}, ErrDeniedSSRF)

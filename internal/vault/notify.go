@@ -123,7 +123,9 @@ func (s *Session) SetResponsePolicy(p ResponsePolicy) error {
 // decision is notify and that do not yet have a successful delivery.
 // It does not read the current response policy. Each source sequence gets
 // at most two attempts, and one call sends at most notifyBatch alerts.
-// A delivery error is audited as notify/failed and is not returned to the caller.
+// A sink failure is audited as notify/failed and is not returned.
+// A failure to persist the attempt or the outcome is returned. The sink
+// is not called when the attempt row cannot be written.
 func (s *Session) DeliverPending() error {
 	if err := s.live(); err != nil {
 		return err
@@ -154,7 +156,7 @@ func (s *Session) DeliverPending() error {
 		}
 		if err := s.deliverOne(ev, class); err != nil {
 			s.logf("notify seq=%d result=error", ev.Seq)
-			return nil
+			return err
 		}
 		sent++
 	}
