@@ -20,7 +20,11 @@ import time
 import urllib.error
 import urllib.request
 
+from complete_codex_clean_review import is_terminal_clean_review
+
 MODEL = "gpt-6.1-sol"
+# Public release opt-in value, not a credential. Installation alone is inert.
+ACTIVATION_VALUE = "reviewed-v1-d9cfdd332b6a490e9999f037f632a750"
 AUTHOR = "pattalkslaw-del"
 CODEX = {"chatgpt-codex-connector[bot]", "codex"}
 REPO = "CharitonMedia/Tremelay"
@@ -127,6 +131,20 @@ def newest_review(reviews, head):
     return latest if latest and latest.get("state") in {"COMMENTED", "CHANGES_REQUESTED"} else None
 
 
+def has_review_feedback(review, findings):
+    """Review-level feedback is evidence even when no inline comments exist."""
+    if findings:
+        return True
+    body = (review.get("body") or "").strip()
+    if not body or is_terminal_clean_review(body):
+        return False
+    # Ignore Codex's fixed wrapper; the model receives the original full body.
+    body = re.sub(r"<details>\s*<summary>\s*ℹ️ About Codex in GitHub\s*</summary>.*?</details>", "", body, flags=re.S | re.I)
+    body = re.sub(r"^\*\*Reviewed commit:\*\* `[^`]+`\s*$", "", body, flags=re.M)
+    boilerplate = {"### 💡 Codex Review", "Here are some automated review suggestions for this pull request."}
+    return any(line.strip() and line.strip() not in boilerplate for line in body.splitlines())
+
+
 def state_body(state, text):
     return text + "\n\n" + MARKER + json.dumps(state, sort_keys=True, separators=(",", ":")) + " -->"
 
@@ -200,7 +218,11 @@ def read_source(path, head):
     item = gh(f"repos/{REPO}/contents/{quote(path, safe='/')}?ref={head}")
     if not isinstance(item, dict) or item.get("encoding") != "base64":
         raise Stop("Cannot read complete supervisor evidence")
-    return base64.b64decode(item["content"]).decode("utf-8")
+    try:
+        encoded = "".join(item["content"].split())
+        return base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (KeyError, TypeError, AttributeError, ValueError):
+        raise Stop("Source evidence is not valid UTF-8 text; manual assessment required") from None
 
 
 def evidence_for(pull, review, comments):
@@ -313,8 +335,10 @@ def recover_worker(pull, comment, state):
     status = result.get("status")
     age = datetime.now(timezone.utc) - datetime.fromisoformat(state["time"])
     if status not in {"FINISHED", "ERROR", "CANCELLED", "EXPIRED"}:
-        if age.total_seconds() > 6 * 3600:
-            state["phase"] = "escalate"
+        if age.total_seconds() > 6 * 3600 and not state.get("timeout_escalated"):
+            # A timeout is not evidence that Cursor stopped. Keep ownership
+            # active across newer reviews/heads and reconcile this same worker.
+            state["timeout_escalated"] = True
             update_state(comment, state, "Worker exceeded six hours. Input required: reconcile the existing Cursor worker before authorizing further launches.")
         else:
             if needs_record:
@@ -374,6 +398,35 @@ def refresh_guard(number, head, review_id, *, require_stop=True, check_activity=
         raise Stop("Review changed or worker activity remains")
 
 
+def retire_stale_assessment(number, comment, state):
+    """Durably retire only a definitely unlaunched stale assessment."""
+    if state.get("phase") != "dispatch_ready":
+        raise Stop("Only an unlaunched assessment can become obsolete")
+    # Only a definitely unattempted create can be made obsolete. A reserved or
+    # accepted create retains its identity and must remain GET-only recovery.
+    if "agent_id" in state or "run_id" in state:
+        raise Stop("Unlaunched checkpoint has a worker identity; reconcile before further work")
+    head, review_id = state["head"], state["review"]
+    fresh = gh(f"repos/{REPO}/pulls/{number}")
+    current = newest_review(pages(f"repos/{REPO}/pulls/{number}/reviews"), fresh["head"]["sha"])
+    reason = None
+    if fresh["head"]["sha"] != head:
+        reason = "head_changed"
+    elif current is None or current["id"] != review_id:
+        reason = "review_changed"
+    if reason:
+        obsolete = dict(state, phase="obsolete", obsolete_reason=reason)
+        text = comment["body"].split("\n\n" + MARKER)[0]
+        text += ("\n\nThis definitely unlaunched assessment is obsolete because its head or "
+                 "independent review changed. Its checkpoint budget remains consumed; "
+                 "no worker was created and no ambiguous create was replayed.")
+        update_state(comment, obsolete, text)
+        state.update(obsolete)
+        print(f"PR #{number}: stale unlaunched assessment recorded as obsolete")
+        return True
+    return False
+
+
 def dispatch_ready(pull, comment, state):
     """Resume a definitely unattempted create without another model call.
 
@@ -384,6 +437,8 @@ def dispatch_ready(pull, comment, state):
     decision = validate_decision(state["decision"], head)
     if state.get("phase") != "dispatch_ready" or decision["decision"] != "resume":
         raise Stop("Checkpoint is not ready for first dispatch")
+    if retire_stale_assessment(number, comment, state):
+        return
     refresh_guard(number, head, review_id)
     payload = worker_payload(number, head, review_id, decision)
     state.update(phase="dispatch_reserved", agent_id=payload["agentId"])
@@ -428,8 +483,8 @@ def run_one(pull, key, max_checkpoints):
         print(f"PR #{number}: automatic checkpoint budget exhausted")
         return
     findings = pages(f"repos/{REPO}/pulls/{number}/reviews/{review['id']}/comments")
-    if not findings:
-        print(f"PR #{number}: no exact-head inline findings; no automatic resume")
+    if not has_review_feedback(review, findings):
+        print(f"PR #{number}: no exact-head review findings; no automatic resume")
         return
     evidence = evidence_for(pull, review, comments)
     # Check before reserving budget or asking the model.
@@ -468,6 +523,9 @@ def main():
     args = parser.parse_args()
     if os.environ.get("GITHUB_REPOSITORY") != REPO:
         raise Stop("Supervisor repository is not authorized")
+    if not args.preflight and os.environ.get("TREMELAY_SUPERVISOR_ACTIVATION") != ACTIVATION_VALUE:
+        print("Checkpoint supervision is disabled; explicit release activation is required.")
+        return 0
     for name in ("GH_TOKEN", "OPENAI_API_KEY", "CURSOR_API_KEY"):
         if not os.environ.get(name):
             raise Stop(f"Missing required repository secret: {name}")
@@ -478,6 +536,8 @@ def main():
         raise Stop("Supervisor checkpoint limit must be 1 through 3")
     if args.preflight:
         print("Supervisor secrets present; owner identity verified. No model call or restart performed.")
+        print("Release activation is enabled." if os.environ.get("TREMELAY_SUPERVISOR_ACTIVATION") == ACTIVATION_VALUE
+              else "Release activation is disabled.")
         return 0
     pulls = pages(f"repos/{REPO}/pulls?state=open")
     failed = False

@@ -1,4 +1,5 @@
 import copy
+import base64
 import json
 from pathlib import Path
 import sys
@@ -91,7 +92,7 @@ class Gates(unittest.TestCase):
 
 
 class Controller(unittest.TestCase):
-    def run_controller(self, *, decision=None, failure=None, previous=None):
+    def run_controller(self, *, decision=None, failure=None, previous=None, review=None, inline=None):
         writes = []
         def api(path, method='GET', data=None, paginate=False):
             if method != 'GET':
@@ -99,12 +100,14 @@ class Controller(unittest.TestCase):
                 if failure and failure(path, method, data):
                     raise s.Stop('Injected transport failure')
                 return {'id': 100} if method == 'POST' and path.endswith('/comments') else None
+            if path.endswith('/pulls/11'):
+                return PULL
             raise AssertionError('Unexpected GET: ' + path)
         def paged(path):
             if path.endswith('/reviews'):
-                return [REVIEW]
+                return [review or REVIEW]
             if path.endswith('/comments') and '/reviews/' in path:
-                return [{'body': 'P1 implementation issue'}]
+                return inline if inline is not None else [{'body': 'P1 implementation issue'}]
             if path.endswith('/comments'):
                 return previous or []
             raise AssertionError(path)
@@ -135,7 +138,7 @@ class Controller(unittest.TestCase):
     def test_idle_timeout_preserves_paid_decision_and_recovers_one_first_create(self):
         state = {'phase': 'dispatch_ready', 'head': HEAD, 'review': 4, 'decision': DECISION}
         comment = {'id': 100, 'body': s.state_body(state, 'Recorded assessment')}
-        with patch.object(s, 'active_goal_work', return_value=True), patch.object(s.time, 'sleep'), patch.object(s, 'cursor') as api, patch.object(s, 'update_state') as write:
+        with patch.object(s, 'gh', return_value=PULL), patch.object(s, 'pages', return_value=[REVIEW]), patch.object(s, 'active_goal_work', return_value=True), patch.object(s.time, 'sleep'), patch.object(s, 'cursor') as api, patch.object(s, 'update_state') as write:
             with self.assertRaises(s.Stop):
                 s.dispatch_ready(PULL, comment, state)
             self.assertEqual(state['phase'], 'dispatch_ready')
@@ -165,7 +168,7 @@ class Controller(unittest.TestCase):
     def test_post_reservation_head_change_never_posts_create(self):
         state = {'phase': 'dispatch_ready', 'head': HEAD, 'review': 4, 'decision': DECISION}
         comment = {'id': 100, 'body': s.state_body(state, 'Recorded assessment')}
-        with patch.object(s, 'refresh_guard', side_effect=[None, s.Stop('Moved head')]), patch.object(s, 'gh'), patch.object(s, 'update_state'), patch.object(s, 'cursor') as api:
+        with patch.object(s, 'retire_stale_assessment', return_value=False), patch.object(s, 'refresh_guard', side_effect=[None, s.Stop('Moved head')]), patch.object(s, 'gh'), patch.object(s, 'update_state'), patch.object(s, 'cursor') as api:
             with self.assertRaises(s.Stop):
                 s.dispatch_ready(PULL, comment, state)
             self.assertEqual(state['phase'], 'dispatch_reserved')
@@ -266,7 +269,7 @@ class Controller(unittest.TestCase):
         state = {'phase': 'dispatch_reserved', 'head': HEAD, 'review': 4}
         claim = {'user': {'login': s.AUTHOR}, 'body': s.state_body(state, 'Claim')}
         next_pull = dict(PULL, number=13)
-        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3'}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', return_value={'login': s.AUTHOR}), patch.object(s, 'pages', side_effect=[[PULL, next_pull], [claim], []]), patch.object(s, 'recover_worker', side_effect=s.Stop('No accepted worker')), patch.object(s, 'run_one') as assess:
+        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', return_value={'login': s.AUTHOR}), patch.object(s, 'pages', side_effect=[[PULL, next_pull], [claim], []]), patch.object(s, 'recover_worker', side_effect=s.Stop('No accepted worker')), patch.object(s, 'run_one') as assess:
             self.assertEqual(s.main(), 1)
             self.assertEqual(assess.call_args.args[0]['number'], 13)
 
@@ -380,6 +383,220 @@ class Controller(unittest.TestCase):
         self.assertIn('CURSOR_API_KEY', text)
         self.assertNotIn('pull_request:', text)
         self.assertFalse((Path(__file__).resolve().parents[1] / '.github/workflows/supervisor-preflight.yml').exists())
+
+    def test_review_body_only_feedback_receives_assessment(self):
+        for state in ['COMMENTED', 'CHANGES_REQUESTED']:
+            review = dict(REVIEW, state=state, body='<details><summary>P1 finding</summary>Maintain a derived suspension index and cover rollback.</details>')
+            writes, model, error = self.run_controller(review=review, inline=[])
+            self.assertIsNone(error)
+            model.assert_called_once()
+            self.assertIn('"phase":"working"', writes[-1][2]['body'])
+
+    def test_empty_clean_and_wrapper_only_reviews_do_not_consume_budget(self):
+        bodies = ['', '  ',
+            "Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** `aaaaaaaa`",
+            '### 💡 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `aaaaaaaa`\n<details> <summary>ℹ️ About Codex in GitHub</summary>Help and setup instructions.</details>']
+        for body in bodies:
+            writes, model, error = self.run_controller(review=dict(REVIEW, body=body), inline=[])
+            self.assertIsNone(error)
+            model.assert_not_called()
+            self.assertEqual(writes, [])
+
+    def test_binary_or_invalid_source_fails_closed_without_exposing_bytes(self):
+        for content in [base64.b64encode(b'\x89PNG\xff').decode(), 'not-base64!', None]:
+            with patch.object(s, 'gh', return_value={'encoding': 'base64', 'content': content}):
+                with self.assertRaisesRegex(s.Stop, '^Source evidence is not valid UTF-8 text; manual assessment required$'):
+                    s.read_source('image.png', HEAD)
+        with patch.object(s, 'gh', return_value={'encoding': 'base64', 'content': 'aGVs\nbG8=\n'}):
+            self.assertEqual(s.read_source('text.txt', HEAD), 'hello')
+
+    def test_binary_evidence_does_not_abort_later_prs(self):
+        next_pull = dict(PULL, number=13)
+        processed = []
+        run_one = s.run_one
+        def paged(path):
+            if path.endswith('/pulls?state=open'):
+                return [PULL, next_pull]
+            if path.endswith('/reviews'):
+                return [REVIEW]
+            if '/reviews/' in path and path.endswith('/comments'):
+                return [{'body': 'P1 finding'}]
+            if path.endswith('/comments'):
+                return []
+            if path.endswith('/files'):
+                return [{'filename': 'image.png', 'status': 'added'}]
+            raise AssertionError(path)
+        def api(path, **kwargs):
+            self.assertEqual(kwargs.get('method', 'GET'), 'GET')
+            if path == 'user':
+                return {'login': s.AUTHOR}
+            if '/git/trees/' in path:
+                return {'tree': [], 'truncated': False}
+            if '/contents/' in path:
+                content = b'\x89PNG\xff' if '/image.png?' in path else b'Required document'
+                return {'encoding': 'base64', 'content': base64.b64encode(content).decode()}
+            raise AssertionError(path)
+        def process(pull, key, limit):
+            if pull['number'] == 11:
+                return run_one(pull, key, limit)
+            processed.append(pull['number'])
+        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'run_one', side_effect=process), patch.object(s, 'assess') as model, patch.object(s, 'cursor') as worker:
+            self.assertEqual(s.main(), 1)
+            self.assertEqual(processed, [13])
+            model.assert_not_called()
+            worker.assert_not_called()
+
+    def test_stale_unlaunched_assessment_is_retired_for_head_or_review_change(self):
+        for change in ['head', 'review', 'approval']:
+            state = {'phase': 'dispatch_ready', 'head': HEAD, 'review': 4, 'decision': DECISION}
+            claim = {'id': 100, 'user': {'login': s.AUTHOR}, 'body': s.state_body(state, 'Recorded assessment')}
+            live = copy.deepcopy(PULL)
+            review = dict(REVIEW, id=5, submitted_at='2026-10-08T06:00:00Z')
+            if change == 'head':
+                live['head']['sha'] = 'b' * 40
+                review['commit_id'] = 'b' * 40
+            elif change == 'approval':
+                review['state'] = 'APPROVED'
+            def api(path, method='GET', data=None, **kwargs):
+                if method == 'PATCH':
+                    self.assertEqual(path, f'repos/{s.REPO}/issues/comments/100')
+                    claim['body'] = data['body']
+                    return None
+                self.assertEqual(method, 'GET')
+                return {'login': s.AUTHOR} if path == 'user' else live
+            def paged(path):
+                if path.endswith('/pulls?state=open'):
+                    return [live]
+                if path.endswith('/reviews'):
+                    return [review]
+                if path.endswith('/comments'):
+                    return [claim]
+                raise AssertionError(path)
+            with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'run_one') as next_assessment, patch.object(s, 'cursor') as worker:
+                self.assertEqual(s.main(), 0)
+                next_assessment.assert_not_called()
+                retired = s.records([claim])[0][1]
+                self.assertEqual(retired['phase'], 'obsolete')
+                self.assertEqual(retired['head'], HEAD)
+                self.assertEqual(retired['review'], 4)
+                self.assertEqual(retired['decision'], DECISION)
+                self.assertNotIn('agent_id', retired)
+                self.assertEqual(s.main(), 0)
+                next_assessment.assert_called_once_with(live, 'test-key', 3)
+                worker.assert_not_called()
+
+    def test_retired_assessments_still_consume_total_budget(self):
+        prior = [{'user': {'login': s.AUTHOR}, 'body': s.state_body({'head': str(i) * 40, 'review': i, 'phase': 'obsolete'}, 'Retired assessment')} for i in range(3)]
+        writes, model, error = self.run_controller(previous=prior)
+        self.assertIsNone(error)
+        model.assert_not_called()
+        self.assertEqual(len(writes), 1)
+        self.assertIn('total checkpoint budget', writes[0][2]['body'])
+
+    def test_failed_retirement_does_not_release_or_launch(self):
+        state = {'phase': 'dispatch_ready', 'head': HEAD, 'review': 4, 'decision': DECISION}
+        claim = {'id': 100, 'body': s.state_body(state, 'Recorded assessment')}
+        changed = copy.deepcopy(PULL)
+        changed['head']['sha'] = 'b' * 40
+        with patch.object(s, 'gh', return_value=changed), patch.object(s, 'pages', return_value=[]), patch.object(s, 'update_state', side_effect=s.Stop('Write failed')), patch.object(s, 'cursor') as worker:
+            with self.assertRaises(s.Stop):
+                s.dispatch_ready(changed, claim, state)
+            self.assertEqual(state['phase'], 'dispatch_ready')
+            worker.assert_not_called()
+
+    def test_reserved_or_identified_worker_cannot_be_retired(self):
+        for extra in [{'phase': 'dispatch_reserved'}, {'phase': 'working'}, {'agent_id': 'bc-unknown'}, {'run_id': 'run-1'}]:
+            state = dict({'phase': 'dispatch_ready', 'head': HEAD, 'review': 4, 'decision': DECISION}, **extra)
+            with patch.object(s, 'gh') as api, patch.object(s, 'update_state') as write:
+                with self.assertRaises(s.Stop):
+                    s.retire_stale_assessment(11, {'id': 100}, state)
+                api.assert_not_called()
+                write.assert_not_called()
+
+
+    def test_timed_out_running_worker_keeps_ownership_across_new_reviews_and_heads(self):
+        state = {'phase': 'working', 'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
+                 'run_id': 'run-1', 'time': '2000-01-01T00:00:00+00:00', 'head': HEAD, 'review': 4}
+        claim = {'id': 100, 'user': {'login': s.AUTHOR}, 'body': s.state_body(state, 'Recorded worker')}
+        writes = []
+        live = copy.deepcopy(PULL)
+        newer_review = dict(REVIEW, id=5, submitted_at='2026-10-08T06:00:00Z')
+        def api(path, method='GET', data=None, **kwargs):
+            if method == 'PATCH':
+                claim['body'] = data['body']
+                writes.append(data['body'])
+                return None
+            self.assertEqual(method, 'GET')
+            return {'login': s.AUTHOR} if path == 'user' else live
+        def paged(path):
+            if path.endswith('/pulls?state=open'):
+                return [live]
+            if path.endswith('/comments'):
+                return [claim]
+            if path.endswith('/reviews'):
+                return [newer_review]
+            raise AssertionError(path)
+        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'RUNNING'}] * 2) as worker, patch.object(s, 'run_one') as assess:
+            self.assertEqual(s.main(), 0)
+            live['head']['sha'] = 'b' * 40
+            newer_review['commit_id'] = 'b' * 40
+            self.assertEqual(s.main(), 0)
+            self.assertEqual(len(writes), 1)
+            saved = s.records([claim])[0][1]
+            self.assertEqual(saved['phase'], 'working')
+            self.assertTrue(saved['timeout_escalated'])
+            self.assertEqual(saved['agent_id'], state['agent_id'])
+            assess.assert_not_called()
+            self.assertTrue(all(not call.kwargs for call in worker.call_args_list))
+
+    def test_timed_out_worker_can_finish_without_a_replacement(self):
+        state = {'phase': 'working', 'timeout_escalated': True,
+                 'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
+                 'run_id': 'run-1', 'time': '2000-01-01T00:00:00+00:00', 'head': HEAD, 'review': 4}
+        advanced = copy.deepcopy(PULL)
+        advanced['head']['sha'] = 'b' * 40
+        with patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'FINISHED'}]) as worker, patch.object(s, 'gh', side_effect=[advanced, {'status': 'ahead'}]), patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'update_state'), patch.object(s, 'finish_review') as review:
+            s.recover_worker(PULL, {'id': 100}, state)
+            self.assertEqual(state['phase'], 'review_reserved')
+            self.assertEqual(state['completed_head'], 'b' * 40)
+            review.assert_called_once()
+            self.assertTrue(all(not call.kwargs for call in worker.call_args_list))
+
+
+    def test_disabled_installation_makes_no_service_calls(self):
+        for activation in ['', 'true', 'reviewed-v1-other-release']:
+            with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'TREMELAY_SUPERVISOR_ACTIVATION': activation}, clear=True), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh') as github, patch.object(s, 'cursor') as worker, patch.object(s, 'assess') as model:
+                self.assertEqual(s.main(), 0)
+                github.assert_not_called()
+                worker.assert_not_called()
+                model.assert_not_called()
+
+    def test_preflight_is_read_only_and_does_not_reveal_values(self):
+        from contextlib import redirect_stdout
+        import io
+        values = {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'github-private-sentinel', 'OPENAI_API_KEY': 'openai-private-sentinel', 'CURSOR_API_KEY': 'cursor-private-sentinel'}
+        output = io.StringIO()
+        with patch.dict(s.os.environ, values, clear=True), patch.object(sys, 'argv', ['checkpoint_supervisor.py', '--preflight']), patch.object(s, 'gh', return_value={'login': s.AUTHOR}) as github, patch.object(s, 'cursor') as worker, patch.object(s, 'assess') as model, redirect_stdout(output):
+            self.assertEqual(s.main(), 0)
+            github.assert_called_once_with('user')
+            worker.assert_not_called()
+            model.assert_not_called()
+        self.assertIn('Release activation is disabled.', output.getvalue())
+        for name in ['GH_TOKEN', 'OPENAI_API_KEY', 'CURSOR_API_KEY']:
+            self.assertNotIn(values[name], output.getvalue())
+        self.assertNotIn(s.ACTIVATION_VALUE, output.getvalue())
+
+    def test_workflow_activation_gate_covers_every_trigger(self):
+        workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/checkpoint-supervisor.yml').read_text()
+        condition = next(line.strip().removeprefix('if: ${{ ').removesuffix(' }}') for line in workflow.splitlines() if line.strip().startswith('if: ${{ '))
+        self.assertIn(s.ACTIVATION_VALUE, condition)
+        expression = condition.replace('vars.TREMELAY_SUPERVISOR_ACTIVATION', 'activation').replace('github.event_name', 'event').replace('inputs.preflight_only', 'preflight').replace('&&', 'and').replace('||', 'or').replace('== true', '== True')
+        for event in ['schedule', 'workflow_run', 'workflow_dispatch']:
+            for activation in ['', 'true', 'old-release', s.ACTIVATION_VALUE]:
+                for preflight in [False, True]:
+                    allowed = eval(expression, {'__builtins__': {}}, {'activation': activation, 'event': event, 'preflight': preflight})
+                    self.assertEqual(allowed, activation == s.ACTIVATION_VALUE or (event == 'workflow_dispatch' and preflight))
+        self.assertIn('TREMELAY_SUPERVISOR_ACTIVATION: ${{ vars.TREMELAY_SUPERVISOR_ACTIVATION }}', workflow)
 
 
 if __name__ == '__main__':

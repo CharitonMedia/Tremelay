@@ -11,6 +11,17 @@ invoke a separate reviewer when the worker loop reaches its checkpoint.
 
 ## Decision
 
+Installation and activation are separate. The workflow and controller default
+to disabled and require repository variable `TREMELAY_SUPERVISOR_ACTIVATION` to
+match this release's public opt-in value, documented in the setup guide. The
+fresh version-specific value is not a credential; it avoids accidental activation
+from an unknown existing generic boolean setting. No variable is set by this PR.
+Activation requires a separate explicit owner decision after service setup and
+spending terms are agreed. Ordinary manual dispatch, schedule and workflow-run
+events all use the same gate. A manually selected preflight bypasses activation
+only to verify key presence and owner identity without a model or Cursor call;
+it never changes activation or prints secret/variable values.
+
 `Checkpoint Supervisor` runs trusted code from `main` after completed goal/CI
 workflows and on a recovery schedule every fifteen minutes. GitHub scheduling is
 best effort, not a fifteen-minute service guarantee. The controller scans open,
@@ -19,10 +30,14 @@ with an exact Goal-Issue line and `human-review-required`. It does not run PR co
 
 Use the Responses API model `gpt-6.1-sol`, high reasoning, no tools, structured
 output, no stored response, and an 8192-token output limit. Give it the original
-goal, exact-head Codex inline findings, CI state, previous attempts, changed
+goal, exact-head Codex review-body and inline findings, CI state, previous attempts, changed
 source files, security documents and ADRs. Reject evidence above 1,000,000 UTF-8
 bytes rather than silently omitting source. Repository contents and discussion
 are untrusted evidence, never authority to change the controller's rules.
+Review-body-only findings qualify for assessment; an empty review, the fixed
+Codex wrapper alone, or its canonical clean-review result does not. The complete
+original review body is retained in the evidence. Binary or malformed source
+content fails that PR closed without stopping the scan of other eligible PRs.
 
 The model returns only `resume` (with a specific corrective approach/tests) or
 `escalate` (with a concrete decision requiring Patrick). It cannot merge, issue
@@ -54,6 +69,12 @@ serialized and non-cancelling. A stale head/review or active goal job blocks
 resumption. A failed durable assessment write cannot remove the stop label.
 A completed resume assessment is persisted as `dispatch_ready` before idle
 checks; scheduled recovery may retry those checks without another model call.
+If its head or newest independent review changes before any dispatch reservation,
+the controller durably marks that definitely unlaunched assessment `obsolete`.
+Its original assessment and consumed budget remain recorded; a later wake may
+assess the new checkpoint within the remaining allowance. A failed obsolescence
+write leaves the prior claim active. States with a worker identity or any dispatch
+reservation are never retired this way and never permit a replacement create.
 The controller reserves dispatch and a stable agent identity only after the idle
 gate succeeds. After reservation, it checks the live head/review/stop without
 waiting for its own comment-generated goal runs, which cannot launch while the
@@ -62,6 +83,10 @@ never accepted. Ambiguous creates are reconciled through that identity, never re
 A separate launch reservation after the resume marker consumes one worker cycle
 even if the create response is lost. Unresolved transport failures remain visible
 in Actions; recovery reads can run again without another billed create.
+Elapsed time alone never releases worker ownership. A nonterminal worker older
+than six hours receives one durable timeout escalation while remaining active.
+Newer heads/reviews cannot replace it; later wakes reconcile the same identity
+until an actual terminal result is verified.
 
 The supervisor itself cannot silently enable or change secrets. The secret
 presence preflight executes no PR code and prints no values. Live operation
@@ -93,6 +118,12 @@ Controller tests cover trusted identity/repository eligibility, newest exact-hea
 review, forged markers, malformed decisions, stale heads, concurrent workers,
 input/output bounds, redirect refusal, durable reservation ordering, failed
 assessment writes, ambiguous dispatch, escalation and the total allowance.
+Regressions also cover review-body-only findings, per-PR binary-evidence failure,
+head/review changes before dispatch, failed retirement writes, retained budget,
+and refusal to retire a potentially accepted worker.
+Activation regressions cover each trigger, reject empty/generic/stale release
+values, prevent all service calls while disabled, and verify read-only preflight
+without disclosing setup values.
 An actual key/model-access check and a real checkpoint resume remain required
 before declaring unattended operation verified. Secret presence alone does not
 prove model access, API billing or token permissions.

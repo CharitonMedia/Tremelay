@@ -24,6 +24,9 @@ concurrency:
 
 jobs:
   supervise:
+    # Public version-specific opt-in. Existing generic true settings cannot
+    # enable billed work when this workflow is first installed.
+    if: ${{ vars.TREMELAY_SUPERVISOR_ACTIVATION == 'reviewed-v1-d9cfdd332b6a490e9999f037f632a750' || (github.event_name == 'workflow_dispatch' && inputs.preflight_only == true) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -42,6 +45,7 @@ jobs:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SUPERVISOR_MAX_CHECKPOINTS: '3'
+          TREMELAY_SUPERVISOR_ACTIVATION: ${{ vars.TREMELAY_SUPERVISOR_ACTIVATION }}
           PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
         run: |
           set -euo pipefail
