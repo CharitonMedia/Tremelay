@@ -45,6 +45,8 @@ type Notification struct {
 	Result       string `json:"result"`
 	AuditSeq     uint64 `json:"audit_seq"`
 	AuditHash    string `json:"audit_hash"`
+	// Reasons is a canonical list of fixed health codes. Broker alerts leave it empty.
+	Reasons string `json:"reasons,omitempty"`
 }
 
 // Notifier delivers one alert. A non-nil error is a delivery failure.
@@ -163,22 +165,32 @@ func (s *Session) DeliverPending() error {
 	return nil
 }
 
-func (s *Session) afterCommit(ev auditEvent) {
-	if s == nil || s.responding || s.notifier == nil || noticeAction(ev.Action) {
-		return
-	}
-	st := s.notices[ev.Seq]
-	if !st.chosen() || st.delivered || st.attempts >= notifyAttemptLimit {
-		return
-	}
-	class := noticeAlertClass(ev, st)
-	if !class.alert() {
+// deliverCommitted sends alerts chosen by this commit. Health alerts use the
+// same reservation and two-attempt cap as M5. Containment is not applied here.
+func (s *Session) deliverCommitted(events []auditEvent) {
+	if s == nil || s.responding || s.notifier == nil {
 		return
 	}
 	s.responding = true
 	defer func() { s.responding = false }()
-	if err := s.deliverOne(ev, class); err != nil {
-		s.logf("notify seq=%d result=error", ev.Seq)
+	sent := 0
+	for _, ev := range events {
+		if sent >= notifyBatch || noticeAction(ev.Action) {
+			continue
+		}
+		st := s.notices[ev.Seq]
+		if !st.chosen() || st.delivered || st.attempts >= notifyAttemptLimit {
+			continue
+		}
+		class := noticeAlertClass(ev, st)
+		if !class.alert() {
+			continue
+		}
+		if err := s.deliverOne(ev, class); err != nil {
+			s.logf("notify seq=%d result=error", ev.Seq)
+			return
+		}
+		sent++
 	}
 }
 
@@ -329,6 +341,7 @@ func notificationFrom(ev auditEvent, class Classification) Notification {
 		Result:       ev.Result,
 		AuditSeq:     ev.Seq,
 		AuditHash:    ev.Hash,
+		Reasons:      ev.Reasons,
 	}
 }
 
@@ -418,8 +431,12 @@ func noticeAlertClass(src auditEvent, st noticeSrc) Classification {
 	if base.alert() {
 		return base
 	}
-	if st.class == ClassRepeatedDenial {
+	switch st.class {
+	case ClassRepeatedDenial:
 		return Classification{Class: ClassRepeatedDenial, Severity: SeverityHigh}
+	case ClassHealth:
+		// Advisory. The recorded class asks for delivery and does not suspend.
+		return Classification{Class: ClassHealth, Severity: SeverityHigh}
 	}
 	return base
 }

@@ -138,9 +138,14 @@ var (
 	// ErrBrokerUpstream means the upstream call failed or could not be completed.
 	// The error text is fixed and does not include the credential or the URL.
 	ErrBrokerUpstream = errors.New("broker upstream failed")
+	// ErrConflict means a credential changed while it was being evaluated.
+	// The in-flight evaluation is discarded. The text is fixed.
+	ErrConflict = errors.New("credential changed during evaluation")
 )
 
 // Lifecycle is non-secret metadata stored with a credential.
+// RotationEvery and ReviewEvery are zero when that interval is disabled.
+// An explicit timestamp on the same field takes precedence over the interval.
 type Lifecycle struct {
 	State         string
 	CreatedAt     time.Time
@@ -148,6 +153,8 @@ type Lifecycle struct {
 	ExpiresAt     *time.Time
 	ReviewDueAt   *time.Time
 	RotationDueAt *time.Time
+	RotationEvery time.Duration
+	ReviewEvery   time.Duration
 }
 
 // Credential is a human-visible credential record.
@@ -160,11 +167,15 @@ type Credential struct {
 	Lifecycle Lifecycle
 }
 
-// PutOptions carries optional lifecycle times. Zero values mean unset.
+// PutOptions carries optional lifecycle times and interval policies.
+// A nil time is unset. A zero duration disables that interval.
+// Sub-second durations are rejected so a value is not silently truncated.
 type PutOptions struct {
 	ExpiresAt     *time.Time
 	ReviewDueAt   *time.Time
 	RotationDueAt *time.Time
+	RotationEvery time.Duration
+	ReviewEvery   time.Duration
 }
 
 type lifecycle struct {
@@ -174,14 +185,19 @@ type lifecycle struct {
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 	ReviewDueAt   *time.Time `json:"review_due_at,omitempty"`
 	RotationDueAt *time.Time `json:"rotation_due_at,omitempty"`
+	// Seconds. Zero is disabled and omitted. Explicit timestamps win.
+	RotationEvery int64 `json:"rotation_every,omitempty"`
+	ReviewEvery   int64 `json:"review_every,omitempty"`
 }
 
 type credential struct {
-	ID        string    `json:"id"`
-	Label     string    `json:"label"`
-	Type      string    `json:"type"`
-	Secret    []byte    `json:"secret"`
-	Lifecycle lifecycle `json:"lifecycle"`
+	ID        string        `json:"id"`
+	Label     string        `json:"label"`
+	Type      string        `json:"type"`
+	Secret    []byte        `json:"secret"`
+	Gen       uint64        `json:"gen,omitempty"`
+	Lifecycle lifecycle     `json:"lifecycle"`
+	Health    *storedHealth `json:"health,omitempty"`
 }
 
 type kdfParams struct {
@@ -216,6 +232,9 @@ type document struct {
 	// Detection is always written, including when empty. A missing member
 	// means the document was sealed before M5. See sealedDetection.
 	Detection detectionState `json:"detection"`
+	// HealthPolicy is absent on vaults sealed before M6. Absence means the
+	// documented defaults, not a fabricated healthy assessment.
+	HealthPolicy healthPolicy `json:"health_policy,omitempty"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -270,6 +289,12 @@ type Session struct {
 	policy ResponsePolicy
 	// responding stops a notification or containment row from raising another one.
 	responding bool
+	// hpolicy is the durable health configuration. The zero value is the
+	// documented default. It is sealed with the credential document.
+	hpolicy healthPolicy
+	// checker is the process-local compromise lookup. Nil means no lookup.
+	// It is not sealed, and a new process starts without one. See ADR 0010.
+	checker CompromiseChecker
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -416,6 +441,10 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		wipe(dek)
 		return nil, deny(ErrCorrupt)
 	}
+	if err := matchHealth(events, doc.Credentials); err != nil {
+		wipe(dek)
+		return nil, deny(ErrCorrupt)
+	}
 	red := &Redactor{}
 	red.Add(passphrase)
 	for i := range doc.Credentials {
@@ -437,6 +466,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		redactor:    red,
 		logger:      logger,
 		db:          db,
+		hpolicy:     doc.HealthPolicy,
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -470,6 +500,8 @@ func (s *Session) Lock() {
 	s.suspensions = nil
 	s.notifier = nil
 	s.responding = false
+	s.checker = nil
+	s.hpolicy = healthPolicy{}
 	if s.redactor != nil {
 		s.redactor.Wipe()
 	}
@@ -506,15 +538,24 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 	if err != nil {
 		return s.denyPut(err)
 	}
+	rotEvery, err := durationSeconds(opt.RotationEvery)
+	if err != nil {
+		return s.denyPut(err)
+	}
+	reviewEvery, err := durationSeconds(opt.ReviewEvery)
+	if err != nil {
+		return s.denyPut(err)
+	}
 	id, err := newID()
 	if err != nil {
 		return Credential{}, err
 	}
-	now := time.Now().UTC()
+	now := s.now()
 	rec := credential{
 		ID:     id,
 		Label:  label,
 		Type:   typ,
+		Gen:    1,
 		Secret: append([]byte(nil), secret...),
 		Lifecycle: lifecycle{
 			State:         StateActive,
@@ -523,23 +564,17 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 			ExpiresAt:     expires,
 			ReviewDueAt:   review,
 			RotationDueAt: rotation,
+			RotationEvery: rotEvery,
+			ReviewEvery:   reviewEvery,
 		},
 	}
-	next := append(append([]credential{}, s.creds...), rec)
-	ev, err := nextEvent(s.audit, actionPut, s.id, id, typ, resultAllowed)
+	s.redactor.Add(secret)
+	stored, err := s.storeNew(rec)
 	if err != nil {
 		wipe(rec.Secret)
 		return Credential{}, err
 	}
-	s.redactor.Add(secret)
-	if err := s.commit(ev, next); err != nil {
-		wipe(rec.Secret)
-		return Credential{}, err
-	}
-	// Labels are caller-controlled and may carry a secret this session has
-	// not seen, so redaction cannot cover them. Keep them out of process logs.
-	s.logf("credential_put id=%s type=%s result=allowed", id, typ)
-	return rec.public(), nil
+	return stored, nil
 }
 
 // Get returns one credential, including its secret, after committing an audit event.
@@ -598,6 +633,8 @@ func (c credential) public() Credential {
 			ExpiresAt:     cloneTime(c.Lifecycle.ExpiresAt),
 			ReviewDueAt:   cloneTime(c.Lifecycle.ReviewDueAt),
 			RotationDueAt: cloneTime(c.Lifecycle.RotationDueAt),
+			RotationEvery: time.Duration(c.Lifecycle.RotationEvery) * time.Second,
+			ReviewEvery:   time.Duration(c.Lifecycle.ReviewEvery) * time.Second,
 		},
 	}
 }
@@ -645,6 +682,19 @@ func (s *Session) denyAction(action string, cause error) error {
 	return cause
 }
 
+// failConflict records a fixed denial when a checker commits during evaluation.
+// Planned credential state is not written. The checker error is not stored.
+func (s *Session) failConflict(action string, err error) error {
+	if err == nil || !errors.Is(err, ErrConflict) {
+		return err
+	}
+	if auditErr := s.persistEvent(action, "", "", resultDenied); auditErr != nil {
+		return auditErr
+	}
+	s.logf("%s result=denied", action)
+	return ErrConflict
+}
+
 func (s *Session) persistEvent(action, credID, credType, result string) error {
 	ev, err := nextEvent(s.audit, action, s.id, credID, credType, result)
 	if err != nil {
@@ -663,15 +713,34 @@ func (s *Session) commit(ev auditEvent, creds []credential) error {
 }
 
 func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentRecord, grants []grantRecord) error {
+	return s.commitBatch([]auditEvent{ev}, creds, agents, grants, true, nil)
+}
+
+// commitBatch seals creds and events in one transaction.
+// withResp lets one ordinary security event pick up its M5 response.
+// policy, when non-nil, becomes the durable health policy only after commit.
+func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
-	events := []auditEvent{ev}
-	if !noticeAction(ev.Action) {
-		var err error
-		events, creds, agents, grants, err = s.withResponse(ev, creds, agents, grants)
-		if err != nil {
-			return err
+	if len(events) == 0 {
+		return ErrAudit
+	}
+	pol := s.hpolicy
+	if policy != nil {
+		pol = *policy
+	}
+	if withResp {
+		if len(events) != 1 || noticeAction(events[0].Action) {
+			if len(events) != 1 {
+				return ErrAudit
+			}
+		} else {
+			var err error
+			events, creds, agents, grants, err = s.withResponse(events[0], creds, agents, grants)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	base := s.denials
@@ -687,7 +756,7 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 		return err
 	}
 	tip := events[len(events)-1]
-	plain, err := json.Marshal(document{Credentials: creds, Agents: agents, Grants: grants, Detection: det})
+	plain, err := json.Marshal(document{Credentials: creds, Agents: agents, Grants: grants, Detection: det, HealthPolicy: pol})
 	if err != nil {
 		return ErrIO
 	}
@@ -727,11 +796,12 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	s.grants = grants
 	s.detection = det
 	s.denials = nextDenials
+	s.hpolicy = pol
 	for _, row := range events {
 		applyNotice(s.notices, row)
 		s.suspensions.apply(s.audit, row)
 	}
-	s.afterCommit(events[0])
+	s.deliverCommitted(events)
 	return nil
 }
 
@@ -926,6 +996,12 @@ func validateStored(creds []credential) error {
 		seen[c.ID] = struct{}{}
 		if c.Lifecycle.State != StateActive || c.Lifecycle.CreatedAt.IsZero() || c.Lifecycle.UpdatedAt.IsZero() {
 			return ErrCorrupt
+		}
+		if c.Lifecycle.RotationEvery < 0 || c.Lifecycle.ReviewEvery < 0 || c.Lifecycle.RotationEvery > maxPolicySeconds || c.Lifecycle.ReviewEvery > maxPolicySeconds {
+			return ErrCorrupt
+		}
+		if err := validateCredentialHealth(c); err != nil {
+			return err
 		}
 	}
 	return nil

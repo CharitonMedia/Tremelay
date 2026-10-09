@@ -44,6 +44,8 @@ const (
 	ClassDestructive = "destructive"
 	// ClassNotice is a notification or containment row. It does not raise another alert.
 	ClassNotice = "notice"
+	// ClassHealth is an advisory credential-health alert. It does not contain.
+	ClassHealth = "health"
 
 	// ponytail: one counter per agent over the last 32 broker rows, capped at
 	// 256 agents by dropping whoever has the oldest latest broker row.
@@ -71,7 +73,7 @@ func knownClass(class string) bool {
 	switch class {
 	case ClassRoutine, ClassExpectedDenial, ClassRepeatedDenial, ClassSecretProbe,
 		ClassOriginMismatch, ClassSSRF, ClassRedirectEscape, ClassPolicyViolation,
-		ClassReplay, ClassAuditTamper, ClassRate, ClassDestructive, ClassNotice:
+		ClassReplay, ClassAuditTamper, ClassRate, ClassDestructive, ClassNotice, ClassHealth:
 		return true
 	default:
 		return false
@@ -307,6 +309,16 @@ func grantRevokedByAction(events []auditEvent, grantID string) bool {
 func baseClass(ev auditEvent) Classification {
 	if noticeAction(ev.Action) {
 		return Classification{Class: ClassNotice, Severity: SeverityInfo}
+	}
+	if healthAction(ev.Action) {
+		switch ev.Result {
+		case resultAllowed, resultUnchanged:
+			return Classification{Class: ClassRoutine, Severity: SeverityInfo}
+		case resultDenied:
+			return Classification{Class: ClassExpectedDenial, Severity: SeverityLow}
+		default:
+			return Classification{Class: ClassAuditTamper, Severity: SeverityCritical}
+		}
 	}
 	switch ev.Result {
 	case resultAllowed, resultCompleted, resultUpstreamError:
@@ -587,6 +599,8 @@ type AuditRecord struct {
 	Class          string `json:"class"`
 	Severity       string `json:"severity"`
 	RefSeq         uint64 `json:"ref_seq,omitempty"`
+	Reasons        string `json:"reasons,omitempty"`
+	CredGen        uint64 `json:"cred_gen,omitempty"`
 	Hash           string `json:"hash"`
 }
 
@@ -735,6 +749,9 @@ func (s *Session) verified() error {
 	if err := matchDetection(s.denials.state(), s.detection); err != nil {
 		return ErrAudit
 	}
+	if err := matchHealth(s.audit, s.creds); err != nil {
+		return ErrAudit
+	}
 	return nil
 }
 
@@ -756,6 +773,8 @@ func auditRecordClass(ev auditEvent, class Classification) AuditRecord {
 		Class:          class.Class,
 		Severity:       class.Severity,
 		RefSeq:         ev.RefSeq,
+		Reasons:        ev.Reasons,
+		CredGen:        ev.CredGen,
 		Hash:           ev.Hash,
 	}
 }

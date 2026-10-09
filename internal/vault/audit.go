@@ -12,21 +12,29 @@ const (
 	auditVersion           = 1
 	auditCapabilityVersion = 2
 	auditNoticeVersion     = 3
+	auditHealthVersion     = 4
 
-	actionCreate      = "vault_create"
-	actionUnlock      = "vault_unlock"
-	actionPut         = "credential_put"
-	actionGet         = "credential_get"
-	actionList        = "credential_list"
-	actionAgentCreate = "agent_create"
-	actionGrantCreate = "grant_create"
-	actionGrantRevoke = "grant_revoke"
-	actionAuthorize   = "capability_authorize"
-	actionCapList     = "capability_list"
-	actionBroker      = "broker_http"
-	actionNotify      = "notify"
-	actionContain     = "contain"
-	actionRespond     = "respond"
+	actionCreate       = "vault_create"
+	actionUnlock       = "vault_unlock"
+	actionPut          = "credential_put"
+	actionGet          = "credential_get"
+	actionList         = "credential_list"
+	actionAgentCreate  = "agent_create"
+	actionGrantCreate  = "grant_create"
+	actionGrantRevoke  = "grant_revoke"
+	actionAuthorize    = "capability_authorize"
+	actionCapList      = "capability_list"
+	actionBroker       = "broker_http"
+	actionNotify       = "notify"
+	actionContain      = "contain"
+	actionRespond      = "respond"
+	actionReplace      = "credential_replace"
+	actionLifecycle    = "credential_lifecycle"
+	actionHealth       = "health_assess"
+	actionRefresh      = "health_refresh"
+	actionHealthPolicy = "health_policy"
+	actionHealthGet    = "health_get"
+	actionHealthList   = "health_list"
 
 	resultAllowed           = "allowed"
 	resultDenied            = "denied"
@@ -77,6 +85,8 @@ type auditEvent struct {
 	Operation string `json:"operation,omitempty"`
 	Class     string `json:"class,omitempty"`
 	RefSeq    uint64 `json:"ref_seq,omitempty"`
+	Reasons   string `json:"reasons,omitempty"`
+	CredGen   uint64 `json:"cred_gen,omitempty"`
 	Prev      string `json:"prev"`
 	Hash      string `json:"hash"`
 }
@@ -124,6 +134,9 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 	if err != nil || matchDetection(indexFromAudit(events).state(), doc.Detection) != nil {
 		return "", ErrAudit
 	}
+	if matchHealth(events, doc.Credentials) != nil {
+		return "", ErrAudit
+	}
 	return events[len(events)-1].Hash, nil
 }
 
@@ -141,6 +154,15 @@ func eventHashV3(prev []byte, seq uint64, timeStr, action, vaultID, credID, cred
 	var ref [8]byte
 	binary.BigEndian.PutUint64(ref[:], refSeq)
 	return hashPartsTail(prev, seq, []string{timeStr, action, vaultID, credID, credType, result, agentID, grantID, operation, class}, ref[:])
+}
+
+// eventHashV4 extends the version-1 preimage with the canonical reason list
+// and the credential generation the assessment is bound to. Version-1, 2, and
+// 3 preimages do not include these fields.
+func eventHashV4(prev []byte, seq uint64, timeStr, action, vaultID, credID, credType, result, reasons string, credGen uint64) []byte {
+	var gen [8]byte
+	binary.BigEndian.PutUint64(gen[:], credGen)
+	return hashPartsTail(prev, seq, []string{timeStr, action, vaultID, credID, credType, result, reasons}, gen[:])
 }
 
 func hashParts(prev []byte, seq uint64, parts ...string) []byte {
@@ -193,18 +215,23 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 	ev.Prev = hex.EncodeToString(prev)
 	var sum []byte
 	switch ev.V {
+	case auditHealthVersion:
+		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 || !canonicalReasons(ev.Reasons) {
+			return auditEvent{}, ErrAudit
+		}
+		sum = eventHashV4(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Reasons, ev.CredGen)
 	case auditNoticeVersion:
-		if ev.Class == "" || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq {
+		if ev.Class == "" || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq || ev.Reasons != "" || ev.CredGen != 0 {
 			return auditEvent{}, ErrAudit
 		}
 		sum = eventHashV3(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Class, ev.RefSeq)
 	case auditCapabilityVersion:
-		if ev.Class != "" || ev.RefSeq != 0 {
+		if ev.Class != "" || ev.RefSeq != 0 || ev.Reasons != "" || ev.CredGen != 0 {
 			return auditEvent{}, ErrAudit
 		}
 		sum = eventHashV2(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation)
 	default:
-		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 {
+		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 || ev.Reasons != "" || ev.CredGen != 0 {
 			return auditEvent{}, ErrAudit
 		}
 		sum = eventHash(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result)
@@ -215,6 +242,8 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 
 func auditVersionFor(action string) int {
 	switch {
+	case healthAction(action):
+		return auditHealthVersion
 	case noticeAction(action):
 		return auditNoticeVersion
 	case capabilityAction(action):
@@ -224,8 +253,19 @@ func auditVersionFor(action string) int {
 	}
 }
 
+func healthAction(action string) bool {
+	switch action {
+	case actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy:
+		return true
+	default:
+		return false
+	}
+}
+
 func hashEvent(prev []byte, ev auditEvent) []byte {
 	switch ev.V {
+	case auditHealthVersion:
+		return eventHashV4(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Reasons, ev.CredGen)
 	case auditNoticeVersion:
 		return eventHashV3(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Class, ev.RefSeq)
 	case auditCapabilityVersion:
@@ -264,7 +304,7 @@ func verifyLinked(events []auditEvent) error {
 		return ErrAudit
 	}
 	for i, ev := range events {
-		if ev.V != 1 && ev.V != 2 && ev.V != 3 {
+		if ev.V != 1 && ev.V != 2 && ev.V != 3 && ev.V != 4 {
 			return ErrAudit
 		}
 		if ev.V != auditVersionFor(ev.Action) || ev.Seq != first.Seq+uint64(i) {
@@ -298,7 +338,9 @@ func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPut, actionGet, actionList,
 		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
-		actionBroker, actionNotify, actionContain, actionRespond:
+		actionBroker, actionNotify, actionContain, actionRespond,
+		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
+		actionHealthGet, actionHealthList:
 		return true
 	default:
 		return false
@@ -322,7 +364,10 @@ func validAuditShape(ev auditEvent) error {
 	if noticeAction(ev.Action) {
 		return validNoticeAudit(ev)
 	}
-	if ev.Class != "" || ev.RefSeq != 0 {
+	if healthAction(ev.Action) {
+		return validHealthAudit(ev)
+	}
+	if ev.Class != "" || ev.RefSeq != 0 || ev.Reasons != "" || ev.CredGen != 0 {
 		return ErrAudit
 	}
 	if ev.Result == resultDeniedSecret && ev.Operation != "" {
@@ -407,7 +452,9 @@ func validAuditShape(ev auditEvent) error {
 }
 
 func validNoticeAudit(ev auditEvent) error {
-	if ev.V != auditNoticeVersion || !knownClass(ev.Class) || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq || ev.Operation != "" {
+	// reasons and cred_gen are outside the version-3 preimage. A notice row
+	// that carries either one is forged even when its hash still matches.
+	if ev.V != auditNoticeVersion || !knownClass(ev.Class) || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq || ev.Operation != "" || ev.Reasons != "" || ev.CredGen != 0 {
 		return ErrAudit
 	}
 	if ev.AgentID != "" && safeID(ev.AgentID) == "" {
@@ -435,6 +482,45 @@ func validNoticeAudit(ev auditEvent) error {
 		}
 	case actionRespond:
 		if ev.Result != resultDecisionNotify && ev.Result != resultDecisionFlag {
+			return ErrAudit
+		}
+	default:
+		return ErrAudit
+	}
+	return nil
+}
+
+func validHealthAudit(ev auditEvent) error {
+	if ev.V != auditHealthVersion || ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 || !canonicalReasons(ev.Reasons) {
+		return ErrAudit
+	}
+	switch ev.Result {
+	case resultAllowed, resultUnchanged, resultDenied:
+	default:
+		return ErrAudit
+	}
+	if ev.Result == resultDenied {
+		if ev.CredID != "" || ev.CredType != "" || ev.Reasons != "" || ev.CredGen != 0 {
+			return ErrAudit
+		}
+		return nil
+	}
+	switch ev.Action {
+	case actionHealthPolicy:
+		if ev.CredID != "" || ev.CredType != "" || ev.Reasons != "" || ev.CredGen != 0 {
+			return ErrAudit
+		}
+		return nil
+	case actionRefresh:
+		if ev.CredID == "" {
+			if ev.CredType != "" || ev.Reasons != "" || ev.CredGen != 0 || ev.Result != resultUnchanged {
+				return ErrAudit
+			}
+			return nil
+		}
+		fallthrough
+	case actionHealth, actionReplace, actionLifecycle:
+		if safeID(ev.CredID) == "" || validateType(ev.CredType) != nil || ev.CredGen == 0 {
 			return ErrAudit
 		}
 	default:
@@ -514,7 +600,7 @@ func suffixAllows(events []auditEvent, header fileHeader) error {
 		// time.Now().UTC().Format(time.RFC3339Nano). Any other metadata, a
 		// noncanonical timestamp, or a time outside [previous, now] is a
 		// forged suffix and must not be incorporated.
-		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != header.ID || ev.CredID != "" || ev.CredType != "" || ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 {
+		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != header.ID || ev.CredID != "" || ev.CredType != "" || ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 || ev.Reasons != "" || ev.CredGen != 0 {
 			return ErrAudit
 		}
 		ts, ok := canonicalAuditTime(ev.Time)
