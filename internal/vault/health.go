@@ -386,15 +386,17 @@ func (s *Session) Replace(id string, secret []byte, opt LifecycleOptions) (Crede
 	fresh := append([]byte(nil), secret...)
 	next[i].Secret = fresh
 	next[i].Lifecycle = lc
-	// Generation and UpdatedAt move only when the secret bytes change, so a
-	// known compromise for those bytes survives a later checker failure.
-	if next[i].Gen == 0 || !same {
+	// A generation above zero and UpdatedAt move only when the bytes change,
+	// so a known compromise and the age of those bytes survive an identical
+	// replacement. Generation 0 is unassessed storage: assign 1 without
+	// treating unchanged bytes as a rotation.
+	if next[i].Gen == 0 {
+		next[i].Gen = 1
+	} else if !same {
+		next[i].Gen++
+	}
+	if !same {
 		next[i].Lifecycle.UpdatedAt = s.now()
-		if next[i].Gen == 0 {
-			next[i].Gen = 1
-		} else {
-			next[i].Gen++
-		}
 	}
 	s.redactor.Add(secret)
 	rows, err := s.rowsForChange(next, id, actionReplace, actionHealth)

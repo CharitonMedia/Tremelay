@@ -12,7 +12,7 @@ Health has to be checked when a secret is added or replaced, and again when a hu
 
 Health lives in the encrypted credential document, next to the secret it describes. A missing `health` member means the credential has not been assessed. Unlock does not invent a healthy result.
 
-Each stored assessment records the credential generation, the assessment time, a sorted set of fixed finding codes, a compromise status, a strength status, and any explicitly unsupported checks. The generation increments only when the secret bytes change. An identical replacement keeps the generation and `UpdatedAt`, so a known match for those bytes survives a later checker failure. A different value drops prior-value evidence. The first assessment of an older credential assigns generation 1 to the bytes already stored.
+Each stored assessment records the credential generation, the assessment time, a sorted set of fixed finding codes, a compromise status, a strength status, and any explicitly unsupported checks. The generation increments only when the secret bytes change. An identical replacement keeps the generation and `UpdatedAt`, so a known match for those bytes survives a later checker failure. A different value drops prior-value evidence. The first assessment of an older credential assigns generation 1 to the bytes already stored. That assignment is not a rotation: unchanged bytes keep their `UpdatedAt`.
 
 Findings that can be true at the same time are `weak`, `reused`, `compromised`, `expired`, `review_due`, `rotation_due`, and `rotation_overdue`. Empty findings are not a health verdict. `evidence` is `unassessed`, `partial`, or `complete`. Complete means the applicable checks finished. It does not mean the credential is safe.
 
@@ -46,7 +46,7 @@ An external checker is not implemented here. One added later must speak this pre
 
 ### Lifecycle
 
-Explicit `ExpiresAt`, `ReviewDueAt`, and `RotationDueAt` win over intervals. `RotationEvery` and `ReviewEvery` apply only while the matching explicit timestamp is unset. Zero disables that interval. Rotation intervals are measured from `UpdatedAt`. Review intervals are measured from `CreatedAt`. Secret replacement updates `UpdatedAt` and therefore moves an interval-based rotation due time. It does not move an explicit timestamp and it does not move a review interval. Expiry has no early reminder. Review uses the reminder lead as the start of `review_due`. Rotation uses the lead for `rotation_due` and becomes `rotation_overdue` at the due instant. The due instant itself is overdue, not merely due.
+Explicit `ExpiresAt`, `ReviewDueAt`, and `RotationDueAt` win over intervals. `RotationEvery` and `ReviewEvery` apply only while the matching explicit timestamp is unset. Zero disables that interval. Rotation intervals are measured from `UpdatedAt`. Review intervals are measured from `CreatedAt`. A replacement that changes the secret bytes updates `UpdatedAt` and therefore moves an interval-based rotation due time. An identical replacement, including the first generation assigned to unchanged pre-assessment bytes, does not. Neither kind of replacement moves an explicit timestamp or a review interval. Expiry has no early reminder. Review uses the reminder lead as the start of `review_due`. Rotation uses the lead for `rotation_due` and becomes `rotation_overdue` at the due instant. The due instant itself is overdue, not merely due.
 
 There is no type or service field on replace. Grants keep their credential id, class, and resource. Health does not revoke, rotate, or widen a grant. Credential state stays `active`.
 
@@ -100,7 +100,7 @@ Human reads are `health_get` and `health_list` at audit version 1. `AgentPrincip
 - Reuse is reported on the other credential, cleared when the match goes away, and excluded for the same id.
 - Replace keeps id, type, creation time, and grant scope. A faulted replace leaves the secret, peer findings, and audit chain unchanged.
 - A checker sees only the prefix. Opt-in and a checker are both required. Malformed bodies and errors do not become a clear result or erase a match. An identical replacement keeps that match; a changed value does not. A reentrant call discards the delayed result and records a fixed denial for the outer refresh, replace, ingest, lifecycle, and policy attempt.
-- Due and overdue boundaries, explicit dates over intervals, disabled policy, and replacement resetting an interval use the session clock.
+- Due and overdue boundaries, explicit dates over intervals, disabled policy, and replacement resetting an interval use the session clock. An identical replacement of an unassessed credential keeps `UpdatedAt`, so an overdue interval stays overdue; a byte change moves `UpdatedAt`.
 - A legacy document without health opens as unassessed. Invalid health and a document that disagrees with the health row fail closed. An older audit table migrates without changing version-1 hashes. A version-3 respond, notify, or contain row with forged reasons or cred_gen fails verify, unlock, and read.
 - Repeated refresh does not repeat the alert. Delivery failure keeps the health row, retries twice, and recovers after reopen. A nil sink does not invent a failure. Containment does not suspend an agent for a weak password.
 - A sentinel secret and a checker error that contains it are absent from audit rows, notifications, and logs.

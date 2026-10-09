@@ -944,6 +944,77 @@ func TestUnchangedReplacementKeepsKnownCompromise(t *testing.T) {
 	}
 }
 
+func TestLegacyIdenticalReplacementKeepsAge(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	modified := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	now := modified.Add(48 * time.Hour)
+	created := modified.Add(-24 * time.Hour)
+	secret := strongPass(t)
+	legacy := credential{
+		ID:     strings.Repeat("cd", 16),
+		Label:  "old",
+		Type:   "password",
+		Secret: append([]byte(nil), secret...),
+		Lifecycle: lifecycle{
+			State:     StateActive,
+			CreatedAt: created,
+			UpdatedAt: modified,
+		},
+	}
+	reseal(t, session, []credential{legacy})
+	session.Lock()
+	opened, err := Unlock(path, pass, nil)
+	if err != nil {
+		t.Fatalf("legacy unlock %v", err)
+	}
+	t.Cleanup(opened.Lock)
+	opened.clock = func() time.Time { return now }
+
+	h := mustHealth(t, opened, legacy.ID)
+	if h.Evidence != EvidenceUnassessed || h.SecretVersion != 0 || len(h.Findings) != 0 {
+		t.Fatalf("reopen fabricated %+v", h)
+	}
+	meta := mustMeta(t, opened, legacy.ID)
+	if !meta.UpdatedAt.Equal(modified) || !meta.CreatedAt.Equal(created) {
+		t.Fatalf("reopen age %v created %v", meta.UpdatedAt, meta.CreatedAt)
+	}
+
+	every := time.Hour
+	if _, err := opened.Replace(legacy.ID, append([]byte(nil), secret...), LifecycleOptions{RotationEvery: &every}); err != nil {
+		t.Fatal(err)
+	}
+	h = mustHealth(t, opened, legacy.ID)
+	if h.SecretVersion != 1 || !finding(h, ReasonRotationOverdue) || finding(h, ReasonRotationDue) {
+		t.Fatalf("identical age %+v", h)
+	}
+	meta = mustMeta(t, opened, legacy.ID)
+	if !meta.UpdatedAt.Equal(modified) || !meta.CreatedAt.Equal(created) || meta.RotationEvery != every {
+		t.Fatalf("identical timestamps updated %v every %v", meta.UpdatedAt, meta.RotationEvery)
+	}
+	if !bytes.Equal(mustGet(t, opened, legacy.ID), secret) {
+		t.Fatal("identical replacement changed the secret")
+	}
+
+	changed := strongPass(t)
+	if bytes.Equal(changed, secret) {
+		t.Fatal("fixture collision")
+	}
+	if _, err := opened.Replace(legacy.ID, changed, LifecycleOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h = mustHealth(t, opened, legacy.ID)
+	if h.SecretVersion != 2 || !finding(h, ReasonRotationDue) || finding(h, ReasonRotationOverdue) {
+		t.Fatalf("changed replacement %+v", h)
+	}
+	meta = mustMeta(t, opened, legacy.ID)
+	if !meta.UpdatedAt.Equal(now) || !meta.CreatedAt.Equal(created) {
+		t.Fatalf("changed timestamps updated %v created %v", meta.UpdatedAt, meta.CreatedAt)
+	}
+	if !bytes.Equal(mustGet(t, opened, legacy.ID), changed) {
+		t.Fatal("changed replacement missing")
+	}
+}
+
 func TestCheckerConflictAuditsOuterAttempt(t *testing.T) {
 	_, _, session := mustCreate(t, nil)
 	policy := DefaultHealthPolicy()
@@ -1190,6 +1261,15 @@ func mustGet(t *testing.T, s *Session, id string) []byte {
 		t.Fatal(err)
 	}
 	return got.Secret
+}
+
+func mustMeta(t *testing.T, s *Session, id string) Lifecycle {
+	t.Helper()
+	got, err := s.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got.Lifecycle
 }
 
 func reseal(t *testing.T, s *Session, creds []credential) {
