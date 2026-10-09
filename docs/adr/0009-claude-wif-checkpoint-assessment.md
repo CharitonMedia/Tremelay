@@ -78,6 +78,10 @@ expected total below one cent is an estimate, not a provider dollar cap.
   `workspace:developer` credential remains privileged and is treated as secret.
 - The workflow requires job-scoped `id-token: write`; runtime identity checks
   and the external federation rule both restrict which workflow can use it.
+  Every step in that job can obtain its OIDC identity, so both first-party
+  actions are pinned to reviewed full commit SHAs from their canonical
+  repositories, not movable major-version tags. The regression suite rejects
+  mutable, abbreviated, changed, or additional action references until reviewed.
 - No new third-party runtime dependency is needed. Standard-library HTTPS keeps
   retry, redirect, token lifetime, response parsing and logging behavior explicit.
 - Credits-only billing is an account control confirmed by the owner. The
