@@ -287,7 +287,7 @@ func (s *Session) SetHealthPolicy(p HealthPolicy) error {
 	rows := []plannedRow{{partial: auditEvent{Action: actionHealthPolicy, Result: resultAllowed}}}
 	assessed, err := s.planAssess(next, credIDs(next), actionHealth, "", &stored)
 	if err != nil {
-		return err
+		return s.failConflict(actionHealthPolicy, err)
 	}
 	return s.commitPlans(append(rows, assessed...), next, &stored)
 }
@@ -355,7 +355,7 @@ func (s *Session) RefreshHealth(id string) error {
 	}
 	rows, err := s.planAssess(next, ids, actionRefresh, always, nil)
 	if err != nil {
-		return err
+		return s.failConflict(actionRefresh, err)
 	}
 	if len(rows) == 0 {
 		rows = []plannedRow{{partial: auditEvent{Action: actionRefresh, Result: resultUnchanged}}}
@@ -382,20 +382,25 @@ func (s *Session) Replace(id string, secret []byte, opt LifecycleOptions) (Crede
 		return Credential{}, s.denyAction(actionReplace, err)
 	}
 	old := next[i].Secret
+	same := subtle.ConstantTimeCompare(old, secret) == 1
 	fresh := append([]byte(nil), secret...)
 	next[i].Secret = fresh
 	next[i].Lifecycle = lc
-	next[i].Lifecycle.UpdatedAt = s.now()
-	if next[i].Gen == 0 {
-		next[i].Gen = 1
-	} else {
-		next[i].Gen++
+	// Generation and UpdatedAt move only when the secret bytes change, so a
+	// known compromise for those bytes survives a later checker failure.
+	if next[i].Gen == 0 || !same {
+		next[i].Lifecycle.UpdatedAt = s.now()
+		if next[i].Gen == 0 {
+			next[i].Gen = 1
+		} else {
+			next[i].Gen++
+		}
 	}
 	s.redactor.Add(secret)
 	rows, err := s.rowsForChange(next, id, actionReplace, actionHealth)
 	if err != nil {
 		wipe(fresh)
-		return Credential{}, err
+		return Credential{}, s.failConflict(actionReplace, err)
 	}
 	if err := s.commitPlans(rows, next, nil); err != nil {
 		wipe(fresh)
@@ -429,7 +434,7 @@ func (s *Session) SetLifecycle(id string, opt LifecycleOptions) (Credential, err
 	}
 	rows, err := s.rowsForChange(next, id, actionLifecycle, actionHealth)
 	if err != nil {
-		return Credential{}, err
+		return Credential{}, s.failConflict(actionLifecycle, err)
 	}
 	if err := s.commitPlans(rows, next, nil); err != nil {
 		return Credential{}, err
@@ -466,7 +471,7 @@ func (s *Session) storeNew(rec credential) (Credential, error) {
 	next := append(cloneCreds(s.creds), rec)
 	rows, err := s.rowsForChange(next, rec.ID, actionPut, actionHealth)
 	if err != nil {
-		return Credential{}, err
+		return Credential{}, s.failConflict(actionPut, err)
 	}
 	if err := s.commitPlans(rows, next, nil); err != nil {
 		return Credential{}, err
@@ -1142,7 +1147,7 @@ func predictable(secret []byte, run int) bool {
 			return true
 		}
 	}
-	return repeatedByte(secret) || sequential(secret, run) || blockRepeat(secret, run)
+	return repeatedByte(secret, run) || sequential(secret, run) || blockRepeat(secret, run)
 }
 
 func containsCommon(lower string) bool {
@@ -1168,16 +1173,22 @@ func asciiLower(b []byte) ([]byte, bool) {
 	return out, true
 }
 
-func repeatedByte(b []byte) bool {
-	if len(b) < 4 {
+func repeatedByte(b []byte, run int) bool {
+	if run < 1 || len(b) < run {
 		return false
 	}
+	n := 1
 	for i := 1; i < len(b); i++ {
-		if b[i] != b[0] {
-			return false
+		if b[i] == b[i-1] {
+			n++
+			if n >= run {
+				return true
+			}
+			continue
 		}
+		n = 1
 	}
-	return true
+	return false
 }
 
 func sequential(b []byte, run int) bool {

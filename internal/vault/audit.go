@@ -452,7 +452,9 @@ func validAuditShape(ev auditEvent) error {
 }
 
 func validNoticeAudit(ev auditEvent) error {
-	if ev.V != auditNoticeVersion || !knownClass(ev.Class) || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq || ev.Operation != "" {
+	// reasons and cred_gen are outside the version-3 preimage. A notice row
+	// that carries either one is forged even when its hash still matches.
+	if ev.V != auditNoticeVersion || !knownClass(ev.Class) || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq || ev.Operation != "" || ev.Reasons != "" || ev.CredGen != 0 {
 		return ErrAudit
 	}
 	if ev.AgentID != "" && safeID(ev.AgentID) == "" {

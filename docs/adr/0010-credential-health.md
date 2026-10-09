@@ -12,7 +12,7 @@ Health has to be checked when a secret is added or replaced, and again when a hu
 
 Health lives in the encrypted credential document, next to the secret it describes. A missing `health` member means the credential has not been assessed. Unlock does not invent a healthy result.
 
-Each stored assessment records the credential generation, the assessment time, a sorted set of fixed finding codes, a compromise status, a strength status, and any explicitly unsupported checks. The generation increments only when the secret bytes are replaced. The first assessment of an older credential assigns generation 1 to the bytes already stored.
+Each stored assessment records the credential generation, the assessment time, a sorted set of fixed finding codes, a compromise status, a strength status, and any explicitly unsupported checks. The generation increments only when the secret bytes change. An identical replacement keeps the generation and `UpdatedAt`, so a known match for those bytes survives a later checker failure. A different value drops prior-value evidence. The first assessment of an older credential assigns generation 1 to the bytes already stored.
 
 Findings that can be true at the same time are `weak`, `reused`, `compromised`, `expired`, `review_due`, `rotation_due`, and `rotation_overdue`. Empty findings are not a health verdict. `evidence` is `unassessed`, `partial`, or `complete`. Complete means the applicable checks finished. It does not mean the credential is safe.
 
@@ -22,7 +22,7 @@ The session clock is the only time base for expiry, review, rotation, and freshn
 
 ### Password strength
 
-The heuristic is a fixed list of common passwords, ASCII case-folding at check time, keyboard walks, sequential runs, repeated bytes, and repeated blocks. Length below the configured minimum is weak. Character-class counts are not treated as strength. The stored bytes are not lowercased, normalized, or truncated.
+The heuristic is a fixed list of common passwords, ASCII case-folding at check time, keyboard walks, sequential runs, contiguous repeated-byte runs, and repeated blocks. Sequential and repeated-byte runs use the pattern-run threshold, including a run that has a different prefix or suffix. Length below the configured minimum is weak. Character-class counts are not treated as strength. The stored bytes are not lowercased, normalized, or truncated.
 
 The scan reads at most 8192 bytes. A longer secret is stored whole and reported `unassessed` with unknown code `strength_bounded`. The list is not a breach corpus and not a general dictionary. Non-ASCII passwords are not matched against that list.
 
@@ -40,7 +40,7 @@ No lookup runs unless a human sets `compromise_opt_in` and the process has a `Co
 
 The checker receives `Algorithm: sha256` and a 5-hex-character prefix of SHA-256 over the exact secret bytes. It does not receive the password, the rest of the hash, the credential id, or the vault id. It returns lowercase hex suffixes. The vault compares those suffixes locally. More than 1024 suffixes, a wrong length, uppercase, or a non-hex suffix makes the whole response `unavailable`. Checker errors are dropped. The prefix is not written to the audit row or the process log.
 
-A checker that calls back into the vault and commits changes the audit sequence. The in-flight result is discarded with `ErrConflict`, whose text is fixed. A delayed match cannot land on a replacement.
+A checker that calls back into the vault and commits changes the audit sequence. The in-flight result is discarded with `ErrConflict`, whose text is fixed, and the outer attempt is recorded as a fixed denial against the current vault state. The planned secret, health, and policy are not committed. A delayed match cannot land on a replacement.
 
 An external checker is not implemented here. One added later must speak this prefix protocol, use HTTPS, refuse redirects, bound the request and the response, and keep the prefix out of logs. The destination and the exact transmitted fields are the algorithm name and the 5-hex prefix. The residual limit is that the checker learns that 20-bit prefix and nothing else about the vault.
 
@@ -58,7 +58,7 @@ A refresh that does not change findings appends one `health_refresh` / `unchange
 
 ### Audit and notification
 
-`credential_put`, `credential_get`, and `credential_list` stay version 1. Health operations use audit version 4. The version-4 preimage is the version-1 preimage plus a length-prefixed canonical reason list and the credential generation as a uint64. Version-1, version-2, and version-3 preimages are unchanged. Older databases gain `reasons` and `cred_gen`, defaulting empty and zero. Existing hashes are not rewritten.
+`credential_put`, `credential_get`, and `credential_list` stay version 1. Health operations use audit version 4. The version-4 preimage is the version-1 preimage plus a length-prefixed canonical reason list and the credential generation as a uint64. Version-1, version-2, and version-3 preimages are unchanged. Older databases gain `reasons` and `cred_gen`, defaulting empty and zero. Existing hashes are not rewritten. Version-3 notice rows leave both columns empty. Verification and human reads reject a notice row that carries either column, because those values are outside the version-3 preimage.
 
 The latest `health_assess` or `health_refresh` row for a credential must match the stored generation and findings. A legacy credential has neither. A mismatch fails unlock and verify.
 
@@ -96,11 +96,11 @@ Human reads are `health_get` and `health_list` at audit version 1. `AgentPrincip
 
 ## Tests
 
-- Common, patterned, and class-mixed passwords; Unicode and malformed bytes round-trip without normalization; over-long secrets stay intact and unassessed.
+- Common, patterned, and class-mixed passwords; Unicode and malformed bytes round-trip without normalization; over-long secrets stay intact and unassessed. A repeated-byte run at the pattern-run threshold is weak with a prefix, suffix, or different neighbors. A shorter run is not.
 - Reuse is reported on the other credential, cleared when the match goes away, and excluded for the same id.
 - Replace keeps id, type, creation time, and grant scope. A faulted replace leaves the secret, peer findings, and audit chain unchanged.
-- A checker sees only the prefix. Opt-in and a checker are both required. Malformed bodies and errors do not become a clear result or erase a match. A reentrant replace discards the delayed result.
+- A checker sees only the prefix. Opt-in and a checker are both required. Malformed bodies and errors do not become a clear result or erase a match. An identical replacement keeps that match; a changed value does not. A reentrant call discards the delayed result and records a fixed denial for the outer refresh, replace, ingest, lifecycle, and policy attempt.
 - Due and overdue boundaries, explicit dates over intervals, disabled policy, and replacement resetting an interval use the session clock.
-- A legacy document without health opens as unassessed. Invalid health and a document that disagrees with the health row fail closed. An older audit table migrates without changing version-1 hashes.
+- A legacy document without health opens as unassessed. Invalid health and a document that disagrees with the health row fail closed. An older audit table migrates without changing version-1 hashes. A version-3 respond, notify, or contain row with forged reasons or cred_gen fails verify, unlock, and read.
 - Repeated refresh does not repeat the alert. Delivery failure keeps the health row, retries twice, and recovers after reopen. A nil sink does not invent a failure. Containment does not suspend an agent for a weak password.
 - A sentinel secret and a checker error that contains it are absent from audit rows, notifications, and logs.

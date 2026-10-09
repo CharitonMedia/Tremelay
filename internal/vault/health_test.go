@@ -21,7 +21,18 @@ func TestPasswordStrengthIsNotCharacterClasses(t *testing.T) {
 		[]byte("qwertyuiop"),
 		[]byte("abcdefghijkl"),
 		[]byte("aaaaaaaaaaaa"),
+		[]byte("aaaaaaaaaaaa!"),
+		[]byte("!aaaaaaaaaaaa"),
+		[]byte("abc!!!!!!defg"),
 		[]byte("abcabcabcabc"),
+	}
+	if got, _ := assessPassword([]byte("k9#aaaaa$m2qz"), pol); got != StrengthAcceptable {
+		t.Fatalf("short run %s", got)
+	}
+	shortRun := pol
+	shortRun.Run = 4
+	if got, _ := assessPassword([]byte("k9#aaaa$m2qz!"), shortRun); got != StrengthWeak {
+		t.Fatalf("lowered run %s", got)
 	}
 	for _, secret := range weak {
 		if got, _ := assessPassword(secret, pol); got != StrengthWeak {
@@ -879,6 +890,222 @@ func TestAttemptWriteFailureDoesNotCallCheckerSink(t *testing.T) {
 	}
 	if len(sink.Snapshot()) != 1 {
 		t.Fatalf("recovered %+v", sink.Snapshot())
+	}
+}
+
+func TestUnchangedReplacementKeepsKnownCompromise(t *testing.T) {
+	_, _, session := mustCreate(t, nil)
+	policy := DefaultHealthPolicy()
+	policy.CompromiseOptIn = true
+	if err := session.SetHealthPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	secret := strongPass(t)
+	checker := &fakeChecker{hashes: map[string]struct{}{}}
+	sum := sha256.Sum256(secret)
+	checker.hashes[hex.EncodeToString(sum[:])] = struct{}{}
+	if err := session.SetCompromiseChecker(checker); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := session.Put("pw", "password", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := mustHealth(t, session, stored.ID)
+	if h.Compromise != CompromiseMatch || !finding(h, ReasonCompromised) {
+		t.Fatalf("match %+v", h)
+	}
+	gen := h.SecretVersion
+	updated := mustOne(t, session).Lifecycle.UpdatedAt
+	checker.err = errors.New("down-" + randHex(t, 8))
+	if _, err := session.Replace(stored.ID, append([]byte(nil), secret...), LifecycleOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(mustGet(t, session, stored.ID), secret) {
+		t.Fatal("identical replacement changed the secret")
+	}
+	if got := mustOne(t, session).Lifecycle.UpdatedAt; !got.Equal(updated) {
+		t.Fatal("identical replacement moved UpdatedAt")
+	}
+	h = mustHealth(t, session, stored.ID)
+	if h.SecretVersion != gen || h.Compromise != CompromiseMatch || !finding(h, ReasonCompromised) {
+		t.Fatalf("match erased %+v", h)
+	}
+	other := strongPass(t)
+	if _, err := session.Replace(stored.ID, other, LifecycleOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	h = mustHealth(t, session, stored.ID)
+	if h.SecretVersion == gen || h.Compromise != CompromiseUnavailable || finding(h, ReasonCompromised) {
+		t.Fatalf("changed value kept prior match %+v", h)
+	}
+	if !bytes.Equal(mustGet(t, session, stored.ID), other) {
+		t.Fatal("changed replacement missing")
+	}
+}
+
+func TestCheckerConflictAuditsOuterAttempt(t *testing.T) {
+	_, _, session := mustCreate(t, nil)
+	policy := DefaultHealthPolicy()
+	policy.CompromiseOptIn = true
+	if err := session.SetHealthPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := "checker-callback-" + randHex(t, 12)
+	checker := &fakeChecker{err: errors.New(sentinel)}
+	if err := session.SetCompromiseChecker(checker); err != nil {
+		t.Fatal(err)
+	}
+	secret := strongPass(t)
+	stored, err := session.Put("pw", "password", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := credIndex(session.creds, stored.ID)
+	before := append([]byte(nil), session.creds[i].Secret...)
+	expires := session.creds[i].Lifecycle.ExpiresAt
+	min := session.hpolicy.MinPasswordLength
+
+	hook := func() {
+		if _, err := session.Health(stored.ID); err != nil {
+			t.Errorf("inner health %v", err)
+		}
+	}
+	run := func(action string, call func() error) {
+		t.Helper()
+		checker.hook = hook
+		if err := call(); !errors.Is(err, ErrConflict) {
+			t.Fatalf("%s %v", action, err)
+		}
+		assertConflictDenial(t, session, action, sentinel)
+	}
+	run(actionRefresh, func() error { return session.RefreshHealth(stored.ID) })
+	run(actionReplace, func() error {
+		_, err := session.Replace(stored.ID, strongPass(t), LifecycleOptions{})
+		return err
+	})
+	run(actionPut, func() error {
+		_, err := session.Put("other", "password", strongPass(t), PutOptions{})
+		return err
+	})
+	due := time.Now().UTC().Add(48 * time.Hour)
+	run(actionLifecycle, func() error {
+		_, err := session.SetLifecycle(stored.ID, LifecycleOptions{ExpiresAt: &due})
+		return err
+	})
+	wider := policy
+	wider.MinPasswordLength = 20
+	run(actionHealthPolicy, func() error { return session.SetHealthPolicy(wider) })
+
+	i = credIndex(session.creds, stored.ID)
+	if i < 0 || !bytes.Equal(session.creds[i].Secret, before) || session.creds[i].Lifecycle.ExpiresAt != expires {
+		t.Fatal("conflict committed credential state")
+	}
+	if len(session.creds) != 1 || session.hpolicy.MinPasswordLength != min {
+		t.Fatal("conflict committed ingest or policy")
+	}
+}
+
+func assertConflictDenial(t *testing.T, s *Session, action, sentinel string) {
+	t.Helper()
+	found := false
+	for _, ev := range s.audit {
+		if strings.Contains(ev.Reasons, sentinel) || strings.Contains(ev.Result, sentinel) || strings.Contains(ev.Action, sentinel) {
+			t.Fatalf("callback text in %s", ev.Action)
+		}
+		if ev.Action == action && ev.Result == resultDenied && ev.Reasons == "" && ev.CredGen == 0 && ev.CredID == "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing denial for %s", action)
+	}
+}
+
+func TestNoticeRowsRejectUnauthenticatedHealthColumns(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	sink := &MemoryNotifier{}
+	if err := session.SetNotifier(sink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Put("pw", "password", []byte("password"), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var respondHash string
+	seen := map[string]bool{}
+	for _, ev := range session.audit {
+		if !noticeAction(ev.Action) {
+			continue
+		}
+		seen[ev.Action] = true
+		if ev.Action == actionRespond {
+			respondHash = ev.Hash
+		}
+		if ev.Reasons != "" || ev.CredGen != 0 {
+			t.Fatalf("notice stored health columns %+v", ev)
+		}
+	}
+	if !seen[actionRespond] || !seen[actionNotify] || respondHash == "" {
+		t.Fatalf("notices %v", seen)
+	}
+	contain, err := nextAudit(session.audit, session.id, auditEvent{
+		Action: actionContain,
+		Result: resultFlagged,
+		Class:  ClassHealth,
+		RefSeq: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.audit = append(session.audit, contain)
+	for _, action := range []string{actionRespond, actionNotify, actionContain} {
+		idx := -1
+		for i := range session.audit {
+			if session.audit[i].Action == action {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			t.Fatalf("missing %s", action)
+		}
+		row, err := session.AuditBySeq(session.audit[idx].Seq, session.audit[idx].Hash)
+		if err != nil || row.Reasons != "" || row.CredGen != 0 {
+			t.Fatalf("%s read %+v %v", action, row, err)
+		}
+		session.audit[idx].Reasons = "forged-reason"
+		session.audit[idx].CredGen = 999
+		forged, err := session.AuditBySeq(session.audit[idx].Seq, "")
+		if !errors.Is(err, ErrAudit) || forged.Reasons == "forged-reason" || forged.CredGen == 999 {
+			t.Fatalf("%s forged read %+v %v", action, forged, err)
+		}
+		session.audit[idx].Reasons = ""
+		session.audit[idx].CredGen = 0
+	}
+	session.Lock()
+
+	db := mustOpen(t, path)
+	for _, action := range []string{actionRespond, actionNotify} {
+		res, err := db.Exec(`UPDATE audit SET reasons=?, cred_gen=? WHERE action=?`, "forged-reason", 999, action)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			t.Fatalf("%s rows %d %v", action, n, err)
+		}
+	}
+	var hash string
+	if err := db.QueryRow(`SELECT hash FROM audit WHERE action=?`, actionRespond).Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	if hash != respondHash {
+		t.Fatal("tamper rewrote the version-3 hash")
+	}
+	if _, err := VerifyAudit(path, pass); !errors.Is(err, ErrAudit) {
+		t.Fatalf("verify %v", err)
+	}
+	if _, err := Unlock(path, pass, nil); !errors.Is(err, ErrAudit) {
+		t.Fatalf("unlock %v", err)
 	}
 }
 

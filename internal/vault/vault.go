@@ -682,6 +682,19 @@ func (s *Session) denyAction(action string, cause error) error {
 	return cause
 }
 
+// failConflict records a fixed denial when a checker commits during evaluation.
+// Planned credential state is not written. The checker error is not stored.
+func (s *Session) failConflict(action string, err error) error {
+	if err == nil || !errors.Is(err, ErrConflict) {
+		return err
+	}
+	if auditErr := s.persistEvent(action, "", "", resultDenied); auditErr != nil {
+		return auditErr
+	}
+	s.logf("%s result=denied", action)
+	return ErrConflict
+}
+
 func (s *Session) persistEvent(action, credID, credType, result string) error {
 	ev, err := nextEvent(s.audit, action, s.id, credID, credType, result)
 	if err != nil {
