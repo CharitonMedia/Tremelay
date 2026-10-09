@@ -51,4 +51,4 @@ jobs:
       - name: Test review ownership and fixed cycle budget
         run: python3 scripts/goal_agent_request.py self-check
       - name: Test automatic checkpoint supervisor
-        run: python3 -m unittest discover -s automation_tests -p 'test_checkpoint_supervisor.py'
+        run: python3 -m unittest discover -s automation_tests -p 'test_*.py'

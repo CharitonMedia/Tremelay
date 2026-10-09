@@ -34,6 +34,45 @@ At the limit:
 
 The count must not be reset by rewording the same defect, restarting the workflow, or spawning a fresh agent against the same unresolved PR lineage.
 
+## Recovering an ordinary review-worker launch
+
+Every ordinary goal-review launch now reserves a deterministic Cursor agent ID
+bound to repository, PR, reviewed commit and review ID before its sole create
+request. Its owner-authored claim records a fixed, validated state envelope.
+The stages distinguish definitely unattempted preparation from a potentially
+accepted dispatch. A GitHub read/validation failure before the create attempt
+releases the claim with verified deletion or a non-owning replacement comment.
+An attempted create with a lost response, 5xx, or agent-ID conflict retains the
+claim and never causes a repeat POST. Response bodies are not copied into logs.
+
+The normal completion job reconciles that recorded identity. If a launch or
+completion job was interrupted, run the `goal` workflow manually on `main`
+with `recovery_pr` set to the PR number and `recovery_comment` set to the
+existing PR reservation comment ID (also reported in the job log when available).
+This recovery is
+serialized with launches for the same PR. It only GETs Cursor; it never creates,
+restarts, cancels, or replaces a worker and does not remove a stop label.
+Normal completion uses that same concurrency group and recovery path. A newer
+review or head cannot create a competitor while a recorded ordinary worker is
+still prepared, reserved, running, or awaiting its review-completion write.
+Both the ordinary launcher and the checkpoint supervisor enforce that ownership;
+the supervisor checks again immediately before dispatch. Delayed review/inline
+events cannot override a newer approval, dismissal, or clean exact-head review.
+
+- A validated `prepared` claim can be released because no create was attempted.
+- A reserved or working claim is reconciled through its stable agent/run IDs.
+  A missing/uncertain GET is not proof that no worker exists; the claim stays.
+- Nonterminal workers retain ownership without repeated comment writes.
+- A finished worker must have advanced the same PR through a descendant commit
+  before an idempotent exact-head Codex review is requested.
+- Terminal failures or no-op finishes remain recorded and counted; they do not
+  launch replacements or silently reset the three-cycle allowance.
+
+Checkpoint comments escape all copied evidence, including HTML control markers
+and plain-text cycle phrases. Quoted findings, paths, prior attempts and CI
+metadata cannot become owner-authorized launch, resume or supervisor state.
+Only the formatter's own final checkpoint marker remains active.
+
 ## CI
 
-Tremelay runs general Go CI plus dedicated `Test Linux` and `Test Windows` workflows used by exact-head review orchestration. CI also verifies the pinned Ponytail Cursor rule and compiles the Python automation helpers.
+Tremelay runs general Go CI plus dedicated `Test Linux` and `Test Windows` workflows used by exact-head review orchestration. CI also verifies the pinned Ponytail Cursor rule, compiles the Python automation helpers, and runs all automation regression test files. The launch tests execute the actual workflow shell with mocked GitHub/Cursor commands; no live workers are used.

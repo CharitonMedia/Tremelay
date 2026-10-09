@@ -13,6 +13,16 @@ on:
     types: [created]
   issue_comment:
     types: [created, edited]
+  workflow_dispatch:
+    inputs:
+      recovery_pr:
+        description: PR number for GET-only review-worker reconciliation
+        type: number
+        required: true
+      recovery_comment:
+        description: Existing launch reservation comment ID; never creates a worker
+        type: number
+        required: true
 
 permissions:
   contents: write
@@ -283,6 +293,7 @@ jobs:
       cancel-in-progress: false
     outputs:
       launch: ${{ steps.claim.outputs.launch }}
+      claim_id: ${{ steps.launch.outputs.claim_id }}
       agent_id: ${{ steps.launch.outputs.agent_id }}
       run_id: ${{ steps.launch.outputs.run_id }}
       before_sha: ${{ steps.launch.outputs.before_sha }}
@@ -290,6 +301,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           token: ${{ github.token }}
       - uses: actions/setup-python@v5
         with:
@@ -443,6 +455,7 @@ jobs:
           claim_id=""
           accepted=false
           settled=false
+          attempted=false
           # A released reservation is gone, or its body no longer owns the review.
           # 404 counts: a previous attempt already deleted the comment.
           claim_http() {
@@ -465,11 +478,11 @@ jobs:
             if [ -z "$claim_id" ]; then
               return 0
             fi
-            decision=$(python scripts/goal_agent_request.py claim-release --accepted "$accepted" --settled "$settled")
+            decision=$(python scripts/goal_agent_request.py claim-release --accepted "$accepted" --settled "$settled" --attempted "$attempted")
             if [ "$decision" != "delete" ]; then
               return 0
             fi
-            # A 4xx rejection did not start a worker. Delete the reservation.
+            # Pre-create failures and definitive rejection did not start a worker.
             # If GitHub still has the comment, replace the body so it neither
             # owns the review nor counts as a cycle. A failed release stays failed.
             released=$(python scripts/goal_agent_request.py released-body)
@@ -484,29 +497,40 @@ jobs:
               sleep "$attempt"
               attempt=$((attempt + 1))
             done
-            echo "Rejected launch reservation ${claim_id} was not released." >&2
+            echo "Unstarted launch reservation ${claim_id} was not released." >&2
             return 1
           }
           trap release_claim EXIT
           trap 'exit 1' TERM INT
-          claim_body=$(python scripts/goal_agent_request.py reservation-body --marker "$marker")
+          python scripts/goal_review_launch.py prepare --repository "$GITHUB_REPOSITORY" --pr "$number" --claim claim.json --payload payload.json --state launch_state.json --body reservation_body.txt
+          claim_body=$(cat reservation_body.txt)
           claim_id=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${number}/comments" -f body="$claim_body" --jq .id)
           if [ -z "$claim_id" ]; then
             echo "Launch reservation was not recorded."
             exit 1
           fi
+          # Persist a stable identity before any potentially accepted create.
+          # Local failures still release the claim until attempted becomes true.
+          python scripts/goal_review_launch.py body --state launch_state.json --phase dispatch_reserved --body dispatch_body.txt
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" -f body="$(cat dispatch_body.txt)" >/dev/null
           # Recheck open/head/stop immediately before create, after the durable claim.
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > precreate_pull.json
           if ! python -c 'import json,sys; p=json.load(open("precreate_pull.json")); c=json.load(open("claim.json")); sys.exit(0 if p["state"]=="open" and p["head"]["sha"]==c["head"] and "human-review-required" not in {l["name"] for l in p["labels"]} else 1)'; then
             echo "PR closed, moved, or stopped before Cursor create; refusing launch."
             exit 1
           fi
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews?per_page=100" > precreate_reviews.json
+          if ! python scripts/goal_agent_request.py review-current --claim claim.json --reviews precreate_reviews.json; then
+            echo "Independent review changed or became clean before create; refusing launch."
+            exit 1
+          fi
+          attempted=true
           set +e
           http_code=$(curl -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json -o response.json -w '%{http_code}' https://api.cursor.com/v1/agents)
           curl_status=$?
           set -e
           if [ "$curl_status" -ne 0 ]; then
-            echo "Cursor create did not settle (curl ${curl_status}). Keeping the launch claim."
+            echo "Cursor create did not settle (curl ${curl_status}). Keeping claim ${claim_id}; use manual GET-only recovery for PR ${number} and this comment ID."
             exit 1
           fi
           outcome=$(python scripts/goal_agent_request.py create-outcome --http-code "$http_code")
@@ -518,19 +542,17 @@ jobs:
             reject)
               settled=true
               echo "Cursor rejected create with HTTP ${http_code}."
-              cat response.json || true
               exit 1
               ;;
             *)
-              echo "Cursor create HTTP ${http_code} is ambiguous. Keeping the launch claim."
-              cat response.json || true
+              echo "Cursor create HTTP ${http_code} is ambiguous. Keeping claim ${claim_id}; use manual GET-only recovery for PR ${number} and this comment ID."
               exit 1
               ;;
           esac
-          url=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["url"])')
-          agent_id=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["id"])')
-          run_id=$(python -c 'import json; print(json.load(open("response.json"))["run"]["id"])')
-          started_body=$(python scripts/goal_agent_request.py accepted-body --url "$url" --marker "$marker")
+          python scripts/goal_review_launch.py body --state launch_state.json --phase working --response response.json --body started_body.txt
+          agent_id=$(python -c 'import json; print(json.load(open("launch_state.json"))["agent_id"])')
+          run_id=$(python -c 'import json; print(json.load(open("launch_state.json"))["run_id"])')
+          started_body=$(cat started_body.txt)
           # The reservation already counts. This PATCH records the agent URL in
           # that same comment. It must succeed before the job continues; a
           # failure leaves the counted claim in place and does not launch another worker.
@@ -539,14 +561,45 @@ jobs:
           echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
           echo "before_sha=${before}" >> "$GITHUB_OUTPUT"
           echo "pr_number=${number}" >> "$GITHUB_OUTPUT"
+          echo "claim_id=${claim_id}" >> "$GITHUB_OUTPUT"
+
+  recover-review:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: goal-review-${{ inputs.recovery_pr }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Reconcile an existing review worker without another create
+        env:
+          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          RECOVERY_PR: ${{ inputs.recovery_pr }}
+          RECOVERY_COMMENT: ${{ inputs.recovery_comment }}
+        run: |
+          set -euo pipefail
+          bash scripts/require_goal_github_token.sh
+          python scripts/goal_review_launch.py recover --repository "$GITHUB_REPOSITORY" --pr "$RECOVERY_PR" --comment "$RECOVERY_COMMENT"
 
   request-codex:
     needs: review-launch
     if: needs.review-launch.result == 'success' && needs.review-launch.outputs.launch == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: goal-review-${{ needs.review-launch.outputs.pr_number }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           token: ${{ github.token }}
       - uses: actions/setup-python@v5
         with:
@@ -561,19 +614,5 @@ jobs:
           bash scripts/require_goal_github_token.sh
           number="${{ needs.review-launch.outputs.pr_number }}"
           status=$(bash scripts/wait_for_agent_run.sh "${{ needs.review-launch.outputs.agent_id }}" "${{ needs.review-launch.outputs.run_id }}")
-          before="${{ needs.review-launch.outputs.before_sha }}"
-          after=$(gh pr view "$number" --json headRefOid --jq .headRefOid)
-          if [ "$status" != "FINISHED" ]; then
-            gh pr comment "$number" --body "Cursor remediation stopped without a commit. Terminal status: \`$status\`. No Codex rereview was requested; human review or explicit relaunch is required."
-            exit 0
-          fi
-          if [ "$before" = "$after" ]; then
-            gh pr comment "$number" --body "Cursor remediation finished but did not move the pull-request head from \`$before\`. No Codex rereview was requested; human review or explicit relaunch is required."
-            exit 0
-          fi
-          gh pr view "$number" --json reviews > reviews.json
-          if comment=$(python scripts/goal_agent_request.py codex-rereview --status "$status" --before "$before" --after "$after" --reviews reviews.json); then
-            gh pr comment "$number" --body "$comment"
-          else
-            echo "no fresh Codex review requested (status ${status})"
-          fi
+          echo "Worker observation: ${status}; reconciling the original recorded identity."
+          python scripts/goal_review_launch.py recover --repository "$GITHUB_REPOSITORY" --pr "$number" --comment "${{ needs.review-launch.outputs.claim_id }}"

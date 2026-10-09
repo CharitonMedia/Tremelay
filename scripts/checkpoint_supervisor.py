@@ -387,12 +387,24 @@ def wait_for_goal_idle(number, head):
     raise Stop("Goal workflows remain active; no overlapping worker launch")
 
 
+def ordinary_worker_pending(number, comments):
+    # This controller also runs as __main__. The helper imports the module by
+    # name, so translate its controlled exception into this caller's class.
+    from goal_review_launch import pending_claim, Stop as ClaimStop
+    try:
+        return pending_claim(comments, REPO, number, AUTHOR)
+    except ClaimStop as error:
+        raise Stop(str(error)) from None
+
+
 def refresh_guard(number, head, review_id, *, require_stop=True, check_activity=True):
     if check_activity:
         wait_for_goal_idle(number, head)
     pull = gh(f"repos/{REPO}/pulls/{number}")
     if not eligible(pull, require_stop=require_stop) or pull["head"]["sha"] != head:
         raise Stop("PR changed during supervisor assessment")
+    if ordinary_worker_pending(number, pages(f"repos/{REPO}/issues/{number}/comments")):
+        raise Stop("An ordinary review worker still owns this PR")
     current = newest_review(pages(f"repos/{REPO}/pulls/{number}/reviews"), head)
     if current is None or current["id"] != review_id or (check_activity and active_goal_work(number, head)):
         raise Stop("Review changed or worker activity remains")
@@ -467,6 +479,9 @@ def run_one(pull, key, max_checkpoints):
     prefix = f"repos/{REPO}/issues/{number}"
     comments = pages(prefix + "/comments")
     states = records(comments)
+    if ordinary_worker_pending(number, comments):
+        print(f"PR #{number}: waiting for the existing ordinary review worker")
+        return
     review = newest_review(pages(f"repos/{REPO}/pulls/{number}/reviews"), head)
     if review is None or active_goal_work(number, head):
         print(f"PR #{number}: waiting for exact-head review or active worker")
