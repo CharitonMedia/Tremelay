@@ -9,6 +9,14 @@ Tremelay uses Cursor Cloud Agents for implementation and Codex for review. The a
 
 These secrets are repository configuration and are not stored in the Tremelay source tree.
 
+## Independent checkpoint assessment
+
+The default-branch supervisor can assess stopped checkpoints through Claude
+Sonnet 5.5 using short-lived Anthropic WIF credentials. It remains disabled until
+separately authorized and retains all three-cycle and exact-head review guards.
+See [setup and activation](checkpoint-supervisor.md). This adds no OpenAI API-key
+requirement and no automatic provider or model fallback.
+
 ## Starting a goal
 
 1. Write a GitHub issue with outcome-oriented acceptance criteria.

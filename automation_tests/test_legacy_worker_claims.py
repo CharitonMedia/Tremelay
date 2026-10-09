@@ -120,7 +120,7 @@ class LegacyOwnershipTests(unittest.TestCase):
             with self.subTest(body=body), patch.object(supervisor, 'pages', return_value=[item]), \
                     patch.object(supervisor, 'assess') as model, patch.object(supervisor, 'cursor') as worker, \
                     patch.object(supervisor, 'gh', return_value=pull), patch.object(supervisor, 'wait_for_goal_idle'):
-                supervisor.run_one(pull, 'test-only-key', 3)
+                supervisor.run_one(pull, 3)
                 for activity in [False, True]:
                     with self.assertRaisesRegex(supervisor.Stop, 'ordinary review worker'):
                         supervisor.refresh_guard(PR, AFTER, 42, check_activity=activity)
@@ -199,7 +199,7 @@ class LegacyOwnershipTests(unittest.TestCase):
             return {'login': supervisor.AUTHOR}
         def forbidden(*args, **kwargs):
             self.fail('No model or worker calls are authorized by ambiguous historical evidence')
-        env = {'GITHUB_REPOSITORY': REPO, 'GH_TOKEN': 'test-owner', 'OPENAI_API_KEY': 'test-openai',
+        env = {'GITHUB_REPOSITORY': REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'test-owner',
                'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3',
                'TREMELAY_SUPERVISOR_ACTIVATION': script['ACTIVATION_VALUE']}
         namespace = script['main'].__globals__

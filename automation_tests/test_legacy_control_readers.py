@@ -288,7 +288,7 @@ class SupervisorDedupe(unittest.TestCase):
                 patch.object(supervisor, "active_goal_work", return_value=False), \
                 patch.object(supervisor, "gh") as api, patch.object(supervisor, "assess") as model, \
                 patch.object(supervisor, "cursor") as worker:
-            supervisor.run_one(PULL, "unused-test-sentinel", 3)
+            supervisor.run_one(PULL, 3)
         model.assert_not_called()
         worker.assert_not_called()
         api.assert_called_once()
