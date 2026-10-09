@@ -322,12 +322,13 @@ jobs:
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)
             marker="<!-- tremelay-cycle-stop head:${head} limit:${max_cycles} -->"
-            existing=$(MARKER="$marker" python - <<'PY'
-          import json, os
+            existing=$(HEAD="$head" LIMIT="$max_cycles" python - <<'PY'
+          import json, os, sys
+          sys.path.insert(0, "scripts")
+          from automation_protocol import stop_comment_matches
           pages=json.load(open("cycle_comments.json", encoding="utf-8"))
           comments=[c for page in pages for c in page]
-          marker=os.environ["MARKER"]
-          print("yes" if any(marker in (c.get("body") or "") for c in comments) else "no")
+          print("yes" if any(stop_comment_matches(c, os.environ["HEAD"], int(os.environ["LIMIT"])) for c in comments) else "no")
           PY
             )
             if [ "$existing" != "yes" ]; then

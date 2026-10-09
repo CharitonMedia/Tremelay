@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 
 from checkpoint_supervisor import gh, pages, newest_review
-from goal_agent_request import CYCLE_COUNT_MARKERS, CYCLE_LIMIT, HUMAN_RESUME_MARKER, TRUSTED_AUTOMATION_LOGIN, comment_counts_cycle, flatten_pages
+from automation_protocol import is_resume_authorization
+from goal_agent_request import CYCLE_COUNT_MARKERS, CYCLE_LIMIT, TRUSTED_AUTOMATION_LOGIN, comment_counts_cycle, flatten_pages
 
 
 def evidence_text(text):
@@ -23,7 +24,7 @@ def evidence_text(text):
 def stop_body(head, comments, review, findings, runs):
     start = 0
     for i, comment in enumerate(comments):
-        if comment.get('user', {}).get('login') == TRUSTED_AUTOMATION_LOGIN and HUMAN_RESUME_MARKER in (comment.get('body') or ''):
+        if comment.get('user', {}).get('login') == TRUSTED_AUTOMATION_LOGIN and is_resume_authorization(comment.get('body')):
             start = i + 1
     attempts = [c for c in comments[start:] if comment_counts_cycle(c.get('body') or '')]
     lines = [f'Automation stopped after {len(attempts)} counted attempts in this segment (limit {CYCLE_LIMIT}).',

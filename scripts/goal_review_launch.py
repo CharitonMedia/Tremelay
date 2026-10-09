@@ -4,6 +4,7 @@
 The trusted workflow serializes prepare/dispatch/recovery per PR. It persists
 prepared before dispatch_reserved, persists dispatch_reserved before its sole
 Cursor POST, and never repeats that POST. Recovery cannot create a worker.
+Legacy claims have no pre-create guarantee and need separate GET-only evidence.
 """
 from __future__ import annotations
 
@@ -14,13 +15,20 @@ import re
 import sys
 import uuid
 
+from automation_protocol import AmbiguousCheckpoint, is_checkpoint_evidence as protocol_checkpoint_evidence
 from checkpoint_supervisor import REPO, Stop, cursor, gh
-from goal_agent_request import TRUSTED_AUTOMATION_LOGIN, released_body, reservation_body, review_claim_marker
+from goal_agent_request import (TRUSTED_AUTOMATION_LOGIN, accepted_launch_body, released_body,
+                                reservation_body, review_claim_marker)
 
 MARKER = "<!-- goal-review-launch-v1 "
+LEGACY_MARKER = "<!-- goal-review-legacy-v1 "
+LEGACY_AGENT = re.compile(r"bc-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+LEGACY_CLAIM = re.compile(r"<!-- goal-review-claim review:([1-9][0-9]*) head:([0-9a-f]{40}) -->")
+LEGACY_PREFIX = "A cloud agent is working through the review findings:"
 SHA = re.compile(r"[0-9a-f]{40}")
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 TERMINAL = frozenset({"FINISHED", "ERROR", "CANCELLED", "EXPIRED"})
+LEGACY_PHASE_STATUSES = {"working": frozenset({"CREATING", "RUNNING"}), "terminal": TERMINAL}
 BASE_KEYS = {"repo", "pr", "review", "head", "agent_id", "phase"}
 PHASE_KEYS = {
     "prepared": set(), "dispatch_reserved": set(), "working": {"run_id"},
@@ -126,8 +134,94 @@ def parse_body(body):
     return state
 
 
+def checkpoint_evidence(body):
+    # The supervisor can run as __main__: use our controlled exception so its
+    # ordinary_worker_pending adapter can fail only this PR, not the whole scan.
+    try:
+        return protocol_checkpoint_evidence(body)
+    except AmbiguousCheckpoint as error:
+        raise Stop(str(error)) from None
+
+
+def legacy_candidate(body):
+    return (isinstance(body, str) and not checkpoint_evidence(body)
+            and ("<!-- goal-review-claim" in body
+                 or "<!-- goal-review-legacy" in body
+                 or LEGACY_PREFIX in body
+                 or "Cursor review launch claimed." in body))
+
+
+def parse_legacy_claim(body):
+    """Read exact historical bodies; they never establish a pre-create phase."""
+    if not isinstance(body, str) or checkpoint_evidence(body):
+        raise Stop("Expected an original legacy worker claim")
+    text = body.rstrip("\n")
+    claims = list(LEGACY_CLAIM.finditer(text))
+    identity = {}
+    if len(claims) == 1:
+        match = claims[0]
+        identity = {"review": match[1], "head": match[2]}
+        marker = match[0]
+        if text in {reservation_body(marker).rstrip("\n"),
+                    "Cursor review launch claimed.\n\n" + marker}:
+            return dict(identity, phase="legacy_reserved")
+    elif claims:
+        raise Stop("Ambiguous legacy review identity; manual reconciliation required")
+    # Pre-claim-marker accepted comments also counted an attempt. Keep that
+    # exact URL-only form, without inventing an original review or head.
+    match = re.fullmatch(re.escape(LEGACY_PREFIX) + r" https://cursor\.com/agents/(" +
+                         LEGACY_AGENT.pattern + r")(?:\n\n" + LEGACY_CLAIM.pattern + r")?", text)
+    if match:
+        return dict(identity, phase="legacy_accepted", agent_id=match[1])
+    raise Stop("Unrecognized legacy worker claim; manual reconciliation required")
+
+
+def validate_legacy_state(state):
+    required = {"repo", "pr", "comment_id", "agent_id", "run_id", "status", "phase"}
+    if (not isinstance(state, dict)
+            or set(state) not in (required, required | {"review", "head"})):
+        raise Stop("Invalid legacy reconciliation fields")
+    validate_target(state["repo"], state["pr"])
+    if (not positive_int(state["comment_id"])
+            or not isinstance(state["agent_id"], str) or not LEGACY_AGENT.fullmatch(state["agent_id"])
+            or not isinstance(state["run_id"], str) or not RUN_ID.fullmatch(state["run_id"])
+            or not isinstance(state["status"], str)
+            or not isinstance(state["phase"], str)
+            or state["status"] not in LEGACY_PHASE_STATUSES.get(state["phase"], ())):
+        raise Stop("Invalid legacy worker identity or status")
+    if "review" in state and (not isinstance(state["review"], str)
+            or not re.fullmatch(r"[1-9][0-9]*", state["review"])
+            or not isinstance(state["head"], str) or not SHA.fullmatch(state["head"])):
+        raise Stop("Invalid original legacy review identity")
+    return state
+
+
+def legacy_state_body(state):
+    validate_legacy_state(state)
+    url = "https://cursor.com/agents/" + state["agent_id"]
+    body = (accepted_launch_body(url, review_claim_marker(state["review"], state["head"]))
+            if "review" in state else LEGACY_PREFIX + " " + url + "\n").rstrip("\n")
+    body += "\n\nLegacy worker reconciled by read-only lookup. No new worker or review authorized."
+    body += f"\nVerified run status: {state['status']}."
+    body += ("\nVerified terminal worker; its consumed cycle remains recorded."
+             if state["phase"] == "terminal" else "\nExisting worker still owns this PR.")
+    return body + "\n\n" + LEGACY_MARKER + json.dumps(state, sort_keys=True, separators=(",", ":")) + " -->\n"
+
+
+def parse_legacy_state(body):
+    if not isinstance(body, str) or body.count(LEGACY_MARKER) != 1:
+        raise Stop("Expected exactly one legacy reconciliation record")
+    line = body.rstrip("\n").split("\n")[-1]
+    if not line.startswith(LEGACY_MARKER) or not line.endswith(" -->"):
+        raise Stop("Legacy reconciliation record must be the final line")
+    state = validate_legacy_state(load_json(line[len(LEGACY_MARKER):-4]))
+    if body.rstrip("\n") != legacy_state_body(state).rstrip("\n"):
+        raise Stop("Legacy claim body does not match its reconciliation record")
+    return state
+
+
 def pending_claim(comments, repository, pr, trusted_login):
-    """Keep newer reviews from replacing a still-owned ordinary worker."""
+    """Keep newer reviews from replacing any unresolved ordinary worker."""
     validate_target(repository, pr)
     if trusted_login != TRUSTED_AUTOMATION_LOGIN:
         raise Stop("Goal-review ownership requires the approved owner identity")
@@ -138,14 +232,23 @@ def pending_claim(comments, repository, pr, trusted_login):
         if not owner_authored(comment):
             continue
         body = comment.get("body")
-        if not isinstance(body, str) or "<!-- goal-review-launch-v1" not in body:
+        if not isinstance(body, str) or checkpoint_evidence(body):
             continue
-        saved = parse_body(body)
-        if (saved["repo"] != repository or saved["pr"] != pr
+        if "<!-- goal-review-launch" in body:
+            saved = parse_body(body)
+        elif "<!-- goal-review-legacy" in body:
+            saved = parse_legacy_state(body)
+            if saved["comment_id"] != comment.get("id"):
+                raise Stop("Legacy reconciliation targets another comment")
+        elif legacy_candidate(body):
+            saved = parse_legacy_claim(body)
+        else:
+            continue
+        if (saved.get("repo", repository) != repository or saved.get("pr", pr) != pr
                 or not positive_int(comment.get("id"))
                 or comment.get("issue_url") != f"https://api.github.com/repos/{REPO}/issues/{pr}"):
             raise Stop("Pending launch comment does not match its PR")
-        if saved["phase"] in {"prepared", "dispatch_reserved", "working", "review_reserved"}:
+        if saved["phase"] not in {"terminal", "completed"}:
             pending = True
     return pending
 
@@ -245,6 +348,79 @@ def finish_review(comment, state):
     return done
 
 
+def verify_legacy_target(agent, run, pr):
+    """Require service evidence of this repository and PR, never a URL guess.
+
+    Cursor GET Agent returns repos/workOnCurrentBranch. GET Run git.branches
+    uses scheme-less repoUrl and is agent-wide, not proof of a reviewed commit.
+    See https://cursor.com/docs/cloud-agent/api/endpoints#get-a-run.
+    """
+    repos = agent.get("repos")
+    if (not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict)
+            or repos[0].get("url") != f"https://github.com/{REPO}"
+            or agent.get("workOnCurrentBranch") is not True):
+        raise Stop("Legacy worker repository or branch ownership is unverified")
+    expected = f"https://github.com/{REPO}/pull/{pr}"
+    destination = repos[0].get("prUrl")
+    if destination is not None and destination != expected:
+        raise Stop("Legacy worker targets another PR")
+    matched = destination == expected
+    if "git" in run:
+        git = run["git"]
+        branches = git.get("branches") if isinstance(git, dict) else None
+        if not isinstance(branches, list):
+            raise Stop("Legacy worker branch evidence is invalid")
+        for branch in branches:
+            if (not isinstance(branch, dict) or branch.get("repoUrl") != f"github.com/{REPO}"
+                    or (branch.get("prUrl") is not None and branch["prUrl"] != expected)):
+                raise Stop("Legacy worker branch evidence targets another repository or PR")
+            matched = matched or branch.get("prUrl") == expected
+    if not matched:
+        raise Stop("Legacy worker PR association is unverified; manual reconciliation required")
+
+
+def recover_legacy(comment, state, repository, pr):
+    if "repo" in state and (state["repo"] != repository or state["pr"] != pr
+                           or state["comment_id"] != comment["id"]):
+        raise Stop("Legacy reconciliation targets another repository, PR or comment")
+    if state["phase"] == "legacy_reserved":
+        raise Stop("Legacy reservation has no recorded worker identity; manual reconciliation required")
+    if state["phase"] == "terminal":
+        return state
+    agent_id = state["agent_id"]
+    agent = cursor("/" + agent_id)
+    if not isinstance(agent, dict) or agent.get("id") != agent_id:
+        raise Stop("Cursor lookup did not establish legacy worker identity")
+    run_id = agent.get("latestRunId")
+    if (not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id)
+            or ("run_id" in state and state["run_id"] != run_id)):
+        raise Stop("Cursor lookup did not establish the same legacy run; manual reconciliation required")
+    run = cursor(f"/{agent_id}/runs/{run_id}")
+    if (not isinstance(run, dict) or run.get("id") != run_id or run.get("agentId") != agent_id
+            or not isinstance(run.get("status"), str)
+            or run["status"] not in TERMINAL | {"CREATING", "RUNNING"}):
+        raise Stop("Cursor lookup did not establish the legacy run status")
+    verify_legacy_target(agent, run, pr)
+    terminal = run["status"] in TERMINAL
+    if terminal:
+        # A historical run finishing does not release a newer run on this agent.
+        # Recheck the current service identity before persisting final ownership.
+        current = cursor("/" + agent_id)
+        if (not isinstance(current, dict) or current.get("id") != agent_id
+                or current.get("latestRunId") != run_id):
+            raise Stop("Legacy worker changed during reconciliation")
+        verify_legacy_target(current, run, pr)
+    saved = dict(state, repo=repository, pr=pr, comment_id=comment["id"], run_id=run_id,
+                 status=run["status"], phase="terminal" if terminal else "working")
+    body = legacy_state_body(saved)
+    if comment["body"].rstrip("\n") != body.rstrip("\n"):
+        gh(f"repos/{REPO}/issues/comments/{comment['id']}", method="PATCH", data={"body": body})
+        comment["body"] = body
+    # Ownership reconciliation cannot attribute historical FINISHED work to a
+    # current head. Never create a worker, request review, or clear the stop.
+    return saved
+
+
 def recover(repository, pr, comment_id):
     """Reconcile one serialized claim. Cursor calls here are always GET-only."""
     validate_target(repository, pr)
@@ -262,7 +438,14 @@ def recover(repository, pr, comment_id):
     # are not evidence that a reserved worker was never created.
     if isinstance(comment.get("body"), str) and comment["body"].rstrip("\n") == released_body().rstrip("\n"):
         return {"phase": "released"}
-    state = parse_body(comment.get("body"))
+    body = comment.get("body")
+    if checkpoint_evidence(body):
+        raise Stop("Checkpoint evidence is not an original worker claim")
+    if isinstance(body, str) and "<!-- goal-review-legacy" in body:
+        return recover_legacy(comment, parse_legacy_state(body), repository, pr)
+    if not isinstance(body, str) or "<!-- goal-review-launch" not in body:
+        return recover_legacy(comment, parse_legacy_claim(body), repository, pr)
+    state = parse_body(body)
     if state["repo"] != repository or state["pr"] != pr:
         raise Stop("Launch record targets another repository or PR")
     if state["phase"] == "prepared":

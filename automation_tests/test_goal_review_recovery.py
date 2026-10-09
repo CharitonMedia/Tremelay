@@ -237,11 +237,11 @@ class PendingClaimTests(unittest.TestCase):
             server = Server(phase)
             self.assertFalse(launch.pending_claim([server.claim], launch.REPO, PR, goal.TRUSTED_AUTOMATION_LOGIN))
 
-    def test_untrusted_and_metadata_free_legacy_comments_do_not_block_new_review(self):
+    def test_untrusted_claims_and_metadata_free_nonclaims_do_not_block_new_review(self):
         server = Server()
         server.claim["user"]["login"] = "outsider"
-        legacy = {"user": {"login": goal.TRUSTED_AUTOMATION_LOGIN}, "body": goal.reservation_body(CLAIM["marker"])}
-        self.assertFalse(launch.pending_claim([server.claim, legacy], launch.REPO, PR, goal.TRUSTED_AUTOMATION_LOGIN))
+        nonclaim = {"user": {"login": goal.TRUSTED_AUTOMATION_LOGIN}, "body": "Waiting for independent review."}
+        self.assertFalse(launch.pending_claim([server.claim, nonclaim], launch.REPO, PR, goal.TRUSTED_AUTOMATION_LOGIN))
 
     def test_malformed_trusted_record_fails_closed_even_after_valid_pending_record(self):
         server = Server()

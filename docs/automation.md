@@ -73,6 +73,29 @@ and plain-text cycle phrases. Quoted findings, paths, prior attempts and CI
 metadata cannot become owner-authorized launch, resume or supervisor state.
 Only the formatter's own final checkpoint marker remains active.
 
+### Upgrading existing control comments
+
+Reader hardening applies to already-stored comments, not only new output. The
+original full and oversized checkpoint envelopes are evidence: quoted supervisor,
+resume, claim, review-request and budget markers in them grant no authority.
+Genuine supervisor records must retain a canonical final state envelope, and
+genuine manual resume markers remain supported at their historical boundaries.
+An ambiguous stop body that may already have been rewritten into active state
+fails closed for explicit reconciliation; it is not silently erased from history.
+
+Pre-upgrade ordinary worker claims also retain ownership across newer heads and
+reviews, even without the newer launch-state record. The same GET-only recovery
+command can reconcile a canonical old accepted-worker URL after verifying the
+agent, run, repository and PR association. It records a separate legacy envelope
+under the same comment, preserving the original random agent ID and one consumed
+cycle. Only a verified terminal run releases pending ownership. Historical
+completion never triggers a new worker, Codex review, stop removal or budget reset.
+
+An old reservation with no recorded worker URL cannot prove that no create was
+attempted. It remains blocking and requires the owner to reconcile the original
+worker outside this automatic path. A missing lookup, newer review, elapsed time,
+or changed head does not justify discarding that reservation or launching again.
+
 ## CI
 
 Tremelay runs general Go CI plus dedicated `Test Linux` and `Test Windows` workflows used by exact-head review orchestration. CI also verifies the pinned Ponytail Cursor rule, compiles the Python automation helpers, and runs all automation regression test files. The launch tests execute the actual workflow shell with mocked GitHub/Cursor commands; no live workers are used.

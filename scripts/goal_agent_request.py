@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from complete_codex_clean_review import is_terminal_clean_review, reviewed_commit
+from automation_protocol import HUMAN_RESUME_MARKER, has_control_marker, is_checkpoint_evidence, is_resume_authorization
 
 DEFAULT_BASE_REF = "main"
 DEFAULT_REPO_URL = "https://github.com/CharitonMedia/Tremelay"
@@ -763,7 +764,6 @@ CYCLE_COUNT_MARKERS = (
     "Cursor remediation round ",
     "<!-- goal-review-claim ",
 )
-HUMAN_RESUME_MARKER = "<!-- tremelay-human-resume -->"
 TRUSTED_AUTOMATION_LOGIN = "pattalkslaw-del"
 CYCLE_LIMIT = 3
 _CLAIM_MARKER_RE = re.compile(
@@ -773,7 +773,7 @@ _CLAIM_MARKER_RE = re.compile(
 
 def comment_counts_cycle(body: str) -> bool:
     text = body or ""
-    return any(marker in text for marker in CYCLE_COUNT_MARKERS)
+    return not is_checkpoint_evidence(text) and any(marker in text for marker in CYCLE_COUNT_MARKERS)
 
 
 def reservation_body(marker: str) -> str:
@@ -835,7 +835,7 @@ def cycle_budget(comments: list | None) -> tuple[int, int]:
         if _actor_login(comment).casefold() != TRUSTED_AUTOMATION_LOGIN:
             continue
         body = comment.get("body") or ""
-        if isinstance(body, str) and HUMAN_RESUME_MARKER in body:
+        if is_resume_authorization(body):
             start = i + 1
     count = 0
     for comment in (comments or [])[start:]:
@@ -970,7 +970,7 @@ def review_claim_owned(
         login = ((comment.get("user") or {}).get("login") or "").casefold()
         if login != trusted:
             continue
-        if marker in (comment.get("body") or ""):
+        if has_control_marker(comment.get("body"), marker):
             return True
     return False
 
