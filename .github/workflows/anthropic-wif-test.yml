@@ -1,0 +1,92 @@
+name: anthropic-wif-test
+
+# One-off, authentication-only test. The isolated branch intentionally omits
+# inherited workflows so no implementation, review, or supervisor is triggered.
+# This does not change the Anthropic trust rule or any production branch.
+'on':
+  push:
+    branches: [auth-test/anthropic-wif-20261009]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  verify-authentication:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Exchange GitHub identity without calling a model
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          retries: 0
+          script: |
+            // Keep both credentials in process memory only. No checkout,
+            // artifacts, environment exports, model calls, or raw-body logging.
+            let jwt;
+            try {
+              jwt = await core.getIDToken('https://api.anthropic.com');
+              core.setSecret(jwt);
+            } catch {
+              core.setFailed('GitHub OIDC token acquisition failed; credential details suppressed.');
+              return;
+            }
+
+            let response;
+            try {
+              response = await fetch('https://api.anthropic.com/v1/oauth/token', {
+                method: 'POST',
+                redirect: 'error',
+                signal: AbortSignal.timeout(30000),
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                  grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+                  assertion: jwt,
+                  federation_rule_id: 'fdrl_013Lev2Ca6SiD7qZMn7EfUU5',
+                  organization_id: '466edc9f-6dfc-43fc-94c9-9c04564e7cda',
+                  service_account_id: 'svac_01SVrjZsb4viBXFasJ3V4t1J',
+                  workspace_id: 'wrkspc_01T2N8u5EmTvb6TbGoaAmWCo'
+                })
+              });
+            } catch {
+              core.setFailed('Anthropic token exchange failed at the network layer; credential details suppressed.');
+              return;
+            } finally {
+              jwt = undefined;
+            }
+
+            const result = {http_status: response.status, authentication_succeeded: false};
+            let body;
+            try {
+              body = await response.json();
+            } catch {
+              core.info(JSON.stringify(result));
+              core.setFailed('Anthropic token exchange returned invalid JSON; response body suppressed.');
+              return;
+            }
+
+            if (body && typeof body.access_token === 'string') {
+              core.setSecret(body.access_token);
+            }
+            const tokenReceived = Boolean(body && typeof body.access_token === 'string' &&
+              body.access_token.startsWith('sk-ant-oat01-'));
+            result.access_token_received = tokenReceived;
+            result.token_type = body && body.token_type === 'Bearer' ? 'Bearer' : null;
+            result.expires_in = body && Number.isInteger(body.expires_in) && body.expires_in > 0
+              ? body.expires_in : null;
+            const allowedScopes = ['workspace:developer', 'workspace:inference',
+              'workspace:manage_tunnels', 'org:admin'];
+            result.scope = body && allowedScopes.includes(body.scope) ? body.scope : null;
+            const allowedErrors = ['authentication_error', 'invalid_request_error',
+              'permission_error', 'rate_limit_error', 'api_error', 'overloaded_error'];
+            const errorType = body && body.error && body.error.type;
+            if (errorType) result.error_type = allowedErrors.includes(errorType) ? errorType : 'other_error';
+            result.authentication_succeeded = response.status === 200 && tokenReceived &&
+              result.token_type === 'Bearer' && result.expires_in !== null && result.scope !== null && !errorType;
+            // Deliberate allowlist: error messages, arbitrary response fields,
+            // JWT claims, and credential values cannot enter the audit output.
+            body = undefined;
+            core.info(JSON.stringify(result));
+            if (!result.authentication_succeeded) {
+              core.setFailed(`Authentication verification failed (HTTP ${response.status}); check Claude Console authentication history for the deny reason.`);
+            }
