@@ -254,6 +254,9 @@ func cmdList(args []string, getenv func(string) string, stdin io.Reader, stdout,
 				ExpiresAt:     cred.Lifecycle.ExpiresAt,
 				ReviewDueAt:   cred.Lifecycle.ReviewDueAt,
 				RotationDueAt: cred.Lifecycle.RotationDueAt,
+				// String form matches time.ParseDuration, including 0s when disabled.
+				RotationEvery: cred.Lifecycle.RotationEvery.String(),
+				ReviewEvery:   cred.Lifecycle.ReviewEvery.String(),
 			}
 			if err := enc.Encode(view); err != nil {
 				// A writer error can echo the encoded entry. Labels are
@@ -546,6 +549,8 @@ type listEntry struct {
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 	ReviewDueAt   *time.Time `json:"review_due_at,omitempty"`
 	RotationDueAt *time.Time `json:"rotation_due_at,omitempty"`
+	RotationEvery string     `json:"rotation_every"`
+	ReviewEvery   string     `json:"review_every"`
 }
 
 func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {

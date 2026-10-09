@@ -970,8 +970,42 @@ func TestCLIReplaceHealthRefreshAndPolicy(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := run([]string{"credential", "lifecycle", "--path", path, "--id", id, "--rotation-every", "1h"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+	if code := run([]string{"credential", "lifecycle", "--path", path, "--id", id, "--rotation-every", "1h", "--review-every", "24h"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
 		t.Fatalf("lifecycle %d %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "list", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("list lifecycle %d %s", code, stderr.String())
+	}
+	var listed map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed["id"] != id || listed["rotation_every"] != "1h0m0s" || listed["review_every"] != "24h0m0s" {
+		t.Fatalf("list intervals %#v", listed)
+	}
+	if _, ok := listed["secret"]; ok || bytes.Contains(stdout.Bytes(), next) {
+		t.Fatal("list exposed secret material")
+	}
+	assertNoSecret(t, &stdout, next, pass)
+	assertNoSecret(t, &stderr, secret, pass)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "lifecycle", "--path", path, "--id", id, "--rotation-every", "0s", "--review-every", "0s"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("disable lifecycle %d %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "list", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("list disabled %d %s", code, stderr.String())
+	}
+	listed = nil
+	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed["rotation_every"] != "0s" || listed["review_every"] != "0s" {
+		t.Fatalf("disabled intervals %#v", listed)
 	}
 	stdout.Reset()
 	stderr.Reset()
