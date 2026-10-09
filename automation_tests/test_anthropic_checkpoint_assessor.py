@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 import secrets
 import socket
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -106,6 +108,14 @@ class Transport(unittest.TestCase):
             code = a.main([] if args is None else args)
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def assert_failure(self, result, stage, http_status=None):
+        code, out, err = result
+        self.assertEqual((code, err), (1, a.SAFE_FAILURE + "\n"))
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertEqual(json.loads(out), {"status": "failed", "stage": stage, "http_status": http_status})
+        for secret in (self.request_token, self.jwt, self.token):
+            self.assertNotIn(secret, out + err)
+
     def test_exact_three_request_sequence_and_minimal_result(self):
         opener = self.opener()
         result = self.run_assessment(opener)
@@ -169,7 +179,7 @@ class Transport(unittest.TestCase):
         text = json.dumps(dict(DECISION, assessment="\\" * 25_000))
         self.assertLess(len(text.encode()), a.MAX_RESULT_BYTES)
         opener = self.opener(message=self.message_body(content=[{"type": "text", "text": text}]))
-        self.assertEqual(self.main(opener), (1, "", a.SAFE_FAILURE + "\n"))
+        self.assert_failure(self.main(opener), "runtime")
         self.assertEqual(len(opener.calls), 3)
 
     def test_current_and_regional_actions_hosts_preserve_supplied_route_and_query(self):
@@ -183,6 +193,22 @@ class Transport(unittest.TestCase):
                 self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(actual).query)["audience"],
                                  [a.AUDIENCE])
 
+    def test_actions_issued_double_slash_idtoken_route_is_preserved_through_preflight(self):
+        url = ("https://run-actions-1-azure-eastus.actions.githubusercontent.com/152//idtoken/"
+               "11111111-1111-1111-1111-111111111111/22222222-2222-2222-2222-222222222222?api-version=2.0")
+        self.environment["ACTIONS_ID_TOKEN_REQUEST_URL"] = url
+        opener = self.opener()
+        code, out, err = self.main(opener, raw=b"", args=["--preflight"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertTrue(json.loads(out)["authentication_succeeded"])
+        self.assertFalse(json.loads(out)["model_called"])
+        self.assertEqual(len(opener.calls), 2)
+        request = opener.calls[0][0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.full_url, url + "&audience=https%3A%2F%2Fapi.anthropic.com")
+        self.assertEqual(urllib.parse.urlsplit(request.full_url).path, urllib.parse.urlsplit(url).path)
+        self.assertEqual(request.get_header("Authorization"), "Bearer " + self.request_token)
+
     def test_bad_oidc_origins_paths_and_queries_never_receive_request_token(self):
         root = "https://pipelines.actions.githubusercontent.com"
         urls = [None, "", "https://evil.example/idtoken", "http://pipelines.actions.githubusercontent.com/a",
@@ -191,7 +217,7 @@ class Transport(unittest.TestCase):
                 "https://evil@pipelines.actions.githubusercontent.com/a", root + ":8443/a",
                 "https://127.0.0.1/a", "https://[::1]/a", root + "./a", root + "/",
                 root + "/a\\b", root + "/a\nb", " " + URL, root + "/a/../idtoken",
-                root + "/a/%2e%2e/idtoken", root + "/a/%252e/idtoken", root + "/a//idtoken",
+                root + "/a/%2e%2e/idtoken", root + "/a/%252e/idtoken",
                 root + "/a%2fidtoken", root + "/a%5cidtoken", root + "/a%00/idtoken",
                 root + "/a;idtoken", root + "/a%GG/idtoken", URL + "#fragment",
                 URL + "&audience=other", URL + "&%61udience=other", URL + "&AUDIENCE=other",
@@ -420,7 +446,7 @@ class Transport(unittest.TestCase):
                     text = text.replace(secret, "".join("\\u%04x" % ord(char) for char in secret))
                 opener = self.opener(message=self.message_body(content=[{"type": "text", "text": text}]))
                 code, out, err = self.main(opener)
-                self.assertEqual((code, out, err), (1, "", a.SAFE_FAILURE + "\n"))
+                self.assert_failure((code, out, err), "messages_response")
                 self.assertEqual(len(opener.calls), 3)
 
     def test_arbitrary_exception_text_error_bodies_and_urls_are_redacted(self):
@@ -428,7 +454,7 @@ class Transport(unittest.TestCase):
             opener = self.opener()
             opener.responses[stage] = RuntimeError(self.token + self.jwt + self.request_token)
             code, out, err = self.main(opener)
-            self.assertEqual((code, out, err), (1, "", a.SAFE_FAILURE + "\n"))
+            self.assert_failure((code, out, err), ["github_acquisition", "anthropic_exchange", "messages"][stage])
             self.assertEqual(len(opener.calls), stage + 1)
 
     def test_invalid_input_fails_before_identity_call(self):
@@ -448,7 +474,7 @@ class Transport(unittest.TestCase):
                           (b'{"head":1,"head":2}', []), (b'{"number":NaN}', []),
                           (b"{}", ["--model", self.token])):
             opener = self.opener()
-            self.assertEqual(self.main(opener, raw=raw, args=args), (1, "", a.SAFE_FAILURE + "\n"))
+            self.assert_failure(self.main(opener, raw=raw, args=args), "input")
             self.assertEqual(opener.calls, [])
 
     def test_smoke_makes_one_fixed_256_token_request_and_returns_only_safe_summary(self):
@@ -476,7 +502,7 @@ class Transport(unittest.TestCase):
         for raw, args in ((json.dumps(INPUT).encode(), ["--smoke"]), (b" ", ["--smoke"]),
                           (b"", ["--smoke", "--preflight"]), (b"", ["--smoke", "--model", "other"])):
             opener = self.opener()
-            self.assertEqual(self.main(opener, raw=raw, args=args), (1, "", a.SAFE_FAILURE + "\n"))
+            self.assert_failure(self.main(opener, raw=raw, args=args), "input")
             self.assertEqual(opener.calls, [])
         for kwargs in ({"value": INPUT, "smoke": True}, {"preflight": True, "smoke": True}):
             opener = self.opener()
@@ -497,7 +523,7 @@ class Transport(unittest.TestCase):
         for update in updates:
             opener = self.opener(message=self.message_body(content=[correct], **update)
                                  if "content" not in update else self.message_body(**update))
-            self.assertEqual(self.main(opener, raw=b"", args=["--smoke"]), (1, "", a.SAFE_FAILURE + "\n"))
+            self.assert_failure(self.main(opener, raw=b"", args=["--smoke"]), "messages_response")
             self.assertEqual(len(opener.calls), 3)
 
     def test_smoke_authentication_quota_and_ambiguous_errors_never_retry_or_fallback(self):
@@ -506,11 +532,80 @@ class Transport(unittest.TestCase):
                           urllib.error.HTTPError(a.MESSAGES_URL, 429, self.token, {}, io.BytesIO(self.jwt.encode()))):
                 opener = self.opener()
                 opener.responses[stage] = error
-                self.assertEqual(self.main(opener, raw=b"", args=["--smoke"]), (1, "", a.SAFE_FAILURE + "\n"))
+                self.assert_failure(self.main(opener, raw=b"", args=["--smoke"]),
+                    ["github_acquisition", "anthropic_exchange", "messages"][stage],
+                    429 if isinstance(error, urllib.error.HTTPError) else None)
                 self.assertEqual(len(opener.calls), stage + 1)
         opener = self.opener(token=self.token_body(scope="org:admin"))
-        self.assertEqual(self.main(opener, raw=b"", args=["--smoke"]), (1, "", a.SAFE_FAILURE + "\n"))
+        self.assert_failure(self.main(opener, raw=b"", args=["--smoke"]), "anthropic_response")
         self.assertEqual(len(opener.calls), 2)
+
+    def test_diagnostics_separate_url_tls_acquisition_and_response_stages(self):
+        self.environment["ACTIONS_ID_TOKEN_REQUEST_URL"] = "https://evil.example/" + self.token
+        opener = self.opener()
+        self.assert_failure(self.main(opener), "github_url")
+        self.assertEqual(opener.calls, [])
+        self.environment["ACTIONS_ID_TOKEN_REQUEST_URL"] = URL
+        for stage, name in enumerate(("github_response", "anthropic_response", "messages_response")):
+            opener = self.opener()
+            opener.responses[stage] = Response(raw=self.token.encode(), content_type="text/html")
+            self.assert_failure(self.main(opener), name)
+            self.assertEqual(len(opener.calls), stage + 1)
+        with patch.object(a.ssl, "create_default_context", side_effect=RuntimeError(self.token)):
+            with self.assertRaises(a.Stop) as error:
+                a.make_opener()
+        self.assertEqual(a.failure_result(error.exception),
+                         {"status": "failed", "stage": "tls_setup", "http_status": None})
+        self.assertNotIn(self.token, str(error.exception))
+
+    def test_failure_projection_never_promotes_unknown_stage_or_status_values(self):
+        for stage in (self.token, None, ["messages"], 42):
+            self.assertEqual(a.failure_result(a.Stop(self.jwt, stage=stage, http_status=403)),
+                             {"status": "failed", "stage": "runtime", "http_status": None})
+        for stage in a.FAILURE_STAGES:
+            for status in (True, 403.0, "403", 399, 600, self.token, None):
+                result = a.failure_result(a.Stop(self.jwt, stage=stage, http_status=status))
+                self.assertEqual(result, {"status": "failed", "stage": stage, "http_status": None})
+            result = a.failure_result(a.Stop(self.jwt, stage=stage, http_status=403))
+            self.assertEqual(result["http_status"], 403 if stage in a.HTTP_FAILURE_STAGES else None)
+        self.assertEqual(a.failure_result(RuntimeError(self.token)),
+                         {"status": "failed", "stage": "runtime", "http_status": None})
+
+    def test_http_failure_diagnostics_only_include_fixed_stage_and_integer_status(self):
+        for stage, name in enumerate(("github_acquisition", "anthropic_exchange", "messages")):
+            for status in (302, 400, 403, 429, 500, 599, 600):
+                opener = self.opener()
+                opener.responses[stage] = urllib.error.HTTPError(
+                    "https://evil.example/" + self.token, status, self.jwt, {}, io.BytesIO(self.token.encode()))
+                self.assert_failure(self.main(opener), name, status if 400 <= status <= 599 else None)
+                self.assertEqual(len(opener.calls), stage + 1)
+
+    def test_real_helper_starts_and_imports_with_exact_isolation_without_authentication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"}
+            for name in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+                         "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
+                path = root / name.lower()
+                path.mkdir(mode=0o700)
+                env[name] = str(path)
+            work = root / "work"
+            work.mkdir(mode=0o700)
+            args = [str(Path(sys.executable).resolve()), "-I", "-B", str(Path(a.__file__).resolve())]
+            # No URL or token is present, so real --preflight cannot reach any
+            # network call. Unlike fake-child tests this imports the full helper.
+            process = subprocess.run(args + ["--preflight"], input=b"", capture_output=True,
+                                     cwd=work, env=env, timeout=10, check=False)
+            self.assert_failure((process.returncode, process.stdout.decode(), process.stderr.decode()), "github_url")
+            # Constructing a TLS context performs no network I/O. This exercises
+            # ssl/_ssl/dynamic-library loading under the same clean environment.
+            probe = ("import runpy; "
+                     f"helper = runpy.run_path({str(Path(a.__file__).resolve())!r}); "
+                     "helper['make_opener'](); print('runtime-ready')")
+            process = subprocess.run(args[:3] + ["-c", probe], input=b"", capture_output=True,
+                                     cwd=work, env=env, timeout=10, check=False)
+            self.assertEqual((process.returncode, process.stdout, process.stderr), (0, b"runtime-ready\n", b""))
+            self.assertEqual(list(work.iterdir()), [])
 
 
 if __name__ == "__main__":

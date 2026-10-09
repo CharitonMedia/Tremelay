@@ -19,6 +19,7 @@ https://github.com/actions/toolkit/blob/main/packages/core/src/oidc-utils.ts
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import math
 import os
 import re
@@ -56,10 +57,46 @@ INFERENCE_TIMEOUT = 175
 # each HTTP operation has its own shorter socket timeout.
 MIN_TOKEN_LIFETIME = 270
 SAFE_FAILURE = "Anthropic assessment failed; no automatic replay."
+FAILURE_STAGES = frozenset({"input", "runtime", "tls_setup", "github_url", "github_acquisition",
+                            "github_response", "anthropic_exchange", "anthropic_response",
+                            "messages", "messages_response"})
+HTTP_FAILURE_STAGES = frozenset({"github_acquisition", "anthropic_exchange", "messages"})
 
 
 class Stop(RuntimeError):
     """A fixed error; never interpolate an upstream body or exception."""
+
+    def __init__(self, message, *, stage=None, http_status=None):
+        super().__init__(message)
+        self.stage = stage
+        self.http_status = http_status
+
+
+@contextmanager
+def at_stage(name):
+    """Attach only our fixed stage, never text from a foreign exception."""
+    try:
+        yield
+    except Stop as error:
+        if error.stage is None:
+            error.stage = name
+        raise
+    except urllib.error.HTTPError:
+        # read_response closes the body without reading it and projects only a
+        # validated numeric status at its fixed request stage.
+        raise
+    except Exception:
+        raise Stop(SAFE_FAILURE, stage=name) from None
+
+
+def failure_result(error):
+    stage = error.stage if isinstance(error, Stop) else None
+    if not isinstance(stage, str) or stage not in FAILURE_STAGES:
+        stage = "runtime"
+    status = error.http_status if isinstance(error, Stop) else None
+    if stage not in HTTP_FAILURE_STAGES or type(status) is not int or not 400 <= status <= 599:
+        status = None
+    return {"status": "failed", "stage": stage, "http_status": status}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -147,11 +184,14 @@ The URL is taken only from Actions' environment, never assessment input.
                                     r"actions\.githubusercontent\.com", host)
                 or parsed.netloc not in (host, host + ":443")
                 or not parsed.path.startswith("/") or parsed.path == "/"
-                or "//" in parsed.path or ";" in parsed.path
+                or ";" in parsed.path
                 or re.search(r"%(?![0-9A-Fa-f]{2})", parsed.path)):
             raise Stop("Invalid GitHub identity endpoint")
         decoded = urllib.parse.unquote(parsed.path, errors="strict")
-        # Reject encoded separators, double encoding, dot traversal and controls.
+        # GitHub-issued routes can include literal doubled slashes (for example
+        # /152//idtoken/<plan>/<job>). Preserve these bytes exactly as the runner
+        # and toolkit do; they do not change the already validated HTTPS origin.
+        # Still reject encoded separators, double encoding, traversal and controls.
         if (decoded.count("/") != parsed.path.count("/") or "\\" in decoded
                 or "%" in decoded or any(ord(char) < 33 for char in decoded)
                 or any(part in {".", ".."} for part in decoded.split("/"))):
@@ -175,14 +215,19 @@ def make_opener():
     # No environment proxies or alternate certificate roots. create_default_context
     # uses only the standard OS trust store with these variables absent; the
     # parent's isolated environment is also checked below before constructing it.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
-        urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    with at_stage("tls_setup"):
+        # Directory-backed OpenSSL CA stores load lazily. An empty get_ca_certs()
+        # result alone must not be treated as proof that the trust store is empty.
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()))
 
 
-def read_response(opener, request, *, timeout, limit):
+def read_response(opener, request, *, timeout, limit, stage="runtime", response_stage="runtime"):
     """One attempt; never read, log or return an HTTP error body."""
     try:
-        with opener.open(request, timeout=timeout) as response:
+        with at_stage(stage):
+            response = opener.open(request, timeout=timeout)
+        with at_stage(response_stage), response:
             if response.status != 200 or response.geturl() != request.full_url:
                 raise Stop("Unexpected API response")
             if response.headers.get("Content-Encoding", "identity").lower() != "identity":
@@ -192,15 +237,16 @@ def read_response(opener, request, *, timeout, limit):
             raw = response.read(limit + 1)
             if len(raw) > limit:
                 raise Stop("API response exceeds bound")
-        value = strict_json(raw)
-        if not isinstance(value, dict) or "error" in value:
-            raise Stop("Invalid API response")
-        return value
+            value = strict_json(raw)
+            if not isinstance(value, dict) or "error" in value:
+                raise Stop("Invalid API response")
+            return value
     except urllib.error.HTTPError as error:
         error.close()
-        raise Stop("API request rejected; no automatic replay") from None
+        raise Stop("API request rejected; no automatic replay", stage=stage,
+                   http_status=error.code) from None
     except (OSError, ValueError):
-        raise Stop("API request failed; no automatic replay") from None
+        raise Stop("API request failed; no automatic replay", stage=stage) from None
 
 
 def _bearer(value, *, prefix=""):
@@ -213,22 +259,24 @@ def _bearer(value, *, prefix=""):
 def authenticate(environment, opener):
     # Reject ambient transport overrides rather than silently trusting a proxy or
     # user-supplied TLS root. Never inspect alternate provider credential values.
-    if any(key.casefold().endswith("_proxy") or key in {
-            "SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE"} for key in environment):
-        raise Stop("Ambient transport overrides refused")
-    url = oidc_request_url(environment.get("ACTIONS_ID_TOKEN_REQUEST_URL"))
-    request_token = environment.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
-    if not _bearer(request_token):
-        raise Stop("GitHub identity request token unavailable")
+    with at_stage("github_url"):
+        if any(key.casefold().endswith("_proxy") or key in {
+                "SSL_CERT_FILE", "SSL_CERT_DIR", "SSLKEYLOGFILE"} for key in environment):
+            raise Stop("Ambient transport overrides refused")
+        url = oidc_request_url(environment.get("ACTIONS_ID_TOKEN_REQUEST_URL"))
+        request_token = environment.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        if not _bearer(request_token):
+            raise Stop("GitHub identity request token unavailable")
     if opener is None:
         opener = make_opener()
     identity = read_response(opener, urllib.request.Request(url, method="GET", headers={
         "Authorization": "Bearer " + request_token, "Accept": "application/json"}),
-        timeout=AUTH_TIMEOUT, limit=MAX_AUTH_BYTES)
+        timeout=AUTH_TIMEOUT, limit=MAX_AUTH_BYTES,
+        stage="github_acquisition", response_stage="github_response")
     jwt = identity.get("value")
     if (not isinstance(jwt, str) or not 16 <= len(jwt) <= 32_768
             or not re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", jwt)):
-        raise Stop("Invalid GitHub identity response")
+        raise Stop("Invalid GitHub identity response", stage="github_response")
     # Anthropic verifies the signed JWT and exact rule claims. This helper does
     # not substitute an unverified local JWT decode for that authentication.
     request = urllib.request.Request(TOKEN_URL, method="POST", headers={
@@ -239,7 +287,8 @@ def authenticate(environment, opener):
                          "service_account_id": SERVICE_ACCOUNT_ID,
                          "workspace_id": WORKSPACE_ID}))
     started = time.monotonic()
-    token_response = read_response(opener, request, timeout=AUTH_TIMEOUT, limit=MAX_AUTH_BYTES)
+    token_response = read_response(opener, request, timeout=AUTH_TIMEOUT, limit=MAX_AUTH_BYTES,
+                                   stage="anthropic_exchange", response_stage="anthropic_response")
     token = token_response.get("access_token")
     expires = token_response.get("expires_in")
     if (not _bearer(token, prefix="sk-ant-oat01-")
@@ -247,7 +296,7 @@ def authenticate(environment, opener):
             or token_response.get("scope") != SCOPE
             or type(expires) is not int or not 1 <= expires <= 86_400
             or expires - (time.monotonic() - started) < MIN_TOKEN_LIFETIME):
-        raise Stop("Unusable Anthropic authentication response")
+        raise Stop("Unusable Anthropic authentication response", stage="anthropic_response")
     # Tokens are used only in this process. The final projection cannot contain
     # any of them even if an upstream response reflects an authentication header.
     return opener, token, expires, started, (request_token, jwt, token)
@@ -307,7 +356,7 @@ def completed_result(response, head, secrets, *, smoke=False):
 
 def run(value=None, *, preflight=False, smoke=False, environment=None, opener=None):
     if smoke and (preflight or value is not None):
-        raise Stop("Smoke test accepts no assessment input")
+        raise Stop("Smoke test accepts no assessment input", stage="input")
     if smoke:
         # Explicit owner-approved model-access check, separate from activation
         # and assessment. Fixed prompt/schema cannot carry candidate evidence.
@@ -320,7 +369,8 @@ def run(value=None, *, preflight=False, smoke=False, environment=None, opener=No
                 "type": "json_schema", "schema": SMOKE_SCHEMA}},
             "messages": [{"role": "user", "content": 'Return {"status":"ok"}.'}]})
     elif not preflight:
-        validate_input(value)
+        with at_stage("input"):
+            validate_input(value)
         # Build before obtaining the one-use JWT or exchanging it, minimizing
         # token age. No candidate field is promoted to a tool or request option.
         payload = json_bytes({"model": MODEL, "max_tokens": MAX_OUTPUT_TOKENS,
@@ -336,38 +386,42 @@ def run(value=None, *, preflight=False, smoke=False, environment=None, opener=No
                 "expires_in": math.floor(expires - (time.monotonic() - started)),
                 "model_called": False}
     if expires - (time.monotonic() - started) < MIN_TOKEN_LIFETIME:
-        raise Stop("Insufficient Anthropic authentication lifetime")
+        raise Stop("Insufficient Anthropic authentication lifetime", stage="anthropic_response")
     response = read_response(opener, urllib.request.Request(MESSAGES_URL, method="POST",
         headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
                  "Accept": "application/json", "anthropic-version": API_VERSION},
-        data=payload), timeout=INFERENCE_TIMEOUT, limit=MAX_RESPONSE_BYTES)
-    return completed_result(response, None if smoke else value["head"], secrets, smoke=smoke)
+        data=payload), timeout=INFERENCE_TIMEOUT, limit=MAX_RESPONSE_BYTES,
+        stage="messages", response_stage="messages_response")
+    with at_stage("messages_response"):
+        return completed_result(response, None if smoke else value["head"], secrets, smoke=smoke)
 
 
 def main(argv=None):
     try:
-        args = sys.argv[1:] if argv is None else argv
-        if args not in ([], ["--preflight"], ["--smoke"]):
-            raise Stop("Unsupported assessment arguments")
-        preflight = args == ["--preflight"]
-        smoke = args == ["--smoke"]
-        value = None
-        if smoke:
-            if sys.stdin.buffer.read(1):
-                raise Stop("Smoke test accepts no assessment input")
-        elif not preflight:
-            raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
-            if len(raw) > MAX_INPUT_BYTES:
-                raise Stop("Assessment input exceeds bound")
-            value = strict_json(raw)
+        with at_stage("input"):
+            args = sys.argv[1:] if argv is None else argv
+            if args not in ([], ["--preflight"], ["--smoke"]):
+                raise Stop("Unsupported assessment arguments")
+            preflight = args == ["--preflight"]
+            smoke = args == ["--smoke"]
+            value = None
+            if smoke:
+                if sys.stdin.buffer.read(1):
+                    raise Stop("Smoke test accepts no assessment input")
+            elif not preflight:
+                raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+                if len(raw) > MAX_INPUT_BYTES:
+                    raise Stop("Assessment input exceeds bound")
+                value = strict_json(raw)
         result = run(value, preflight=preflight, smoke=smoke)
         output = json_bytes(result)
         if len(output) + 1 > MAX_STDOUT_BYTES:
             raise Stop("Assessment output exceeds bound")
         sys.stdout.write(output.decode("utf-8") + "\n")
         return 0
-    except Exception:
+    except Exception as error:
         # No traceback, URL, token, response body, or arbitrary exception text.
+        sys.stdout.write(json_bytes(failure_result(error)).decode("utf-8") + "\n")
         sys.stderr.write(SAFE_FAILURE + "\n")
         return 1
 
