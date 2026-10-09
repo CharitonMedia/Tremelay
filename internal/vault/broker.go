@@ -414,6 +414,7 @@ func pinnedTransportDial(ip net.IP, port string, dial func(context.Context, stri
 		TLSHandshakeTimeout:   brokerTimeout,
 		ResponseHeaderTimeout: brokerTimeout,
 		ForceAttemptHTTP2:     false,
+		DisableKeepAlives:     true,
 	}, nil
 }
 
