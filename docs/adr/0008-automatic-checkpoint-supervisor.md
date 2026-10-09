@@ -97,6 +97,27 @@ from the deployed default-branch workflow.
 
 ## Security and operational consequences
 
+- Upgrade readers recognize the original checkpoint evidence envelopes before
+  interpreting any copied protocol controls. Canonical historical supervisor
+  state and authorized resume boundaries remain valid; ambiguous mutated history
+  fails closed rather than dropping a potentially consumed budget or live worker.
+- Legacy ordinary claims remain owning across new review/head identities. A
+  canonical old accepted-worker URL may be reconciled through GET-only identity,
+  run and PR checks into a separate legacy envelope. Unknown reservations are
+  never treated as definitely unattempted. Verified terminal migration preserves
+  cycle accounting and cannot create a worker or request a historical rereview.
+- Both controller paths refuse a competing launch while an ordinary claim is
+  unresolved, and all recovery callers share the per-PR serialization group.
+- Owner-authored checkpoint comments must escape all copied evidence before
+  adding their own final control marker. This includes review bodies, findings,
+  paths, links, prior attempts, CI metadata and plain cycle-count phrases; no
+  quoted evidence may be reinterpreted as owner-authorized protocol state.
+- Ordinary goal-review launches also reserve stable client-supplied worker IDs.
+  Definitely pre-create failures release their claims, while attempted or
+  ambiguous creates retain ownership for GET-only reconciliation. The manual
+  default-branch recovery path never creates a worker, removes a stop, or resets
+  the cycle budget. Completion verifies an advancing descendant before an
+  idempotent exact-head independent review request.
 - This is development automation, not a new Tremelay vault or agent secret API.
 - Public PR text/code cannot cause arbitrary privileged tool calls from a model.
 - A supervisor-produced correction is still subject to the worker's security
@@ -124,6 +145,17 @@ and refusal to retire a potentially accepted worker.
 Activation regressions cover each trigger, reject empty/generic/stale release
 values, prevent all service calls while disabled, and verify read-only preflight
 without disclosing setup values.
+Protocol-boundary regressions cover malicious markers in every evidence field
+and the bounded fallback comment. Launch tests execute the actual workflow shell
+with mocked services for pre-create GitHub failures, stopped/moved/closed PRs,
+definitive rejections, lost responses, server errors and agent-ID conflicts.
+Recovery tests cover stable identity validation, strict trusted envelopes,
+GET-only reconciliation, unchanged polls, terminal/no-op results and idempotent
+independent review completion without clearing stop labels.
+Upgrade regressions use the frozen pre-escaping formatter, including its oversized
+fallback and malicious controls before the genuine stop footer. Legacy ownership
+tests cross head/review changes and exercise unknown identities, unrelated PRs,
+missing lookups, active/terminal runs and preserved cycle counts.
 An actual key/model-access check and a real checkpoint resume remain required
 before declaring unattended operation verified. Secret presence alone does not
 prove model access, API billing or token permissions.

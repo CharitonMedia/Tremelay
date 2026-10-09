@@ -14,11 +14,11 @@ import re
 import uuid
 from pathlib import Path
 from typing import Any
+from automation_protocol import HUMAN_RESUME_MARKER, is_checkpoint_evidence, is_resume_authorization
 
 CODEX_LOGINS = frozenset({"codex", "chatgpt-codex-connector[bot]"})
 LOOP_LABEL = "codex-cursor-loop"
 MARKER_PREFIX = "<!-- codex-cursor-remediation "
-HUMAN_RESUME_MARKER = "<!-- tremelay-human-resume -->"
 MARKER_RE = re.compile(
     r"<!-- codex-cursor-remediation review:(?P<review_id>[0-9]+) "
     r"head:(?P<head>[0-9a-fA-F]{40}) -->"
@@ -118,7 +118,7 @@ def _round_markers(
         if _actor_login(comment).casefold() != trusted:
             continue
         body = comment.get("body")
-        if isinstance(body, str) and HUMAN_RESUME_MARKER in body:
+        if is_resume_authorization(body):
             start = i + 1
     found: list[str] = []
     seen: set[str] = set()
@@ -126,7 +126,7 @@ def _round_markers(
         if _actor_login(comment).casefold() != trusted:
             continue
         body = comment.get("body")
-        if not isinstance(body, str):
+        if not isinstance(body, str) or is_checkpoint_evidence(body):
             continue
         for line in body.splitlines():
             marker = line.strip()

@@ -131,6 +131,10 @@ var (
 	ErrDeniedMalformed = errors.New("denied_malformed")
 	// ErrDeniedAbuse means the abuse-control hook vetoed the call before the credential was sent.
 	ErrDeniedAbuse = errors.New("denied_abuse")
+	// ErrDeniedDestructive means a configured destructive-method rule refused the call before the credential was sent.
+	ErrDeniedDestructive = errors.New("denied_destructive")
+	// ErrAuditNotFound means the requested audit sequence is not in the verified chain.
+	ErrAuditNotFound = errors.New("audit record not found")
 	// ErrBrokerUpstream means the upstream call failed or could not be completed.
 	// The error text is fixed and does not include the credential or the URL.
 	ErrBrokerUpstream = errors.New("broker upstream failed")
@@ -209,6 +213,9 @@ type document struct {
 	Credentials []credential  `json:"credentials"`
 	Agents      []agentRecord `json:"agents,omitempty"`
 	Grants      []grantRecord `json:"grants,omitempty"`
+	// Detection is always written, including when empty. A missing member
+	// means the document was sealed before M5. See sealedDetection.
+	Detection detectionState `json:"detection"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -243,6 +250,26 @@ type Session struct {
 	// credential is copied. It cannot turn a denial into an allow.
 	// Production leaves it nil. See ADR 0006.
 	abuseGuard func(AbuseDecision) error
+	// detection is the encrypted mirror of broker-denial counts. The audit
+	// chain is authoritative; a mirror that disagrees fails closed.
+	detection detectionState
+	// denials is the derived lookback index for detection. Unlock builds it
+	// once from the chain. A commit updates it only after that commit
+	// succeeds, so a failed write leaves the previous mirror in place.
+	denials *detectionIndex
+	// notices is per-source response and delivery state. Unlock builds it
+	// once from the chain. A commit applies its new rows only after that
+	// commit succeeds. It is not part of the encrypted document.
+	notices map[uint64]noticeSrc
+	// suspensions contains durable containment and explicit-revocation facts.
+	suspensions *suspensionIndex
+	// notifier delivers high-risk alerts. Nil means delivery is not configured.
+	notifier Notifier
+	// policy chooses containment. The zero value notifies only and does not
+	// mutate grants or agents. See ADR 0007.
+	policy ResponsePolicy
+	// responding stops a notification or containment row from raising another one.
+	responding bool
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -296,10 +323,12 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 			WrapNonce:  wrapNonce,
 			WrappedDEK: wrapped,
 		},
-		creds:    []credential{},
-		redactor: red,
-		logger:   logger,
-		db:       db,
+		creds:       []credential{},
+		notices:     map[uint64]noticeSrc{},
+		suspensions: newSuspensionIndex(),
+		redactor:    red,
+		logger:      logger,
+		db:          db,
 	}
 	if err := s.persistEvent(actionCreate, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -309,6 +338,15 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	s.logf("vault_create id=%s result=allowed", id)
 	return s, nil
 }
+
+// unlockDecoded, when set, sees credentials after Unlock decodes them and
+// before a rejected document is wiped. Tests capture that buffer. Production
+// leaves it nil.
+var unlockDecoded func([]credential)
+
+// wipedSecret, when set, sees each credential secret immediately before it
+// is zeroed. Tests hold that buffer. Production leaves it nil.
+var wipedSecret func([]byte)
 
 // Unlock opens path with passphrase. A rejected unlock appends a denial and
 // does not update encrypted credential state. The denial has no passphrase
@@ -349,13 +387,34 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	}
 	defer wipe(plain)
 	var doc document
+	// retained is set only when the session keeps these buffers. Every earlier
+	// return, including a partial decode, zeroes them. VerifyAudit does the same.
+	retained := false
+	defer func() {
+		if !retained {
+			wipeCredentials(doc.Credentials)
+		}
+	}()
 	if err := unmarshalStrict(plain, &doc); err != nil {
 		wipe(dek)
 		return nil, deny(ErrCorrupt)
 	}
+	if unlockDecoded != nil {
+		unlockDecoded(doc.Credentials)
+	}
+	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
+	if err != nil {
+		wipe(dek)
+		return nil, deny(err)
+	}
 	if err := validateDocument(doc); err != nil {
 		wipe(dek)
 		return nil, deny(err)
+	}
+	idx := indexFromAudit(events)
+	if err := matchDetection(idx.state(), doc.Detection); err != nil {
+		wipe(dek)
+		return nil, deny(ErrCorrupt)
 	}
 	red := &Redactor{}
 	red.Add(passphrase)
@@ -363,17 +422,21 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		red.Add(doc.Credentials[i].Secret)
 	}
 	s := &Session{
-		path:     path,
-		id:       header.ID,
-		dek:      dek,
-		header:   header,
-		creds:    doc.Credentials,
-		agents:   doc.Agents,
-		grants:   doc.Grants,
-		audit:    events,
-		redactor: red,
-		logger:   logger,
-		db:       db,
+		path:        path,
+		id:          header.ID,
+		dek:         dek,
+		header:      header,
+		creds:       doc.Credentials,
+		agents:      doc.Agents,
+		grants:      doc.Grants,
+		audit:       events,
+		detection:   doc.Detection,
+		denials:     idx,
+		notices:     noticeIndex(events),
+		suspensions: suspensionFromAudit(events),
+		redactor:    red,
+		logger:      logger,
+		db:          db,
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -382,6 +445,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	}
 	closeDB = false
 	s.logf("vault_unlock id=%s result=allowed", s.id)
+	retained = true
 	return s, nil
 }
 
@@ -400,6 +464,12 @@ func (s *Session) Lock() {
 	s.agents = nil
 	s.grants = nil
 	s.audit = nil
+	s.detection = detectionState{}
+	s.denials = nil
+	s.notices = nil
+	s.suspensions = nil
+	s.notifier = nil
+	s.responding = false
 	if s.redactor != nil {
 		s.redactor.Wipe()
 	}
@@ -585,7 +655,9 @@ func (s *Session) persistEvent(action, credID, credType, result string) error {
 
 // commit encrypts credential state under the new audit head and writes that
 // ciphertext plus the audit row in one transaction. Agent and grant rows
-// already on the session are sealed in the same document.
+// already on the session are sealed in the same document. A high-risk row
+// also carries its response decision and any configured suspension in that
+// same transaction.
 func (s *Session) commit(ev auditEvent, creds []credential) error {
 	return s.commitState(ev, creds, s.agents, s.grants)
 }
@@ -594,12 +666,33 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
-	plain, err := json.Marshal(document{Credentials: creds, Agents: agents, Grants: grants})
+	events := []auditEvent{ev}
+	if !noticeAction(ev.Action) {
+		var err error
+		events, creds, agents, grants, err = s.withResponse(ev, creds, agents, grants)
+		if err != nil {
+			return err
+		}
+	}
+	base := s.denials
+	if base == nil {
+		base = indexFromAudit(s.audit)
+	}
+	nextDenials := base.clone()
+	for _, ev := range events {
+		nextDenials.apply(ev)
+	}
+	det := nextDenials.state()
+	if err := validateDetection(det); err != nil {
+		return err
+	}
+	tip := events[len(events)-1]
+	plain, err := json.Marshal(document{Credentials: creds, Agents: agents, Grants: grants, Detection: det})
 	if err != nil {
 		return ErrIO
 	}
 	defer wipe(plain)
-	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, ev.Hash, ev.Seq))
+	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, tip.Hash, tip.Seq))
 	if err != nil {
 		return err
 	}
@@ -609,20 +702,46 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 	h.Root = rootPassphrase
 	h.DataNonce = nonce
 	h.Data = ct
-	h.AuditHead = ev.Hash
-	h.AuditSeq = ev.Seq
-	if err := writeTx(s.db, h, ev, len(s.audit) == 0, s.commitFault); err != nil {
+	h.AuditHead = tip.Hash
+	h.AuditSeq = tip.Seq
+	if err := writeTx(s.db, h, events, len(s.audit) == 0, s.commitFault); err != nil {
 		if errors.Is(err, ErrIO) {
 			s.logf("vault_write result=error")
 		}
 		return err
 	}
 	s.header = h
-	s.audit = append(s.audit, ev)
+	// Append only after the transaction succeeds. A failed commit leaves the
+	// prefix in place, and append grows the backing array instead of copying
+	// it on every row. The notice index follows the same commit: a failed
+	// write does not publish the rows that were not stored.
+	if s.notices == nil {
+		s.notices = noticeIndex(s.audit)
+	}
+	if s.suspensions == nil {
+		s.suspensions = suspensionFromAudit(s.audit)
+	}
+	s.audit = append(s.audit, events...)
 	s.creds = creds
 	s.agents = agents
 	s.grants = grants
+	s.detection = det
+	s.denials = nextDenials
+	for _, row := range events {
+		applyNotice(s.notices, row)
+		s.suspensions.apply(s.audit, row)
+	}
+	s.afterCommit(events[0])
 	return nil
+}
+
+func wipeCredentials(creds []credential) {
+	for i := range creds {
+		if wipedSecret != nil {
+			wipedSecret(creds[i].Secret)
+		}
+		wipe(creds[i].Secret)
+	}
 }
 
 func (s *Session) logf(format string, args ...any) {

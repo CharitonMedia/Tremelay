@@ -77,6 +77,25 @@ func TestCLICreatePutGetListAndRedaction(t *testing.T) {
 	if strings.TrimSpace(stdout.String()) == "" {
 		t.Fatal("missing audit head")
 	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"audit", "list", "--path", path, "--action", "credential_put", "--limit", "5"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("audit list %d %s", code, stderr.String())
+	}
+	assertNoSecret(t, &stdout, secret, pass)
+	assertNoSecret(t, &stderr, secret, pass)
+	if !strings.Contains(stdout.String(), `"action":"credential_put"`) || strings.Contains(stdout.String(), `"secret"`) {
+		t.Fatalf("audit list %s", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"audit", "get", "--path", path, "--seq", "1"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("audit get %d %s", code, stderr.String())
+	}
+	assertNoSecret(t, &stdout, secret, pass)
+	if !strings.Contains(stdout.String(), `"seq":1`) {
+		t.Fatalf("audit get %s", stdout.String())
+	}
 	wrongVerify := map[string]string{"TREMELAY_PASSPHRASE": randHex(t, 16)}
 	stdout.Reset()
 	stderr.Reset()

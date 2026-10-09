@@ -11,6 +11,7 @@ import (
 const (
 	auditVersion           = 1
 	auditCapabilityVersion = 2
+	auditNoticeVersion     = 3
 
 	actionCreate      = "vault_create"
 	actionUnlock      = "vault_unlock"
@@ -23,6 +24,9 @@ const (
 	actionAuthorize   = "capability_authorize"
 	actionCapList     = "capability_list"
 	actionBroker      = "broker_http"
+	actionNotify      = "notify"
+	actionContain     = "contain"
+	actionRespond     = "respond"
 
 	resultAllowed           = "allowed"
 	resultDenied            = "denied"
@@ -42,8 +46,21 @@ const (
 	resultDeniedAction      = "denied_action"
 	resultDeniedMalformed   = "denied_malformed"
 	resultDeniedAbuse       = "denied_abuse"
+	resultDeniedSecret      = "denied_secret"
+	resultDeniedDestructive = "denied_destructive"
 	resultUpstreamError     = "upstream_error"
 	resultCompleted         = "completed"
+	resultDelivered         = "delivered"
+	resultFailed            = "failed"
+	resultAttempted         = "attempted"
+	resultFlagged           = "flagged"
+	resultSuspended         = "suspended"
+	resultAgentSuspended    = "agent_suspended"
+	resultUnchanged         = "unchanged"
+	// Response decisions are fixed codes on a respond row. They are not
+	// inferred from the process-local policy at delivery time.
+	resultDecisionNotify = "notify"
+	resultDecisionFlag   = "flag"
 )
 
 type auditEvent struct {
@@ -58,6 +75,8 @@ type auditEvent struct {
 	AgentID   string `json:"agent_id,omitempty"`
 	GrantID   string `json:"grant_id,omitempty"`
 	Operation string `json:"operation,omitempty"`
+	Class     string `json:"class,omitempty"`
+	RefSeq    uint64 `json:"ref_seq,omitempty"`
 	Prev      string `json:"prev"`
 	Hash      string `json:"hash"`
 }
@@ -90,7 +109,21 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 	if err != nil {
 		return "", ErrAudit
 	}
-	wipe(plain)
+	defer wipe(plain)
+	var doc document
+	// The closure reads doc after unmarshal. A deferred wipeCredentials(doc.Credentials)
+	// would capture the nil slice header from before the decode.
+	defer func() { wipeCredentials(doc.Credentials) }()
+	if err := unmarshalStrict(plain, &doc); err != nil {
+		return "", ErrAudit
+	}
+	// The detection mirror is inside the authenticated document. A pre-M5
+	// document has no member; the chain supplies it. A stored member that
+	// does not match the chain is a failed verification, not a clean tip.
+	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
+	if err != nil || matchDetection(indexFromAudit(events).state(), doc.Detection) != nil {
+		return "", ErrAudit
+	}
 	return events[len(events)-1].Hash, nil
 }
 
@@ -104,7 +137,17 @@ func eventHashV2(prev []byte, seq uint64, timeStr, action, vaultID, credID, cred
 	return hashParts(prev, seq, timeStr, action, vaultID, credID, credType, result, agentID, grantID, operation)
 }
 
+func eventHashV3(prev []byte, seq uint64, timeStr, action, vaultID, credID, credType, result, agentID, grantID, operation, class string, refSeq uint64) []byte {
+	var ref [8]byte
+	binary.BigEndian.PutUint64(ref[:], refSeq)
+	return hashPartsTail(prev, seq, []string{timeStr, action, vaultID, credID, credType, result, agentID, grantID, operation, class}, ref[:])
+}
+
 func hashParts(prev []byte, seq uint64, parts ...string) []byte {
+	return hashPartsTail(prev, seq, parts, nil)
+}
+
+func hashPartsTail(prev []byte, seq uint64, parts []string, tail []byte) []byte {
 	h := sha256.New()
 	h.Write(prev)
 	var seqb [8]byte
@@ -117,6 +160,7 @@ func hashParts(prev []byte, seq uint64, parts ...string) []byte {
 		h.Write(n[:])
 		h.Write(b)
 	}
+	h.Write(tail)
 	return h.Sum(nil)
 }
 
@@ -142,17 +186,25 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 		seq = last.Seq + 1
 	}
 	ev := partial
-	ev.V = auditVersion
+	ev.V = auditVersionFor(ev.Action)
 	ev.Seq = seq
 	ev.Time = time.Now().UTC().Format(time.RFC3339Nano)
 	ev.VaultID = vaultID
 	ev.Prev = hex.EncodeToString(prev)
 	var sum []byte
-	if capabilityAction(ev.Action) {
-		ev.V = auditCapabilityVersion
+	switch ev.V {
+	case auditNoticeVersion:
+		if ev.Class == "" || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq {
+			return auditEvent{}, ErrAudit
+		}
+		sum = eventHashV3(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Class, ev.RefSeq)
+	case auditCapabilityVersion:
+		if ev.Class != "" || ev.RefSeq != 0 {
+			return auditEvent{}, ErrAudit
+		}
 		sum = eventHashV2(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation)
-	} else {
-		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" {
+	default:
+		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 {
 			return auditEvent{}, ErrAudit
 		}
 		sum = eventHash(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result)
@@ -161,11 +213,26 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 	return ev, nil
 }
 
-func hashEvent(prev []byte, ev auditEvent) []byte {
-	if capabilityAction(ev.Action) {
-		return eventHashV2(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation)
+func auditVersionFor(action string) int {
+	switch {
+	case noticeAction(action):
+		return auditNoticeVersion
+	case capabilityAction(action):
+		return auditCapabilityVersion
+	default:
+		return auditVersion
 	}
-	return eventHash(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result)
+}
+
+func hashEvent(prev []byte, ev auditEvent) []byte {
+	switch ev.V {
+	case auditNoticeVersion:
+		return eventHashV3(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Class, ev.RefSeq)
+	case auditCapabilityVersion:
+		return eventHashV2(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation)
+	default:
+		return eventHash(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result)
+	}
 }
 
 func verifyChain(events []auditEvent) error {
@@ -197,11 +264,15 @@ func verifyLinked(events []auditEvent) error {
 		return ErrAudit
 	}
 	for i, ev := range events {
-		wantV := auditVersion
-		if capabilityAction(ev.Action) {
-			wantV = auditCapabilityVersion
+		if ev.V != 1 && ev.V != 2 && ev.V != 3 {
+			return ErrAudit
 		}
-		if ev.V != wantV || ev.Seq != first.Seq+uint64(i) {
+		if ev.V != auditVersionFor(ev.Action) || ev.Seq != first.Seq+uint64(i) {
+			return ErrAudit
+		}
+		// events[:i] are already contiguous from first.Seq, so the referenced
+		// row exists exactly when RefSeq falls in that prefix.
+		if noticeAction(ev.Action) && (ev.RefSeq < first.Seq || ev.RefSeq >= ev.Seq) {
 			return ErrAudit
 		}
 		if ev.VaultID != first.VaultID || !knownAction(ev.Action) {
@@ -227,11 +298,15 @@ func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPut, actionGet, actionList,
 		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
-		actionBroker:
+		actionBroker, actionNotify, actionContain, actionRespond:
 		return true
 	default:
 		return false
 	}
+}
+
+func noticeAction(action string) bool {
+	return action == actionNotify || action == actionContain || action == actionRespond
 }
 
 func capabilityAction(action string) bool {
@@ -244,6 +319,15 @@ func capabilityAction(action string) bool {
 }
 
 func validAuditShape(ev auditEvent) error {
+	if noticeAction(ev.Action) {
+		return validNoticeAudit(ev)
+	}
+	if ev.Class != "" || ev.RefSeq != 0 {
+		return ErrAudit
+	}
+	if ev.Result == resultDeniedSecret && ev.Operation != "" {
+		return ErrAudit
+	}
 	if !capabilityAction(ev.Action) {
 		if ev.Result != resultAllowed && ev.Result != resultDenied {
 			return ErrAudit
@@ -270,7 +354,7 @@ func validAuditShape(ev auditEvent) error {
 	}
 	switch ev.Result {
 	case resultAllowed, resultDenied, resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,
-		resultDeniedScope, resultDeniedExpired, resultDeniedRevoked, resultDeniedMissing:
+		resultDeniedScope, resultDeniedExpired, resultDeniedRevoked, resultDeniedMissing, resultDeniedSecret:
 	default:
 		if ev.Action != actionBroker || !brokerOnlyResult(ev.Result) {
 			return ErrAudit
@@ -322,11 +406,48 @@ func validAuditShape(ev auditEvent) error {
 	return nil
 }
 
+func validNoticeAudit(ev auditEvent) error {
+	if ev.V != auditNoticeVersion || !knownClass(ev.Class) || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq || ev.Operation != "" {
+		return ErrAudit
+	}
+	if ev.AgentID != "" && safeID(ev.AgentID) == "" {
+		return ErrAudit
+	}
+	if ev.GrantID != "" && safeID(ev.GrantID) == "" {
+		return ErrAudit
+	}
+	if ev.CredID != "" && safeID(ev.CredID) == "" {
+		return ErrAudit
+	}
+	if ev.CredType != "" && validateType(ev.CredType) != nil {
+		return ErrAudit
+	}
+	switch ev.Action {
+	case actionNotify:
+		if ev.Result != resultDelivered && ev.Result != resultFailed && ev.Result != resultAttempted {
+			return ErrAudit
+		}
+	case actionContain:
+		switch ev.Result {
+		case resultFlagged, resultSuspended, resultAgentSuspended, resultUnchanged:
+		default:
+			return ErrAudit
+		}
+	case actionRespond:
+		if ev.Result != resultDecisionNotify && ev.Result != resultDecisionFlag {
+			return ErrAudit
+		}
+	default:
+		return ErrAudit
+	}
+	return nil
+}
+
 func brokerOnlyResult(result string) bool {
 	switch result {
 	case resultDeniedDestination, resultDeniedOrigin, resultDeniedSSRF, resultDeniedRedirect,
 		resultDeniedMethod, resultDeniedPath, resultDeniedAction, resultDeniedMalformed,
-		resultDeniedAbuse, resultUpstreamError, resultCompleted:
+		resultDeniedAbuse, resultDeniedDestructive, resultUpstreamError, resultCompleted:
 		return true
 	default:
 		return false
@@ -340,7 +461,7 @@ func validBrokerAudit(ev auditEvent) error {
 		return ErrAudit
 	}
 	switch ev.Result {
-	case resultAllowed, resultCompleted, resultUpstreamError, resultDeniedAbuse:
+	case resultAllowed, resultCompleted, resultUpstreamError, resultDeniedAbuse, resultDeniedDestructive:
 		if ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType == "" || ev.Operation != OpHTTPRequest {
 			return ErrAudit
 		}
@@ -393,7 +514,7 @@ func suffixAllows(events []auditEvent, header fileHeader) error {
 		// time.Now().UTC().Format(time.RFC3339Nano). Any other metadata, a
 		// noncanonical timestamp, or a time outside [previous, now] is a
 		// forged suffix and must not be incorporated.
-		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != header.ID || ev.CredID != "" || ev.CredType != "" || ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" {
+		if ev.Action != actionUnlock || ev.Result != resultDenied || ev.VaultID != header.ID || ev.CredID != "" || ev.CredType != "" || ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 {
 			return ErrAudit
 		}
 		ts, ok := canonicalAuditTime(ev.Time)

@@ -43,6 +43,9 @@ CREATE TABLE audit (
   agent_id TEXT NOT NULL,
   grant_id TEXT NOT NULL,
   operation TEXT NOT NULL,
+  v INTEGER NOT NULL,
+  class TEXT NOT NULL,
+  ref_seq INTEGER NOT NULL,
   FOREIGN KEY (vault_id) REFERENCES vault(id)
 );`
 
@@ -186,6 +189,12 @@ func loadVault(path string) (*sql.DB, fileHeader, []auditEvent, error) {
 		db.Close()
 		return nil, fileHeader{}, nil, err
 	}
+	// M1–M4 files predate v, class, and ref_seq. Add the missing columns
+	// before the read so an older vault still unlocks. Hashes are not rewritten.
+	if err := migrateAudit(db); err != nil {
+		db.Close()
+		return nil, fileHeader{}, nil, err
+	}
 	events, err := readAuditRows(db)
 	if err != nil {
 		db.Close()
@@ -226,8 +235,127 @@ func readVaultRow(db *sql.DB) (fileHeader, error) {
 	return h, nil
 }
 
+func auditColumnSet(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(audit)`)
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return nil, ErrCorrupt
+		}
+		cols[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, ErrCorrupt
+	}
+	return cols, nil
+}
+
+// migrateAudit adds audit columns introduced after M1. Existing rows keep
+// their hash preimage. v is derived from the action. class and ref_seq
+// stay empty on rows that did not have those columns.
+func migrateAudit(db *sql.DB) error {
+	cols, err := auditColumnSet(db)
+	if err != nil {
+		return err
+	}
+	if len(cols) == 0 || !cols["seq"] || !cols["hash"] {
+		return ErrCorrupt
+	}
+	type addCol struct {
+		name string
+		ddl  string
+	}
+	adds := []addCol{
+		{"agent_id", `ALTER TABLE audit ADD COLUMN agent_id TEXT NOT NULL DEFAULT ''`},
+		{"grant_id", `ALTER TABLE audit ADD COLUMN grant_id TEXT NOT NULL DEFAULT ''`},
+		{"operation", `ALTER TABLE audit ADD COLUMN operation TEXT NOT NULL DEFAULT ''`},
+		{"v", `ALTER TABLE audit ADD COLUMN v INTEGER NOT NULL DEFAULT 1`},
+		{"class", `ALTER TABLE audit ADD COLUMN class TEXT NOT NULL DEFAULT ''`},
+		{"ref_seq", `ALTER TABLE audit ADD COLUMN ref_seq INTEGER NOT NULL DEFAULT 0`},
+	}
+	missing := false
+	for _, col := range adds {
+		if !cols[col.name] {
+			missing = true
+			break
+		}
+	}
+	if !missing {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return ErrIO
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, col := range adds {
+		if cols[col.name] {
+			continue
+		}
+		if _, err := tx.Exec(col.ddl); err != nil {
+			return ErrCorrupt
+		}
+	}
+	if !cols["v"] {
+		if err := backfillAuditVersion(tx); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ErrIO
+	}
+	committed = true
+	return nil
+}
+
+func backfillAuditVersion(tx *sql.Tx) error {
+	rows, err := tx.Query(`SELECT seq, action FROM audit`)
+	if err != nil {
+		return ErrCorrupt
+	}
+	type versioned struct {
+		seq int64
+		v   int
+	}
+	var updates []versioned
+	for rows.Next() {
+		var seq int64
+		var action string
+		if err := rows.Scan(&seq, &action); err != nil {
+			rows.Close()
+			return ErrCorrupt
+		}
+		updates = append(updates, versioned{seq: seq, v: auditVersionFor(action)})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return ErrCorrupt
+	}
+	if err := rows.Close(); err != nil {
+		return ErrCorrupt
+	}
+	for _, row := range updates {
+		if _, err := tx.Exec(`UPDATE audit SET v=? WHERE seq=?`, row.v, row.seq); err != nil {
+			return ErrCorrupt
+		}
+	}
+	return nil
+}
+
 func readAuditRows(db *sql.DB) ([]auditEvent, error) {
-	rows, err := db.Query(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation FROM audit ORDER BY seq`)
+	rows, err := db.Query(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq FROM audit ORDER BY seq`)
 	if err != nil {
 		return nil, ErrCorrupt
 	}
@@ -236,18 +364,15 @@ func readAuditRows(db *sql.DB) ([]auditEvent, error) {
 	var prev uint64
 	for rows.Next() {
 		var ev auditEvent
-		var seq int64
-		if err := rows.Scan(&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation); err != nil {
+		var seq, ref int64
+		if err := rows.Scan(&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref); err != nil {
 			return nil, ErrCorrupt
 		}
-		if seq <= 0 {
+		if seq <= 0 || ref < 0 || (ev.V != auditVersion && ev.V != auditCapabilityVersion && ev.V != auditNoticeVersion) {
 			return nil, ErrAudit
 		}
-		ev.V = auditVersion
-		if capabilityAction(ev.Action) {
-			ev.V = auditCapabilityVersion
-		}
 		ev.Seq = uint64(seq)
+		ev.RefSeq = uint64(ref)
 		if prev != 0 && ev.Seq != prev+1 {
 			return nil, ErrAudit
 		}
@@ -260,10 +385,15 @@ func readAuditRows(db *sql.DB) ([]auditEvent, error) {
 	return out, nil
 }
 
-// writeTx commits the encrypted vault row and one audit event together.
+// writeTx commits the encrypted vault row and the audit events together.
 // fresh inserts the vault row; later calls update it. fault, when set, fails
-// the transaction after both statements so tests can observe rollback.
-func writeTx(db *sql.DB, h fileHeader, ev auditEvent, fresh bool, fault func() error) error {
+// the transaction after the statements so tests can observe rollback.
+// A failure rolls every event in the call back; callers put a security
+// event, its response decision, and its containment row in one call.
+func writeTx(db *sql.DB, h fileHeader, events []auditEvent, fresh bool, fault func() error) error {
+	if len(events) == 0 {
+		return ErrAudit
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return ErrIO
@@ -281,8 +411,10 @@ func writeTx(db *sql.DB, h fileHeader, ev auditEvent, fresh bool, fault func() e
 	} else if err := updateVault(tx, h); err != nil {
 		return err
 	}
-	if err := insertAudit(tx, ev); err != nil {
-		return err
+	for _, ev := range events {
+		if err := insertAudit(tx, ev); err != nil {
+			return err
+		}
 	}
 	if fault != nil {
 		if err := fault(); err != nil {
@@ -325,9 +457,9 @@ func updateVault(tx *sql.Tx, h fileHeader) error {
 
 func insertAudit(tx *sql.Tx, ev auditEvent) error {
 	_, err := tx.Exec(`INSERT INTO audit (
-		seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		int64(ev.Seq), ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Prev, ev.Hash, ev.AgentID, ev.GrantID, ev.Operation)
+		seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		int64(ev.Seq), ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Prev, ev.Hash, ev.AgentID, ev.GrantID, ev.Operation, ev.V, ev.Class, int64(ev.RefSeq))
 	if err != nil {
 		return ErrIO
 	}
@@ -376,17 +508,14 @@ func appendDenial(db *sql.DB, vaultID string) error {
 
 func readAuditTip(tx *sql.Tx) (auditEvent, error) {
 	var ev auditEvent
-	var seq int64
-	err := tx.QueryRow(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation FROM audit ORDER BY seq DESC LIMIT 1`).Scan(
-		&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation,
+	var seq, ref int64
+	err := tx.QueryRow(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq FROM audit ORDER BY seq DESC LIMIT 1`).Scan(
+		&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref,
 	)
-	if err != nil || seq <= 0 {
+	if err != nil || seq <= 0 || ref < 0 || ev.V != auditVersionFor(ev.Action) {
 		return auditEvent{}, ErrAudit
 	}
-	ev.V = auditVersion
-	if capabilityAction(ev.Action) {
-		ev.V = auditCapabilityVersion
-	}
 	ev.Seq = uint64(seq)
+	ev.RefSeq = uint64(ref)
 	return ev, nil
 }

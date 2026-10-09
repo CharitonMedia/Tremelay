@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Verify supervisor controller tests
-        run: python -m unittest discover -s automation_tests -p 'test_checkpoint_supervisor.py'
+        run: python -m unittest discover -s automation_tests -p 'test_*.py'
       - name: Assess stopped goal PRs
         env:
           GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}

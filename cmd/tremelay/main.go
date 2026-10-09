@@ -61,6 +61,8 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay capability list --path PATH --agent ID
   tremelay capability authorize --path PATH --agent ID --credential ID --operation OP --resource SCOPE
   tremelay audit verify --path PATH
+  tremelay audit list --path PATH [--credential ID] [--agent ID] [--action ACTION] [--class CLASS] [--since RFC3339] [--until RFC3339] [--after SEQ] [--limit N]
+  tremelay audit get --path PATH --seq SEQ
 
 Types: %s
 Grant operations: %s
@@ -261,14 +263,28 @@ type listEntry struct {
 }
 
 func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] != "verify" {
+	if len(args) == 0 {
 		usage(stderr)
 		return 2
 	}
+	switch args[0] {
+	case "verify":
+		return cmdAuditVerify(args[1:], getenv, stdin, stdout, stderr)
+	case "list":
+		return cmdAuditList(args[1:], getenv, stdin, stdout, stderr)
+	case "get":
+		return cmdAuditGet(args[1:], getenv, stdin, stdout, stderr)
+	default:
+		usage(stderr)
+		return 2
+	}
+}
+
+func cmdAuditVerify(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("audit verify", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	path := fs.String("path", "", "vault file")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *path == "" || fs.NArg() != 0 {
@@ -293,6 +309,87 @@ func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout
 		return 1
 	}
 	return 0
+}
+
+func cmdAuditList(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("audit list", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	cred := fs.String("credential", "", "credential id")
+	agent := fs.String("agent", "", "agent id")
+	action := fs.String("action", "", "audit action")
+	class := fs.String("class", "", "risk class")
+	since := fs.String("since", "", "inclusive start (RFC3339)")
+	until := fs.String("until", "", "inclusive end (RFC3339)")
+	after := fs.Uint64("after", 0, "return rows after this sequence")
+	limit := fs.Int("limit", 0, "page size")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *path == "" || fs.NArg() != 0 {
+		usage(stderr)
+		return 2
+	}
+	filter := vault.AuditFilter{
+		CredentialID: *cred,
+		AgentID:      *agent,
+		Action:       *action,
+		Class:        *class,
+		AfterSeq:     *after,
+		Limit:        *limit,
+	}
+	if *since != "" {
+		t, err := time.Parse(time.RFC3339, *since)
+		if err != nil {
+			fmt.Fprintln(stderr, "invalid vault input")
+			return 1
+		}
+		filter.Since = t
+	}
+	if *until != "" {
+		t, err := time.Parse(time.RFC3339, *until)
+		if err != nil {
+			fmt.Fprintln(stderr, "invalid vault input")
+			return 1
+		}
+		filter.Until = t
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		rows, err := session.AuditHistory(filter)
+		if err != nil {
+			return err
+		}
+		enc := json.NewEncoder(stdout)
+		for _, row := range rows {
+			if err := enc.Encode(row); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func cmdAuditGet(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("audit get", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	seq := fs.Uint64("seq", 0, "audit sequence")
+	hash := fs.String("hash", "", "expected row hash")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *path == "" || *seq == 0 || fs.NArg() != 0 {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		row, err := session.AuditBySeq(*seq, *hash)
+		if err != nil {
+			return err
+		}
+		enc := json.NewEncoder(stdout)
+		return enc.Encode(row)
+	})
 }
 
 // denyKnownVault records a metadata-free denial when parsing fails after a

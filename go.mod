@@ -1,8 +1,6 @@
 module github.com/CharitonMedia/Tremelay
 
-go 1.26.0
-
-toolchain go1.26.8
+go 1.26.9
 
 require (
 	golang.org/x/crypto v0.41.0

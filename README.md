@@ -8,7 +8,7 @@ Tremelay is a self-hosted credential vault and capability broker. Humans can sto
 
 ## Project status
 
-M1 is a local single-user vault. A human can create a vault, unlock it with a passphrase, and store and retrieve a credential with the `tremelay` CLI. M2 adds distinct agent principals and revocable, expiring capability grants. M3 adds an in-process HTTP broker on an agent principal: the broker injects a stored credential into one authorized HTTPS request and does not return the credential. An `http_request` grant used by the broker names the exact method and canonical URL, for example `GET https://svc.example/v1/ping`. M4 enforces that text as origin, method, path, and action policy, and refuses SSRF, DNS rebinding, proxy bypass, and redirects before a credential can follow them. The CLI remains the human control plane: agent and grant commands do not retrieve raw secrets, and there is no agent-facing `getSecret`. Later milestones add audit review and credential health. See [MILESTONES.md](MILESTONES.md).
+M1 is a local single-user vault. A human can create a vault, unlock it with a passphrase, and store and retrieve a credential with the `tremelay` CLI. M2 adds distinct agent principals and revocable, expiring capability grants. M3 adds an in-process HTTP broker on an agent principal: the broker injects a stored credential into one authorized HTTPS request and does not return the credential. An `http_request` grant used by the broker names the exact method and canonical URL, for example `GET https://svc.example/v1/ping`. M4 enforces that text as origin, method, path, and action policy, and refuses SSRF, DNS rebinding, proxy bypass, and redirects before a credential can follow them. M5 adds human audit views, a fixed risk classification, a secret-free notification interface, and optional containment. The CLI remains the human control plane: agent and grant commands do not retrieve raw secrets, and there is no agent-facing `getSecret`. A later milestone adds credential health. See [MILESTONES.md](MILESTONES.md).
 
 ```
 tremelay vault create --path vault.db
@@ -21,9 +21,11 @@ tremelay capability list --path vault.db --agent AGENT_ID
 tremelay capability authorize --path vault.db --agent AGENT_ID --credential CREDENTIAL_ID --operation http_request --resource svc:example
 tremelay grant revoke --path vault.db --id GRANT_ID
 tremelay audit verify --path vault.db
+tremelay audit list --path vault.db
+tremelay audit get --path vault.db --seq 1
 ```
 
-The path is one local SQLite database. Credential bytes are encrypted; the file does not store plaintext secrets. The passphrase comes from `TREMELAY_PASSPHRASE` or a no-echo terminal prompt. It is not a command-line argument. `audit verify` uses that passphrase to authenticate the sealed audit head. `credential get` writes the raw secret to stdout.
+The path is one local SQLite database. Credential bytes are encrypted; the file does not store plaintext secrets. The passphrase comes from `TREMELAY_PASSPHRASE` or a no-echo terminal prompt. It is not a command-line argument. `audit verify` uses that passphrase to authenticate the sealed audit head. `audit list` and `audit get` are the same human view of the chain and do not return credential plaintext. `credential get` writes the raw secret to stdout.
 
 ## Core goals
 

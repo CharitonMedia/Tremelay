@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from complete_codex_clean_review import is_terminal_clean_review, reviewed_commit
+from automation_protocol import HUMAN_RESUME_MARKER, has_control_marker, is_checkpoint_evidence, is_resume_authorization
 
 DEFAULT_BASE_REF = "main"
 DEFAULT_REPO_URL = "https://github.com/CharitonMedia/Tremelay"
@@ -763,7 +764,6 @@ CYCLE_COUNT_MARKERS = (
     "Cursor remediation round ",
     "<!-- goal-review-claim ",
 )
-HUMAN_RESUME_MARKER = "<!-- tremelay-human-resume -->"
 TRUSTED_AUTOMATION_LOGIN = "pattalkslaw-del"
 CYCLE_LIMIT = 3
 _CLAIM_MARKER_RE = re.compile(
@@ -773,7 +773,7 @@ _CLAIM_MARKER_RE = re.compile(
 
 def comment_counts_cycle(body: str) -> bool:
     text = body or ""
-    return any(marker in text for marker in CYCLE_COUNT_MARKERS)
+    return not is_checkpoint_evidence(text) and any(marker in text for marker in CYCLE_COUNT_MARKERS)
 
 
 def reservation_body(marker: str) -> str:
@@ -800,7 +800,7 @@ def released_body() -> str:
     phrase or the claim marker, so it neither owns the review nor counts.
     """
     return (
-        "Cursor rejected this review launch before a worker was created. "
+        "This review launch did not create a worker. "
         "The reservation was released.\n"
     )
 
@@ -835,7 +835,7 @@ def cycle_budget(comments: list | None) -> tuple[int, int]:
         if _actor_login(comment).casefold() != TRUSTED_AUTOMATION_LOGIN:
             continue
         body = comment.get("body") or ""
-        if isinstance(body, str) and HUMAN_RESUME_MARKER in body:
+        if is_resume_authorization(body):
             start = i + 1
     count = 0
     for comment in (comments or [])[start:]:
@@ -901,6 +901,14 @@ def _newest_submitted_review(reviews: list | None, commit: str) -> dict | None:
     return chosen
 
 
+def review_is_current(review_id: str, head: str, reviews: list | None) -> bool:
+    newest = _newest_submitted_review(reviews, head)
+    return bool(newest is not None
+                and _identity_from_review(newest) == (review_id, head)
+                and _review_state(newest) not in {"approved", "dismissed"}
+                and not is_terminal_clean_review(newest.get("body") or ""))
+
+
 def review_launch_identity(
     event: dict,
     event_name: str,
@@ -962,7 +970,7 @@ def review_claim_owned(
         login = ((comment.get("user") or {}).get("login") or "").casefold()
         if login != trusted:
             continue
-        if marker in (comment.get("body") or ""):
+        if has_control_marker(comment.get("body"), marker):
             return True
     return False
 
@@ -981,10 +989,19 @@ def review_launch_decision(
     if identity is None:
         return {"status": "unbound", "owned": False, "marker": "", "review_id": "", "head": ""}
     review_id, head = identity
+    if reviews is not None and not review_is_current(review_id, head, reviews):
+        return {"status": "blocked", "owned": False, "marker": "", "review_id": review_id, "head": head}
     if pull is not None and ("human-review-required" in _label_names(pull)
                              or ((pull.get("head") or {}).get("sha") != head)
                              or pull.get("state") != "open"):
         return {"status": "blocked", "owned": False, "marker": "", "review_id": review_id, "head": head}
+    if pull is not None and trusted_login:
+        # A newer review is not permission to replace an unresolved worker.
+        # Import locally: the recovery helper also uses our fixed claim format.
+        from goal_review_launch import pending_claim
+        repository = ((pull.get("head") or {}).get("repo") or {}).get("full_name")
+        if pending_claim(comments or [], repository, pull.get("number"), trusted_login):
+            return {"status": "blocked", "owned": False, "marker": "", "review_id": review_id, "head": head}
     marker = review_claim_marker(review_id, head)
     owned = review_claim_owned(comments, review_id, head, trusted_login)
     return {
@@ -1000,10 +1017,13 @@ def create_outcome(http_code: str) -> str:
     """Classify a Cursor create HTTP status.
 
     accept: 2xx, the worker exists.
-    reject: 4xx, the server refused and did not create a worker.
+    reject: other 4xx, the server refused and did not create a worker.
+    ambiguous: 409 can identify an existing client-supplied agent ID.
     ambiguous: 5xx, redirects, and any other status. The worker may exist.
     """
     code = (http_code or "").strip()
+    if code == "409":
+        return "ambiguous"
     if len(code) == 3 and code.isdigit():
         if code[0] == "2":
             return "accept"
@@ -1012,7 +1032,7 @@ def create_outcome(http_code: str) -> str:
     return "ambiguous"
 
 
-def claim_survives_cancel(*, accepted: bool, create_settled: bool) -> bool:
+def claim_survives_cancel(*, accepted: bool, create_settled: bool, create_attempted: bool = True) -> bool:
     """A cancelled run keeps the claim once a worker was accepted or the create is unknown.
 
     create_settled is true only for a definitive outcome: the worker was accepted,
@@ -1020,10 +1040,11 @@ def claim_survives_cancel(*, accepted: bool, create_settled: bool) -> bool:
     status is not settled. A settled rejection deletes the claim so a later event
     can launch. Cancellation while the create call is in flight keeps the claim
     and does not start a replacement.
+    A failure before the create call is attempted releases the reservation.
     """
     if accepted:
         return True
-    return not create_settled
+    return create_attempted and not create_settled
 
 
 def _cmd_review_claim(args: argparse.Namespace) -> int:
@@ -1044,8 +1065,14 @@ def _cmd_review_claim(args: argparse.Namespace) -> int:
 def _cmd_claim_release(args: argparse.Namespace) -> int:
     accepted = args.accepted == "true"
     settled = args.settled == "true"
-    print("keep" if claim_survives_cancel(accepted=accepted, create_settled=settled) else "delete")
+    print("keep" if claim_survives_cancel(accepted=accepted, create_settled=settled, create_attempted=args.attempted == "true") else "delete")
     return 0
+
+
+def _cmd_review_current(args: argparse.Namespace) -> int:
+    claim = _load_json(args.claim) or {}
+    reviews = flatten_pages(_load_json(args.reviews) or [])
+    return 0 if review_is_current(claim.get("review_id"), claim.get("head"), reviews) else 1
 
 
 def _cmd_create_outcome(args: argparse.Namespace) -> int:
@@ -1231,7 +1258,7 @@ def _self_check() -> None:
         "201": "accept",
         "400": "reject",
         "401": "reject",
-        "409": "reject",
+        "409": "ambiguous",
         "422": "reject",
         "429": "reject",
         " 404 ": "reject",
@@ -1400,10 +1427,15 @@ def main(argv: list[str] | None = None) -> int:
     claim.add_argument("--trusted-login", default="")
     claim.add_argument("--out", required=True)
     claim.set_defaults(func=_cmd_review_claim)
+    current = sub.add_parser("review-current")
+    current.add_argument("--claim", required=True)
+    current.add_argument("--reviews", required=True)
+    current.set_defaults(func=_cmd_review_current)
 
     release = sub.add_parser("claim-release")
     release.add_argument("--accepted", required=True, choices=("true", "false"))
     release.add_argument("--settled", required=True, choices=("true", "false"))
+    release.add_argument("--attempted", default="true", choices=("true", "false"))
     release.set_defaults(func=_cmd_claim_release)
 
     outcome = sub.add_parser("create-outcome")

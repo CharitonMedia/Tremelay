@@ -208,6 +208,8 @@ func brokerDenial(result string) error {
 		return ErrDeniedMalformed
 	case resultDeniedAbuse:
 		return ErrDeniedAbuse
+	case resultDeniedDestructive:
+		return ErrDeniedDestructive
 	case resultDeniedDestination:
 		return ErrDeniedDestination
 	default:
