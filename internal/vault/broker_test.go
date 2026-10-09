@@ -165,8 +165,16 @@ func TestBrokerAuditShape(t *testing.T) {
 	}
 	bad := base
 	bad.Result = resultCompleted
-	bad.Operation = "https://evil.example/secret"
+	bad.Operation = OpGitHubIssueState
 	next, err := nextAudit(chain, vaultID, bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyChain(append(chain, next)); err != nil {
+		t.Fatalf("github issue operation: %v", err)
+	}
+	bad.Operation = "https://evil.example/secret"
+	next, err = nextAudit(chain, vaultID, bad)
 	if err != nil {
 		t.Fatal(err)
 	}

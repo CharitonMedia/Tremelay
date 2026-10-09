@@ -45,12 +45,38 @@ var (
 	errBrokerTransport = errors.New("broker transport failed")
 )
 
+// brokerAttempt is one authorized broker call. prepare may set broker-owned
+// headers. accept, when set, sees a retained HTTP 200 body before the
+// completed audit and must not keep that body. A nil accept is the status-only
+// path: any non-redirect 200–599 status is returned and the body is wiped.
+type brokerAttempt struct {
+	credentialID string
+	method       string
+	target       string
+	operation    string
+	prepare      func(*http.Request)
+	accept       func([]byte) error
+}
+
 // brokerHTTP is the trusted broker path for one agent id.
 // Credential bytes are copied only after policy, destination, and abuse-hook
 // checks succeed, and only into the outbound Authorization header.
 func (s *Session) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error) {
-	if err := s.live(); err != nil {
+	status, err := s.brokerExchange(agentID, brokerAttempt{
+		credentialID: req.CredentialID,
+		method:       req.Method,
+		target:       req.Target,
+		operation:    OpHTTPRequest,
+	})
+	if err != nil {
 		return HTTPBrokerResponse{}, err
+	}
+	return HTTPBrokerResponse{StatusCode: status}, nil
+}
+
+func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error) {
+	if err := s.live(); err != nil {
+		return 0, err
 	}
 	// A suspended agent is an ordinary denial before request-shape checks and
 	// destination classification, so an unsupported method stays attributed
@@ -58,50 +84,50 @@ func (s *Session) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerR
 	// Malformed caller fields stay off the event.
 	if s.agentExists(agentID) && !s.agentActive(agentID) {
 		method := ""
-		if brokerMethod(req.Method) {
-			method = req.Method
+		if brokerMethod(call.method) {
+			method = call.method
 		}
-		return s.brokerDeny(s.destinationEvent(agentID, req.CredentialID, resultDeniedAgent), method, ErrDeniedAgent)
+		return s.failExchange(s.destinationEvent(agentID, call.credentialID, resultDeniedAgent, call.operation), method, ErrDeniedAgent)
 	}
-	if safeID(req.CredentialID) == "" || !brokerMethod(req.Method) {
-		return s.brokerDeny(auditEvent{Result: resultDenied}, "", ErrInvalid)
+	if safeID(call.credentialID) == "" || !brokerMethod(call.method) {
+		return s.failExchange(auditEvent{Result: resultDenied}, "", ErrInvalid)
 	}
-	resource, host, port, class := classifyTarget(req.Method, req.Target)
+	resource, host, port, class := classifyTarget(call.method, call.target)
 	switch class {
 	case targetInvalid:
-		return s.brokerDeny(auditEvent{Result: resultDenied}, req.Method, ErrInvalid)
+		return s.failExchange(auditEvent{Result: resultDenied}, call.method, ErrInvalid)
 	case targetMalformed:
-		return s.brokerDeny(s.policyDenial(agentID, req.CredentialID, req.Method, req.Target, resultDeniedMalformed), req.Method, ErrDeniedMalformed)
+		return s.failExchange(s.policyDenial(agentID, call.credentialID, call.method, call.target, resultDeniedMalformed, call.operation), call.method, ErrDeniedMalformed)
 	case targetSSRF:
-		return s.brokerDeny(s.policyDenial(agentID, req.CredentialID, req.Method, req.Target, resultDeniedSSRF), req.Method, ErrDeniedSSRF)
+		return s.failExchange(s.policyDenial(agentID, call.credentialID, call.method, call.target, resultDeniedSSRF, call.operation), call.method, ErrDeniedSSRF)
 	case targetOrigin:
-		return s.brokerDeny(s.policyDenial(agentID, req.CredentialID, req.Method, req.Target, resultDeniedOrigin), req.Method, ErrDeniedOrigin)
+		return s.failExchange(s.policyDenial(agentID, call.credentialID, call.method, call.target, resultDeniedOrigin, call.operation), call.method, ErrDeniedOrigin)
 	}
-	partial, cause := s.judge(agentID, req.CredentialID, OpHTTPRequest, resource)
+	partial, cause := s.judge(agentID, call.credentialID, call.operation, resource)
 	if cause != nil {
 		if partial.Result == resultDeniedScope {
-			if class, id, ok := reclassifyScope(s.grants, agentID, partial.CredID, partial.CredType, req.Method, req.Target); ok {
+			if class, id, ok := reclassifyScope(s.grants, agentID, partial.CredID, partial.CredType, call.method, call.target, call.operation); ok {
 				partial.Result = class
 				partial.GrantID = id
 				cause = brokerDenial(class)
 			}
 		}
-		return s.brokerDeny(partial, req.Method, cause)
+		return s.failExchange(partial, call.method, cause)
 	}
-	if req.Method == http.MethodDelete && s.policy.Destructive == DestructiveDeny {
+	if call.method == http.MethodDelete && s.policy.Destructive == DestructiveDeny {
 		partial.Result = resultDeniedDestructive
-		return s.brokerDeny(partial, req.Method, ErrDeniedDestructive)
+		return s.failExchange(partial, call.method, ErrDeniedDestructive)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), brokerTimeout)
 	defer cancel()
 	ips, err := s.lookupBroker(ctx, host)
 	if err != nil || len(ips) == 0 {
 		partial.Result = resultDeniedDestination
-		return s.brokerDeny(partial, req.Method, ErrDeniedDestination)
+		return s.failExchange(partial, call.method, ErrDeniedDestination)
 	}
 	if !publicIPs(ips) {
 		partial.Result = resultDeniedSSRF
-		return s.brokerDeny(partial, req.Method, ErrDeniedSSRF)
+		return s.failExchange(partial, call.method, ErrDeniedSSRF)
 	}
 	// ponytail: pin the first validated address. A mixed answer set was refused
 	// above. Upgrade path: dial any address in the already-validated set,
@@ -109,65 +135,123 @@ func (s *Session) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerR
 	pin := normalizeIP(ips[0])
 	if !isPublicIP(pin) {
 		partial.Result = resultDeniedSSRF
-		return s.brokerDeny(partial, req.Method, ErrDeniedSSRF)
+		return s.failExchange(partial, call.method, ErrDeniedSSRF)
 	}
-	upstream, err := http.NewRequestWithContext(ctx, req.Method, req.Target, nil)
-	if err != nil || upstream.URL == nil || upstream.URL.String() != req.Target || upstream.URL.User != nil {
+	upstream, err := http.NewRequestWithContext(ctx, call.method, call.target, nil)
+	if err != nil || upstream.URL == nil || upstream.URL.String() != call.target || upstream.URL.User != nil {
 		partial.Result = resultUpstreamError
-		return s.brokerDeny(partial, req.Method, ErrBrokerUpstream)
+		return s.failExchange(partial, call.method, ErrBrokerUpstream)
+	}
+	if call.prepare != nil {
+		call.prepare(upstream)
+	}
+	if upstream.URL == nil || upstream.URL.String() != call.target || upstream.URL.User != nil || upstream.Host != upstream.URL.Host || upstream.Method != call.method || upstream.Body != nil {
+		partial.Result = resultUpstreamError
+		return s.failExchange(partial, call.method, ErrBrokerUpstream)
 	}
 	if err := s.abuseHook(AbuseDecision{
 		AgentID:      partial.AgentID,
 		GrantID:      partial.GrantID,
 		CredentialID: partial.CredID,
-		Action:       actionClass(req.Method),
+		Action:       actionClass(call.method),
 		Class:        resultAllowed,
 	}); err != nil {
 		partial.Result = resultDeniedAbuse
-		return s.brokerAudit(partial, ErrDeniedAbuse)
+		_, err := s.brokerAudit(partial, ErrDeniedAbuse)
+		return 0, err
 	}
 	secret, ok := s.copySecret(partial.CredID)
 	if !ok || !safeHeaderSecret(secret) {
 		wipe(secret)
 		partial.Result = resultUpstreamError
-		return s.brokerDeny(partial, req.Method, ErrBrokerUpstream)
+		return s.failExchange(partial, call.method, ErrBrokerUpstream)
 	}
 	defer wipe(secret)
 	if err := s.brokerCommit(partial, resultAllowed); err != nil {
-		return HTTPBrokerResponse{}, err
+		return 0, err
 	}
-	// ponytail: bearer header only. Upgrade path: a typed credential adapter.
+	// ponytail: bearer header only. Upgrade path: a typed credential adapter
+	// that still cannot accept a caller-supplied authorization header.
+	upstream.Header.Del("Authorization")
 	upstream.Header.Set("Authorization", "Bearer "+string(secret))
 	defer upstream.Header.Del("Authorization")
+	if call.accept == nil {
+		return s.finishStatus(partial, upstream, pin, port, call.method)
+	}
+	return s.finishAccepted(partial, upstream, pin, port, call.method, call.accept)
+}
+
+func (s *Session) failExchange(ev auditEvent, method string, cause error) (int, error) {
+	_, err := s.brokerDeny(ev, method, cause)
+	return 0, err
+}
+
+func (s *Session) failTransport(partial auditEvent, method string, err error) (int, error) {
+	if errors.Is(err, errRedirectRefused) {
+		partial.Result = resultDeniedRedirect
+		return s.failExchange(partial, method, ErrDeniedRedirect)
+	}
+	if errors.Is(err, errDestination) {
+		partial.Result = resultDeniedSSRF
+		return s.failExchange(partial, method, ErrDeniedSSRF)
+	}
+	partial.Result = resultUpstreamError
+	return s.failExchange(partial, method, ErrBrokerUpstream)
+}
+
+func (s *Session) finishStatus(partial auditEvent, upstream *http.Request, pin net.IP, port, method string) (int, error) {
 	resp, err := s.doBroker(upstream, pin, port)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			discardBody(resp.Body)
 		}
-		if errors.Is(err, errRedirectRefused) {
-			partial.Result = resultDeniedRedirect
-			return s.brokerDeny(partial, req.Method, ErrDeniedRedirect)
-		}
-		if errors.Is(err, errDestination) {
-			partial.Result = resultDeniedSSRF
-			return s.brokerDeny(partial, req.Method, ErrDeniedSSRF)
-		}
-		partial.Result = resultUpstreamError
-		return s.brokerDeny(partial, req.Method, ErrBrokerUpstream)
+		return s.failTransport(partial, method, err)
 	}
 	status, kind := takeStatus(resp)
+	return s.finishKind(partial, method, status, kind)
+}
+
+func (s *Session) finishAccepted(partial auditEvent, upstream *http.Request, pin net.IP, port, method string, accept func([]byte) error) (int, error) {
+	resp, err := s.roundTrip(upstream, pin, port)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			discardBody(resp.Body)
+		}
+		return s.failTransport(partial, method, err)
+	}
+	var body []byte
+	var readErr error
+	if resp != nil && resp.Body != nil {
+		body, readErr = readCapped(resp.Body, githubIssueMaxBody)
+	}
+	defer wipe(body)
+	code := 0
+	if resp != nil {
+		code = resp.StatusCode
+	}
+	status, kind := responseClass(code, readErr)
+	if kind == brokerBodyOK && status != http.StatusOK {
+		kind = brokerBodyBad
+	}
+	if kind == brokerBodyOK && accept(body) != nil {
+		kind = brokerBodyBad
+	}
+	return s.finishKind(partial, method, status, kind)
+}
+
+func (s *Session) finishKind(partial auditEvent, method string, status, kind int) (int, error) {
 	switch kind {
 	case brokerBodyRedir:
 		partial.Result = resultDeniedRedirect
-		return s.brokerDeny(partial, req.Method, ErrDeniedRedirect)
+		return s.failExchange(partial, method, ErrDeniedRedirect)
 	case brokerBodyBad:
 		partial.Result = resultUpstreamError
-		return s.brokerDeny(partial, req.Method, ErrBrokerUpstream)
+		return s.failExchange(partial, method, ErrBrokerUpstream)
 	}
 	if err := s.brokerCommit(partial, resultCompleted); err != nil {
-		return HTTPBrokerResponse{}, err
+		return 0, err
 	}
-	return HTTPBrokerResponse{StatusCode: status}, nil
+	return status, nil
 }
 
 func (s *Session) brokerDeny(ev auditEvent, method string, cause error) (HTTPBrokerResponse, error) {
@@ -195,8 +279,8 @@ func (s *Session) brokerCommit(partial auditEvent, result string) error {
 	return s.finish(partial, nil)
 }
 
-func (s *Session) destinationEvent(agentID, credentialID, result string) auditEvent {
-	ev := auditEvent{Result: result, Operation: OpHTTPRequest}
+func (s *Session) destinationEvent(agentID, credentialID, result, operation string) auditEvent {
+	ev := auditEvent{Result: result, Operation: operation}
 	if safeID(agentID) == "" || !s.agentExists(agentID) {
 		return ev
 	}
@@ -210,8 +294,8 @@ func (s *Session) destinationEvent(agentID, credentialID, result string) auditEv
 
 // policyDenial records a destination-class refusal. The raw target is used
 // only to find an exact grant id. It is not an audit field.
-func (s *Session) policyDenial(agentID, credentialID, method, target, result string) auditEvent {
-	ev := s.destinationEvent(agentID, credentialID, result)
+func (s *Session) policyDenial(agentID, credentialID, method, target, result, operation string) auditEvent {
+	ev := s.destinationEvent(agentID, credentialID, result, operation)
 	resource := method + " " + target
 	if ev.AgentID == "" || ev.CredID == "" || validateResource(resource) != nil {
 		return ev
@@ -219,7 +303,7 @@ func (s *Session) policyDenial(agentID, credentialID, method, target, result str
 	var id string
 	for i := range s.grants {
 		g := s.grants[i]
-		if g.AgentID == ev.AgentID && g.Resource == resource && grantAllowsOp(g, OpHTTPRequest) && grantMatchesCred(g, ev.CredID, ev.CredType) {
+		if g.AgentID == ev.AgentID && g.Resource == resource && grantAllowsOp(g, operation) && grantMatchesCred(g, ev.CredID, ev.CredType) {
 			id = preferID(id, g.ID)
 		}
 	}
@@ -244,6 +328,24 @@ func (s *Session) lookupBroker(ctx context.Context, host string) ([]net.IP, erro
 }
 
 func (s *Session) doBroker(req *http.Request, ip net.IP, port string) (*http.Response, error) {
+	resp, err := s.roundTrip(req, ip, port)
+	if err != nil || s.httpDo != nil {
+		return resp, err
+	}
+	if resp == nil || resp.Body == nil {
+		return resp, nil
+	}
+	buf, readErr := readLimited(resp.Body)
+	_ = resp.Body.Close()
+	wipe(buf)
+	if readErr != nil {
+		return nil, errBrokerTransport
+	}
+	resp.Body = http.NoBody
+	return resp, nil
+}
+
+func (s *Session) roundTrip(req *http.Request, ip net.IP, port string) (*http.Response, error) {
 	if s.httpDo != nil {
 		return s.httpDo(req)
 	}
@@ -267,13 +369,6 @@ func (s *Session) doBroker(req *http.Request, ip net.IP, port string) (*http.Res
 		}
 		return nil, errBrokerTransport
 	}
-	buf, readErr := readLimited(resp.Body)
-	_ = resp.Body.Close()
-	wipe(buf)
-	if readErr != nil {
-		return nil, errBrokerTransport
-	}
-	resp.Body = http.NoBody
 	return resp, nil
 }
 
@@ -366,13 +461,30 @@ func takeStatus(resp *http.Response) (int, int) {
 		wipe(buf)
 		readErr = err
 	}
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+	return responseClass(resp.StatusCode, readErr)
+}
+
+func responseClass(code int, readErr error) (int, int) {
+	if code >= 300 && code < 400 {
 		return 0, brokerBodyRedir
 	}
-	if readErr != nil || resp.StatusCode < 200 || resp.StatusCode > 599 {
+	if readErr != nil || code < 200 || code > 599 {
 		return 0, brokerBodyBad
 	}
-	return resp.StatusCode, brokerBodyOK
+	return code, brokerBodyOK
+}
+
+func readCapped(body io.ReadCloser, n int) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	buf, err := io.ReadAll(io.LimitReader(body, int64(n)+1))
+	_ = body.Close()
+	if err != nil || len(buf) > n {
+		wipe(buf)
+		return nil, errBrokerTransport
+	}
+	return buf, nil
 }
 
 func readLimited(body io.Reader) ([]byte, error) {

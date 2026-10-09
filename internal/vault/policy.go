@@ -124,7 +124,7 @@ func containsByte(s string, c byte) bool {
 // reclassifyScope turns an M2 scope miss into the closest explicit HTTP
 // policy mismatch. Grants that are not canonical HTTP policies are ignored.
 // The winner is deterministic: higher specificity, then the lowest grant id.
-func reclassifyScope(grants []grantRecord, agentID, credID, credType, method, target string) (result, grantID string, ok bool) {
+func reclassifyScope(grants []grantRecord, agentID, credID, credType, method, target, operation string) (result, grantID string, ok bool) {
 	req, good := requestPolicy(method, target)
 	if !good {
 		return "", "", false
@@ -135,7 +135,7 @@ func reclassifyScope(grants []grantRecord, agentID, credID, credType, method, ta
 	var bestClass string
 	for i := range grants {
 		g := grants[i]
-		if g.AgentID != agentID || !grantMatchesCred(g, credID, credType) || !grantAllowsOp(g, OpHTTPRequest) {
+		if g.AgentID != agentID || !grantMatchesCred(g, credID, credType) || !grantAllowsOp(g, operation) {
 			continue
 		}
 		pol, parsed := policyFromResource(g.Resource)

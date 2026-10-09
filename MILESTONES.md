@@ -53,6 +53,8 @@ Acceptance includes password strength assessment, compromised-password checking 
 
 **Goal:** Demonstrate a real-world capability model for GitHub without exposing the underlying credential.
 
+The reference capability is a scoped issue-state read. An agent with an expiring `github_issue_state` grant for one repository issue receives the issue number, open or closed state, lock flag, and comment count. The broker inserts the credential. An `http_request` grant does not authorize that response. Acceptance is demonstrated by the synthetic tests in [ADR 0011](docs/adr/0011-github-issue-state.md) and [docs/m7-github-issue.md](docs/m7-github-issue.md). Live GitHub calls are not part of that demonstration.
+
 ## M8 — SSH/signing broker
 
 **Goal:** Allow authorized signing operations while keeping private key material inside Tremelay.
