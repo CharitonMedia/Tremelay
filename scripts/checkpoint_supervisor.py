@@ -42,6 +42,20 @@ ASSESSOR_TERMINATE_GRACE_SECONDS = 5
 ASSESSOR_PATH = Path(__file__).resolve().with_name("anthropic_checkpoint_assessor.py")
 TRUSTED_PATH = "/usr/local/bin:/usr/bin:/bin"
 MAX_SAFE_COUNTER = 2 ** 53 - 1
+ASSESSOR_FAILURE_STAGES = {
+    "input": "input validation",
+    "runtime": "helper runtime",
+    "tls_setup": "TLS initialization",
+    "github_url": "GitHub identity endpoint validation",
+    "github_acquisition": "GitHub identity acquisition",
+    "github_response": "GitHub identity response validation",
+    "anthropic_exchange": "Anthropic token exchange",
+    "anthropic_response": "Anthropic token response validation",
+    "messages": "Anthropic model request",
+    "messages_response": "Anthropic model response validation",
+}
+ASSESSOR_HTTP_STAGES = {"github_acquisition", "anthropic_exchange", "messages"}
+ASSESSOR_GENERIC_FAILURE = "Anthropic assessment failed or was ambiguous; no automatic replay"
 SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
@@ -245,6 +259,29 @@ def stop_assessor(process):
         process.wait()
 
 
+def assessor_failure(raw):
+    """Project only the helper's fixed failure vocabulary, never its raw text."""
+    try:
+        value = strict_json(raw.decode("utf-8"))
+        if (not isinstance(value, dict)
+                or set(value) != {"status", "stage", "http_status"}
+                or value["status"] != "failed"
+                or not isinstance(value["stage"], str)
+                or value["stage"] not in ASSESSOR_FAILURE_STAGES):
+            return ASSESSOR_GENERIC_FAILURE
+        stage = value["stage"]
+        status = value["http_status"]
+        if status is not None and (stage not in ASSESSOR_HTTP_STAGES
+                or type(status) is not int or not 400 <= status <= 599):
+            return ASSESSOR_GENERIC_FAILURE
+        message = "Anthropic assessment failed at " + ASSESSOR_FAILURE_STAGES[stage]
+        if status is not None:
+            message += f" (HTTP {status})"
+        return message + "; no automatic replay"
+    except (Stop, UnicodeError, ValueError, TypeError, RecursionError):
+        return ASSESSOR_GENERIC_FAILURE
+
+
 def invoke_assessor(payload=None, *, preflight=False, smoke=False):
     """One credential-minimal child, one bounded result, never an API retry."""
     if preflight and smoke:
@@ -310,8 +347,6 @@ def invoke_assessor(payload=None, *, preflight=False, smoke=False):
                             pending_input = None
                     if cancelled:
                         raise AssessmentCancelled("Anthropic assessment cancelled; no automatic replay")
-                    if process.returncode != 0:
-                        raise Stop("Anthropic assessment failed or was ambiguous; no automatic replay")
                 finally:
                     stop_assessor(process)
                     if process.stdin is not None:
@@ -322,6 +357,9 @@ def invoke_assessor(payload=None, *, preflight=False, smoke=False):
                 raw = output.read(MAX_ASSESSOR_OUTPUT_BYTES + 1)
                 if len(raw) > MAX_ASSESSOR_OUTPUT_BYTES:
                     raise Stop("Anthropic assessment output exceeds its bound")
+                if process.returncode != 0:
+                    message = assessor_failure(raw) if process.returncode == 1 else ASSESSOR_GENERIC_FAILURE
+                    raise Stop(message)
                 result = strict_json(raw.decode("utf-8"))
                 if cancelled:
                     raise AssessmentCancelled("Anthropic assessment cancelled; no automatic replay")

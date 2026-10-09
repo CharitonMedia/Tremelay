@@ -82,6 +82,12 @@ See [ADR 0009](adr/0009-claude-wif-checkpoint-assessment.md) for the backend cha
 and [Anthropic's WIF reference](https://platform.claude.com/docs/en/manage-claude/wif-reference)
 for the exchange contract. Preflight prints only allowlisted authentication
 metadata; it does not print JWT claims, credential values or provider error bodies.
+On failure, it reports only a fixed stage and, for an HTTP rejection, the status
+number. A GitHub identity endpoint/acquisition failure occurs before the Anthropic
+exchange; an Anthropic token-exchange failure can be compared with the existing
+authentication event in Claude Console. A generic failure means no valid safe
+diagnostic was available. Do not change federation rules or retry paid assessments
+based only on that generic message; checkpoint reservations remain consumed.
 
 ## Operation
 

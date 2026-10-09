@@ -183,6 +183,44 @@ class AssessorBoundary(unittest.TestCase):
             child.assert_called_once()
             fallback.assert_not_called()
 
+    def test_failure_diagnostic_requires_exact_allowlisted_envelope_and_exit_one(self):
+        value = {'status': 'failed', 'stage': 'anthropic_exchange', 'http_status': 403}
+        raw = json.dumps(value).encode()
+        with self.helper(self.output_source(raw, returncode=1)):
+            with self.assertRaisesRegex(s.Stop, 'Anthropic token exchange \\(HTTP 403\\); no automatic replay'):
+                s.authentication_preflight()
+        for code in [0, 2, 127]:
+            with self.subTest(code=code), self.helper(self.output_source(raw, returncode=code)):
+                with self.assertRaises(s.Stop) as error:
+                    s.authentication_preflight()
+                self.assertNotIn('HTTP 403', str(error.exception))
+        # Safe diagnostics are still a terminal failure in model modes.
+        with self.helper(self.output_source(raw, returncode=1)):
+            with self.assertRaises(s.Stop):
+                s.assess({'head': HEAD})
+            with self.assertRaises(s.Stop):
+                s.model_smoke()
+
+    def test_failure_diagnostic_never_echoes_unknown_or_malformed_fields(self):
+        token = ENV['ACTIONS_ID_TOKEN_REQUEST_TOKEN']
+        valid = {'status': 'failed', 'stage': 'anthropic_exchange', 'http_status': None}
+        invalid = [dict(valid, stage=token), dict(valid, status=token), dict(valid, detail=token),
+                   dict(valid, http_status=token), dict(valid, stage=['anthropic_exchange']),
+                   dict(valid, stage='github_response', http_status=403)]
+        invalid += [dict(valid, http_status=value) for value in [True, 200, 399, 600, 403.0, '403']]
+        invalid += [{key: value for key, value in valid.items() if key != 'http_status'}]
+        raw_values = [json.dumps(value).encode() for value in invalid]
+        raw_values += [b'', b'\xff', b'{}{}', b'[]', b'null', b'NaN',
+                       b'{"status":"failed","stage":"anthropic_exchange","stage":"input","http_status":null}']
+        for raw in raw_values:
+            with self.subTest(raw=raw[:60]):
+                message = s.assessor_failure(raw)
+                self.assertEqual(message, s.ASSESSOR_GENERIC_FAILURE)
+                self.assertNotIn(token, message)
+        for stage, label in s.ASSESSOR_FAILURE_STAGES.items():
+            raw = json.dumps(dict(valid, stage=stage)).encode()
+            self.assertEqual(s.assessor_failure(raw), f'Anthropic assessment failed at {label}; no automatic replay')
+
     def test_only_exact_main_workflow_can_request_identity(self):
         for change in [{'GITHUB_REPOSITORY': 'other/repo'}, {'GITHUB_REF': 'refs/heads/feature'},
                        {'GITHUB_WORKFLOW_REF': ENV['GITHUB_WORKFLOW_REF'].replace('@refs/heads/main', '@refs/heads/feature')},

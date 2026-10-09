@@ -50,6 +50,20 @@ tokens or exception messages. Bounded response sizes and a process-group deadlin
 prevent unbounded local waits/output. A failed or ambiguous assessment retains
 its durable reservation and never causes an automatic second inference request.
 
+Failure diagnostics expose only a fixed stage name and an optional integer HTTP
+status at request stages. The helper emits that exact small envelope on exit 1;
+the controller independently validates its keys, stages and status range before
+mapping it to fixed text. Unknown or malformed output remains a generic failure.
+Raw stderr, response bodies, endpoints and credential values remain suppressed.
+This lets an auth-only preflight distinguish a local URL/transport rejection
+from an Anthropic exchange denial without weakening the credential boundary.
+
+GitHub's OIDC request path is opaque and must be preserved, including literal
+doubled slashes used by its hosted runner service. The runner supplies that URL;
+the helper validates its HTTPS origin and appends the audience without rewriting
+the path. Encoded separators, traversal, userinfo, fragments, redirects and
+untrusted hosts remain refused.
+
 Normal event/schedule/manual execution and the controller require the fresh
 public `claude-wif-v2-5134b392b4a044deae9973b1c8757af2` release activation value.
 The prior OpenAI value cannot activate this backend. The job and controller also
@@ -111,3 +125,5 @@ termination. No token exchange or model call is made by those tests.
 - [GitHub Actions federation](https://platform.claude.com/docs/en/manage-claude/wif-providers/github-actions)
 - [Sonnet 5.5 model and pricing](https://platform.claude.com/docs/en/models/sonnet-5-5/overview)
 - [Structured output contract](https://platform.claude.com/docs/en/build-with-claude/structured-outputs)
+- [GitHub runner OIDC environment](https://github.com/actions/runner/blob/main/src/Runner.Worker/Handlers/ScriptHandler.cs)
+- [GitHub toolkit OIDC URL handling](https://github.com/actions/toolkit/blob/main/packages/core/src/oidc-utils.ts)
