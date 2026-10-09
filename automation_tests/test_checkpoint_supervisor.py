@@ -82,9 +82,9 @@ class Gates(unittest.TestCase):
 
     def test_model_input_and_output_are_bounded_without_tools(self):
         with self.assertRaises(s.Stop):
-            s.assess({'head': HEAD, 'evidence': 'x' * (s.MAX_BYTES + 1)}, 'test-sentinel-key')
+            s.assess({'head': HEAD, 'evidence': 'x' * (s.MAX_BYTES + 1)})
         self.assertNotIn('tools', s.SCHEMA['properties'])
-        self.assertEqual(s.MODEL, 'gpt-6.1-sol')
+        self.assertEqual(s.MODEL, 'claude-sonnet-5-5')
 
     def test_redirect_is_refused(self):
         with self.assertRaises(s.Stop):
@@ -119,7 +119,7 @@ class Controller(unittest.TestCase):
         with context[0], context[1], context[2], context[3], context[4], context[5], context[6] as model:
             error = None
             try:
-                s.run_one(PULL, 'test-sentinel-key', 3)
+                s.run_one(PULL, 3)
             except s.Stop as exc:
                 error = exc
         return writes, model, error
@@ -269,7 +269,7 @@ class Controller(unittest.TestCase):
         state = {'phase': 'dispatch_reserved', 'head': HEAD, 'review': 4}
         claim = {'user': {'login': s.AUTHOR}, 'body': s.state_body(state, 'Claim')}
         next_pull = dict(PULL, number=13)
-        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', return_value={'login': s.AUTHOR}), patch.object(s, 'pages', side_effect=[[PULL, next_pull], [claim], []]), patch.object(s, 'recover_worker', side_effect=s.Stop('No accepted worker')), patch.object(s, 'run_one') as assess:
+        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': s.REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'test-token', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', return_value={'login': s.AUTHOR}), patch.object(s, 'pages', side_effect=[[PULL, next_pull], [claim], []]), patch.object(s, 'recover_worker', side_effect=s.Stop('No accepted worker')), patch.object(s, 'run_one') as assess:
             self.assertEqual(s.main(), 1)
             self.assertEqual(assess.call_args.args[0]['number'], 13)
 
@@ -436,11 +436,11 @@ class Controller(unittest.TestCase):
                 content = b'\x89PNG\xff' if '/image.png?' in path else b'Required document'
                 return {'encoding': 'base64', 'content': base64.b64encode(content).decode()}
             raise AssertionError(path)
-        def process(pull, key, limit):
+        def process(pull, limit):
             if pull['number'] == 11:
-                return run_one(pull, key, limit)
+                return run_one(pull, limit)
             processed.append(pull['number'])
-        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'run_one', side_effect=process), patch.object(s, 'assess') as model, patch.object(s, 'cursor') as worker:
+        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': s.REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'test-token', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'run_one', side_effect=process), patch.object(s, 'assess') as model, patch.object(s, 'cursor') as worker:
             self.assertEqual(s.main(), 1)
             self.assertEqual(processed, [13])
             model.assert_not_called()
@@ -472,7 +472,7 @@ class Controller(unittest.TestCase):
                 if path.endswith('/comments'):
                     return [claim]
                 raise AssertionError(path)
-            with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'run_one') as next_assessment, patch.object(s, 'cursor') as worker:
+            with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': s.REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'test-token', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'run_one') as next_assessment, patch.object(s, 'cursor') as worker:
                 self.assertEqual(s.main(), 0)
                 next_assessment.assert_not_called()
                 retired = s.records([claim])[0][1]
@@ -482,7 +482,7 @@ class Controller(unittest.TestCase):
                 self.assertEqual(retired['decision'], DECISION)
                 self.assertNotIn('agent_id', retired)
                 self.assertEqual(s.main(), 0)
-                next_assessment.assert_called_once_with(live, 'test-key', 3)
+                next_assessment.assert_called_once_with(live, 3)
                 worker.assert_not_called()
 
     def test_retired_assessments_still_consume_total_budget(self):
@@ -536,7 +536,7 @@ class Controller(unittest.TestCase):
             if path.endswith('/reviews'):
                 return [newer_review]
             raise AssertionError(path)
-        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'test-token', 'OPENAI_API_KEY': 'test-key', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'RUNNING'}] * 2) as worker, patch.object(s, 'run_one') as assess:
+        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': s.REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'test-token', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'RUNNING'}] * 2) as worker, patch.object(s, 'run_one') as assess:
             self.assertEqual(s.main(), 0)
             live['head']['sha'] = 'b' * 40
             newer_review['commit_id'] = 'b' * 40
@@ -564,7 +564,7 @@ class Controller(unittest.TestCase):
 
 
     def test_disabled_installation_makes_no_service_calls(self):
-        for activation in ['', 'true', 'reviewed-v1-other-release']:
+        for activation in ['', 'true', 'reviewed-v1-d9cfdd332b6a490e9999f037f632a750', 'cursor-v2-43b97c8db2a048cba47178df2e964a2f']:
             with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'TREMELAY_SUPERVISOR_ACTIVATION': activation}, clear=True), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh') as github, patch.object(s, 'cursor') as worker, patch.object(s, 'assess') as model:
                 self.assertEqual(s.main(), 0)
                 github.assert_not_called()
@@ -574,15 +574,16 @@ class Controller(unittest.TestCase):
     def test_preflight_is_read_only_and_does_not_reveal_values(self):
         from contextlib import redirect_stdout
         import io
-        values = {'GITHUB_REPOSITORY': s.REPO, 'GH_TOKEN': 'github-private-sentinel', 'OPENAI_API_KEY': 'openai-private-sentinel', 'CURSOR_API_KEY': 'cursor-private-sentinel'}
+        values = {'GITHUB_REPOSITORY': s.REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': s.REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'github-private-sentinel', 'CURSOR_API_KEY': 'cursor-private-sentinel'}
         output = io.StringIO()
-        with patch.dict(s.os.environ, values, clear=True), patch.object(sys, 'argv', ['checkpoint_supervisor.py', '--preflight']), patch.object(s, 'gh', return_value={'login': s.AUTHOR}) as github, patch.object(s, 'cursor') as worker, patch.object(s, 'assess') as model, redirect_stdout(output):
+        with patch.dict(s.os.environ, values, clear=True), patch.object(sys, 'argv', ['checkpoint_supervisor.py', '--preflight']), patch.object(s, 'gh', return_value={'login': s.AUTHOR}) as github, patch.object(s, 'cursor') as worker, patch.object(s, 'assess') as model, patch.object(s, 'authentication_preflight') as authentication, redirect_stdout(output):
             self.assertEqual(s.main(), 0)
             github.assert_called_once_with('user')
             worker.assert_not_called()
             model.assert_not_called()
+            authentication.assert_called_once_with()
         self.assertIn('Release activation is disabled.', output.getvalue())
-        for name in ['GH_TOKEN', 'OPENAI_API_KEY', 'CURSOR_API_KEY']:
+        for name in ['GH_TOKEN', 'CURSOR_API_KEY']:
             self.assertNotIn(values[name], output.getvalue())
         self.assertNotIn(s.ACTIVATION_VALUE, output.getvalue())
 
@@ -590,12 +591,16 @@ class Controller(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/checkpoint-supervisor.yml').read_text()
         condition = next(line.strip().removeprefix('if: ${{ ').removesuffix(' }}') for line in workflow.splitlines() if line.strip().startswith('if: ${{ '))
         self.assertIn(s.ACTIVATION_VALUE, condition)
-        expression = condition.replace('vars.TREMELAY_SUPERVISOR_ACTIVATION', 'activation').replace('github.event_name', 'event').replace('inputs.preflight_only', 'preflight').replace('&&', 'and').replace('||', 'or').replace('== true', '== True')
+        expression = condition.replace('vars.TREMELAY_SUPERVISOR_ACTIVATION', 'activation').replace('github.event_name', 'event').replace('inputs.preflight_only', 'preflight').replace('inputs.model_smoke_only', 'smoke').replace('github.workflow_ref', 'workflow_ref').replace('github.ref', 'ref').replace('&&', 'and').replace('||', 'or').replace('== true', '== True')
+        trusted_workflow = s.REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main'
         for event in ['schedule', 'workflow_run', 'workflow_dispatch']:
             for activation in ['', 'true', 'old-release', s.ACTIVATION_VALUE]:
                 for preflight in [False, True]:
-                    allowed = eval(expression, {'__builtins__': {}}, {'activation': activation, 'event': event, 'preflight': preflight})
-                    self.assertEqual(allowed, activation == s.ACTIVATION_VALUE or (event == 'workflow_dispatch' and preflight))
+                    for smoke in [False, True]:
+                        for ref in ['refs/heads/main', 'refs/heads/feature', 'refs/pull/1/merge']:
+                            for workflow_ref in [trusted_workflow, trusted_workflow.replace('@refs/heads/main', '@refs/heads/feature')]:
+                                allowed = eval(expression, {'__builtins__': {}}, {'activation': activation, 'event': event, 'preflight': preflight, 'smoke': smoke, 'ref': ref, 'workflow_ref': workflow_ref})
+                                self.assertEqual(allowed, ref == 'refs/heads/main' and workflow_ref == trusted_workflow and (activation == s.ACTIVATION_VALUE or (event == 'workflow_dispatch' and (preflight or smoke))))
         self.assertIn('TREMELAY_SUPERVISOR_ACTIVATION: ${{ vars.TREMELAY_SUPERVISOR_ACTIVATION }}', workflow)
 
 

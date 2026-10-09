@@ -13,9 +13,12 @@ import base64
 from datetime import datetime, timezone
 import json
 import os
+from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -23,15 +26,22 @@ import urllib.request
 from complete_codex_clean_review import is_terminal_clean_review
 from automation_protocol import AmbiguousCheckpoint, SUPERVISOR_MARKER, has_control_marker as _has_control_marker, supervisor_state
 
-MODEL = "gpt-6.1-sol"
+MODEL = "claude-sonnet-5-5"
+BACKEND = "anthropic-wif"
 # Public release opt-in value, not a credential. Installation alone is inert.
-ACTIVATION_VALUE = "reviewed-v1-d9cfdd332b6a490e9999f037f632a750"
+ACTIVATION_VALUE = "claude-wif-v2-5134b392b4a044deae9973b1c8757af2"
 AUTHOR = "pattalkslaw-del"
 CODEX = {"chatgpt-codex-connector[bot]", "codex"}
 REPO = "CharitonMedia/Tremelay"
 MARKER = SUPERVISOR_MARKER
 MAX_BYTES = 1_000_000
-MAX_OUTPUT = 8192
+MAX_ASSESSOR_OUTPUT_BYTES = 96 * 1024
+MAX_ASSESSOR_REQUEST_BYTES = MAX_BYTES + 16 * 1024
+ASSESSOR_TIMEOUT_SECONDS = 240
+ASSESSOR_TERMINATE_GRACE_SECONDS = 5
+ASSESSOR_PATH = Path(__file__).resolve().with_name("anthropic_checkpoint_assessor.py")
+TRUSTED_PATH = "/usr/local/bin:/usr/bin:/bin"
+MAX_SAFE_COUNTER = 2 ** 53 - 1
 SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
@@ -67,6 +77,10 @@ cap, fresh head and independent review; you cannot modify those limits.
 
 class Stop(RuntimeError):
     """Safe fixed error text. Never include HTTP bodies or credential values."""
+
+
+class AssessmentCancelled(Stop):
+    """Cancellation stops the controller scan as well as its owned child."""
 
 
 def has_control_marker(body, marker):
@@ -179,41 +193,203 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise Stop("Credential-bearing API redirect refused")
 
 
-def assess(evidence, key):
-    packed = json.dumps(evidence, ensure_ascii=False)
-    if len(packed.encode("utf-8")) > MAX_BYTES:
-        raise Stop("Evidence exceeds supervisor input bound; manual assessment required")
-    payload = {
-        "model": MODEL, "reasoning": {"effort": "high"}, "store": False,
-        "max_output_tokens": MAX_OUTPUT,
-        "input": [{"role": "system", "content": INSTRUCTIONS},
-                  {"role": "user", "content": packed}],
-        "text": {"format": {"type": "json_schema", "name": "checkpoint_decision",
-                            "strict": True, "schema": SCHEMA}},
-    }
-    request = urllib.request.Request("https://api.openai.com/v1/responses",
-                                     data=json.dumps(payload).encode(), method="POST",
-                                     headers={"Authorization": "Bearer " + key,
-                                              "Content-Type": "application/json"})
+def strict_json(text):
+    """Reject ambiguous JSON before any model output can become durable state."""
+    def pairs(items):
+        result = {}
+        for name, value in items:
+            if name in result:
+                raise ValueError("Duplicate JSON key")
+            result[name] = value
+        return result
+
+    def constant(_):
+        raise ValueError("Non-finite JSON value")
+
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+
+
+def trusted_workflow_guard():
+    # A checkout of main does not make a feature-branch workflow trusted.
+    expected = REPO + "/.github/workflows/checkpoint-supervisor.yml@refs/heads/main"
+    if (os.environ.get("GITHUB_REPOSITORY") != REPO
+            or os.environ.get("GITHUB_REF") != "refs/heads/main"
+            or os.environ.get("GITHUB_WORKFLOW_REF") != expected):
+        raise Stop("Supervisor requires the trusted main workflow")
+
+
+def assessor_context_guard():
+    trusted_workflow_guard()
+    if os.name != "posix":
+        raise Stop("Isolated supervisor assessment requires POSIX")
+    for name in ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
+        if not os.environ.get(name):
+            raise Stop("Missing GitHub workload identity request credentials")
+
+
+def stop_assessor(process):
+    """Cancel the entire owned session, including a surviving descendant."""
     try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=240) as response:
-            result = json.load(response)
-    except (urllib.error.URLError, TimeoutError, ValueError):
-        raise Stop("OpenAI assessment failed or was ambiguous; no automatic replay") from None
-    if result.get("status") != "completed":
-        raise Stop("OpenAI assessment did not complete")
-    output = []
-    for item in result.get("output", []):
-        for content in item.get("content", []):
-            if content.get("type") == "refusal":
-                raise Stop("OpenAI assessment declined")
-            if content.get("type") == "output_text":
-                output.append(content["text"])
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
     try:
-        decision = validate_decision(json.loads("".join(output)), evidence["head"])
-    except ValueError:
-        raise Stop("OpenAI returned invalid decision JSON") from None
-    return decision, result.get("usage", {})
+        process.wait(timeout=ASSESSOR_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def invoke_assessor(payload=None, *, preflight=False, smoke=False):
+    """One credential-minimal child, one bounded result, never an API retry."""
+    if preflight and smoke:
+        raise Stop("Assessor diagnostic modes are mutually exclusive")
+    if (preflight or smoke) and payload is not None:
+        raise Stop("Assessor diagnostic modes cannot receive assessment input")
+    assessor_context_guard()
+    previous_handlers = {}
+    cancelled = False
+
+    def cancel(_signum, _frame):
+        nonlocal cancelled
+        cancelled = True
+
+    try:
+        packed = b"" if preflight or smoke else json.dumps(
+            payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        if len(packed) > MAX_ASSESSOR_REQUEST_BYTES:
+            raise Stop("Evidence exceeds supervisor request bound; manual assessment required")
+        # Signal handling is intentionally main-thread/POSIX only. No child is
+        # started if this cancellation contract cannot be installed.
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, cancel)
+        with tempfile.TemporaryDirectory(prefix="tremelay-assessor-") as directory:
+            root = Path(directory)
+            env = {"PATH": TRUSTED_PATH, "LANG": "C.UTF-8"}
+            for name in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+                         "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
+                path = root / name.lower()
+                path.mkdir(mode=0o700)
+                env[name] = str(path)
+            for name in ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
+                env[name] = os.environ[name]
+            work = root / "work"
+            work.mkdir(mode=0o700)
+            args = [str(Path(sys.executable).resolve()), "-I", "-B", str(ASSESSOR_PATH)]
+            if preflight:
+                args.append("--preflight")
+            elif smoke:
+                args.append("--smoke")
+            # No copied auth files, candidate files, inherited descriptors or
+            # stderr. Disk-backed stdout is size-checked before every bounded
+            # read; even a broken helper cannot grow the controller's memory.
+            with tempfile.TemporaryFile(dir=root) as output:
+                deadline = time.monotonic() + ASSESSOR_TIMEOUT_SECONDS
+                process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=output,
+                    stderr=subprocess.DEVNULL, cwd=work, env=env,
+                    start_new_session=True, close_fds=True)
+                try:
+                    pending_input = packed
+                    while True:
+                        if cancelled:
+                            raise AssessmentCancelled("Anthropic assessment cancelled; no automatic replay")
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise Stop("Anthropic assessment timed out; no automatic replay")
+                        if os.fstat(output.fileno()).st_size > MAX_ASSESSOR_OUTPUT_BYTES:
+                            raise Stop("Anthropic assessment output exceeds its bound")
+                        try:
+                            process.communicate(input=pending_input, timeout=min(remaining, 0.1))
+                            break
+                        except subprocess.TimeoutExpired:
+                            pending_input = None
+                    if cancelled:
+                        raise AssessmentCancelled("Anthropic assessment cancelled; no automatic replay")
+                    if process.returncode != 0:
+                        raise Stop("Anthropic assessment failed or was ambiguous; no automatic replay")
+                finally:
+                    stop_assessor(process)
+                    if process.stdin is not None:
+                        process.stdin.close()
+                if os.fstat(output.fileno()).st_size > MAX_ASSESSOR_OUTPUT_BYTES:
+                    raise Stop("Anthropic assessment output exceeds its bound")
+                output.seek(0)
+                raw = output.read(MAX_ASSESSOR_OUTPUT_BYTES + 1)
+                if len(raw) > MAX_ASSESSOR_OUTPUT_BYTES:
+                    raise Stop("Anthropic assessment output exceeds its bound")
+                result = strict_json(raw.decode("utf-8"))
+                if cancelled:
+                    raise AssessmentCancelled("Anthropic assessment cancelled; no automatic replay")
+                return result
+    except (OSError, ValueError, TypeError, KeyError, RecursionError,
+            subprocess.SubprocessError, OverflowError):
+        raise Stop("Anthropic assessment failed or was ambiguous; no automatic replay") from None
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+def safe_counter(value, *, positive=False):
+    return type(value) is int and (1 if positive else 0) <= value <= MAX_SAFE_COUNTER
+
+
+def authentication_preflight():
+    result = invoke_assessor(preflight=True)
+    if (not isinstance(result, dict)
+            or set(result) != {"authentication_succeeded", "scope", "expires_in", "model_called"}
+            or result["authentication_succeeded"] is not True
+            or result["scope"] != "workspace:developer"
+            or result["model_called"] is not False
+            or not safe_counter(result["expires_in"], positive=True)):
+        raise Stop("Anthropic authentication preflight returned an invalid result")
+    return result
+
+
+def model_smoke():
+    result = invoke_assessor(smoke=True)
+    if (not isinstance(result, dict)
+            or set(result) != {"smoke_succeeded", "model_called", "model", "usage"}
+            or result["smoke_succeeded"] is not True
+            or result["model_called"] is not True
+            or result["model"] != MODEL):
+        raise Stop("Anthropic model smoke returned an invalid result")
+    usage = result["usage"]
+    if (not isinstance(usage, dict) or set(usage) != {"input_tokens", "output_tokens"}
+            or not safe_counter(usage["input_tokens"])
+            or not safe_counter(usage["output_tokens"], positive=True)
+            or usage["output_tokens"] > 256):
+        raise Stop("Anthropic model smoke returned invalid usage")
+    return result
+
+
+def assess(evidence):
+    try:
+        packed = json.dumps(evidence, ensure_ascii=False, allow_nan=False)
+        if len(packed.encode("utf-8")) > MAX_BYTES:
+            raise Stop("Evidence exceeds supervisor input bound; manual assessment required")
+        if (not isinstance(evidence, dict) or not isinstance(evidence.get("head"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", evidence["head"])):
+            raise Stop("Invalid supervisor evidence head")
+        result = invoke_assessor({"model": MODEL, "head": evidence["head"],
+            "instructions": INSTRUCTIONS, "schema": SCHEMA, "evidence": evidence})
+        if (not isinstance(result, dict)
+                or set(result) != {"status", "model", "result", "usage"}
+                or result["status"] != "finished" or result["model"] != MODEL
+                or not isinstance(result["result"], str)):
+            raise Stop("Invalid Anthropic assessment result")
+        usage = result["usage"]
+        if (not isinstance(usage, dict) or set(usage) != {"input_tokens", "output_tokens"}
+                or any(not safe_counter(value) for value in usage.values())):
+            raise Stop("Invalid Anthropic assessment usage")
+        decision = validate_decision(strict_json(result["result"]), evidence["head"])
+        return decision, usage
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        raise Stop("Anthropic returned invalid decision JSON") from None
 
 
 def read_source(path, head):
@@ -478,7 +654,7 @@ def dispatch_ready(pull, comment, state):
     print(f"PR #{number}: supervisor correction worker started; no merge performed")
 
 
-def run_one(pull, key, max_checkpoints):
+def run_one(pull, max_checkpoints):
     number, head = pull["number"], pull["head"]["sha"]
     prefix = f"repos/{REPO}/issues/{number}"
     comments = pages(prefix + "/comments")
@@ -508,11 +684,11 @@ def run_one(pull, key, max_checkpoints):
     evidence = evidence_for(pull, review, comments)
     # Check before reserving budget or asking the model.
     refresh_guard(number, head, review["id"])
-    state = {"head": head, "review": review["id"], "phase": "reserved", "model": MODEL,
+    state = {"head": head, "review": review["id"], "phase": "reserved", "backend": BACKEND, "model": MODEL,
              "time": datetime.now(timezone.utc).isoformat()}
-    claim = gh(prefix + "/comments", method="POST", data={"body": state_body(state, "Automatic supervisor checkpoint reserved. Model: GPT-6.1 Sol / high. A reserved assessment consumes budget even on failure.")})
+    claim = gh(prefix + "/comments", method="POST", data={"body": state_body(state, f"Automatic supervisor checkpoint reserved. Backend: {BACKEND}; model: {MODEL}. A reserved assessment consumes budget even on failure.")})
     try:
-        decision, usage = assess(evidence, key)
+        decision, usage = assess(evidence)
         # Persist a completed assessment before any idle wait. A queued own
         # comment run must not strand a paid assessment as an ambiguous call.
         state.update(phase="dispatch_ready" if decision["decision"] == "resume" else "escalate",
@@ -538,14 +714,18 @@ def run_one(pull, key, max_checkpoints):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--preflight", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--preflight", action="store_true")
+    mode.add_argument("--model-smoke", action="store_true")
     args = parser.parse_args()
     if os.environ.get("GITHUB_REPOSITORY") != REPO:
         raise Stop("Supervisor repository is not authorized")
-    if not args.preflight and os.environ.get("TREMELAY_SUPERVISOR_ACTIVATION") != ACTIVATION_VALUE:
+    if (not args.preflight and not args.model_smoke
+            and os.environ.get("TREMELAY_SUPERVISOR_ACTIVATION") != ACTIVATION_VALUE):
         print("Checkpoint supervision is disabled; explicit release activation is required.")
         return 0
-    for name in ("GH_TOKEN", "OPENAI_API_KEY", "CURSOR_API_KEY"):
+    trusted_workflow_guard()
+    for name in ("GH_TOKEN", "CURSOR_API_KEY"):
         if not os.environ.get(name):
             raise Stop(f"Missing required repository secret: {name}")
     if gh("user").get("login") != AUTHOR:
@@ -554,9 +734,15 @@ def main():
     if raw_limit not in {"1", "2", "3"}:
         raise Stop("Supervisor checkpoint limit must be 1 through 3")
     if args.preflight:
-        print("Supervisor secrets present; owner identity verified. No model call or restart performed.")
+        authentication_preflight()
+        print("Anthropic workload identity authenticated; owner identity verified. No model call or restart performed.")
         print("Release activation is enabled." if os.environ.get("TREMELAY_SUPERVISOR_ACTIVATION") == ACTIVATION_VALUE
               else "Release activation is disabled.")
+        return 0
+    if args.model_smoke:
+        result = model_smoke()
+        usage = result["usage"]
+        print(f"Anthropic model smoke succeeded: {MODEL}; input tokens {usage['input_tokens']}, output tokens {usage['output_tokens']}. No worker launched.")
         return 0
     pulls = pages(f"repos/{REPO}/pulls?state=open")
     failed = False
@@ -575,7 +761,9 @@ def main():
                 else:
                     recover_worker(pull, comment, state)
             elif eligible(pull):
-                run_one(pull, os.environ["OPENAI_API_KEY"], int(raw_limit))
+                run_one(pull, int(raw_limit))
+        except AssessmentCancelled:
+            raise
         except Stop as error:
             print(f"PR #{pull['number']}: {error}", file=sys.stderr)
             failed = True

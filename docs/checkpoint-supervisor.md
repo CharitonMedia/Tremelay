@@ -1,38 +1,87 @@
 # Unattended checkpoint supervision
 
-The reviewer model is pinned to GPT-6.1 Sol (`gpt-6.1-sol`) with high reasoning.
-Cursor remains the implementer; Codex remains the independent code reviewer.
+The assessment model is pinned to Claude Sonnet 5.5 (`claude-sonnet-5-5`), using
+adaptive thinking at high effort. Cursor remains the implementer; Codex remains
+the independent code reviewer. The supervisor uses Anthropic Workload Identity
+Federation (WIF), not an OpenAI API key or a copied personal OAuth session.
 
-## Setup
+## Installation and setup
 
-Installation is disabled by default. Merging this workflow does not authorize
-paid model calls or worker launches, and a generic pre-existing `true` setting
-cannot enable this release. Activation is a separate owner decision after the
-spending limit and service setup are agreed.
+Installation is disabled by default. This backend has a new release opt-in;
+the old OpenAI release value cannot enable it. No account settings, federation
+rules, secrets or activation variables are changed by installing this code.
 
-1. Merge the independently reviewed supervisor PR with all exact-head checks
-   passing. The scheduled/event/manual execution gates remain closed.
-2. Add a billed OpenAI API key as repository secret `OPENAI_API_KEY` in
-   CharitonMedia/Tremelay. Do not paste its value into a PR, issue or chat.
-3. Retain `GOAL_GITHUB_TOKEN` for `pattalkslaw-del`, with repository contents/PR
-   read and issue/comment/label write permissions. Retain the existing
-   `CURSOR_API_KEY`; the trusted supervisor uses it to send its corrective plan
-   directly to the worker.
-4. Run the default-branch workflow with `preflight_only` selected. This may check
-   key presence and the GitHub owner identity while activation remains disabled.
-5. Only after explicit owner approval of activation and its spending terms, set
-   the repository Actions variable `TREMELAY_SUPERVISOR_ACTIVATION` to
-   `reviewed-v1-d9cfdd332b6a490e9999f037f632a750`. This is a public release opt-in
-   value, not a secret or authentication credential. Do not enable it merely
-   because setup or CI passed. Scheduled/event triggers can make billed calls
-   after this value is set; no open browser, workstation or chat is needed.
-6. Inspect the first `Checkpoint Supervisor` run and resulting PR assessment.
-   Verify that the chosen worker actually starts and gets a new exact-head review.
+1. Review and merge the adapter with all exact-head checks passing. It runs only
+   the deployed `main` workflow; a manual dispatch on another branch is refused.
+2. Retain `GOAL_GITHUB_TOKEN` for `pattalkslaw-del` and the existing
+   `CURSOR_API_KEY`. These are used by the deterministic controller, never sent
+   to Claude. `OPENAI_API_KEY` is neither required nor read; there is no API-key
+   or alternate-provider fallback. Existing account credentials are not deleted.
+3. Before production use, the owner must authorize the existing Anthropic
+   federation rule for the production identity. The successful auth-only test
+   covered only `auth-test/anthropic-wif-20261009`; it does not authorize `main`.
+   The intended exact production claims are:
+   - audience: `https://api.anthropic.com`
+   - subject: `repo:CharitonMedia@331478552/Tremelay@1404909620:ref:refs/heads/main`
+   - repository_owner: `CharitonMedia`
+   - workflow_ref: `CharitonMedia/Tremelay/.github/workflows/checkpoint-supervisor.yml@refs/heads/main`
+   Do not add wildcard branches or substitute `job_workflow_ref` for this
+   non-reusable workflow. The workflow's `id-token: write` permission is scoped
+   to its supervisor job; this permission allows token acquisition, not repository
+   writes. Production trust changes require a separate owner action.
+4. Open [Checkpoint Supervisor](https://github.com/CharitonMedia/Tremelay/actions/workflows/checkpoint-supervisor.yml),
+   choose **Run workflow**, branch **main**, and select **Verify setup and
+   Anthropic federation without a model call or restart** (`preflight_only`).
+   This verifies existing key presence, GitHub owner identity, and a fresh WIF
+   exchange. It does not call Messages, start Cursor, or enable supervision.
+   A test-branch-only federation rule is expected to reject this production check.
+5. After production preflight and explicit test approval, run the same workflow
+   on **main** with only **One small billed Claude connection test; no worker
+   launch** (`model_smoke_only`) selected. It sends one fixed synthetic prompt,
+   caps output at 256 tokens, validates the model/JSON result, and makes no
+   checkpoint, worker, review or budget-marker changes. At published pricing the
+   maximum output charge is $0.00256, plus the small fixed input charge; the total
+   is expected below one cent, not a guaranteed per-request dollar ceiling. It
+   never retries. Do not select preflight and smoke together.
+6. After the approved smoke, independent review, and explicit activation
+   approval, set repository Actions variable `TREMELAY_SUPERVISOR_ACTIVATION` to
+   `claude-wif-v2-5134b392b4a044deae9973b1c8757af2`. This is a public release opt-in
+   value, not a credential. It authorizes scheduled/event-triggered assessments;
+   do not set it merely because installation or authentication passed.
+7. Inspect an actual checkpoint, its worker, and the later exact-head review.
+   The tiny smoke establishes model access, not real checkpoint-assessment quality.
+   Its `between_tools` thinking mode avoids up-front reasoning; production
+   assessments use `adaptive` thinking, which still needs a real checkpoint check.
+   Authentication alone is not an inference test.
 
-The default-branch workflow supports `preflight_only` to report missing secret
-names without printing values or calling a model. Candidate PR workflows never
-receive these secrets. Preflight cannot prove account access or billing.
-The live supervisor makes the actual API call only at a stopped checkpoint.
+The owner selected an Anthropic API-credit allowance with overages disabled.
+WIF changes authentication, not billing: assessments use that Anthropic workspace's
+API credits. Insufficient credit, rate limits, authentication errors, partial
+responses and ambiguous network failures stop the assessment without automatic
+retry, token refresh, reloading credits, another model, or another billing route.
+Cursor worker use still consumes its separate existing Cursor allowance.
+
+## Credential and response boundary
+
+A short-lived isolated Python subprocess receives only GitHub's OIDC request
+credentials. It has a clean temporary working directory, no inherited proxy or
+provider configuration, no GitHub write token, no Cursor key and no model tools.
+It obtains one audience-bound GitHub assertion immediately before one Anthropic
+token exchange, then makes at most one Messages request. The assertion and
+short-lived Bearer token stay in memory and never enter prompts, files, workflow
+outputs, artifacts or logs. Redirects and raw upstream error output are refused.
+The controller has a total deadline and kills an unresponsive subprocess group.
+
+Only a completed, exact-model response with locally validated JSON for the exact
+reviewed head can resume work. Thinking blocks are discarded, not published.
+Unknown output fields, tools, refusals, truncation and missing/invalid usage fail
+closed. The existing durable assessment reservation still consumes a checkpoint
+on all ambiguous outcomes. No model result is a merge authorization.
+
+See [ADR 0009](adr/0009-claude-wif-checkpoint-assessment.md) for the backend change
+and [Anthropic's WIF reference](https://platform.claude.com/docs/en/manage-claude/wif-reference)
+for the exchange contract. Preflight prints only allowlisted authentication
+metadata; it does not print JWT claims, credential values or provider error bodies.
 
 ## Operation
 

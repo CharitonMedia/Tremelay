@@ -1,6 +1,10 @@
 # ADR 0008: Automatic review of worker checkpoints
 
-Status: Proposed
+Status: Accepted; model/authentication details superseded by ADR 0009
+
+The original OpenAI assessment transport described below is historical. The
+current Claude WIF backend is specified by [ADR 0009](0009-claude-wif-checkpoint-assessment.md).
+All deterministic ownership, budget, review and dispatch guards remain in force.
 
 ## Context
 

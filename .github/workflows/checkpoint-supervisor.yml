@@ -9,7 +9,11 @@ on:
   workflow_dispatch:
     inputs:
       preflight_only:
-        description: Verify setup without a model call or restart
+        description: Verify setup and Anthropic federation without a model call or restart
+        type: boolean
+        default: false
+      model_smoke_only:
+        description: One small billed Claude connection test; no worker launch
         type: boolean
         default: false
 
@@ -24,9 +28,12 @@ concurrency:
 
 jobs:
   supervise:
-    # Public version-specific opt-in. Existing generic true settings cannot
-    # enable billed work when this workflow is first installed.
-    if: ${{ vars.TREMELAY_SUPERVISOR_ACTIVATION == 'reviewed-v1-d9cfdd332b6a490e9999f037f632a750' || (github.event_name == 'workflow_dispatch' && inputs.preflight_only == true) }}
+    # A backend change requires new owner activation. The former OpenAI opt-in
+    # cannot enable Claude. Never mint production identity from another ref.
+    if: ${{ github.ref == 'refs/heads/main' && github.workflow_ref == 'CharitonMedia/Tremelay/.github/workflows/checkpoint-supervisor.yml@refs/heads/main' && (vars.TREMELAY_SUPERVISOR_ACTIVATION == 'claude-wif-v2-5134b392b4a044deae9973b1c8757af2' || (github.event_name == 'workflow_dispatch' && (inputs.preflight_only == true || inputs.model_smoke_only == true))) }}
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -43,14 +50,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SUPERVISOR_MAX_CHECKPOINTS: '3'
           TREMELAY_SUPERVISOR_ACTIVATION: ${{ vars.TREMELAY_SUPERVISOR_ACTIVATION }}
           PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
+          MODEL_SMOKE_ONLY: ${{ inputs.model_smoke_only }}
         run: |
           set -euo pipefail
+          if [ "$PREFLIGHT_ONLY" = "true" ] && [ "$MODEL_SMOKE_ONLY" = "true" ]; then
+            echo 'Choose either authentication preflight or the model smoke test.' >&2
+            exit 1
+          fi
           if [ "$PREFLIGHT_ONLY" = "true" ]; then
             python scripts/checkpoint_supervisor.py --preflight
+          elif [ "$MODEL_SMOKE_ONLY" = "true" ]; then
+            python scripts/checkpoint_supervisor.py --model-smoke
           else
             python scripts/checkpoint_supervisor.py
           fi

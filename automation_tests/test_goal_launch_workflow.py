@@ -173,7 +173,7 @@ raise SystemExit("Unexpected tool")
         comment = {'id': 101, 'user': {'login': g.TRUSTED_AUTOMATION_LOGIN}, 'issue_url': f'https://api.github.com/repos/{REPO}/issues/11', 'body': recovery.state_body(state)}
         pull = {'number': 11, 'head': {'sha': HEAD}}
         with patch.object(supervisor, 'pages', return_value=[comment]), patch.object(supervisor, 'assess') as model, patch.object(supervisor, 'cursor') as worker:
-            supervisor.run_one(pull, 'test-only-key', 3)
+            supervisor.run_one(pull, 3)
             model.assert_not_called()
             worker.assert_not_called()
         fresh = {'number': 11, 'state': 'open', 'draft': False, 'user': {'login': supervisor.AUTHOR},
@@ -202,7 +202,7 @@ raise SystemExit("Unexpected tool")
             if '/issues/11/comments' in path:
                 return [{'id': 101, 'user': {'login': 'pattalkslaw-del'}, 'issue_url': f'https://api.github.com/repos/{REPO}/issues/11', 'body': '<!-- goal-review-launch-v1 broken -->'}]
             return []
-        env = {'GITHUB_REPOSITORY': REPO, 'GH_TOKEN': 'test-owner', 'OPENAI_API_KEY': 'test-openai', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': script['ACTIVATION_VALUE']}
+        env = {'GITHUB_REPOSITORY': REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'test-owner', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': script['ACTIVATION_VALUE']}
         with patch.dict(os.environ, env), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.dict(namespace, {'pages': pages, 'gh': lambda path: {'login': 'pattalkslaw-del'}}):
             self.assertEqual(script['main'](), 1)
         self.assertTrue(any('/issues/13/comments' in path for path in seen))
