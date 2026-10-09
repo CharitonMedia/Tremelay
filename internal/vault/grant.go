@@ -768,6 +768,9 @@ func validateDocument(doc document) error {
 	if err := validateAgentsAndGrants(doc); err != nil {
 		return err
 	}
+	if err := validateHealthPolicyStored(doc.HealthPolicy); err != nil {
+		return err
+	}
 	return validateDetection(doc.Detection)
 }
 

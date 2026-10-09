@@ -138,11 +138,18 @@ func TestCredentialAndAuditCommitAtomically(t *testing.T) {
 	db := mustOpen(t, path)
 	var action, head string
 	var seq int64
+	var puts int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action=? AND result=?`, actionPut, resultAllowed).Scan(&puts); err != nil {
+		t.Fatal(err)
+	}
+	if puts != 1 {
+		t.Fatalf("allowed puts %d", puts)
+	}
 	if err := db.QueryRow(`SELECT action FROM audit WHERE seq=?`, session.header.AuditSeq).Scan(&action); err != nil {
 		t.Fatal(err)
 	}
-	if action != actionPut {
-		t.Fatalf("action %s", action)
+	if action != actionPut && action != actionHealth && action != actionRespond {
+		t.Fatalf("head action %s", action)
 	}
 	if err := db.QueryRow(`SELECT audit_head, audit_seq FROM vault`).Scan(&head, &seq); err != nil {
 		t.Fatal(err)

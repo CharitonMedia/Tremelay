@@ -55,6 +55,11 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay credential put --path PATH --label LABEL --type TYPE --secret-file PATH
   tremelay credential get --path PATH --id ID
   tremelay credential list --path PATH
+  tremelay credential replace --path PATH --id ID --secret-file PATH
+  tremelay credential lifecycle --path PATH --id ID [--expires RFC3339] [--review RFC3339] [--rotation RFC3339] [--rotation-every DURATION] [--review-every DURATION]
+  tremelay credential health --path PATH [--id ID]
+  tremelay credential refresh --path PATH [--id ID]
+  tremelay credential policy --path PATH [--min-length N] [--pattern-run N] [--freshness DURATION] [--reminder-lead DURATION] [--compromise-opt-in true|false]
   tremelay agent create --path PATH --label LABEL
   tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339
   tremelay grant revoke --path PATH --id ID
@@ -68,6 +73,7 @@ Types: %s
 Grant operations: %s
 Passphrase: TREMELAY_PASSPHRASE, or a no-echo terminal prompt.
 The passphrase is not accepted as an argument. credential get writes the raw secret to stdout.
+Health is advisory. Refresh runs only while the vault is unlocked; a locked or stopped process does not evaluate credentials.
 `, strings.Join(vault.CredentialTypes(), ", "), strings.Join(vault.GrantOperations(), ", "))
 }
 
@@ -120,6 +126,16 @@ func cmdCredential(args []string, getenv func(string) string, stdin io.Reader, s
 		return cmdGet(args[1:], getenv, stdin, stdout, stderr)
 	case "list":
 		return cmdList(args[1:], getenv, stdin, stdout, stderr)
+	case "replace":
+		return cmdReplace(args[1:], getenv, stdin, stdout, stderr)
+	case "lifecycle":
+		return cmdLifecycle(args[1:], getenv, stdin, stdout, stderr)
+	case "health":
+		return cmdHealth(args[1:], getenv, stdin, stdout, stderr)
+	case "refresh":
+		return cmdRefresh(args[1:], getenv, stdin, stdout, stderr)
+	case "policy":
+		return cmdPolicy(args[1:], getenv, stdin, stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, "unknown command")
 		return 2
@@ -248,6 +264,276 @@ func cmdList(args []string, getenv func(string) string, stdin io.Reader, stdout,
 		}
 		return nil
 	})
+}
+
+func cmdReplace(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("credential replace", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	id := fs.String("id", "", "credential id")
+	secretFile := fs.String("secret-file", "", "file containing the secret")
+	opt, times := lifecycleFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectReplace(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	red := &vault.Redactor{}
+	return withSession(*path, getenv, stdin, stderr, red, func(session *vault.Session) error {
+		if fs.NArg() != 0 || *secretFile == "" {
+			return session.RejectReplace(vault.ErrInvalid)
+		}
+		parsed, err := finishLifecycle(*opt, times)
+		if err != nil {
+			return session.RejectReplace(vault.ErrInvalid)
+		}
+		secret, err := readSecretFile(*secretFile)
+		if err != nil {
+			return session.RejectReplace(err)
+		}
+		defer vault.Wipe(secret)
+		red.Add(secret)
+		cred, err := session.Replace(*id, secret, parsed)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, cred.ID)
+		return err
+	})
+}
+
+func cmdLifecycle(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("credential lifecycle", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	id := fs.String("id", "", "credential id")
+	opt, times := lifecycleFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectLifecycle(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		if fs.NArg() != 0 || *id == "" {
+			return session.RejectLifecycle(vault.ErrInvalid)
+		}
+		parsed, err := finishLifecycle(*opt, times)
+		if err != nil {
+			return session.RejectLifecycle(vault.ErrInvalid)
+		}
+		cred, err := session.SetLifecycle(*id, parsed)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, cred.ID)
+		return err
+	})
+}
+
+func cmdHealth(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("credential health", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	id := fs.String("id", "", "credential id")
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectHealth(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		if fs.NArg() != 0 {
+			return session.RejectHealth(vault.ErrInvalid)
+		}
+		enc := json.NewEncoder(stdout)
+		if *id == "" {
+			items, policy, err := session.ListHealth()
+			if err != nil {
+				return err
+			}
+			return enc.Encode(struct {
+				Policy vault.HealthPolicy `json:"policy"`
+				Items  []vault.Health     `json:"items"`
+			}{Policy: policy, Items: items})
+		}
+		item, err := session.Health(*id)
+		if err != nil {
+			return err
+		}
+		return enc.Encode(item)
+	})
+}
+
+func cmdRefresh(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("credential refresh", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	id := fs.String("id", "", "credential id")
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectRefresh(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		if fs.NArg() != 0 {
+			return session.RejectRefresh(vault.ErrInvalid)
+		}
+		if err := session.RefreshHealth(*id); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintln(stdout, "refreshed")
+		return err
+	})
+}
+
+func cmdPolicy(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("credential policy", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	minLen := fs.Int("min-length", 0, "minimum password length")
+	run := fs.Int("pattern-run", 0, "predictable-run length")
+	fresh := fs.String("freshness", "", "assessment freshness")
+	lead := fs.String("reminder-lead", "", "reminder lead")
+	optIn := fs.String("compromise-opt-in", "", "true or false")
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
+			return session.RejectHealthPolicy(vault.ErrInvalid)
+		})
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		if fs.NArg() != 0 || (*minLen == 0 && *run == 0 && *fresh == "" && *lead == "" && *optIn == "") {
+			return session.RejectHealthPolicy(vault.ErrInvalid)
+		}
+		_, current, err := session.ListHealth()
+		if err != nil {
+			return err
+		}
+		if *minLen != 0 {
+			current.MinPasswordLength = *minLen
+		}
+		if *run != 0 {
+			current.PatternRun = *run
+		}
+		if *fresh != "" {
+			d, err := time.ParseDuration(*fresh)
+			if err != nil {
+				return session.RejectHealthPolicy(vault.ErrInvalid)
+			}
+			current.Freshness = d
+		}
+		if *lead != "" {
+			d, err := time.ParseDuration(*lead)
+			if err != nil {
+				return session.RejectHealthPolicy(vault.ErrInvalid)
+			}
+			current.ReminderLead = d
+		}
+		switch *optIn {
+		case "":
+		case "true":
+			current.CompromiseOptIn = true
+		case "false":
+			current.CompromiseOptIn = false
+		default:
+			return session.RejectHealthPolicy(vault.ErrInvalid)
+		}
+		if err := session.SetHealthPolicy(current); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, "policy updated")
+		return err
+	})
+}
+
+type lifecycleTimes struct {
+	expires  *string
+	review   *string
+	rotation *string
+	everyRot *string
+	everyRev *string
+	clearExp *bool
+	clearRev *bool
+	clearRot *bool
+}
+
+func lifecycleFlags(fs *flag.FlagSet) (*vault.LifecycleOptions, lifecycleTimes) {
+	opt := &vault.LifecycleOptions{}
+	times := lifecycleTimes{
+		expires:  fs.String("expires", "", "explicit expiry (RFC3339)"),
+		review:   fs.String("review", "", "explicit review time (RFC3339)"),
+		rotation: fs.String("rotation", "", "explicit rotation time (RFC3339)"),
+		everyRot: fs.String("rotation-every", "", "rotation interval"),
+		everyRev: fs.String("review-every", "", "review interval"),
+		clearExp: fs.Bool("clear-expires", false, "clear explicit expiry"),
+		clearRev: fs.Bool("clear-review", false, "clear explicit review time"),
+		clearRot: fs.Bool("clear-rotation", false, "clear explicit rotation time"),
+	}
+	return opt, times
+}
+
+func finishLifecycle(opt vault.LifecycleOptions, times lifecycleTimes) (vault.LifecycleOptions, error) {
+	opt.ClearExpires = *times.clearExp
+	opt.ClearReview = *times.clearRev
+	opt.ClearRotation = *times.clearRot
+	var err error
+	if opt.ExpiresAt, err = parseOptionalTime(*times.expires); err != nil {
+		return opt, err
+	}
+	if opt.ReviewDueAt, err = parseOptionalTime(*times.review); err != nil {
+		return opt, err
+	}
+	if opt.RotationDueAt, err = parseOptionalTime(*times.rotation); err != nil {
+		return opt, err
+	}
+	if opt.RotationEvery, err = parseOptionalDuration(*times.everyRot); err != nil {
+		return opt, err
+	}
+	if opt.ReviewEvery, err = parseOptionalDuration(*times.everyRev); err != nil {
+		return opt, err
+	}
+	return opt, nil
+}
+
+func parseOptionalTime(s string) (*time.Time, error) {
+	if s == "" {
+		return nil, nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return nil, err
+	}
+	t = t.UTC()
+	return &t, nil
+}
+
+func parseOptionalDuration(s string) (*time.Duration, error) {
+	if s == "" {
+		return nil, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
 }
 
 type listEntry struct {

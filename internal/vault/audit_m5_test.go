@@ -485,7 +485,7 @@ func TestM5NotifyContainAndViews(t *testing.T) {
 	var note Notification
 	for _, field := range reflect.VisibleFields(reflect.TypeOf(note)) {
 		switch field.Name {
-		case "Severity", "Class", "Time", "AgentID", "CredentialID", "GrantID", "Action", "Result", "AuditSeq", "AuditHash":
+		case "Severity", "Class", "Time", "AgentID", "CredentialID", "GrantID", "Action", "Result", "AuditSeq", "AuditHash", "Reasons":
 		default:
 			t.Fatalf("notification field %s", field.Name)
 		}

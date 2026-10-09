@@ -920,3 +920,65 @@ func assertNoSecret(t *testing.T, buf *bytes.Buffer, secret []byte, pass string)
 		t.Fatal("output contains secret material")
 	}
 }
+
+func TestCLIReplaceHealthRefreshAndPolicy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	secret := []byte("password-" + randHex(t, 8))
+	next := randBytes(t, 24)
+	secretPath := filepath.Join(dir, "secret")
+	nextPath := filepath.Join(dir, "next")
+	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nextPath, next, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"TREMELAY_PASSPHRASE": pass}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"vault", "create", "--path", path}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("create %d %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "put", "--path", path, "--label", "pw", "--type", "password", "--secret-file", secretPath}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("put %d %s", code, stderr.String())
+	}
+	id := strings.TrimSpace(stdout.String())
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "health", "--path", path, "--id", id}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("health %d %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"weak"`) || bytes.Contains(stdout.Bytes(), secret) {
+		t.Fatalf("health json %s", stdout.String())
+	}
+	assertNoSecret(t, &stderr, secret, pass)
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "refresh", "--path", path, "--id", id}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("refresh %d %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "replace", "--path", path, "--id", id, "--secret-file", nextPath}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("replace %d %s", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != id || bytes.Contains(stdout.Bytes(), next) || bytes.Contains(stderr.Bytes(), next) {
+		t.Fatalf("replace output %s %s", stdout.String(), stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "lifecycle", "--path", path, "--id", id, "--rotation-every", "1h"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("lifecycle %d %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "policy", "--path", path, "--compromise-opt-in", "false", "--reminder-lead", "1h"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("policy %d %s", code, stderr.String())
+	}
+	assertNoSecret(t, &stdout, next, pass)
+	assertNoSecret(t, &stderr, next, pass)
+	assertNoSecret(t, &stderr, secret, pass)
+}
