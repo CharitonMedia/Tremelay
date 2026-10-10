@@ -725,6 +725,105 @@ func TestLocalAttestInvalidLifecycle(t *testing.T) {
 	}
 }
 
+func TestLocalAttestSelectsCurrentKey(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	defer session.Lock()
+	oldPub, oldPriv := mustEd25519(t)
+	newPub, newPriv := mustEd25519(t)
+	oldDER, err := x509.MarshalPKCS8PrivateKey(oldPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDER, err := x509.MarshalPKCS8PrivateKey(newPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("rotate-" + randHex(t, 16))
+	resource := "artifact:" + randHex(t, 8)
+	cred, err := session.Put("signing-key", CredTypeEd25519, oldDER, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := session.CreateAgent("worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := time.Now().Add(time.Hour).UTC()
+	spec := GrantSpec{AgentID: agent.ID, CredentialID: cred.ID, Operations: []string{OpLocalArtifactAttest}, Resource: resource, ExpiresAt: exp}
+	stale, err := session.IssueGrant(spec)
+	if err != nil || stale.KeyID != hex.EncodeToString(oldPub) {
+		t.Fatalf("stale grant %+v %v", stale, err)
+	}
+	if _, err := session.Replace(cred.ID, newDER, LifecycleOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := session.IssueGrant(spec)
+	if err != nil || fresh.KeyID != hex.EncodeToString(newPub) || fresh.KeyID == stale.KeyID {
+		t.Fatalf("fresh grant %+v %v", fresh, err)
+	}
+	// The stale grant must sort first. Random ids do not guarantee that.
+	const staleID = "00000000000000000000000000000001"
+	const freshID = "fffffffffffffffffffffffffffffffe"
+	bound := 0
+	for i := range session.grants {
+		switch session.grants[i].ID {
+		case stale.ID:
+			session.grants[i].ID = staleID
+			bound++
+		case fresh.ID:
+			session.grants[i].ID = freshID
+			bound++
+		}
+	}
+	if bound != 2 {
+		t.Fatal("grant ids were not ordered")
+	}
+	principal, err := session.Agent(agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := LocalAttestRequest{CredentialID: cred.ID, Resource: resource, Payload: payload}
+	if id, err := principal.Authorize(cred.ID, OpLocalArtifactAttest, resource); err != nil || id != freshID {
+		t.Fatalf("authorize %s %v", id, err)
+	}
+	got, err := principal.LocalAttest(req)
+	if err != nil || !attestVerified(newPub, resource, payload, got) || VerifyLocalAttestation(oldPub, resource, payload, got.Signature[:]) {
+		t.Fatalf("attest %+v %v", got, err)
+	}
+	completed := 0
+	for _, ev := range mustAudit(t, path) {
+		if ev.Action != actionLocalAttest || ev.Result != resultCompleted {
+			continue
+		}
+		completed++
+		if ev.GrantID != freshID {
+			t.Fatalf("completed grant %s", ev.GrantID)
+		}
+	}
+	if completed != 1 {
+		t.Fatalf("completed rows %d", completed)
+	}
+	if err := session.RevokeGrant(freshID); err != nil {
+		t.Fatal(err)
+	}
+	var zero LocalAttestation
+	revoked, err := principal.LocalAttest(req)
+	if !errors.Is(err, ErrDeniedRevoked) || revoked != zero || echoedSecret(err, payload, oldDER, newDER) {
+		t.Fatalf("revoked current key %+v %v", revoked, err)
+	}
+	if id, err := principal.Authorize(cred.ID, OpLocalArtifactAttest, resource); err == nil || id != "" || !errors.Is(err, ErrDeniedRevoked) {
+		t.Fatalf("authorize revoked %s %v", id, err)
+	}
+	for _, ev := range mustAudit(t, path) {
+		if ev.Result == resultDeniedRevoked && ev.GrantID != freshID {
+			t.Fatalf("revocation named %s on %s", ev.GrantID, ev.Action)
+		}
+	}
+	if _, err := VerifyAudit(path, pass); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func attestVerified(pub ed25519.PublicKey, resource string, payload []byte, got LocalAttestation) bool {
 	return got.Domain == AttestDomain && got.Purpose == AttestPurpose && got.Resource == resource &&
 		bytes.Equal(got.PublicKey[:], pub) && VerifyLocalAttestation(pub, resource, payload, got.Signature[:]) &&

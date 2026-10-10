@@ -262,13 +262,68 @@ func (s *Session) matchAttestKey(partial auditEvent) (ed25519.PrivateKey, auditE
 		partial.Result = resultFailed
 		return nil, partial, ErrSignFailed
 	}
-	want, err := hex.DecodeString(g.KeyID)
-	if err != nil || len(want) != ed25519.PublicKeySize || subtle.ConstantTimeCompare(want, pub) != 1 {
+	if keyBound(g.KeyID, pub) {
+		return priv, partial, nil
+	}
+	// decideAccess picks the lowest active grant id before it knows the key.
+	// A replaced credential can leave that stale grant active beside a grant
+	// for the current key. Choose again from grants that name this public key.
+	// Revocation and expiry of those grants still beat a stale active grant.
+	// No grant for this key keeps the original id, which is denied_key below.
+	partial, cause := s.retargetAttestGrant(partial, g.Resource, pub)
+	if cause != nil {
+		wipe(priv)
+		return nil, partial, cause
+	}
+	if partial.GrantID == g.ID {
 		wipe(priv)
 		partial.Result = resultDeniedKey
 		return nil, partial, ErrDeniedKey
 	}
+	ng, ok := s.grantByID(partial.GrantID)
+	if !ok || ng.CredentialID != partial.CredID || ng.Resource != g.Resource || !keyBound(ng.KeyID, pub) {
+		wipe(priv)
+		partial.Result = resultFailed
+		return nil, partial, ErrSignFailed
+	}
 	return priv, partial, nil
+}
+
+// retargetAttestGrant moves an allowed decision onto the grant bound to pub.
+// An empty match leaves partial unchanged.
+func (s *Session) retargetAttestGrant(partial auditEvent, resource string, pub ed25519.PublicKey) (auditEvent, error) {
+	matched := grantsForAttestKey(s.grants, partial.AgentID, partial.CredID, resource, hex.EncodeToString(pub))
+	if len(matched) == 0 {
+		return partial, nil
+	}
+	now, err := s.evaluationTime()
+	if err != nil {
+		partial.Result = resultFailed
+		return partial, ErrSignFailed
+	}
+	result, grantID := decideAccess(matched, true, partial.AgentID, partial.CredID, partial.CredType, true, OpLocalArtifactAttest, resource, now)
+	if result != resultAllowed {
+		partial.Result = result
+		partial.GrantID = grantID
+		return partial, denialError(result)
+	}
+	partial.GrantID = grantID
+	return partial, nil
+}
+
+func grantsForAttestKey(grants []grantRecord, agentID, credID, resource, keyID string) []grantRecord {
+	var out []grantRecord
+	for _, g := range grants {
+		if g.AgentID == agentID && g.CredentialID == credID && g.Resource == resource && g.KeyID == keyID && attestCredScope(g, OpLocalArtifactAttest) {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+func keyBound(keyID string, pub ed25519.PublicKey) bool {
+	want, err := hex.DecodeString(keyID)
+	return err == nil && len(want) == ed25519.PublicKeySize && subtle.ConstantTimeCompare(want, pub) == 1
 }
 
 // screenAttestKey applies the key binding and discards the private key.
