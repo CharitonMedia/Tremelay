@@ -619,8 +619,8 @@ func TestSharedSentinelReentryAndRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, c := range listed {
-		if c.Label != "" || len(c.Secret) != 0 {
-			t.Fatal("member saw a label or secret")
+		if c.Label != "" || len(c.Secret) != 0 || c.Lifecycle != (Lifecycle{}) || c.ID == "" || c.Type == "" {
+			t.Fatal("member saw more than credential id and type")
 		}
 	}
 	if grant.ID == "" {
@@ -645,6 +645,580 @@ func TestSharedSentinelReentryAndRace(t *testing.T) {
 	if err := validateSharedState(env.s.org, env.s.members, env.s.requests, env.s.creds, env.s.agents, env.s.grants); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestSharedBootstrapRepeatIsDenied(t *testing.T) {
+	env := newSharedEnv(t)
+	org := env.s.org.ID
+	if err := env.s.BootstrapShared(env.bobID); !errors.Is(err, ErrDenied) {
+		t.Fatalf("repeat bootstrap %v", err)
+	}
+	if env.s.org == nil || env.s.org.ID != org || len(env.s.members) != 2 {
+		t.Fatal("repeat bootstrap changed the binding")
+	}
+	if _, ok := env.s.member(env.bobID); !ok {
+		t.Fatal("member missing")
+	}
+	bob, _ := env.s.member(env.bobID)
+	if bob.Role != RoleMember {
+		t.Fatal("repeat bootstrap promoted the member")
+	}
+}
+
+func TestSharedMemberViewAndGrantStatus(t *testing.T) {
+	env := newSharedEnv(t)
+	owner, err := env.alice.Credentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := env.bob.Credentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owner) == 0 || len(owner) != len(member) {
+		t.Fatalf("inventory owner %d member %d", len(owner), len(member))
+	}
+	for i := range owner {
+		if owner[i].Label == "" || owner[i].Lifecycle.State != StateActive {
+			t.Fatalf("owner view %+v", owner[i])
+		}
+		if member[i].ID != owner[i].ID || member[i].Type != owner[i].Type || member[i].Label != "" || len(member[i].Secret) != 0 || member[i].Lifecycle != (Lifecycle{}) {
+			t.Fatalf("member view %+v", member[i])
+		}
+	}
+	spec := env.requestSpec(time.Hour, 20*time.Minute)
+	req, err := env.bob.RequestAccess(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := env.bob.Requests()
+	if err != nil || len(pending) != 1 || pending[0].Status != requestPending || pending[0].GrantStatus != "" {
+		t.Fatalf("pending %+v %v", pending, err)
+	}
+	grant, err := env.alice.Approve(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := requestStatus(t, env.bob, req.ID); st != GrantActive {
+		t.Fatalf("active %s", st)
+	}
+	env.s.clock = func() time.Time { return spec.ExpiresAt }
+	if st := requestStatus(t, env.bob, req.ID); st != GrantExpired {
+		t.Fatalf("expired %s", st)
+	}
+	env.s.clock = nil
+	if st := requestStatus(t, env.bob, req.ID); st != GrantActive {
+		t.Fatalf("clock reset %s", st)
+	}
+	carolID := mustID(t)
+	if err := env.alice.Attach(carolID, RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	carol, err := env.s.BindHuman(carolID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := carol.AssignRole(env.aliceID, RoleMember); err != nil {
+		t.Fatal(err)
+	}
+	if st := requestStatus(t, env.bob, req.ID); st != requestInvalidated {
+		t.Fatalf("demotion %s", st)
+	}
+	if err := carol.AssignRole(env.aliceID, RoleOwner); err != nil {
+		t.Fatal(err)
+	}
+	if st := requestStatus(t, env.bob, req.ID); st != requestInvalidated {
+		t.Fatalf("repromotion revived %s", st)
+	}
+	env.reopen(t)
+	if st := requestStatus(t, env.bob, req.ID); st != requestInvalidated {
+		t.Fatalf("reopen %s", st)
+	}
+	daveID := mustID(t)
+	if err := env.alice.Attach(daveID, RoleMember); err != nil {
+		t.Fatal(err)
+	}
+	dave, err := env.s.BindHuman(daveID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	others, err := dave.Requests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range others {
+		if rec.ID == req.ID {
+			t.Fatal("other member saw the request")
+		}
+	}
+	again, err := env.bob.RequestAccess(env.requestSpec(2*time.Hour, 20*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := env.alice.Approve(again.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.alice.RevokeGrant(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if st := requestStatus(t, env.bob, again.ID); st != GrantRevoked {
+		t.Fatalf("revoked %s", st)
+	}
+	env.reopen(t)
+	if st := requestStatus(t, env.bob, again.ID); st != GrantRevoked {
+		t.Fatalf("revoked reopen %s", st)
+	}
+	if grant.ID == "" || second.ID == "" {
+		t.Fatal("missing grant")
+	}
+}
+
+func TestSharedExpiryAndHistoryDowngrade(t *testing.T) {
+	env := newSharedEnv(t)
+	rows, err := env.alice.Audit(AuditFilter{})
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("owner audit %v", err)
+	}
+	org := env.s.org
+	members := append([]membershipRecord{}, env.s.members...)
+	requests := append([]requestRecord{}, env.s.requests...)
+	env.s.org = nil
+	env.s.members = nil
+	env.s.requests = nil
+	if _, err := env.s.AuditHistory(AuditFilter{}); !errors.Is(err, ErrAudit) {
+		t.Fatalf("cached audit accepted a shared downgrade %v", err)
+	}
+	env.s.org = org
+	env.s.members = members
+	env.s.requests = requests
+
+	path, pass := env.path, append([]byte(nil), env.pass...)
+	env.s.org = nil
+	env.s.members = nil
+	env.s.requests = nil
+	sealCurrent(t, env.s)
+	env.s.Lock()
+	if _, err := VerifyAudit(path, pass); !errors.Is(err, ErrAudit) {
+		t.Fatalf("empty-grant downgrade verified %v", err)
+	}
+	if opened, err := Unlock(path, pass, nil); err == nil {
+		if _, getErr := opened.Get("any"); getErr == nil {
+			t.Fatal("downgrade allowed legacy get")
+		}
+		opened.Lock()
+		t.Fatalf("empty-grant downgrade unlocked")
+	}
+
+	live := newSharedEnv(t)
+	spec := live.requestSpec(time.Hour, 20*time.Minute)
+	req, err := live.bob.RequestAccess(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := live.alice.Approve(req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range live.s.grants {
+		if live.s.grants[i].ID == grant.ID {
+			live.s.grants[i].ExpiresAt = spec.ExpiresAt.Add(2 * time.Hour)
+		}
+	}
+	sealCurrent(t, live.s)
+	live.s.Lock()
+	if _, err := VerifyAudit(live.path, live.pass); !errors.Is(err, ErrAudit) {
+		t.Fatalf("extended expiry verified %v", err)
+	}
+	if _, err := Unlock(live.path, live.pass, nil); !errors.Is(err, ErrCorrupt) && !errors.Is(err, ErrAudit) {
+		t.Fatalf("extended expiry unlocked %v", err)
+	}
+
+	use := newSharedEnv(t)
+	useSpec := use.requestSpec(time.Hour, 20*time.Minute)
+	useReq, err := use.bob.RequestAccess(useSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := use.alice.Approve(useReq.ID); err != nil {
+		t.Fatal(err)
+	}
+	use.s.clock = func() time.Time { return useSpec.ExpiresAt }
+	principal, err := use.s.Agent(use.agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := principal.LocalAttest(LocalAttestRequest{CredentialID: use.cred.ID, Resource: use.resource, Payload: []byte("late")}); !errors.Is(err, ErrDeniedExpired) {
+		t.Fatalf("expired use %v", err)
+	}
+	use.reopen(t)
+	use.s.clock = func() time.Time { return useSpec.ExpiresAt }
+	principal, err = use.s.Agent(use.agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := principal.LocalAttest(LocalAttestRequest{CredentialID: use.cred.ID, Resource: use.resource, Payload: []byte("late")}); !errors.Is(err, ErrDeniedExpired) {
+		t.Fatalf("expired reopen %v", err)
+	}
+	use.s.clock = nil
+	rejected, err := use.bob.RequestAccess(use.requestSpec(2*time.Hour, 20*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := use.alice.Reject(rejected.ID); err != nil {
+		t.Fatal(err)
+	}
+	use.reopen(t)
+	if _, err := use.alice.Approve(rejected.ID); !errors.Is(err, ErrDenied) {
+		t.Fatalf("rejected request reopened %v", err)
+	}
+
+	legacy, legacyPass, session := mustCreate(t, nil)
+	secret := randBytesT(t, 16)
+	cred, err := session.Put("solo", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Lock()
+	opened, err := Unlock(legacy, legacyPass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := opened.Get(cred.ID)
+	if err != nil || !bytes.Equal(got.Secret, secret) {
+		t.Fatal("legacy retrieval")
+	}
+	opened.Lock()
+	if _, err := VerifyAudit(legacy, legacyPass); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSharedDeniedAdminAttribution(t *testing.T) {
+	env := newSharedEnv(t)
+	secret := randBytesT(t, 16)
+	if _, err := env.bob.Put("nope", "generic", secret, PutOptions{}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("put %v", err)
+	}
+	if _, err := env.bob.CreateAgent("nope"); !errors.Is(err, ErrDenied) {
+		t.Fatalf("agent %v", err)
+	}
+	if _, err := env.bob.Replace(env.cred.ID, env.der, LifecycleOptions{}); !errors.Is(err, ErrDenied) {
+		t.Fatalf("replace %v", err)
+	}
+	if n := inventoryCount(env.s, env.bobID, resultDenied); n != 3 {
+		t.Fatalf("member denials attributed %d", n)
+	}
+	forged := strings.Repeat("ef", 16)
+	ghost, err := env.s.BindHuman(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ghost.Put("nope", "generic", secret, PutOptions{}); !errors.Is(err, ErrDenied) {
+		t.Fatal(err)
+	}
+	if _, err := ghost.CreateAgent("nope"); !errors.Is(err, ErrDenied) {
+		t.Fatal(err)
+	}
+	if _, err := ghost.Replace(env.cred.ID, env.der, LifecycleOptions{}); !errors.Is(err, ErrDenied) {
+		t.Fatal(err)
+	}
+	for _, ev := range env.s.audit {
+		if ev.ActorID == forged || ev.TargetID == forged || ev.RequestID == forged {
+			t.Fatal("foreign caller became an audit id")
+		}
+	}
+	before := len(env.s.creds)
+	env.s.commitFault = func() error { return errors.New("disk") }
+	if _, err := env.bob.Put("nope", "generic", secret, PutOptions{}); !errors.Is(err, ErrAudit) {
+		t.Fatalf("put audit %v", err)
+	}
+	if _, err := env.bob.CreateAgent("nope"); !errors.Is(err, ErrAudit) {
+		t.Fatalf("agent audit %v", err)
+	}
+	if _, err := env.bob.Replace(env.cred.ID, env.der, LifecycleOptions{}); !errors.Is(err, ErrAudit) {
+		t.Fatalf("replace audit %v", err)
+	}
+	env.s.commitFault = nil
+	if len(env.s.creds) != before {
+		t.Fatal("failed denial changed credentials")
+	}
+
+	env.s.hpolicy.CompromiseOptIn = true
+	var nested error
+	if err := env.s.SetCompromiseChecker(callChecker{fn: func() {
+		_, nested = env.bob.Put("nested", "generic", secret, PutOptions{})
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	marked := len(env.s.audit)
+	if _, err := env.alice.Put("weak", "password", []byte("password"), PutOptions{}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("checker commit %v", err)
+	}
+	if !errors.Is(nested, ErrDenied) {
+		t.Fatalf("nested put %v", nested)
+	}
+	deniedActors := inventoryActorsAfter(env.s, marked, resultDenied)
+	if len(deniedActors) < 2 || deniedActors[0] != env.bobID || deniedActors[1] != env.aliceID {
+		t.Fatalf("nested actors %v", deniedActors)
+	}
+	env.s.checker = nil
+
+	var during error
+	if err := env.s.SetNotifier(reentryNotifier{fn: func(Notification) error {
+		_, during = env.bob.Put("during-notify", "generic", secret, PutOptions{})
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	marked = len(env.s.audit)
+	if _, err := env.alice.Put("weak-2", "password", []byte("password1"), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(during, ErrDenied) {
+		t.Fatalf("notifier put %v", during)
+	}
+	if actor := inventoryActorAfter(env.s, marked, resultDenied); actor != env.bobID {
+		t.Fatalf("notifier denial actor %s", actor)
+	}
+	if actor := inventoryActorAfter(env.s, marked, resultAllowed); actor != env.aliceID {
+		t.Fatalf("notifier allow actor %s", actor)
+	}
+}
+
+func TestSharedCallbackReplacement(t *testing.T) {
+	env := newSharedEnv(t)
+	req, err := env.bob.RequestAccess(env.requestSpec(time.Hour, 20*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.alice.Approve(req.ID); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-started
+		if err := env.s.SetNotifier(nil); err != nil {
+			t.Errorf("clear notifier %v", err)
+		}
+		if err := env.s.SetNotifier(&MemoryNotifier{}); err != nil {
+			t.Errorf("replace notifier %v", err)
+		}
+		close(release)
+	}()
+	if err := env.s.SetNotifier(reentryNotifier{fn: func(Notification) error {
+		if _, err := env.alice.Credentials(); err != nil {
+			t.Errorf("reentry %v", err)
+		}
+		once.Do(func() { close(started) })
+		<-release
+		return nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	again, err := env.bob.RequestAccess(env.requestSpec(time.Hour, 15*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.alice.Approve(again.ID); err != nil {
+		once.Do(func() { close(started) })
+		t.Fatal(err)
+	}
+	wg.Wait()
+}
+
+func TestAttestStopsAfterCredentialChange(t *testing.T) {
+	payload := []byte("artifact-body")
+	t.Run("replacement", func(t *testing.T) {
+		env := approvedShared(t)
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der, err := x509.MarshalPKCS8PrivateKey(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env.s.attestFault = func() error {
+			_, err := env.alice.Replace(env.cred.ID, der, LifecycleOptions{})
+			return err
+		}
+		att, err := env.attestErr(t, payload)
+		if !errors.Is(err, ErrDeniedKey) || att != (LocalAttestation{}) {
+			t.Fatalf("replacement %+v %v", att, err)
+		}
+	})
+	t.Run("revocation", func(t *testing.T) {
+		env := approvedShared(t)
+		env.s.attestFault = func() error {
+			g := env.s.grants[len(env.s.grants)-1]
+			return env.alice.RevokeGrant(g.ID)
+		}
+		att, err := env.attestErr(t, payload)
+		if !errors.Is(err, ErrDeniedRevoked) || att != (LocalAttestation{}) {
+			t.Fatalf("revocation %+v %v", att, err)
+		}
+	})
+	t.Run("removal", func(t *testing.T) {
+		env := approvedShared(t)
+		env.s.attestFault = func() error {
+			return env.alice.Remove(env.bobID)
+		}
+		att, err := env.attestErr(t, payload)
+		if !errors.Is(err, ErrDeniedRevoked) || att != (LocalAttestation{}) {
+			t.Fatalf("removal %+v %v", att, err)
+		}
+	})
+	t.Run("retarget", func(t *testing.T) {
+		_, _, session := mustCreate(t, nil)
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der, err := x509.MarshalPKCS8PrivateKey(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cred, err := session.Put("k", CredTypeEd25519, der, PutOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent, err := session.CreateAgent("w")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resource := "artifact-" + randHex(t, 8)
+		exp := time.Now().Add(time.Hour)
+		grant, err := session.IssueGrant(GrantSpec{
+			AgentID: agent.ID, CredentialID: cred.ID,
+			Operations: []string{OpLocalArtifactAttest}, Resource: resource, ExpiresAt: exp,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		principal, err := session.Agent(agent.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, priv2, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der2, err := x509.MarshalPKCS8PrivateKey(priv2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session.attestFault = func() error {
+			if _, err := session.Replace(cred.ID, der2, LifecycleOptions{}); err != nil {
+				return err
+			}
+			_, err := session.IssueGrant(GrantSpec{
+				AgentID: agent.ID, CredentialID: cred.ID,
+				Operations: []string{OpLocalArtifactAttest}, Resource: resource, ExpiresAt: exp,
+			})
+			return err
+		}
+		att, err := principal.LocalAttest(LocalAttestRequest{CredentialID: cred.ID, Resource: resource, Payload: payload})
+		if !errors.Is(err, ErrDeniedKey) || att != (LocalAttestation{}) || VerifyLocalAttestation(pub, resource, payload, att.Signature[:]) {
+			t.Fatalf("retarget %+v %v", att, err)
+		}
+		denied := false
+		for _, ev := range session.audit {
+			if ev.Action == actionLocalAttest && ev.Result == resultDeniedKey {
+				denied = true
+				if ev.GrantID != grant.ID {
+					t.Fatalf("authority moved to %s", ev.GrantID)
+				}
+			}
+		}
+		if !denied {
+			t.Fatal("key change was not audited")
+		}
+	})
+}
+
+func requestStatus(t *testing.T, h *HumanPrincipal, id string) string {
+	t.Helper()
+	rows, err := h.Requests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range rows {
+		if rec.ID == id {
+			if rec.Status != requestConsumed {
+				t.Fatalf("status %s", rec.Status)
+			}
+			return rec.GrantStatus
+		}
+	}
+	t.Fatal("request missing")
+	return ""
+}
+
+func inventoryCount(s *Session, actor, result string) int {
+	n := 0
+	for _, ev := range s.audit {
+		if ev.Action == actionInventory && ev.ActorID == actor && ev.Result == result && ev.OrgID != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func inventoryActorAfter(s *Session, after int, result string) string {
+	actors := inventoryActorsAfter(s, after, result)
+	if len(actors) == 0 {
+		return ""
+	}
+	return actors[0]
+}
+
+func inventoryActorsAfter(s *Session, after int, result string) []string {
+	var out []string
+	for _, ev := range s.audit[after:] {
+		if ev.Action == actionInventory && ev.Result == result && ev.OrgID != "" {
+			out = append(out, ev.ActorID)
+		}
+	}
+	return out
+}
+
+func approvedShared(t *testing.T) *sharedEnv {
+	t.Helper()
+	env := newSharedEnv(t)
+	req, err := env.bob.RequestAccess(env.requestSpec(time.Hour, 20*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.alice.Approve(req.ID); err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+func (e *sharedEnv) attestErr(t *testing.T, payload []byte) (LocalAttestation, error) {
+	t.Helper()
+	principal, err := e.s.Agent(e.agent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return principal.LocalAttest(LocalAttestRequest{CredentialID: e.cred.ID, Resource: e.resource, Payload: payload})
+}
+
+type callChecker struct{ fn func() }
+
+func (c callChecker) Lookup(CompromiseQuery) ([]string, error) {
+	if c.fn != nil {
+		fn := c.fn
+		c.fn = nil
+		fn()
+	}
+	return nil, nil
 }
 
 type reentryNotifier struct {

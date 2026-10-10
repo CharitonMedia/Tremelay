@@ -37,12 +37,18 @@ func (s *Session) SetAbuseGuard(fn func(AbuseDecision) error) error {
 }
 
 func (s *Session) abuseHook(d AbuseDecision) error {
-	if s == nil || s.abuseGuard == nil {
+	if s == nil {
+		return nil
+	}
+	// Snapshot under the lock. SetAbuseGuard may replace or clear the hook
+	// while the callback runs.
+	guard := s.abuseGuard
+	if guard == nil {
 		return nil
 	}
 	var err error
 	s.duringCallback(func() {
-		err = s.abuseGuard(d)
+		err = guard(d)
 	})
 	return err
 }

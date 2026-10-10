@@ -789,6 +789,12 @@ func (s *Session) verified() error {
 	if err := matchHealth(s.audit, s.creds); err != nil {
 		return ErrAudit
 	}
+	if err := validateSharedState(s.org, s.members, s.requests, s.creds, s.agents, s.grants); err != nil {
+		return ErrAudit
+	}
+	if err := sharedHistoryBound(s.audit, s.org, s.members, s.requests, s.grants); err != nil {
+		return ErrAudit
+	}
 	return nil
 }
 

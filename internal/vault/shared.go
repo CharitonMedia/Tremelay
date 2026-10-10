@@ -7,8 +7,8 @@ import (
 const (
 	// RoleOwner manages membership, inventory, agents, audit, approval, and revocation.
 	RoleOwner = "owner"
-	// RoleMember can see the minimum metadata needed to request access and can
-	// inspect only their own requests.
+	// RoleMember can see credential id and type, and agent id, and can inspect
+	// only their own requests and the resulting grant status.
 	RoleMember = "member"
 
 	memberActive  = "active"
@@ -95,6 +95,8 @@ type sharedSnap struct {
 
 // AccessRequest is the caller-visible request. Resource text stays out of
 // the audit chain. Approval takes the ID, not a replacement of these fields.
+// GrantStatus is computed at read time from the trusted clock and current
+// membership. It is empty until a grant exists.
 type AccessRequest struct {
 	ID           string
 	AgentID      string
@@ -104,6 +106,7 @@ type AccessRequest struct {
 	Deadline     time.Time
 	Status       string
 	GrantID      string
+	GrantStatus  string
 }
 
 // AccessRequestSpec is a member's request for one local attestation grant.
@@ -154,7 +157,7 @@ func (s *Session) BootstrapShared(ownerID string) error {
 	}
 	defer s.end()
 	if s.shared() {
-		return s.auditShared(auditEvent{Action: actionBootstrap, Result: resultDenied, Decision: decisionBootstrap, ActorID: actorSystem}, nil, nil, nil)
+		return s.auditShared(auditEvent{Action: actionBootstrap, Result: resultDenied, Decision: decisionBootstrap, ActorID: actorSystem}, ErrDenied, nil, nil)
 	}
 	if safeID(ownerID) == "" || ownerID == actorSystem || s.agentExists(ownerID) {
 		return s.auditShared(auditEvent{Action: actionBootstrap, Result: resultDenied, Decision: decisionBootstrap, ActorID: actorSystem}, ErrInvalid, nil, nil)
@@ -325,7 +328,8 @@ func (h *HumanPrincipal) Cancel(requestID string) error {
 	return h.s.auditShared(h.event(actionAccessCancel, resultAllowed, decisionCancel, "", rec.ID, ""), nil, &sharedSnap{org: h.s.org, members: h.s.members, requests: next}, nil)
 }
 
-// Requests returns this caller's own requests.
+// Requests returns this caller's own requests and the live status of any
+// grant they produced. Another member's requests are omitted.
 func (h *HumanPrincipal) Requests() ([]AccessRequest, error) {
 	if err := h.begin(); err != nil {
 		return nil, err
@@ -335,10 +339,14 @@ func (h *HumanPrincipal) Requests() ([]AccessRequest, error) {
 	if err != nil {
 		return nil, h.denyRequest(err)
 	}
+	now, err := h.s.evaluationTime()
+	if err != nil {
+		return nil, h.denyRequest(err)
+	}
 	var out []AccessRequest
 	for _, rec := range h.s.requests {
 		if rec.RequesterID == m.HumanID {
-			out = append(out, rec.public())
+			out = append(out, h.s.projectRequest(rec, now))
 		}
 	}
 	return out, nil
@@ -543,14 +551,13 @@ func (h *HumanPrincipal) CreateAgent(label string) (Agent, error) {
 		return Agent{}, err
 	}
 	defer h.s.end()
+	defer h.s.bindActor(h.id)()
 	if _, err := h.owner(); err != nil {
 		if aerr := h.s.finish(auditEvent{Action: actionAgentCreate, Result: resultDenied}, err); aerr != nil {
 			return Agent{}, aerr
 		}
 		return Agent{}, ErrDenied
 	}
-	h.s.boundActor = h.id
-	defer func() { h.s.boundActor = "" }()
 	agent, err := h.s.createAgentUnlocked(label)
 	if err != nil {
 		return Agent{}, err
@@ -564,11 +571,10 @@ func (h *HumanPrincipal) Put(label, typ string, secret []byte, opt PutOptions) (
 		return Credential{}, err
 	}
 	defer h.s.end()
+	defer h.s.bindActor(h.id)()
 	if _, err := h.owner(); err != nil {
 		return h.s.denyPut(ErrDenied)
 	}
-	h.s.boundActor = h.id
-	defer func() { h.s.boundActor = "" }()
 	return h.s.putUnlocked(label, typ, secret, opt)
 }
 
@@ -579,18 +585,17 @@ func (h *HumanPrincipal) Replace(id string, secret []byte, opt LifecycleOptions)
 		return Credential{}, err
 	}
 	defer h.s.end()
+	defer h.s.bindActor(h.id)()
 	if _, err := h.owner(); err != nil {
 		if aerr := h.s.denyAction(actionReplace, ErrDenied); aerr != nil {
 			return Credential{}, aerr
 		}
 		return Credential{}, ErrDenied
 	}
-	h.s.boundActor = h.id
-	defer func() { h.s.boundActor = "" }()
 	return h.s.replaceUnlocked(id, secret, opt)
 }
 
-// Credentials returns inventory metadata. Members do not receive labels.
+// Credentials returns inventory metadata. A member receives only id and type.
 // Secrets are never returned.
 func (h *HumanPrincipal) Credentials() ([]Credential, error) {
 	if err := h.begin(); err != nil {
@@ -603,10 +608,11 @@ func (h *HumanPrincipal) Credentials() ([]Credential, error) {
 	}
 	out := make([]Credential, len(h.s.creds))
 	for i := range h.s.creds {
-		out[i] = h.s.creds[i].public()
 		if m.Role != RoleOwner {
-			out[i].Label = ""
+			out[i] = Credential{ID: h.s.creds[i].ID, Type: h.s.creds[i].Type}
+			continue
 		}
+		out[i] = h.s.creds[i].public()
 	}
 	return out, nil
 }
@@ -799,6 +805,20 @@ func (h *HumanPrincipal) denyMember(action, decision, humanID string, cause erro
 	return cause
 }
 
+// bindActor attributes one human call and restores the previous actor when
+// the call returns. A callback that enters another human method therefore
+// cannot publish the outer actor, and the outer commit still sees its own.
+// An id that is not a stored member attributes nothing.
+func (s *Session) bindActor(id string) func() {
+	prev := s.boundActor
+	next := ""
+	if m, ok := s.member(id); ok && m.HumanID == id && id != actorSystem && safeID(id) != "" {
+		next = id
+	}
+	s.boundActor = next
+	return func() { s.boundActor = prev }
+}
+
 func (s *Session) auditShared(partial auditEvent, cause error, snap *sharedSnap, grants []grantRecord) error {
 	if grants == nil {
 		grants = s.grants
@@ -863,6 +883,35 @@ func (r requestRecord) public() AccessRequest {
 	}
 }
 
+// projectRequest adds the grant's live status. Revocation wins, then a
+// membership generation or role change, then expiry. A consumed request
+// with no usable grant is invalidated rather than shown as active.
+func (s *Session) projectRequest(r requestRecord, now time.Time) AccessRequest {
+	out := r.public()
+	if r.Status != requestConsumed || safeID(r.GrantID) == "" {
+		return out
+	}
+	g, ok := s.grantByID(r.GrantID)
+	if !ok || g.Provenance == nil || g.ID != r.GrantID {
+		out.GrantStatus = requestInvalidated
+		return out
+	}
+	if g.RevokedAt != nil {
+		out.GrantStatus = GrantRevoked
+		return out
+	}
+	if !s.provenanceLive(g.Provenance) {
+		out.GrantStatus = requestInvalidated
+		return out
+	}
+	if !now.Before(g.ExpiresAt) {
+		out.GrantStatus = GrantExpired
+		return out
+	}
+	out.GrantStatus = GrantActive
+	return out
+}
+
 // decisionGrants presents shared grants whose membership no longer
 // authorizes them as revoked, so a newer grant can still match.
 func (s *Session) decisionGrants() []grantRecord {
@@ -916,6 +965,44 @@ func (s *Session) sharedGrantLive(id string) error {
 		return ErrDeniedExpired
 	}
 	return nil
+}
+
+// sharedHistoryBound keeps shared mode attached to an allowed bootstrap in
+// the verified chain. Missing shared fields after that bootstrap are not a
+// legacy vault. A chain with no allowed bootstrap stays single-user.
+func sharedHistoryBound(events []auditEvent, org *orgRecord, members []membershipRecord, requests []requestRecord, grants []grantRecord) error {
+	orgID, vaultID, shared, err := bootstrapBinding(events)
+	if err != nil {
+		return err
+	}
+	if !shared {
+		if org != nil || len(members) != 0 || len(requests) != 0 {
+			return ErrCorrupt
+		}
+		for _, g := range grants {
+			if g.Provenance != nil {
+				return ErrCorrupt
+			}
+		}
+		return nil
+	}
+	if org == nil || org.ID != orgID || org.VaultID != vaultID || safeID(orgID) == "" {
+		return ErrCorrupt
+	}
+	return nil
+}
+
+func bootstrapBinding(events []auditEvent) (orgID, vaultID string, shared bool, err error) {
+	for _, ev := range events {
+		if ev.Action != actionBootstrap || ev.Result != resultAllowed {
+			continue
+		}
+		if shared && (orgID != ev.OrgID || vaultID != ev.VaultID) {
+			return "", "", false, ErrCorrupt
+		}
+		orgID, vaultID, shared = ev.OrgID, ev.VaultID, true
+	}
+	return orgID, vaultID, shared, nil
 }
 
 func validateDocument(doc document) error {
@@ -1061,7 +1148,7 @@ func validateSharedState(org *orgRecord, members []membershipRecord, requests []
 		if p.RequesterID != req.RequesterID || p.RequesterGen != req.RequesterGen || p.ApproverID != req.ApproverID || p.ApproverGen != req.ApproverGen {
 			return ErrCorrupt
 		}
-		if g.AgentID != req.AgentID || g.CredentialID != req.CredentialID || g.KeyID != req.KeyID || g.Resource != req.Resource {
+		if g.AgentID != req.AgentID || g.CredentialID != req.CredentialID || g.KeyID != req.KeyID || g.Resource != req.Resource || !g.ExpiresAt.Equal(req.ExpiresAt) {
 			return ErrCorrupt
 		}
 		if g.CredentialClass != "" || !soleLocalAttest(g.Operations) {

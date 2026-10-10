@@ -722,7 +722,10 @@ func (s *Session) assessCredential(c credential, reused bool, prev *storedHealth
 
 func (s *Session) checkCompromise(c credential, prev *storedHealth, pol resolvedPolicy) (string, error) {
 	keepMatch := prev != nil && prev.Gen == c.Gen && prev.Compromise == CompromiseMatch
-	if !pol.OptIn || s.checker == nil {
+	// Snapshot under the lock. SetCompromiseChecker may replace or clear the
+	// lookup while the callback runs.
+	checker := s.checker
+	if !pol.OptIn || checker == nil {
 		if keepMatch {
 			return CompromiseMatch, nil
 		}
@@ -733,7 +736,7 @@ func (s *Session) checkCompromise(c credential, prev *storedHealth, pol resolved
 	var suffixes []string
 	var err error
 	s.duringCallback(func() {
-		suffixes, err = s.checker.Lookup(CompromiseQuery{Algorithm: "sha256", Prefix: prefix})
+		suffixes, err = checker.Lookup(CompromiseQuery{Algorithm: "sha256", Prefix: prefix})
 	})
 	if s.header.AuditSeq != seq {
 		return "", ErrConflict

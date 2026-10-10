@@ -339,7 +339,9 @@ type Session struct {
 	// defunct is set when a commit loses a race. Later calls return ErrStale.
 	defunct bool
 	// boundActor, when set, attributes the commit with one version-5 inventory
-	// row. Human inventory methods set it. It is not a caller-supplied audit id.
+	// row. Human inventory methods set it for the duration of one call and
+	// restore the previous value, including across a callback. It is not a
+	// caller-supplied audit id.
 	boundActor string
 }
 
@@ -483,6 +485,10 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		return nil, deny(err)
 	}
 	if err := sharedMatchesVault(doc, header.ID); err != nil {
+		wipe(dek)
+		return nil, deny(err)
+	}
+	if err := sharedHistoryBound(events, doc.Organization, doc.Memberships, doc.Requests, doc.Grants); err != nil {
 		wipe(dek)
 		return nil, deny(err)
 	}
@@ -934,6 +940,9 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 		org, members, requests = shared.org, shared.members, shared.requests
 	}
 	if err := validateSharedState(org, members, requests, creds, agents, grants); err != nil {
+		return err
+	}
+	if err := sharedHistoryBound(append(append([]auditEvent{}, s.audit...), events...), org, members, requests, grants); err != nil {
 		return err
 	}
 	tip := events[len(events)-1]

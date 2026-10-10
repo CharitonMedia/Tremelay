@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -454,6 +455,45 @@ func newBrokerEnv(t *testing.T) brokerEnv {
 		return nil, errors.New("dial")
 	}
 	return brokerEnv{session: session, principal: principal, agentID: agent.ID, apiID: api.ID, secret: secret, path: path, pass: pass, logs: logs}
+}
+
+func TestAbuseGuardSnapshot(t *testing.T) {
+	e := newBrokerEnv(t)
+	e.session.resolve = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("1.1.1.1")}, nil
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-started
+		if err := e.session.SetAbuseGuard(nil); err != nil {
+			t.Errorf("clear guard %v", err)
+		}
+		if err := e.session.SetAbuseGuard(func(AbuseDecision) error { return nil }); err != nil {
+			t.Errorf("replace guard %v", err)
+		}
+		close(release)
+	}()
+	if err := e.session.SetAbuseGuard(func(AbuseDecision) error {
+		if err := e.session.SetNotifier(nil); err != nil {
+			t.Errorf("reentry %v", err)
+		}
+		once.Do(func() { close(started) })
+		<-release
+		return errors.New("veto")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := e.principal.BrokerHTTP(HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://svc.example/v1/ping"})
+	if !errors.Is(err, ErrDeniedAbuse) || res.StatusCode != 0 {
+		once.Do(func() { close(started) })
+		t.Fatalf("status %d err %v", res.StatusCode, err)
+	}
+	wg.Wait()
 }
 
 func (e brokerEnv) deny(t *testing.T, req HTTPBrokerRequest, want error) {

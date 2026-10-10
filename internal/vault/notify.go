@@ -296,7 +296,10 @@ func planSuspendAgent(src auditEvent, agents []agentRecord) ([]agentRecord, stri
 }
 
 func (s *Session) deliverOne(src auditEvent, class Classification) error {
-	if s.notifier == nil {
+	// Snapshot under the lock. The callback releases it, and SetNotifier may
+	// replace or clear the sink before Notify returns.
+	n := s.notifier
+	if n == nil {
 		return nil
 	}
 	st := s.notices[src.Seq]
@@ -311,7 +314,7 @@ func (s *Session) deliverOne(src auditEvent, class Classification) error {
 	result := resultDelivered
 	var nerr error
 	s.duringCallback(func() {
-		nerr = s.notifier.Notify(notificationFrom(src, class))
+		nerr = n.Notify(notificationFrom(src, class))
 	})
 	if nerr != nil {
 		result = resultFailed

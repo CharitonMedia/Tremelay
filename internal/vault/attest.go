@@ -204,12 +204,16 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 		wipe(msg)
 		return LocalAttestation{}, err
 	}
-	if s.attestFault != nil {
+	boundGen := uint64(0)
+	if c, ok := s.credByID(partial.CredID); ok {
+		boundGen = c.Gen
+	}
+	// Snapshot under the lock. The callback releases it.
+	fault := s.attestFault
+	if fault != nil {
 		var faultErr error
 		s.duringCallback(func() {
-			if s.attestFault != nil {
-				faultErr = s.attestFault()
-			}
+			faultErr = fault()
 		})
 		if faultErr != nil {
 			wipe(priv)
@@ -220,15 +224,23 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 			return LocalAttestation{}, ErrSignFailed
 		}
 	}
-	if err := s.sharedGrantLive(partial.GrantID); err != nil {
+	// The callback, or another session, may have replaced the key, revoked the
+	// grant, or removed a member. Recheck this grant and this key. Do not
+	// retarget onto a grant that appeared during the callback.
+	if err := s.attestStillBound(partial, priv, boundGen, g.Resource); err != nil {
 		wipe(priv)
 		wipe(msg)
 		if errors.Is(err, ErrStale) {
 			return LocalAttestation{}, err
 		}
-		code := resultDeniedRevoked
-		if errors.Is(err, ErrDeniedExpired) {
+		code := resultFailed
+		switch {
+		case errors.Is(err, ErrDeniedRevoked):
+			code = resultDeniedRevoked
+		case errors.Is(err, ErrDeniedExpired):
 			code = resultDeniedExpired
+		case errors.Is(err, ErrDeniedKey):
+			code = resultDeniedKey
 		}
 		if werr := s.attestWrite(partial, code); werr != nil {
 			return LocalAttestation{}, werr
@@ -253,6 +265,53 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 	out.Purpose = AttestPurpose
 	out.Resource = g.Resource
 	return out, nil
+}
+
+// attestStillBound reports whether partial's grant and the copied key are
+// still the credential that was authorized. A generation change, lifecycle
+// change, or different public key is a failure. Another grant is not selected.
+func (s *Session) attestStillBound(partial auditEvent, priv ed25519.PrivateKey, gen uint64, resource string) error {
+	if err := s.requireCurrent(); err != nil {
+		return err
+	}
+	if err := s.sharedGrantLive(partial.GrantID); err != nil {
+		return err
+	}
+	g, ok := s.grantByID(partial.GrantID)
+	if !ok || g.RevokedAt != nil {
+		return ErrDeniedRevoked
+	}
+	if g.CredentialID != partial.CredID || g.Resource != resource || !canonicalKeyID(g.KeyID) {
+		return ErrSignFailed
+	}
+	now, err := s.evaluationTime()
+	if err != nil || !now.Before(g.ExpiresAt) {
+		return ErrDeniedExpired
+	}
+	c, ok := s.credByID(partial.CredID)
+	if !ok || c.Type != CredTypeEd25519 || c.Lifecycle.State != StateActive {
+		return ErrSignFailed
+	}
+	if c.Gen != gen {
+		return ErrDeniedKey
+	}
+	secret, ok := s.copySecret(partial.CredID)
+	if !ok {
+		return ErrSignFailed
+	}
+	defer wipe(secret)
+	cur, err := parseEd25519Private(secret)
+	if err != nil {
+		wipe(cur)
+		return ErrSignFailed
+	}
+	defer wipe(cur)
+	pub, ok := cur.Public().(ed25519.PublicKey)
+	held, heldOK := priv.Public().(ed25519.PublicKey)
+	if !ok || !heldOK || !keyBound(g.KeyID, pub) || subtle.ConstantTimeCompare(held, pub) != 1 {
+		return ErrDeniedKey
+	}
+	return nil
 }
 
 // matchAttestKey checks the stored key against the grant binding.

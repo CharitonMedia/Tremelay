@@ -9,6 +9,7 @@ import (
 	"log"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1178,6 +1179,62 @@ func TestNoticeRowsRejectUnauthenticatedHealthColumns(t *testing.T) {
 	if _, err := Unlock(path, pass, nil); !errors.Is(err, ErrAudit) {
 		t.Fatalf("unlock %v", err)
 	}
+}
+
+func TestCompromiseCheckerSnapshot(t *testing.T) {
+	_, _, session := mustCreate(t, nil)
+	policy := DefaultHealthPolicy()
+	policy.CompromiseOptIn = true
+	if err := session.SetHealthPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-started
+		if err := session.SetCompromiseChecker(nil); err != nil {
+			t.Errorf("clear checker %v", err)
+		}
+		if err := session.SetCompromiseChecker(callChecker{}); err != nil {
+			t.Errorf("replace checker %v", err)
+		}
+		close(release)
+	}()
+	if err := session.SetCompromiseChecker(blockChecker{
+		started: started, release: release, once: &once,
+		reenter: func() {
+			if err := session.SetNotifier(nil); err != nil {
+				t.Errorf("reentry %v", err)
+			}
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Put("pw", "password", strongPass(t), PutOptions{}); err != nil {
+		once.Do(func() { close(started) })
+		t.Fatal(err)
+	}
+	wg.Wait()
+}
+
+type blockChecker struct {
+	started chan struct{}
+	release chan struct{}
+	once    *sync.Once
+	reenter func()
+}
+
+func (b blockChecker) Lookup(CompromiseQuery) ([]string, error) {
+	if b.reenter != nil {
+		b.reenter()
+	}
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return nil, nil
 }
 
 type fakeChecker struct {

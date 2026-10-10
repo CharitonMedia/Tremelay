@@ -161,7 +161,7 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 	if matchHealth(events, doc.Credentials) != nil {
 		return "", ErrAudit
 	}
-	if validateDocument(doc) != nil || sharedMatchesVault(doc, header.ID) != nil {
+	if validateDocument(doc) != nil || sharedMatchesVault(doc, header.ID) != nil || sharedHistoryBound(events, doc.Organization, doc.Memberships, doc.Requests, doc.Grants) != nil {
 		return "", ErrAudit
 	}
 	return events[len(events)-1].Hash, nil
