@@ -662,6 +662,11 @@ def recover_worker(pull, comment, state, *, reconcile_only=False):
 
 
 def active_goal_work(number, head):
+    if os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1":
+        trusted_workflow_guard()
+        # This controller holds the shared job lock. Queued goal jobs cannot
+        # create; durable claims cover workers that outlive their originating job.
+        return False
     run_pages = gh(f"repos/{REPO}/actions/workflows/goal.yml/runs?per_page=100", paginate=True)
     runs = [run for page in run_pages for run in page["workflow_runs"]]
     # issue_comment runs execute main and often omit pull_requests. Conservatively
@@ -851,8 +856,8 @@ def recover_comment(number, comment_id):
     recover_worker(pull, comment, state, reconcile_only=True)
 
 
-def recover_retired_ordinary(pull, comments):
-    """Upgrade legacy receipts; modern recovery retains its per-PR job lock."""
+def recover_ordinary_receipts(pull, comments, *, reconcile_only=True):
+    """GET existing workers; only a live eligible goal may complete its review."""
     from goal_review_launch import pending_claim, recover, legacy_candidate, owner_authored, Stop as ClaimStop
     failed = False
     seen = set()
@@ -861,16 +866,15 @@ def recover_retired_ordinary(pull, comments):
             continue
         seen.add(comment.get("id"))
         try:
-            # Never release a prepared modern claim from this controller's
-            # different concurrency group. Legacy accepted/migrated receipts
-            # cannot enter a create path, and the fresh read enforces that type.
             body = comment.get("body") or ""
-            if "<!-- goal-review-launch" in body or not legacy_candidate(body):
+            modern = "<!-- goal-review-launch" in body
+            serialized = os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1"
+            if (modern and not serialized) or (not modern and not legacy_candidate(body)):
                 continue
             if pending_claim([comment], REPO, pull["number"], AUTHOR, include_supervisor=False):
-                recover(REPO, pull["number"], comment["id"], reconcile_only=True, legacy_only=True)
+                recover(REPO, pull["number"], comment["id"], reconcile_only=reconcile_only, legacy_only=not modern)
         except ClaimStop as error:
-            print(f"PR #{pull['number']}: legacy receipt {comment.get('id')} retained: {error}", file=sys.stderr)
+            print(f"PR #{pull['number']}: ordinary receipt {comment.get('id')} retained: {error}", file=sys.stderr)
             failed = True
     return failed
 
@@ -916,27 +920,54 @@ def main():
         return 0
     # Closed or de-labelled PRs can still have an accepted worker. Only their
     # existing receipts are reconciled; launch/model eligibility stays separate.
-    pulls = pages(f"repos/{REPO}/pulls?state=all")
     failed = False
+    if os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1":
+        from goal_initial_launch import recover_all, Stop as InitialStop
+        try:
+            failed = recover_all()
+        except InitialStop as error:
+            print(f"Initial ownership retained: {error}", file=sys.stderr)
+            failed = True
+    pulls = pages(f"repos/{REPO}/pulls?state=all")
     for pull in pulls:
-        if not recovery_target(pull):
+        own_pr = (isinstance(pull, dict) and isinstance(pull.get("head"), dict)
+                  and (pull["head"].get("repo") or {}).get("full_name") == REPO)
+        if not recovery_target(pull) and not (own_pr and os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1"):
             continue
         try:
             comments = pages(f"repos/{REPO}/issues/{pull['number']}/comments")
+            if os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1":
+                from generic_worker import pending_generic_claim, reconcile, Stop as GenericStop
+                try:
+                    if pending_generic_claim(comments, pull["number"]):
+                        reconcile(pull["number"])
+                except GenericStop as error:
+                    print(f"PR #{pull['number']}: generic ownership retained: {error}", file=sys.stderr)
+                    failed = True
+            if not recovery_target(pull):
+                continue
             states = records(comments)
-            if not eligible(pull, require_stop=False):
-                failed = recover_retired_ordinary(pull, comments) or failed
+            retired = not eligible(pull, require_stop=False)
+            if not retired:
+                try:
+                    live_lineage(pull)
+                except Stop:
+                    # Closed source issues and merged sibling PRs also retire
+                    # structurally open/goal PRs. Uncertain reads permit only GET.
+                    retired = True
+            if retired or os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1":
+                failed = recover_ordinary_receipts(pull, comments, reconcile_only=retired) or failed
             active = [(c, st) for c, st in states if supervisor_owns_work(st)
                       and ("agent_id" in st or st.get("phase") in {"dispatch_ready", "dispatch_reserved", "working", "review_reserved"})]
             if active:
                 for comment, state in active:
                     if state["phase"] == "dispatch_ready" and "agent_id" not in state:
-                        if len(active) == 1 and eligible(pull):
+                        if len(active) == 1 and not retired and eligible(pull):
                             dispatch_ready(pull, comment, state)
                     else:
                         recover_worker(pull, comment, state,
-                                       reconcile_only=len(active) > 1 or not eligible(pull, require_stop=False))
-            elif eligible(pull):
+                                       reconcile_only=len(active) > 1 or retired)
+            elif not retired and eligible(pull):
                 run_one(pull, int(raw_limit))
         except AssessmentCancelled:
             raise

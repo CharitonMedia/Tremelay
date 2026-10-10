@@ -45,17 +45,45 @@ This changes development-automation ownership, not Tremelay's credential broker.
 No model authority, credentials, activation, secrets, provider fallback, merge
 permission, three-cycle allowance or total assessment allowance is expanded.
 All-state scans read only metadata/receipts; only eligible current checkpoints
-can consume the existing model budget. Recovery remains serialized by the
-existing controller, with an optional targeted existing-receipt mode. Automatic
-ordinary upgrades are limited to accepted/migrated legacy receipts, which cannot
-enter a create/release path. Modern ordinary claims retain their existing per-PR
-workflow lock, including release of definitely unattempted prepared claims.
+can consume the existing model budget. Every create path (initial goal, ordinary
+review, checkpoint supervisor and opted-in generic remediation), plus ownership
+recovery/completion, uses one job-level `tremelay-worker-admission` group with
+`cancel-in-progress: false`. The supervisor keeps its different workflow-level
+controller group. The fixed `serialized-v1` contract replaces its old coarse
+active-workflow gate: queued jobs cannot dispatch while admission is held.
 
-Initial issue workers consult shared review/supervisor ownership, but their own
-initial create protocol is not redesigned here. Its ambiguous creates still
-require explicit reconciliation. Previously created branches may contain older
-workflow YAML: a main-only merge does not retroactively replace that definition.
-Retired branches must remain unqueued, and future goals start from patched main.
+Initial goal creates reserve a deterministic agent ID in a source-issue comment
+before POST. Prepared claims can release only before dispatch reservation;
+reserved or accepted/unknown creates require GET-only reconciliation forever,
+including after job cancellation. Terminal initial receipts prevent relabelling
+from repeating the initial attempt. Historical issue receipts migrate through
+verified repository and source-branch association without requiring a PR URL.
+Generic creates use the same prepared/dispatch distinction: definite pre-create
+failures release a still-matching prepared receipt without consuming a round,
+and same-head admission can safely retry. Reserved, working and terminal records
+retain the original three-round marker. A failed release remains owned until
+serialized reconciliation; cancellation after dispatch reservation, 404 and
+ambiguous responses never delete ownership or replay create.
+
+The controller recovers initial receipts in every issue state and existing
+supervisor/generic/ordinary receipts in all PR states. Retired ordinary recovery also
+includes open goal PRs whose source issue closed or whose lineage already merged.
+Shared admission allows safe recovery of modern prepared claims. On a live,
+eligible ordinary goal, recovery can complete the existing exact-head review
+request after fresh descendant/lineage and request-deduplication checks. Cursor
+calls remain GET-only; these already-authorized GitHub completion writes prevent
+a displaced pending completion job from stranding the goal. Retired/held goals
+remain status-only. Unknown legacy
+generic forms remain blocked for explicit assessment; the deployment inventory
+contained no such records. Missing service access never means terminal.
+
+GitHub may replace an unstarted pending job in a shared group. Durable receipts
+preserve safety across that cancellation, while scheduled completion of eligible ordinary claims and the explicit
+recovery inputs retain a route to progress. Superseded unstarted goals must be
+requeued only after existing ownership is settled. Previously created branches
+may contain older workflow YAML: a main-only merge does not retroactively replace
+that definition. Retired branches remain unqueued; future goals start from
+patched main. No production launch is part of patch validation.
 
 ## Validation
 
@@ -73,3 +101,11 @@ reference](https://cursor.com/docs/cloud-agent/api/endpoints#get-a-run): run ID,
 agent ID and status are explicit fields; pushed-branch metadata is per-agent.
 The retained PR-association check accepts the recorded agent repository PR URL
 or its run's matching pushed-branch PR URL, never a guessed branch-to-PR mapping.
+
+Additional offline regressions cover two queued initial labels, initial versus
+ordinary/supervisor/generic admission, accepted and ambiguous initial creates,
+source closure after preparation, current-run changes, historical source-branch
+migration, open-PR retirement recovery, all create/recovery job locks, and generic
+single-create/no-replay behavior. The read-only deployment inventory is 65
+unreconciled receipts, at most 195 Cursor GETs for successful terminal upgrades,
+not proof of live or terminal service state.

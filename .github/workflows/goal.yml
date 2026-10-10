@@ -70,6 +70,11 @@ jobs:
   implement:
     if: github.event_name == 'issues' && github.event.label.name == 'goal' && !github.event.issue.pull_request
     runs-on: ubuntu-latest
+    concurrency:
+      group: tremelay-worker-admission
+      cancel-in-progress: false
+    env:
+      TREMELAY_WORKER_ADMISSION: serialized-v1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -150,11 +155,9 @@ jobs:
           else
             python scripts/goal_lineage.py --issue "$number" --launch --repository-ownership
           fi
-          curl --fail-with-body -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json https://api.cursor.com/v1/agents > response.json
-          url=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["url"])')
-          gh issue comment "$number" --body "A cloud agent is implementing this issue: ${url}. The workflow opens the pull request, with the Goal-Issue line and the goal label, after the branch has commits. The agent does not open one."
-          python -c 'import json; print(json.load(open("response.json"))["agent"]["id"])' > agent_id.txt
-          python -c 'import json; print(json.load(open("response.json"))["run"]["id"])' > run_id.txt
+          python scripts/goal_initial_launch.py launch --issue "$number" --payload payload.json --out initial_state.json
+          python -c 'import json; print(json.load(open("initial_state.json"))["state"]["agent_id"])' > agent_id.txt
+          python -c 'import json; print(json.load(open("initial_state.json"))["state"]["run_id"])' > run_id.txt
       - name: Open the pull request after the agent finishes
         if: steps.build.outputs.launch == 'true' && steps.launch.outcome == 'success'
         env:
@@ -166,6 +169,11 @@ jobs:
           bash scripts/require_goal_github_token.sh
           status=$(bash scripts/wait_for_agent_run.sh "$(cat agent_id.txt)" "$(cat run_id.txt)")
           echo "agent run status: ${status}"
+          claim_id=$(python -c 'import json; print(json.load(open("initial_state.json"))["comment_id"])')
+          python scripts/goal_initial_launch.py recover --issue "${{ github.event.issue.number }}" --comment "$claim_id" --out initial_state.json
+          # Poll completion alone is not ownership evidence: bind the current
+          # service run to the source branch before publication or review.
+          status=$(python -c 'import json,sys; s=json.load(open("initial_state.json"))["state"]; sys.exit(1) if s["phase"] != "terminal" else print(s["status"])')
           before=$(tr -d '\n' < before_sha.txt)
           base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
           issue="${{ github.event.issue.number }}"
@@ -304,8 +312,10 @@ jobs:
     if: "github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment' || (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.login == 'chatgpt-codex-connector[bot]' && !(contains(github.event.comment.body, 'Codex Review: Didn''t find any major issues.') && contains(github.event.comment.body, '**Reviewed commit:**')))"
     runs-on: ubuntu-latest
     concurrency:
-      group: goal-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: tremelay-worker-admission
       cancel-in-progress: false
+    env:
+      TREMELAY_WORKER_ADMISSION: serialized-v1
     outputs:
       launch: ${{ steps.claim.outputs.launch }}
       claim_id: ${{ steps.launch.outputs.claim_id }}
@@ -587,8 +597,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     concurrency:
-      group: goal-review-${{ inputs.recovery_pr }}
+      group: tremelay-worker-admission
       cancel-in-progress: false
+    env:
+      TREMELAY_WORKER_ADMISSION: serialized-v1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -614,8 +626,10 @@ jobs:
     if: needs.review-launch.result == 'success' && needs.review-launch.outputs.launch == 'true'
     runs-on: ubuntu-latest
     concurrency:
-      group: goal-review-${{ needs.review-launch.outputs.pr_number }}
+      group: tremelay-worker-admission
       cancel-in-progress: false
+    env:
+      TREMELAY_WORKER_ADMISSION: serialized-v1
     steps:
       - uses: actions/checkout@v4
         with:

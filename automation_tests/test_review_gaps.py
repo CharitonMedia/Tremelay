@@ -103,6 +103,8 @@ if tool == 'git':
 if tool == 'gh':
     path = args[-1]
     changed = state['stage'] == 'changed'
+    if '/issues?state=all' in path or '/comments?' in path:
+        print('[]'); sys.exit(0)
     if '/issues/10' in path:
         if changed and scenario == 'unavailable': sys.exit(1)
         print(json.dumps({'number': 10, 'state': 'closed' if changed and scenario == 'closed' else 'open'}))

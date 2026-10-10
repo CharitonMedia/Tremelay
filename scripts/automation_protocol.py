@@ -24,9 +24,11 @@ _OLD_STATUS_HEADER = re.compile(
     r"Automation stopped after (?P<limit>three|[0-9]+) implementation/remediation cycles "
     r"for this (?:supervised segment|pull-request lineage)\. "
 )
-_AUTHORITY_PREFIXES = ("<!-- tremelay-supervisor-", "<!-- goal-review-",
+_AUTHORITY_PREFIXES = ("<!-- tremelay-supervisor-", "<!-- goal-review-", "<!-- goal-initial",
+                       "<!-- codex-cursor-worker", "<!-- codex-cursor-claim",
                        "<!-- tremelay-human-resume", "<!-- codex-cursor-remediation",
                        "A cloud agent is working through the review findings:",
+                       "A cloud agent is implementing this issue:",
                        "Cursor review launch claimed.", "Cursor remediation round ")
 
 

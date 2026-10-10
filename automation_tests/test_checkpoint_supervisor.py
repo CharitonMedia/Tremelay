@@ -274,7 +274,8 @@ class Controller(unittest.TestCase):
             self.assertTrue(s.active_goal_work(11, HEAD))
             self.assertTrue(api.call_args.kwargs['paginate'])
 
-    def test_failed_pr_reconciliation_does_not_starve_later_checkpoints(self):
+    @patch.object(s, 'live_lineage')
+    def test_failed_pr_reconciliation_does_not_starve_later_checkpoints(self, _lineage):
         state = {'phase': 'dispatch_reserved', 'head': HEAD, 'review': 4}
         claim = {'user': {'login': s.AUTHOR}, 'body': s.state_body(state, 'Claim')}
         next_pull = dict(PULL, number=13)
@@ -422,7 +423,8 @@ class Controller(unittest.TestCase):
         with patch.object(s, 'gh', return_value={'encoding': 'base64', 'content': 'aGVs\nbG8=\n'}):
             self.assertEqual(s.read_source('text.txt', HEAD), 'hello')
 
-    def test_binary_evidence_does_not_abort_later_prs(self):
+    @patch.object(s, 'live_lineage')
+    def test_binary_evidence_does_not_abort_later_prs(self, _lineage):
         next_pull = dict(PULL, number=13)
         processed = []
         run_one = s.run_one
@@ -458,7 +460,8 @@ class Controller(unittest.TestCase):
             model.assert_not_called()
             worker.assert_not_called()
 
-    def test_stale_unlaunched_assessment_is_retired_for_head_or_review_change(self):
+    @patch.object(s, 'live_lineage')
+    def test_stale_unlaunched_assessment_is_retired_for_head_or_review_change(self, _lineage):
         for change in ['head', 'review', 'approval']:
             state = {'phase': 'dispatch_ready', 'head': HEAD, 'review': 4, 'decision': DECISION}
             claim = {'id': 100, 'user': {'login': s.AUTHOR}, 'body': s.state_body(state, 'Recorded assessment')}

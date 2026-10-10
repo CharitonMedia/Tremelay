@@ -45,6 +45,8 @@ class Sources:
         self.calls.append(path)
         if path == f'repos/{REPO}/pulls?state=all':
             return copy.deepcopy(self.pulls)
+        if path == f'repos/{REPO}/issues?state=all':
+            return [copy.deepcopy(self.issue)]
         prefix = f'repos/{REPO}/issues/'
         if path.startswith(prefix) and path.endswith('/comments'):
             return copy.deepcopy(self.comments.get(int(path[len(prefix):].split('/')[0]), []))

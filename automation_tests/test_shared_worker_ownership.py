@@ -186,7 +186,7 @@ class ClosedGoalRecovery(unittest.TestCase):
                    ' https://cursor.com/agents/bc-7cce015b-2d8b-441e-892b-25f3b1d0cd77')
         next_old = dict(old, id=201)
         with patch.object(launch, 'recover', side_effect=[s.Stop('unknown worker'), {'phase': 'terminal'}]) as recover:
-            self.assertTrue(s.recover_retired_ordinary(PULL, [modern, old, next_old, next_old]))
+            self.assertTrue(s.recover_ordinary_receipts(PULL, [modern, old, next_old, next_old]))
             self.assertEqual([call.args[2] for call in recover.call_args_list], [200, 201])
             self.assertTrue(all(call.kwargs == {'reconcile_only': True, 'legacy_only': True}
                                 for call in recover.call_args_list))

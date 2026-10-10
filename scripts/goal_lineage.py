@@ -91,10 +91,12 @@ def ensure_not_held(pulls):
 
 def ensure_unowned_lineage(pulls, *, pages, ignore_comment_id=None):
     from goal_review_launch import pending_claim
+    from generic_worker import pending_generic_claim
     for pull in pulls:
         comments = pages(f"repos/{REPO}/issues/{pull['number']}/comments")
-        if pending_claim(comments, REPO, pull["number"], OWNER,
-                         ignore_comment_id=ignore_comment_id):
+        if (pending_claim(comments, REPO, pull["number"], OWNER,
+                          ignore_comment_id=ignore_comment_id)
+                or pending_generic_claim(comments, pull["number"], ignore_comment_id=ignore_comment_id)):
             raise LineageStop("An existing worker or supervisor owns this goal lineage")
 
 
@@ -109,6 +111,18 @@ def ensure_unowned_repository(*, pages, ignore_comment_id=None):
             raise LineageStop("Malformed repository PR ownership history")
     own = [pull for pull in pulls if (pull["head"].get("repo") or {}).get("full_name") == REPO]
     ensure_unowned_lineage(own, pages=pages, ignore_comment_id=ignore_comment_id)
+    from goal_initial_launch import pending_claim as initial_pending
+    issues = pages(f"repos/{REPO}/issues?state=all")
+    if not isinstance(issues, list):
+        raise LineageStop("Incomplete repository issue ownership history")
+    for issue in issues:
+        if not isinstance(issue, dict) or not _number(issue.get("number")):
+            raise LineageStop("Malformed repository issue ownership history")
+        if issue.get("pull_request"):
+            continue
+        if initial_pending(pages(f"repos/{REPO}/issues/{issue['number']}/comments"),
+                           issue["number"], ignore_comment_id=ignore_comment_id):
+            raise LineageStop("An initial implementation worker owns repository work")
 
 
 def gh_read(path):

@@ -59,11 +59,15 @@ if tool=="gh":
         if scenario=="lineage_merged":history.append(dict(pull,number=9,state="closed",merged_at="2026-10-01T00:00:00Z"))
         if scenario=="lineage_owner":history.append(dict(pull,number=9,state="closed"))
         print(json.dumps(history));sys.exit(0)
+    if "/issues?state=all" in path:
+        print(json.dumps([{"number":10,"state":"open"}] if scenario=="lineage_initial" else []));sys.exit(0)
     if path.endswith("/issues/10"):
         if scenario=="lineage_read_error":sys.exit(1)
         print(json.dumps({"number":10,"state":"closed" if scenario=="lineage_closed" else "open"}));sys.exit(0)
     if "/issues/" in path and "/comments" in path:
         comments=[]
+        if scenario=="lineage_initial" and "/issues/10/" in path:
+            comments=[{"id":90,"user":{"login":"pattalkslaw-del"},"issue_url":"https://api.github.com/repos/"+os.environ["GITHUB_REPOSITORY"]+"/issues/10", "body":"A cloud agent is implementing this issue: https://cursor.com/agents/bc-7cce015b-2d8b-441e-892b-25f3b1d0cd77. The workflow opens the pull request, with the Goal-Issue line and the goal label, after the branch has commits. The agent does not open one."}]
         if scenario=="lineage_owner" and "/issues/9/" in path:
             comments=[{"id":90,"user":{"login":"pattalkslaw-del"},"issue_url":"https://api.github.com/repos/"+os.environ["GITHUB_REPOSITORY"]+"/issues/9", "body":"A cloud agent is working through the review findings: https://cursor.com/agents/bc-7cce015b-2d8b-441e-892b-25f3b1d0cd77"}]
         print(json.dumps(comments));sys.exit(0)
@@ -100,7 +104,7 @@ raise SystemExit("Unexpected tool")
             return result, calls, state, output
 
     def test_real_launch_step_releases_every_definite_precreate_failure(self):
-        for scenario in ["pre_read_failure", "closed", "moved", "stopped", "claim_patch_failure", "review_read_failure", "new_review", "lineage_closed", "lineage_merged", "lineage_manual_hold", "lineage_owner", "lineage_read_error"]:
+        for scenario in ["pre_read_failure", "closed", "moved", "stopped", "claim_patch_failure", "review_read_failure", "new_review", "lineage_closed", "lineage_merged", "lineage_manual_hold", "lineage_owner", "lineage_initial", "lineage_read_error"]:
             with self.subTest(scenario=scenario):
                 result, calls, _, _ = self.run_launch(scenario)
                 self.assertNotEqual(result.returncode, 0, result.stderr)
@@ -148,13 +152,13 @@ raise SystemExit("Unexpected tool")
     def test_manual_recovery_is_serialized_and_cannot_launch(self):
         text = (ROOT / ".github/workflows/goal.yml").read_text()
         job = text.split("  recover-review:", 1)[1].split("  request-codex:", 1)[0]
-        for value in ["ref: main", "goal-review-${{ inputs.recovery_pr }}", "goal_review_launch.py recover"]:
+        for value in ["ref: main", "tremelay-worker-admission", "goal_review_launch.py recover"]:
             self.assertIn(value, job)
         self.assertNotIn("curl", job)
         self.assertNotIn(" prepare ", job)
         self.assertNotIn("--phase dispatch_reserved", job)
         monitor = text.split('  request-codex:', 1)[1]
-        self.assertIn('group: goal-review-${{ needs.review-launch.outputs.pr_number }}', monitor)
+        self.assertIn('group: tremelay-worker-admission', monitor)
         self.assertIn('cancel-in-progress: false', monitor)
 
     def test_new_review_cannot_replace_an_unresolved_worker(self):
@@ -218,7 +222,7 @@ raise SystemExit("Unexpected tool")
                 return [{'id': 101, 'user': {'login': 'pattalkslaw-del'}, 'issue_url': f'https://api.github.com/repos/{REPO}/issues/11', 'body': '<!-- goal-review-launch-v1 broken -->'}]
             return []
         env = {'GITHUB_REPOSITORY': REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'test-owner', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': script['ACTIVATION_VALUE']}
-        with patch.dict(os.environ, env), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.dict(namespace, {'pages': pages, 'gh': lambda path: {'login': 'pattalkslaw-del'}}):
+        with patch.dict(os.environ, env), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.dict(namespace, {'pages': pages, 'gh': lambda path: {'login': 'pattalkslaw-del'}, 'live_lineage': lambda pull: None}):
             self.assertEqual(script['main'](), 1)
         self.assertTrue(any('/issues/13/comments' in path for path in seen))
 

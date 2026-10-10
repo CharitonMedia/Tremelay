@@ -379,7 +379,8 @@ class AssessorBoundary(unittest.TestCase):
                     helper.assert_not_called()
                     worker.assert_not_called()
 
-    def test_recovery_needs_no_new_identity_or_static_model_key(self):
+    @patch.object(s, 'live_lineage')
+    def test_recovery_needs_no_new_identity_or_static_model_key(self, _lineage):
         env = {name: value for name, value in ENV.items()
                if not name.startswith('ACTIONS_') and name not in {'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'}}
         env['TREMELAY_SUPERVISOR_ACTIVATION'] = s.ACTIVATION_VALUE
@@ -394,7 +395,8 @@ class AssessorBoundary(unittest.TestCase):
             recovery.assert_called_once_with(pull, comment, state, reconcile_only=False)
             helper.assert_not_called()
 
-    def test_cancellation_ends_scan_before_assessing_another_pr(self):
+    @patch.object(s, 'live_lineage')
+    def test_cancellation_ends_scan_before_assessing_another_pr(self, _lineage):
         env = dict(ENV, TREMELAY_SUPERVISOR_ACTIVATION=s.ACTIVATION_VALUE)
         with patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', ['supervisor']), \
                 patch.object(s, 'gh', return_value={'login': s.AUTHOR}), \

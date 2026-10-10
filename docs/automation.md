@@ -58,7 +58,7 @@ completion job was interrupted, run the `goal` workflow manually on `main`
 with `recovery_pr` set to the PR number and `recovery_comment` set to the
 existing PR reservation comment ID (also reported in the job log when available).
 This recovery is
-serialized with launches for the same PR. It only GETs Cursor; it never creates,
+serialized with all repository worker launches and ownership recovery. It only GETs Cursor; it never creates,
 restarts, cancels, or replaces a worker and does not remove a stop label.
 Normal completion uses that same concurrency group and recovery path. A newer
 review or head cannot create a competitor while a recorded ordinary worker is
@@ -110,8 +110,10 @@ Tremelay runs general Go CI plus dedicated `Test Linux` and `Test Windows` workf
 
 ## Shared ownership and manual takeover
 
-Before any initial goal, ordinary review, or supervisor worker create, read the
-full repository PR history and both trusted claim families. A normal reservation,
+Before any initial goal, ordinary review, supervisor, or opted-in generic worker
+create, read the full repository issue and PR histories and all trusted claim
+families. Initial issue reservations and historical accepted-worker URLs count
+even before any PR exists. A normal reservation,
 legacy accepted-worker receipt, supervisor assessment reservation, or accepted
 supervisor worker may still own work after a newer head/review, label removal,
 PR closure, or merge. Malformed trusted state and orphan supervisor launch
@@ -126,20 +128,45 @@ so a newly queued milestone waits for earlier recorded workers to be reconciled.
 
 `human-review-required` is a checkpoint invitation to the deployed supervisor,
 not an exclusive manual takeover. For manual work, retain that label and remove
-`goal` from the PR. Publication preserves this hold. Inspect both ordinary and
+`goal` from the PR. Publication preserves this hold. Inspect initial, ordinary, generic and
 supervisor ownership before editing/pushing/merging; the labels do not cancel an
 accepted worker. Wait for a verified terminal result before competing work.
 Restore `goal` only after ownership and the next authorized action are settled.
 
-The scheduled supervisor reads all PR states for existing supervisor receipts
-and legacy accepted ordinary receipts. Modern ordinary claims retain their
-serialized per-PR `goal` recovery job, so an active prepared claim cannot be
-released by another controller. Closed or held PRs only receive GET-only worker
-reconciliation and updates to their existing receipt; they cannot trigger assessment, create, review requests or label changes.
-Agent identity, its current run, repository/PR association and terminal status
-must all match, including a second current-run lookup before recording terminal
-ownership. A missing lookup, unknown status or newer run preserves the claim.
-No create is replayed. Existing checkpoint/cycle history remains consumed.
+All create-capable jobs and ownership recovery jobs use the repository-wide
+`tremelay-worker-admission` job concurrency group with cancellation disabled.
+The supervisor's separate controller lock remains distinct. The fixed
+`serialized-v1` contract means queued goal jobs do not count as active workers;
+they cannot dispatch while the supervisor holds admission. Durable receipts
+retain ownership after the originating job exits or is cancelled.
+
+The scheduled supervisor reads all source issue states for initial receipts and
+all PR states for supervisor/generic and ordinary receipts. Retirement includes a closed source issue or a merged
+sibling lineage PR even when the current PR is still open and labelled `goal`.
+The shared lock lets retired prepared claims release without racing a create.
+Retired goals only receive GET-only worker reconciliation and updates to their
+existing receipt; they cannot trigger assessment, create, review requests or
+label changes. Agent identity, current run, repository and target association,
+and terminal status must all match, including a second current-run lookup
+before recording terminal ownership. Initial workers bind the canonical source
+branch (or its verified PR), since they may never have known a PR URL.
+A missing lookup, unknown status or newer run preserves the claim. No create is
+replayed. Existing checkpoint/cycle history remains consumed.
+
+Initial launches reserve a stable agent ID on the source issue before their sole
+create. A definitely unlaunched `prepared` state may release on failure; once
+`dispatch_reserved` is durable, every uncertain outcome stays owned. A verified
+terminal initial receipt still records that implementation attempt: relabelling
+the same issue does not authorize another initial worker. The normal independent
+review path handles further corrections. Canonical historical initial URL
+receipts migrate in place through the same GET-only checks.
+
+Opted-in generic remediation prepares a durable receipt, rechecks admission,
+and then records dispatch reservation immediately before one create, with no
+retry or 404-based deletion. A verified pre-create release is non-owning and
+uncounted, allowing the same review/head to retry safely. Reserved, working and
+terminal receipts preserve the existing three-round marker. New generic receipts recover automatically even after closure
+or label removal; unknown legacy generic receipts require explicit assessment.
 
 For a specific supervisor receipt, run Checkpoint Supervisor on `main` with
 `recovery_pr` and `recovery_comment`, leaving preflight and smoke disabled. This
@@ -151,10 +178,19 @@ Deployment limits: the new implement/publish definitions check out trusted main,
 but an already-created goal branch can still carry an old workflow definition.
 Do not requeue a retired goal or assume a main-only merge retroactively changes
 its old push workflow. Keep old duplicates held until their workers are verified
-terminal; create future milestone branches from the patched main. Initial issue
-workers now honor shared review/supervisor ownership, but their own first-create
-receipt protocol is unchanged. An ambiguous initial issue-worker create still
-needs explicit service reconciliation; relabeling/retrying is not proof it failed.
+terminal; create future milestone branches from the patched main. Relabelling or
+retrying an ambiguous initial launch is not proof it failed.
+
+GitHub retains only one pending job per concurrency group, so a newer queued job
+can supersede an unstarted goal or completion job. Running admission jobs are not
+cancelled. After existing ownership is reconciled, requeue a superseded, never
+started goal only if its issue/lineage remains eligible. If an ordinary completion job is superseded, scheduled recovery completes the
+existing claim under the same lock. Cursor calls are GET-only; for a still-live,
+eligible goal, GitHub completion may request the already-authorized independent
+review after fresh head, lineage and existing-request checks. Duplicate wakes
+reuse the durable review reservation and never create another worker. Retired or
+held goals remain status-only and never request review. The explicit `goal`
+recovery inputs remain available.
 
 History reads stop after 100 pages of 100 records and fail closed if the history
 cannot be completed within that bound. Historical receipt upgrade is incremental: a verified terminal receipt is not
@@ -164,3 +200,12 @@ unverifiable PR association remains blocking and is reported with its receipt
 ID for an explicit owner retirement assessment. No automatic retirement or new
 worker is authorized by that report. A terminal upgrade uses three Cursor GETs
 and one existing-comment update; running receipts need two GETs per check.
+
+The deployment inventory contained 51 legacy PR receipts, 13 initial issue
+receipts, and one unresolved supervisor receipt. A complete successful terminal
+upgrade would use at most 195 Cursor GETs plus ordinary GitHub history/receipt
+reads. This inventory is not evidence that any worker is active or terminal.
+Exact repeated comment IDs are deduplicated; distinct historical receipts keep
+their evidence and consumed attempts. Already verified terminal records are not
+fetched again. Failed or inaccessible records stay held for an explicit owner
+retirement assessment, with no automatic replacement or silent terminality.
