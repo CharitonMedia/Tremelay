@@ -210,7 +210,7 @@ func TestMCPWireAdmission(t *testing.T) {
 		t.Fatalf("legacy initialize %s", got)
 	}
 	missing := rpcFrame(t, 4, "tools/call", map[string]any{"name": toolInvoke, "arguments": map[string]any{}})
-	if got = raw.round(t, missing); !bytes.Contains(got, []byte("unsupported protocol version")) {
+	if got = raw.round(t, missing); !bytes.Contains(got, []byte("invalid params")) || bytes.Contains(got, []byte("unsupported protocol version")) {
 		t.Fatalf("missing revision %s", got)
 	}
 	badRev := rpcFrame(t, 5, "tools/call", map[string]any{
@@ -219,7 +219,7 @@ func TestMCPWireAdmission(t *testing.T) {
 	})
 	before := len(env.s.audit)
 	got = raw.round(t, badRev)
-	if !bytes.Contains(got, []byte("unsupported protocol version")) || bytes.Contains(got, []byte("2025-11-25")) {
+	if !bytes.Contains(got, []byte("unsupported protocol version")) || !bytes.Contains(got, []byte(`"supported":["2026-07-28"]`)) || !bytes.Contains(got, []byte(`"requested":"2025-11-25"`)) || bytes.Contains(got, []byte(`"2025-11-25","2026-07-28"`)) || bytes.Contains(got, []byte(`"2026-07-28","2025-11-25"`)) {
 		t.Fatalf("mismatched revision %s", got)
 	}
 	if env.s.audit[len(env.s.audit)-1].Action != actionLocalAttest || len(env.s.audit) != before+1 {
@@ -281,14 +281,6 @@ func TestMCPWireAdmission(t *testing.T) {
 		t.Fatal("request_capability mutated authority or skipped the denial")
 	}
 
-	env.s.commitFault = func() error { return errors.New("induced " + sentinel) }
-	before = len(env.s.audit)
-	got = raw.round(t, ask)
-	env.s.commitFault = nil
-	if bytes.Contains(got, []byte(sentinel)) || bytes.Contains(got, []byte("persist")) || bytes.Contains(got, []byte("recorded")) || !bytes.Contains(got, []byte("internal error")) || bytes.Contains(got, []byte(`"id":null`)) || !bytes.Contains(got, []byte(`"id":11`)) || len(env.s.audit) != before {
-		t.Fatalf("audit fault %s rows %d", got, len(env.s.audit)-before)
-	}
-
 	blocked := make(chan struct{})
 	release := make(chan struct{})
 	env.s.attestFault = func() error {
@@ -323,7 +315,7 @@ func TestMCPWireAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	busy := raw.read(t)
-	if !bytes.Contains(busy, []byte(`"id":13`)) || !bytes.Contains(busy, []byte("endpoint busy")) || bytes.Contains(busy, []byte(sentinel)) {
+	if !bytes.Contains(busy, []byte(`"id":13`)) || !bytes.Contains(busy, []byte("endpoint busy")) || !bytes.Contains(busy, []byte("-31010")) || bytes.Contains(busy, []byte("-32010")) || bytes.Contains(busy, []byte(sentinel)) {
 		t.Fatalf("busy %s", busy)
 	}
 	close(release)
@@ -890,41 +882,61 @@ func TestMCPReviewFixes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		id, err := jsonrpc.MakeID(float64(7))
-		if err != nil {
+		clientRead, serverWrite := io.Pipe()
+		serverRead, clientWrite := io.Pipe()
+		release := make(chan struct{})
+		hold := &holdWriter{w: serverWrite, entered: make(chan struct{}), release: release}
+		ctx, cancel := context.WithCancel(context.Background())
+		errc := make(chan error, 1)
+		go func() { errc <- ep.Serve(ctx, serverRead, hold) }()
+		defer func() {
+			cancel()
+			_ = clientWrite.Close()
+			_ = clientRead.Close()
+			select {
+			case <-errc:
+			case <-time.After(5 * time.Second):
+			}
+		}()
+		first := append(rpcFrame(t, 7, "tools/list", map[string]any{"_meta": mcpMeta()}), '\n')
+		if _, err := clientWrite.Write(first); err != nil {
 			t.Fatal(err)
 		}
-		if !ep.beginCall(callKey{num: 7, isNum: true}, true) {
-			t.Fatal("admit")
+		select {
+		case <-hold.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("response write did not block")
 		}
 		before := len(env.s.audit)
-		started := make(chan struct{})
-		release := make(chan struct{})
-		c := &admitConn{ep: ep, rawW: &blockWriter{started: started, release: release}}
-		errc := make(chan error, 1)
-		go func() {
-			errc <- c.Write(context.Background(), &jsonrpc.Response{ID: id, Result: json.RawMessage(`{"ok":true}`)})
-		}()
-		select {
-		case <-started:
-		case <-time.After(5 * time.Second):
-			t.Fatal("write did not block")
-		}
-		if ep.beginCall(callKey{num: 8, isNum: true}, false) {
-			t.Fatal("second call admitted while the response write was blocked")
-		}
-		if len(env.s.audit) != before {
-			t.Fatal("success write recorded a denial")
-		}
-		close(release)
-		if err := <-errc; err != nil {
+		second := append(rpcFrame(t, 8, "tools/list", map[string]any{"_meta": mcpMeta()}), '\n')
+		if _, err := clientWrite.Write(second); err != nil {
 			t.Fatal(err)
 		}
-		if len(env.s.audit) != before {
-			t.Fatal("completed write recorded a denial")
+		deadline := time.Now().Add(5 * time.Second)
+		for len(env.s.audit) == before {
+			if time.Now().After(deadline) {
+				t.Fatal("second call was not rejected while the response write was blocked")
+			}
+			time.Sleep(5 * time.Millisecond)
 		}
-		if !ep.beginCall(callKey{num: 8, isNum: true}, false) {
-			t.Fatal("slot stayed held after the write returned")
+		assertSparse(t, env.s, before, actionAgentCap)
+		close(release)
+		reader := bufio.NewReader(clientRead)
+		ok := readFrame(t, reader)
+		busy := readFrame(t, reader)
+		if !bytes.Contains(ok, []byte(toolList)) || bytes.Contains(ok, []byte("endpoint busy")) {
+			t.Fatalf("first response %s", ok)
+		}
+		if !bytes.Contains(busy, []byte(`"id":8`)) || !bytes.Contains(busy, []byte("endpoint busy")) || !bytes.Contains(busy, []byte("-31010")) || bytes.Contains(busy, []byte("-32010")) {
+			t.Fatalf("busy %s", busy)
+		}
+		again := append(rpcFrame(t, 9, "tools/list", map[string]any{"_meta": mcpMeta()}), '\n')
+		if _, err := clientWrite.Write(again); err != nil {
+			t.Fatal(err)
+		}
+		next := readFrame(t, reader)
+		if !bytes.Contains(next, []byte(toolList)) || bytes.Contains(next, []byte("endpoint busy")) {
+			t.Fatalf("slot stayed held %s", next)
 		}
 	})
 	t.Run("pre-handler-once", func(t *testing.T) {
@@ -1009,6 +1021,163 @@ func TestMCPReviewFixes(t *testing.T) {
 			t.Fatal("Serve did not return while a response write was blocked")
 		}
 	})
+	t.Run("notification-drop", func(t *testing.T) {
+		env := approvedShared(t)
+		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
+		before := len(env.s.audit)
+		note := []byte("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+		if _, err := raw.w.Write(note); err != nil {
+			t.Fatal(err)
+		}
+		badCancel := []byte("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{}}\n")
+		if _, err := raw.w.Write(badCancel); err != nil {
+			t.Fatal(err)
+		}
+		got := raw.round(t, rpcFrame(t, 40, "tools/list", map[string]any{"_meta": mcpMeta()}))
+		if !bytes.Contains(got, []byte(toolList)) || bytes.Contains(got, []byte("invalid request")) || bytes.Contains(got, []byte(`"id":null`)) {
+			t.Fatalf("notification drew a response %s", got)
+		}
+		var denied int
+		for _, ev := range env.s.audit[before:] {
+			if ev.Result == resultDenied && ev.GrantID == "" && ev.CredID == "" {
+				denied++
+			}
+		}
+		if denied != 2 {
+			t.Fatalf("notification denials %d", denied)
+		}
+		nullID := []byte(`{"jsonrpc":"2.0","id":null,"method":"tools/list","params":{"_meta":` + string(mustJSON(t, mcpMeta())) + `}}`)
+		got = raw.round(t, nullID)
+		if !bytes.Contains(got, []byte("invalid request")) || !bytes.Contains(got, []byte(`"id":null`)) {
+			t.Fatalf("explicit null id %s", got)
+		}
+	})
+	t.Run("pre-handler-close", func(t *testing.T) {
+		env := approvedShared(t)
+		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := make(chan struct{})
+		ep.server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+			return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+				if method != "tools/call" {
+					return next(ctx, method, req)
+				}
+				close(started)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+		})
+		clientRead, serverWrite := io.Pipe()
+		serverRead, clientWrite := io.Pipe()
+		errc := make(chan error, 1)
+		go func() { errc <- ep.Serve(context.Background(), serverRead, serverWrite) }()
+		defer func() {
+			_ = clientWrite.Close()
+			_ = clientRead.Close()
+		}()
+		handle := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+		frame := append(rpcFrame(t, 30, "tools/call", map[string]any{
+			"name": toolInvoke, "_meta": mcpMeta(),
+			"arguments": map[string]any{
+				"handle":  handle,
+				"payload": base64.StdEncoding.EncodeToString([]byte("x")),
+			},
+		}), '\n')
+		before := len(env.s.audit)
+		if _, err := clientWrite.Write(frame); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("handler was not entered")
+		}
+		if err := clientWrite.Close(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-errc:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Serve did not finish after the peer closed")
+		}
+		assertSparse(t, env.s, before, actionLocalAttest)
+	})
+	t.Run("audit-fault", func(t *testing.T) {
+		env := approvedShared(t)
+		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sentinel := "audit-fault-" + strings.Repeat("Z", 16)
+		env.s.commitFault = func() error { return errors.New("induced " + sentinel) }
+		clientRead, serverWrite := io.Pipe()
+		serverRead, clientWrite := io.Pipe()
+		errc := make(chan error, 1)
+		go func() { errc <- ep.Serve(context.Background(), serverRead, serverWrite) }()
+		defer func() {
+			_ = clientWrite.Close()
+			_ = clientRead.Close()
+		}()
+		ask := append(rpcFrame(t, 11, "tools/call", map[string]any{
+			"name": toolRequest, "arguments": map[string]any{}, "_meta": mcpMeta(),
+		}), '\n')
+		before := len(env.s.audit)
+		if _, err := clientWrite.Write(ask); err != nil {
+			t.Fatal(err)
+		}
+		got := readFrame(t, bufio.NewReader(clientRead))
+		if bytes.Contains(got, []byte(sentinel)) || bytes.Contains(got, []byte("persist")) || !bytes.Contains(got, []byte("internal error")) || bytes.Contains(got, []byte(`"id":null`)) || !bytes.Contains(got, []byte(`"id":11`)) {
+			t.Fatalf("audit fault %s", got)
+		}
+		select {
+		case err := <-errc:
+			if err == nil {
+				t.Fatal("host did not observe the denial audit failure")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Serve kept running after the denial audit failed")
+		}
+		if len(env.s.audit) != before {
+			t.Fatalf("fault persisted rows %d", len(env.s.audit)-before)
+		}
+	})
+	t.Run("broken-output", func(t *testing.T) {
+		env := approvedShared(t)
+		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		serverRead, clientWrite := io.Pipe()
+		errc := make(chan error, 1)
+		go func() { errc <- ep.Serve(context.Background(), serverRead, failWC{}) }()
+		defer func() { _ = clientWrite.Close() }()
+		handle := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32))
+		bad := rpcFrame(t, 1, "resources/list", map[string]any{"_meta": mcpMeta()})
+		invoke := rpcFrame(t, 2, "tools/call", map[string]any{
+			"name": toolInvoke, "_meta": mcpMeta(),
+			"arguments": map[string]any{
+				"handle":  handle,
+				"payload": base64.StdEncoding.EncodeToString([]byte("x")),
+			},
+		})
+		before := len(env.s.audit)
+		if _, err := clientWrite.Write(append(append(bad, '\n'), append(invoke, '\n')...)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-errc:
+		case <-time.After(5 * time.Second):
+			t.Fatal("failed error write did not stop the session")
+		}
+		if len(env.s.audit) != before+1 || env.s.audit[len(env.s.audit)-1].Action != actionAgentCap {
+			t.Fatalf("later call ran after a broken write %+v", env.s.audit[before:])
+		}
+	})
 }
 
 func assertSparse(t *testing.T, s *Session, before int, action string) {
@@ -1031,19 +1200,53 @@ func waitRaw(t *testing.T, raw *rawPipe) {
 	}
 }
 
-type blockWriter struct {
-	started chan struct{}
+func readFrame(t *testing.T, r *bufio.Reader) []byte {
+	t.Helper()
+	type got struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan got, 1)
+	go func() {
+		line, err := r.ReadBytes('\n')
+		ch <- got{line, err}
+	}()
+	select {
+	case g := <-ch:
+		if g.err != nil {
+			t.Fatal(g.err)
+		}
+		return g.b
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for a frame")
+		return nil
+	}
+}
+
+type holdWriter struct {
+	w       io.Writer
+	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
 }
 
-func (w *blockWriter) Write(p []byte) (int, error) {
-	w.once.Do(func() { close(w.started) })
-	<-w.release
-	return len(p), nil
+func (h *holdWriter) Write(p []byte) (int, error) {
+	h.once.Do(func() { close(h.entered) })
+	<-h.release
+	return h.w.Write(p)
 }
 
-func (w *blockWriter) Close() error { return nil }
+func (h *holdWriter) Close() error {
+	if c, ok := h.w.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+type failWC struct{}
+
+func (failWC) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+func (failWC) Close() error              { return nil }
 
 type gateWriter struct {
 	entered   chan struct{}

@@ -41,9 +41,12 @@ const (
 	maxMCPName           = 64
 	maxMCPReason         = 128
 
-	// mcpCodeBusy is the fixed JSON-RPC code for a second request while one
+	// mcpCodeBusy is the fixed application code for a second request while one
 	// call is already inside this endpoint. There is no waiting queue.
-	mcpCodeBusy = -32010
+	// JSON-RPC reserves -32768 through -32000, and MCP forbids new allocations
+	// in the legacy sub-range -32000 through -32019, so this code sits outside
+	// both. It is not an MCP-specified code and carries no protocol data.
+	mcpCodeBusy = -31010
 	// mcpCodeCancelled is the fixed code for a call abandoned before the
 	// vault operation starts. It does not recall a signature already released.
 	mcpCodeCancelled = -32800
@@ -83,11 +86,11 @@ func mcpMaxInvokeFrame() int {
 // The host must not use the bound session on another goroutine while Serve is
 // running, except from a callback the session invokes after releasing its own
 // lock. This process does not enforce that duty for any other process.
-// A second request fails closed and does not wait. The one admission slot stays
-// held until that call's response write returns, or until the write is abandoned
-// because its context is already cancelled. Cancellation and close do not
-// recall a signature already released, and a missing response is not a
-// signal to replay the call.
+// A second request fails closed and does not wait on the response write. The
+// one admission slot stays held until that call's response write returns, or
+// until the write is abandoned because its context is already cancelled.
+// Cancellation and close do not recall a signature already released, and a
+// missing response is not a signal to replay the call.
 type MCPEndpoint struct {
 	cap    *AgentCapability
 	server *mcp.Server
@@ -100,6 +103,7 @@ type MCPEndpoint struct {
 	callInvoke  bool
 	callHandled bool
 	cancelSent  bool
+	auditErr    error
 }
 
 type callKey struct {
@@ -169,6 +173,7 @@ func (e *MCPEndpoint) Serve(ctx context.Context, r io.ReadCloser, w io.WriteClos
 		e.mu.Lock()
 		e.serving = false
 		e.inCall = false
+		e.callHandled = false
 		e.cancelSent = false
 		e.mu.Unlock()
 	}()
@@ -187,6 +192,7 @@ func (e *MCPEndpoint) Serve(ctx context.Context, r io.ReadCloser, w io.WriteClos
 	defer ss.Close()
 	errc := make(chan error, 1)
 	go func() { errc <- ss.Wait() }()
+	var serveErr error
 	select {
 	case <-ctx.Done():
 		// The SDK's graceful close waits until the handler returns. A handler
@@ -195,13 +201,25 @@ func (e *MCPEndpoint) Serve(ctx context.Context, r io.ReadCloser, w io.WriteClos
 		_ = conn.Close()
 		_ = ss.Close()
 		<-errc
-		return ctx.Err()
+		serveErr = ctx.Err()
 	case err := <-errc:
-		if err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
-			return nil
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
+			serveErr = err
 		}
-		return err
 	}
+	// Dispatch has stopped. A call the SDK cancelled before its handler, or
+	// whose response write was suppressed because the reader was already gone,
+	// still needs one sparse denial. A handler that already audited is skipped.
+	if aerr := e.settleOutstanding(); aerr != nil {
+		return aerr
+	}
+	if serveErr != nil {
+		return serveErr
+	}
+	e.mu.Lock()
+	stored := e.auditErr
+	e.mu.Unlock()
+	return stored
 }
 
 // denyOverlap records a sparse denial when a callback reenters this endpoint
@@ -271,6 +289,42 @@ func (e *MCPEndpoint) finishCall(id callKey) {
 	}
 }
 
+// settleOutstanding records the one admitted attempt whose handler never
+// audited. It runs only after the SDK session has stopped, so a late Write
+// cannot record the same row. A failed write is returned and is not described
+// as persisted.
+func (e *MCPEndpoint) settleOutstanding() error {
+	if e == nil || e.cap == nil {
+		return ErrUnauthenticated
+	}
+	e.mu.Lock()
+	if !e.inCall || e.callHandled {
+		e.mu.Unlock()
+		return nil
+	}
+	invoke := e.callInvoke
+	e.callHandled = true
+	e.inCall = false
+	e.cancelSent = false
+	e.mu.Unlock()
+	err := e.cap.denyBound(invoke)
+	if err != nil {
+		e.noteAudit(err)
+	}
+	return err
+}
+
+func (e *MCPEndpoint) noteAudit(err error) {
+	if e == nil || err == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.auditErr == nil {
+		e.auditErr = err
+	}
+	e.mu.Unlock()
+}
+
 func (e *MCPEndpoint) acceptCancel(id callKey) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -305,6 +359,7 @@ func (e *MCPEndpoint) onTool(ctx context.Context, req *mcp.CallToolRequest) (*mc
 
 func (e *MCPEndpoint) toolFail(invoke bool, code int64) (*mcp.CallToolResult, error) {
 	if err := e.cap.denyBound(invoke); err != nil {
+		e.noteAudit(err)
 		return nil, rpcError(jsonrpc.CodeInternalError)
 	}
 	return nil, rpcError(code)
@@ -543,7 +598,14 @@ type admitConn struct {
 	raw  io.ReadCloser
 	rawW io.WriteCloser
 	wmu  sync.Mutex
-	once sync.Once
+	// writing is true while a frame is being written to rawW. Admission does
+	// not take wmu. A rejection that arrives during that write keeps one
+	// deferred frame; a second one closes the pipe.
+	// ponytail: one deferred rejection, then close. Not a queue. A larger
+	// bound would still be a queue, so the upgrade is to keep closing.
+	writing bool
+	pending []byte
+	once    sync.Once
 }
 
 func (c *admitConn) SessionID() string { return "" }
@@ -568,15 +630,13 @@ func (c *admitConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 		d := classifyFrame(frame)
 		switch d.op {
 		case opForward:
-			// wmu orders this decision with the in-flight response write.
-			// The slot is released before that write unlocks, so a call that
-			// arrives after delivery is admitted. A call that arrives while
-			// the handler still holds the slot is rejected.
-			c.wmu.Lock()
-			admitted := c.ep.beginCall(d.key, d.invoke)
-			c.wmu.Unlock()
-			if !admitted {
-				c.reject(d, mcpCodeBusy)
+			// The slot check does not take wmu. A response write may be
+			// blocked in rawW; waiting here would admit the frame after that
+			// write released the slot. beginCall rejects it now.
+			if !c.ep.beginCall(d.key, d.invoke) {
+				if err := c.reject(d, mcpCodeBusy); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			msg, err := decodeAdmitted(ctx, frame)
@@ -594,18 +654,36 @@ func (c *admitConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 				return nil, err
 			}
 			return msg, nil
+		case opDrop:
+			if err := c.drop(d); err != nil {
+				return nil, err
+			}
 		default:
-			c.reject(d, d.code)
+			if err := c.reject(d, d.code); err != nil {
+				return nil, err
+			}
 		}
 	}
 }
 
-func (c *admitConn) reject(d frameDecision, code int64) {
+func (c *admitConn) reject(d frameDecision, code int64) error {
 	if err := c.ep.cap.denyBound(d.invoke); err != nil {
-		c.surfaceAuditFailure(d)
-		return
+		return c.finishAuditFailure(d, err)
 	}
-	_ = c.writeCode(d.idRaw, code)
+	if err := c.writeCode(d.idRaw, code, d.requested); err != nil {
+		_ = c.Close()
+		return err
+	}
+	return nil
+}
+
+// drop audits a notification and writes nothing. The peer gets no response.
+func (c *admitConn) drop(d frameDecision) error {
+	if err := c.ep.cap.denyBound(d.invoke); err != nil {
+		_ = c.Close()
+		return err
+	}
+	return nil
 }
 
 // failFrame audits a partial or oversized frame, then returns err.
@@ -617,11 +695,7 @@ func (c *admitConn) failFrame(frame []byte, err error) error {
 	}
 	d := classifyFrame(frame)
 	if aerr := c.ep.cap.denyBound(d.invoke); aerr != nil {
-		c.surfaceAuditFailure(d)
-		if errors.Is(err, errMCPFrame) {
-			_ = c.Close()
-		}
-		return aerr
+		return c.finishAuditFailure(d, aerr)
 	}
 	if errors.Is(err, errMCPFrame) {
 		_ = c.Close()
@@ -634,26 +708,31 @@ func (c *admitConn) failAdmitted(d frameDecision, err error) error {
 	aerr := c.ep.settleDenied(d.key)
 	c.ep.finishCall(d.key)
 	if aerr != nil {
-		c.surfaceAuditFailure(d)
-		return aerr
+		return c.finishAuditFailure(d, aerr)
 	}
 	_ = c.Close()
 	return err
 }
 
-// surfaceAuditFailure emits one correlated internal error when the id is
-// valid. An unvalidated id is not rewritten to null; the pipe is closed.
-func (c *admitConn) surfaceAuditFailure(d frameDecision) {
-	if d.idOK {
-		_ = c.writeCode(d.idRaw, jsonrpc.CodeInternalError)
-		return
+// finishAuditFailure makes a failed denial visible to the host. A validated
+// request id gets one correlated internal error. A notification, or an id
+// that did not validate, gets no response and a closed pipe. The returned
+// error is the audit failure, including when the peer write also fails.
+func (c *admitConn) finishAuditFailure(d frameDecision, auditErr error) error {
+	c.ep.noteAudit(auditErr)
+	if d.idOK && d.op != opDrop {
+		if werr := c.writeCode(d.idRaw, jsonrpc.CodeInternalError, ""); werr != nil {
+			_ = c.Close()
+		}
+		return auditErr
 	}
 	_ = c.Close()
+	return auditErr
 }
 
 func (c *admitConn) Write(ctx context.Context, msg jsonrpc.Message) error {
-	// Keep the admission slot until this write returns. Releasing it first lets
-	// the SDK start another handler while this one is blocked on the pipe.
+	// The slot stays held while the body write is blocked. emitResponse
+	// releases it before the frame can be decoded.
 	auditErr := c.settleWrite(msg)
 	if auditErr != nil {
 		return c.writeAuditFailure(ctx, msg, auditErr)
@@ -662,14 +741,11 @@ func (c *admitConn) Write(ctx context.Context, msg jsonrpc.Message) error {
 		c.noteResponse(msg)
 		return ctx.Err()
 	}
-	frame := frameFor(msg)
-	c.wmu.Lock()
-	_, err := c.rawW.Write(frame)
-	// Release only after the bytes are written, and before wmu is dropped, so
-	// the next admission cannot observe a delivered response as still busy.
-	c.noteResponse(msg)
-	c.wmu.Unlock()
-	return err
+	// Release the slot before the last two bytes. Those are the closing brace
+	// and the newline, so neither a JSON decoder nor a line reader can observe
+	// a complete frame until the slot is free. A peer that is not reading
+	// blocks on the earlier bytes and the slot stays held.
+	return c.emitResponse(frameFor(msg), msg)
 }
 
 // settleWrite records a pre-handler denial for an error response whose handler
@@ -698,14 +774,107 @@ func (c *admitConn) writeAuditFailure(ctx context.Context, msg jsonrpc.Message, 
 		_ = c.Close()
 		return auditErr
 	}
-	c.wmu.Lock()
-	_, werr := c.rawW.Write(encodeRPCError(id, jsonrpc.CodeInternalError))
+	werr := c.emit(encodeRPCError(id, jsonrpc.CodeInternalError, ""))
 	c.noteResponse(msg)
-	c.wmu.Unlock()
 	if werr != nil {
-		return auditErr
+		_ = c.Close()
 	}
 	return auditErr
+}
+
+// emitResponse writes a call response. The admission slot stays held while the
+// body write is blocked. It is released before the closing brace and newline,
+// so a frame that arrived during the blocked body is rejected, and a peer
+// cannot decode the frame and send the next call until the slot is free.
+func (c *admitConn) emitResponse(frame []byte, msg jsonrpc.Message) error {
+	c.wmu.Lock()
+	if c.writing {
+		c.wmu.Unlock()
+		err := c.emit(frame)
+		c.noteResponse(msg)
+		return err
+	}
+	c.writing = true
+	c.wmu.Unlock()
+
+	// ponytail: hold back "}\n" (or the last byte). A peer that parses early
+	// still cannot finish the value. Upgrade path is a write that signals
+	// before unblocking the reader, which io.Writer does not offer.
+	split := len(frame)
+	if split >= 2 && frame[split-1] == '\n' {
+		split -= 2
+	} else if split > 0 {
+		split--
+	}
+	var err error
+	if split > 0 {
+		_, err = c.rawW.Write(frame[:split])
+	}
+	c.noteResponse(msg)
+	if err == nil && split < len(frame) {
+		_, err = c.rawW.Write(frame[split:])
+	}
+	if err == nil {
+		err = c.flushPending()
+	}
+	c.wmu.Lock()
+	c.writing = false
+	if err != nil {
+		c.pending = nil
+	}
+	c.wmu.Unlock()
+	if err != nil {
+		_ = c.Close()
+	}
+	return err
+}
+
+// emit writes one frame. A response body already in progress keeps at most
+// one deferred frame so the read loop can keep consuming cancellation. A
+// second frame that arrives while that slot is full closes the pipe.
+func (c *admitConn) emit(frame []byte) error {
+	c.wmu.Lock()
+	if c.writing {
+		if c.pending != nil {
+			c.wmu.Unlock()
+			_ = c.Close()
+			return io.ErrClosedPipe
+		}
+		c.pending = append([]byte(nil), frame...)
+		c.wmu.Unlock()
+		return nil
+	}
+	c.writing = true
+	c.wmu.Unlock()
+	_, err := c.rawW.Write(frame)
+	if err == nil {
+		err = c.flushPending()
+	}
+	c.wmu.Lock()
+	c.writing = false
+	if err != nil {
+		c.pending = nil
+	}
+	c.wmu.Unlock()
+	if err != nil {
+		_ = c.Close()
+	}
+	return err
+}
+
+func (c *admitConn) flushPending() error {
+	for {
+		c.wmu.Lock()
+		extra := c.pending
+		c.pending = nil
+		c.wmu.Unlock()
+		if extra == nil {
+			return nil
+		}
+		if _, err := c.rawW.Write(extra); err != nil {
+			return err
+		}
+	}
 }
 
 func (c *admitConn) noteResponse(msg jsonrpc.Message) {
@@ -718,11 +887,8 @@ func (c *admitConn) noteResponse(msg jsonrpc.Message) {
 	}
 }
 
-func (c *admitConn) writeCode(id json.RawMessage, code int64) error {
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	_, err := c.rawW.Write(encodeRPCError(id, code))
-	return err
+func (c *admitConn) writeCode(id json.RawMessage, code int64, requested string) error {
+	return c.emit(encodeRPCError(id, code, requested))
 }
 
 func (c *admitConn) nextFrame() ([]byte, error) {
@@ -758,15 +924,17 @@ const (
 	opReject = iota
 	opForward
 	opCancel
+	opDrop
 )
 
 type frameDecision struct {
-	op     int
-	code   int64
-	invoke bool
-	key    callKey
-	idRaw  json.RawMessage
-	idOK   bool
+	op        int
+	code      int64
+	invoke    bool
+	key       callKey
+	idRaw     json.RawMessage
+	idOK      bool
+	requested string
 }
 
 func classifyFrame(frame []byte) frameDecision {
@@ -779,13 +947,18 @@ func classifyFrame(frame []byte) frameDecision {
 	// denial even when a later envelope or id check rejects the frame.
 	// Unparseable input does not reach this assignment.
 	deny.invoke = recognizedInvoke(v)
+	// A parsed object with no id key is a notification, including when a later
+	// check rejects it. id:null is an explicit invalid id, not an absent id.
+	if _, hasID := v.field("id"); !hasID {
+		return classifyNotification(v, deny.invoke)
+	}
 	ver, ok := v.field("jsonrpc")
 	method, mok := v.field("method")
 	if !ok || !mok || ver.kind != 's' || ver.s != "2.0" || method.kind != 's' || method.s == "" || len(method.s) > maxMCPName {
 		deny.code = jsonrpc.CodeInvalidRequest
 		return deny
 	}
-	id, hasID := v.field("id")
+	id, _ := v.field("id")
 	params, hasParams := v.field("params")
 	for _, kv := range v.obj {
 		switch kv.k {
@@ -795,34 +968,21 @@ func classifyFrame(frame []byte) frameDecision {
 			return deny
 		}
 	}
-	if hasID {
-		raw, key, good := correlationID(id)
-		if !good {
-			deny.code = jsonrpc.CodeInvalidRequest
-			return deny
-		}
-		deny.idRaw = raw
-		deny.key = key
-		deny.idOK = true
+	raw, key, good := correlationID(id)
+	if !good {
+		deny.code = jsonrpc.CodeInvalidRequest
+		return deny
 	}
+	deny.idRaw = raw
+	deny.key = key
+	deny.idOK = true
 	if method.s == "notifications/cancelled" {
-		if hasID || !hasParams {
-			deny.code = jsonrpc.CodeInvalidRequest
-			return deny
-		}
-		key, ok := cancelledParams(params)
-		if !ok {
-			deny.code = jsonrpc.CodeInvalidParams
-			return deny
-		}
-		return frameDecision{op: opCancel, key: key}
-	}
-	if !hasID {
 		deny.code = jsonrpc.CodeInvalidRequest
 		return deny
 	}
 	if method.s == "initialize" {
 		deny.code = mcp.CodeUnsupportedProtocolVersion
+		deny.requested = requestedVersion(params, hasParams)
 		return deny
 	}
 	switch method.s {
@@ -832,12 +992,22 @@ func classifyFrame(frame []byte) frameDecision {
 		return deny
 	}
 	if !hasParams || params.kind != 'o' {
-		deny.code = mcp.CodeUnsupportedProtocolVersion
+		deny.code = jsonrpc.CodeInvalidParams
 		return deny
 	}
 	meta, mok := params.field("_meta")
-	if !mok || !metaAllowed(meta) {
+	if !mok {
+		deny.code = jsonrpc.CodeInvalidParams
+		return deny
+	}
+	switch class, requested := classifyMeta(meta); class {
+	case metaVersion:
 		deny.code = mcp.CodeUnsupportedProtocolVersion
+		deny.requested = requested
+		return deny
+	case metaOK:
+	default:
+		deny.code = jsonrpc.CodeInvalidParams
 		return deny
 	}
 	invoke, code, ok := methodParams(method.s, params)
@@ -849,6 +1019,47 @@ func classifyFrame(frame []byte) frameDecision {
 		return deny
 	}
 	return frameDecision{op: opForward, invoke: invoke, key: deny.key, idRaw: deny.idRaw, idOK: true}
+}
+
+// classifyNotification audits later and produces no response. A valid
+// notifications/cancelled for one outstanding id is forwarded once.
+func classifyNotification(v jv, invoke bool) frameDecision {
+	drop := frameDecision{op: opDrop, invoke: invoke}
+	ver, ok := v.field("jsonrpc")
+	method, mok := v.field("method")
+	if !ok || !mok || ver.kind != 's' || ver.s != "2.0" || method.kind != 's' || method.s == "" || len(method.s) > maxMCPName {
+		return drop
+	}
+	for _, kv := range v.obj {
+		switch kv.k {
+		case "jsonrpc", "method", "params":
+		default:
+			return drop
+		}
+	}
+	if method.s != "notifications/cancelled" {
+		return drop
+	}
+	params, hasParams := v.field("params")
+	if !hasParams {
+		return drop
+	}
+	key, good := cancelledParams(params)
+	if !good {
+		return drop
+	}
+	return frameDecision{op: opCancel, key: key}
+}
+
+func requestedVersion(params jv, hasParams bool) string {
+	if !hasParams || params.kind != 'o' {
+		return "invalid"
+	}
+	pv, ok := params.field("protocolVersion")
+	if !ok || pv.kind != 's' || !safeVersionToken(pv.s) {
+		return "invalid"
+	}
+	return pv.s
 }
 
 func recognizedInvoke(v jv) bool {
@@ -897,32 +1108,70 @@ func safeIDString(s string) bool {
 	return true
 }
 
-func metaAllowed(v jv) bool {
+const (
+	metaOK metaClass = iota
+	metaInvalid
+	metaVersion
+)
+
+type metaClass int
+
+// classifyMeta accepts the selected revision's required _meta. A present but
+// unsupported protocolVersion is metaVersion. A missing or malformed required
+// field is metaInvalid and is not reported as an unsupported version.
+func classifyMeta(v jv) (metaClass, string) {
 	if v.kind != 'o' || v.rawEnd < v.rawBeg || v.rawEnd-v.rawBeg > maxMCPMeta {
-		return false
+		return metaInvalid, ""
 	}
 	var sawVersion, sawCaps bool
+	var requested string
+	var badVersion bool
 	for _, kv := range v.obj {
 		switch kv.k {
 		case metaProtocolVersion:
-			if kv.v.kind != 's' || kv.v.s != mcpProtocolRevision {
-				return false
+			if kv.v.kind != 's' || !safeVersionToken(kv.v.s) {
+				return metaInvalid, ""
 			}
 			sawVersion = true
+			if kv.v.s != mcpProtocolRevision {
+				badVersion = true
+				requested = kv.v.s
+			}
 		case metaClientInfo:
 			if !clientInfoAllowed(kv.v) {
-				return false
+				return metaInvalid, ""
 			}
 		case metaClientCapabilities:
 			if !clientCapsAllowed(kv.v) {
-				return false
+				return metaInvalid, ""
 			}
 			sawCaps = true
+		default:
+			return metaInvalid, ""
+		}
+	}
+	if !sawVersion || !sawCaps {
+		return metaInvalid, ""
+	}
+	if badVersion {
+		return metaVersion, requested
+	}
+	return metaOK, ""
+}
+
+func safeVersionToken(s string) bool {
+	if len(s) == 0 || len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c == '.', c == '_', c == '-':
 		default:
 			return false
 		}
 	}
-	return sawVersion && sawCaps
+	return true
 }
 
 func clientInfoAllowed(v jv) bool {
@@ -1100,14 +1349,14 @@ func (discardWC) Close() error                { return nil }
 func frameFor(msg jsonrpc.Message) []byte {
 	raw, err := jsonrpc.EncodeMessage(msg)
 	if err != nil || len(raw) == 0 || !utf8.Valid(raw) {
-		return encodeRPCError([]byte("null"), jsonrpc.CodeInternalError)
+		return encodeRPCError([]byte("null"), jsonrpc.CodeInternalError, "")
 	}
 	id, code, isErr := probeRPC(raw)
 	if isErr {
-		return encodeRPCError(id, code)
+		return encodeRPCError(id, code, "")
 	}
 	if len(raw) > maxMCPFrame || jsonTrailing(raw) {
-		return encodeRPCError(id, jsonrpc.CodeInternalError)
+		return encodeRPCError(id, jsonrpc.CodeInternalError, "")
 	}
 	out := make([]byte, len(raw)+1)
 	copy(out, raw)
@@ -1165,13 +1414,23 @@ func safeIDRaw(raw json.RawMessage) json.RawMessage {
 	return []byte("null")
 }
 
-func encodeRPCError(id json.RawMessage, code int64) []byte {
+func encodeRPCError(id json.RawMessage, code int64, requested string) []byte {
 	if len(id) == 0 {
 		id = []byte("null")
 	}
 	code = normalizeCode(code)
 	msg, _ := mcpMessage(code)
-	frame := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":%d,\"message\":%q}}\n", id, code, msg)
+	var frame string
+	if code == mcp.CodeUnsupportedProtocolVersion {
+		if !safeVersionToken(requested) {
+			requested = "invalid"
+		}
+		// supported is the fixed allowlist. requested is a bounded token, not
+		// the raw frame, and is not added to supported.
+		frame = fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":%d,\"message\":%q,\"data\":{\"supported\":[%q],\"requested\":%q}}}\n", id, code, msg, mcpProtocolRevision, requested)
+	} else {
+		frame = fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":%d,\"message\":%q}}\n", id, code, msg)
+	}
 	if len(frame) > maxMCPFrame+1 {
 		frame = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"internal error\"}}\n"
 	}
