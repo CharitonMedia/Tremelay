@@ -67,7 +67,7 @@ The SSH slice is one host-bound user authentication signature. An already-bound 
 
 **Goal:** Support organizations, ownership, shared vaults, recovery, role separation, and approvals without weakening earlier invariants.
 
-M9 is not complete. M9a is the local shared-vault authorization reference in [ADR 0015](docs/adr/0015-local-shared-vault-authorization.md) and [docs/m9a-shared-vault.md](docs/m9a-shared-vault.md). A bound member requests one exact local attestation, a different bound owner approves the stored request, and the designated agent uses the grant through the existing broker. Revocation or membership removal stops later use. Real authentication, recovery, independent custody, and production shared access remain open.
+M9 is not complete. M9a is the local shared-vault authorization reference in [ADR 0015](docs/adr/0015-local-shared-vault-authorization.md) and [docs/m9a-shared-vault.md](docs/m9a-shared-vault.md). A bound member requests one exact local attestation, a different bound owner approves the stored request, and the designated agent uses the grant through the existing broker. Revocation or membership removal stops later use. M9b is a local checkpoint-bound snapshot of that vault ([ADR 0016](docs/adr/0016-local-checkpoint-backup.md), [docs/m9b-local-backup.md](docs/m9b-local-backup.md)). The host supplies the existing unlock material and a checkpoint kept outside the artifact. An old backup paired with its own old checkpoint is not detected as stale. Real authentication, lost-secret recovery, independent custody, freshness services, cross-machine cutover, and production shared access remain open.
 
 ## M10 — Agent SDK / MCP integration
 
