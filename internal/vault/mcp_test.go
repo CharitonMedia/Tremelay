@@ -1155,43 +1155,80 @@ func TestMCPReviewFixes(t *testing.T) {
 		}
 	})
 	t.Run("broken-output", func(t *testing.T) {
-		env := approvedShared(t)
-		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
-		if err != nil {
-			t.Fatal(err)
-		}
-		serverRead, clientWrite := io.Pipe()
-		errc := make(chan error, 1)
-		go func() { errc <- ep.Serve(context.Background(), serverRead, failWC{}) }()
-		defer func() { _ = clientWrite.Close() }()
-		handle := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32))
-		bad := rpcFrame(t, 1, "resources/list", map[string]any{"_meta": mcpMeta()})
-		invoke := rpcFrame(t, 2, "tools/call", map[string]any{
-			"name": toolInvoke, "_meta": mcpMeta(),
-			"arguments": map[string]any{
-				"handle":  handle,
-				"payload": base64.StdEncoding.EncodeToString([]byte("x")),
-			},
-		})
-		before := len(mcpAuditSnapshot(env.s))
-		if _, err := clientWrite.Write(append(append(bad, '\n'), append(invoke, '\n')...)); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case <-errc:
-		case <-time.After(5 * time.Second):
-			t.Fatal("failed error write did not stop the session")
-		}
-		rows := mcpAuditSnapshot(env.s)[before:]
-		if len(rows) < 1 || len(rows) > 2 || rows[0].Action != actionAgentCap {
-			t.Fatalf("broken-output audit %+v", rows)
-		}
-		// The reader can audit a second frame before the failed Write returns.
-		// It must never execute it or emit a credential result.
-		for _, row := range rows {
-			if row.Result != resultDenied || row.GrantID != "" || row.CredID != "" {
-				t.Fatalf("later call ran after a broken write %+v", row)
-			}
+		for _, tc := range []struct {
+			name      string
+			frame     []byte
+			action    string
+			failAudit bool
+		}{
+			{"invoke", lifecycleInvoke(t, 2), actionLocalAttest, false},
+			{"notification", cancellationFrame(t, 2), actionAgentCap, false},
+			{"malformed", []byte(`{"jsonrpc":`), actionAgentCap, false},
+			{"audit-failure", lifecycleInvoke(t, 2), actionLocalAttest, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				env := approvedShared(t)
+				ep := lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID))
+				var handled bool
+				ep.server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+					return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+						handled = true
+						return next(ctx, method, req)
+					}
+				})
+				var attempts int
+				if tc.failAudit {
+					env.s.commitFault = func() error {
+						attempts++
+						if attempts == 2 {
+							return errors.New("test-only consumed-frame audit failure")
+						}
+						return nil
+					}
+				}
+				bad := rpcFrame(t, 1, "resources/list", map[string]any{"_meta": mcpMeta()})
+				reader := &shutdownMCPReader{
+					first: append(bad, '\n'), second: append(append([]byte(nil), tc.frame...), '\n'),
+					copied: make(chan struct{}), closed: make(chan struct{}),
+				}
+				writer := &shutdownMCPWriter{copied: reader.copied, closed: make(chan struct{})}
+				before := len(mcpAuditSnapshot(env.s))
+				errc := make(chan error, 1)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				go func() { errc <- ep.Serve(ctx, reader, writer) }()
+				awaitMCPSignal(t, reader.copied)
+				var serveErr error
+				select {
+				case serveErr = <-errc:
+				case <-time.After(5 * time.Second):
+					t.Fatal("broken output did not stop the session")
+				}
+				if handled || writer.calls != 1 {
+					t.Fatal("consumed frame was dispatched or produced output after failure")
+				}
+				rows := mcpAuditSnapshot(env.s)[before:]
+				if tc.failAudit {
+					if !errors.Is(serveErr, ErrAudit) || attempts != 2 || len(rows) != 1 {
+						t.Fatalf("shutdown hid audit failure: %v attempts=%d rows=%+v", serveErr, attempts, rows)
+					}
+				} else {
+					if len(rows) != 2 || rows[1].Action != tc.action {
+						t.Fatalf("consumed frame was not audited exactly once: %+v", rows)
+					}
+					if !errors.Is(serveErr, io.ErrClosedPipe) {
+						t.Fatalf("shutdown error %v", serveErr)
+					}
+				}
+				if len(rows) == 0 || rows[0].Action != actionAgentCap {
+					t.Fatalf("first denial %+v", rows)
+				}
+				for _, row := range rows {
+					if row.Result != resultDenied || row.GrantID != "" || row.CredID != "" || row.AgentID != env.agent.ID {
+						t.Fatalf("non-sparse shutdown denial %+v", row)
+					}
+				}
+			})
 		}
 	})
 }
@@ -1291,10 +1328,52 @@ func (h *holdWriter) Close() error {
 	return nil
 }
 
-type failWC struct{}
+// shutdownMCPReader models a read that has copied a complete second frame
+// before output fails, but returns those bytes only after Close. The real
+// nextFrame path therefore finishes with a consumed frame in terminal state.
+// All data fields are used by the sole reader; channels coordinate the writer.
+type shutdownMCPReader struct {
+	first, second  []byte
+	copied, closed chan struct{}
+	once           sync.Once
+}
 
-func (failWC) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
-func (failWC) Close() error              { return nil }
+func (r *shutdownMCPReader) Read(p []byte) (int, error) {
+	if len(r.first) > 0 {
+		n := copy(p, r.first)
+		r.first = r.first[n:]
+		return n, nil
+	}
+	if len(r.second) > 0 {
+		n := copy(p, r.second)
+		r.second = r.second[n:]
+		if len(r.second) == 0 {
+			close(r.copied)
+			<-r.closed
+		}
+		return n, nil
+	}
+	return 0, io.EOF
+}
+
+func (r *shutdownMCPReader) Close() error { r.once.Do(func() { close(r.closed) }); return nil }
+
+type shutdownMCPWriter struct {
+	copied <-chan struct{}
+	closed chan struct{}
+	calls  int
+	once   sync.Once
+}
+
+func (w *shutdownMCPWriter) Write([]byte) (int, error) {
+	w.calls++
+	select {
+	case <-w.copied:
+	case <-w.closed:
+	}
+	return 0, io.ErrClosedPipe
+}
+func (w *shutdownMCPWriter) Close() error { w.once.Do(func() { close(w.closed) }); return nil }
 
 type gateWriter struct {
 	entered   chan struct{}

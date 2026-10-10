@@ -753,14 +753,20 @@ func (c *admitConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 		if err != nil {
 			return nil, c.failFrame(frame, err)
 		}
+		d := classifyFrame(frame)
 		c.ep.mu.Lock()
 		terminal := c.closed || c.terminal
 		c.ep.mu.Unlock()
 		if terminal {
+			// nextFrame already consumed this attempt, even if output failed
+			// before Read resumed. Audit its bounded classification without
+			// dispatch, output, or settling another admitted request.
+			if err := c.drop(d); err != nil {
+				return nil, err
+			}
 			_ = c.Close()
 			return nil, io.ErrClosedPipe
 		}
-		d := classifyFrame(frame)
 		switch d.op {
 		case opForward:
 			// The slot check never waits for rawW. A call arriving during
