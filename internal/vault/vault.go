@@ -8,8 +8,10 @@
 // the HTTP broker, request one local Ed25519 attestation, and open one
 // host-bound SSH userauth stream for one identity.
 // BindAgentCapability is a separate in-process byte interface for that
-// principal's local attestation grants. It cannot retrieve credential plaintext.
-// This package must not grow an agent-facing raw-secret retrieval API.
+// principal's local attestation grants. BindMCPEndpoint is one in-memory MCP
+// peer for an adapter the host already bound. Neither can retrieve credential
+// plaintext, and neither is a network service. This package must not grow an
+// agent-facing raw-secret retrieval API.
 package vault
 
 import (

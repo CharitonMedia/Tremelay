@@ -158,10 +158,21 @@ func (a *AgentCapability) Exchange(message []byte) ([]byte, error) {
 }
 
 func (a *AgentCapability) protocolDeny(invoke bool, code string) ([]byte, error) {
-	if err := a.broker.agentCapDeny(a.agentID, invoke); err != nil {
+	if err := a.denyBound(invoke); err != nil {
 		return nil, err
 	}
 	return encodeCapError(code)
+}
+
+// denyBound records one sparse denial for this adapter's agent.
+// invoke selects local_attest; any other attempt stays agent_capability.
+// The row has no grant, credential, handle, or caller text.
+// A non-nil error means the row was not persisted.
+func (a *AgentCapability) denyBound(invoke bool) error {
+	if a == nil || a.broker == nil || safeID(a.agentID) == "" {
+		return ErrUnauthenticated
+	}
+	return a.broker.agentCapDeny(a.agentID, invoke)
 }
 
 func (a *AgentCapability) list() ([]byte, error) {
