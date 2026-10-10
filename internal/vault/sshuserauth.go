@@ -88,8 +88,9 @@ type sshBroker interface {
 // ssh_userauth grant for this principal. Construction does not sign, does not
 // write an allow row, and does not make an expired, revoked, or otherwise
 // unusable grant usable. A different grant needs a different stream.
-// Rejected construction records a fixed denial with no grant or credential
-// fields and only a verified principal ID. Audit failure replaces the denial.
+// Rejected construction records a metadata-free denial: empty operation, grant,
+// and credential fields, and only a verified principal id. Audit failure
+// replaces the denial.
 func (a *AgentPrincipal) SSHUserAuth(grantID string) (*SSHUserAuth, error) {
 	if a == nil || a.view == nil {
 		return nil, ErrUnauthenticated
@@ -394,7 +395,8 @@ func (s *Session) sshConstruct(agentID, grantID string) error {
 }
 
 func (s *Session) denySSHConstruct(agentID string, cause error) error {
-	ev := auditEvent{Action: actionSSHUserAuth, Operation: OpSSHUserAuth, Result: resultDenied}
+	// Operation stays empty. A wrong-operation probe must not be labeled in the chain.
+	ev := auditEvent{Action: actionSSHUserAuth, Result: resultDenied}
 	if safeID(agentID) != "" && s.agentExists(agentID) {
 		ev.AgentID = agentID
 	}

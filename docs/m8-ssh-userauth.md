@@ -4,6 +4,8 @@ An agent principal that already holds one expiring `ssh_userauth` grant can obta
 
 The human control plane chooses the principal and one existing grant when it builds the stream. A wire message cannot choose the principal, grant, credential, resource, clock, or host key. `Authorize` can describe that grant and does not replace the checks performed at signing.
 
+A successful construction writes no allow row. A rejected construction appends one metadata-free `denied` audit row: empty operation, grant id, credential id, and credential type. The agent id is included only when that agent exists. A locked session records nothing.
+
 ## What the grant allows
 
 The grant authorizes SSH authentication as one exact username to the server identified by one Ed25519 host public key. That is account authentication only. It does not limit a remote command, path, repository, SFTP session, shell, or forwarding channel. The resource string is an opaque label stored with the grant. It does not add those limits.

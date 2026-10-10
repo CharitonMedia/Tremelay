@@ -44,6 +44,7 @@ func TestM5ClassifyTable(t *testing.T) {
 		{auditEvent{Action: actionSSHUserAuth, Result: resultDeniedKey, AgentID: agent}, Classification{ClassExpectedDenial, SeverityLow}},
 		{auditEvent{Action: actionSSHUserAuth, Result: resultFailed, AgentID: agent}, Classification{ClassExpectedDenial, SeverityLow}},
 		{auditEvent{Action: actionSSHUserAuth, Result: resultDenied, AgentID: agent}, Classification{ClassExpectedDenial, SeverityLow}},
+		{auditEvent{Action: actionSSHUserAuth, Result: resultDenied}, Classification{ClassExpectedDenial, SeverityLow}},
 		{auditEvent{Action: actionSSHUserAuth, Result: resultAllowed, AgentID: agent}, Classification{ClassRoutine, SeverityInfo}},
 		{auditEvent{Action: actionSSHUserAuth, Result: resultCompleted, AgentID: agent}, Classification{ClassRoutine, SeverityInfo}},
 		{auditEvent{Action: actionGrantRevoke, Result: resultDenied}, Classification{ClassExpectedDenial, SeverityLow}},

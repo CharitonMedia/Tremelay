@@ -589,9 +589,9 @@ func sshUserAuthResult(result string) bool {
 // validSSHUserAuthAudit keeps SSH userauth rows on fixed codes.
 // Username, host key, session id, preimage, and signature are not fields.
 func validSSHUserAuthAudit(ev auditEvent) error {
-	// Constructor denials have no target attribution. Only version 2 binds
-	// the optional verified actor and fixed operation into the audit hash.
-	if ev.V == auditCapabilityVersion && ev.Action == actionSSHUserAuth && ev.Operation == OpSSHUserAuth && ev.Result == resultDenied && ev.GrantID == "" && ev.CredID == "" && ev.CredType == "" {
+	// Constructor denials are metadata-free. Any grant, credential, or operation
+	// on that result is a different shape and falls through to the full-field rule.
+	if ev.V == auditCapabilityVersion && ev.Action == actionSSHUserAuth && ev.Result == resultDenied && ev.Operation == "" && ev.GrantID == "" && ev.CredID == "" && ev.CredType == "" && (ev.AgentID == "" || safeID(ev.AgentID) != "") {
 		return nil
 	}
 	if ev.Operation != OpSSHUserAuth || ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType != CredTypeEd25519 {
