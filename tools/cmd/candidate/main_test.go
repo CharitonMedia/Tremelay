@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,6 +46,7 @@ func TestGoEnvIgnoresPersistedConfig(t *testing.T) {
 	}
 	home := t.TempDir()
 	configDir, identity := userConfigIdentity(home)
+	fixtureEnv := fixtureGoEnv(t, goBin, home, configDir, identity)
 	if err := os.MkdirAll(filepath.Join(configDir, "go"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +55,7 @@ func TestGoEnvIgnoresPersistedConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	bare := exec.Command(goBin, "env", "GOEXPERIMENT", "GOCACHEPROG", "GOFIPS140")
-	bare.Env = append([]string{"PATH=" + os.Getenv("PATH"), "GOTOOLCHAIN=" + evidence.GoToolchain, "GOTELEMETRY=off"}, identity...)
+	bare.Env = fixtureEnv
 	out, err := bare.Output()
 	if err != nil {
 		t.Fatal(err)
@@ -312,6 +314,8 @@ func TestModVerifyDetectsCacheModification(t *testing.T) {
 	cache := t.TempDir()
 	gocache := t.TempDir()
 	home := t.TempDir()
+	configDir, identity := userConfigIdentity(home)
+	fixtureGoEnv(t, goBin, home, configDir, identity)
 	gopath := t.TempDir()
 	t.Cleanup(func() {
 		for _, root := range []string{cache, gocache, gopath, home} {
@@ -397,8 +401,13 @@ func TestBootstrapControlsHelper(t *testing.T) {
 	if err != nil {
 		return
 	}
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
 	home := t.TempDir()
 	configDir, identity := userConfigIdentity(home)
+	fixtureEnv := fixtureGoEnv(t, goBin, home, configDir, identity)
 	if err := os.MkdirAll(filepath.Join(configDir, "go"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +415,7 @@ func TestBootstrapControlsHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(sh, scriptPath, "print-env")
-	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "TMPDIR=" + t.TempDir()}, identity...)
+	cmd.Env = append(fixtureEnv, "TMPDIR="+t.TempDir())
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)
@@ -424,10 +433,6 @@ func TestBootstrapControlsHelper(t *testing.T) {
 	if got := envValue(env, "GOENV"); got != "off" || envValue(env, "GOFLAGS") != "-mod=readonly" || envValue(env, "GOWORK") != "off" {
 		t.Fatalf("print-env %+v", env)
 	}
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatal(err)
-	}
 	probe := exec.Command(goBin, "env", "GOEXPERIMENT", "GOCACHEPROG")
 	probe.Env = env
 	out, err = probe.Output()
@@ -437,6 +442,42 @@ func TestBootstrapControlsHelper(t *testing.T) {
 	if strings.Contains(string(out), "fieldtrack") || strings.Contains(string(out), "evil-cacheprog") {
 		t.Fatalf("bootstrap env read persisted Go settings: %q", out)
 	}
+}
+
+// Go's GOTELEMETRY go-env value is not settable through the process environment.
+// Disable telemetry through its supported command before any other Go command
+// can start a sidecar writing into this fixture's temporary configuration.
+func fixtureGoEnv(t *testing.T, goBin, home, configDir string, identity []string) []string {
+	t.Helper()
+	// Do not inherit GOENV, XDG_CONFIG_HOME, APPDATA or USERPROFILE from the host.
+	// userConfigIdentity supplies the applicable paths beneath this temporary HOME.
+	env := append([]string{"PATH=" + os.Getenv("PATH"), "GOTOOLCHAIN=" + evidence.GoToolchain}, identity...)
+	off := exec.Command(goBin, "telemetry", "off")
+	off.Dir, off.Env = home, env
+	if out, err := off.CombinedOutput(); err != nil {
+		t.Fatalf("disable fixture telemetry: %v\n%s", err, out)
+	}
+	probe := exec.Command(goBin, "env", "-json", "GOTELEMETRY", "GOTELEMETRYDIR", "GOENV")
+	probe.Dir, probe.Env = home, env
+	out, err := probe.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]string
+	if err := json.Unmarshal(out, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings["GOTELEMETRY"] != "off" {
+		t.Fatalf("fixture telemetry mode: %q", settings["GOTELEMETRY"])
+	}
+	rel, err := filepath.Rel(home, settings["GOTELEMETRYDIR"])
+	if err != nil || !filepath.IsLocal(rel) || rel == "." {
+		t.Fatalf("telemetry directory escaped fixture: %q (%v)", settings["GOTELEMETRYDIR"], err)
+	}
+	if want := filepath.Join(configDir, "go", "env"); settings["GOENV"] != want {
+		t.Fatalf("fixture Go config %q, want %q", settings["GOENV"], want)
+	}
+	return env
 }
 
 func userConfigIdentity(home string) (string, []string) {
