@@ -70,18 +70,24 @@ jobs:
   implement:
     if: github.event_name == 'issues' && github.event.label.name == 'goal' && !github.event.issue.pull_request
     runs-on: ubuntu-latest
+    concurrency:
+      group: tremelay-worker-admission
+      cancel-in-progress: false
+    env:
+      TREMELAY_WORKER_ADMISSION: serialized-v1
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           token: ${{ github.token }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: List open pull requests
+      - name: Check source goal and worker ownership
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh pr list --state open --limit 100 --json number,url,body,labels,headRefName,baseRefName > open_prs.json
+        run: python scripts/goal_lineage.py --issue "${{ github.event.issue.number }}" --launch --repository-ownership --open-prs-out open_prs.json
       - name: Build Cloud Agent request
         id: build
         run: |
@@ -98,6 +104,8 @@ jobs:
       - name: Ensure goal branch
         id: ensure
         if: steps.build.outputs.launch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
@@ -109,6 +117,9 @@ jobs:
           if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
             echo "branch exists"
           else
+            # Branch publication can itself trigger goal workflows. Recheck
+            # live ownership and lineage after setup, immediately before push.
+            python scripts/goal_lineage.py --issue "${{ github.event.issue.number }}" --launch --repository-ownership
             git push origin "refs/remotes/origin/${base}:refs/heads/${branch}"
           fi
       - name: Launch Cloud Agent
@@ -138,11 +149,15 @@ jobs:
             before=$(git rev-parse "origin/${base}")
           fi
           printf '%s\n' "$before" > before_sha.txt
-          curl --fail-with-body -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json https://api.cursor.com/v1/agents > response.json
-          url=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["url"])')
-          gh issue comment "$number" --body "A cloud agent is implementing this issue: ${url}. The workflow opens the pull request, with the Goal-Issue line and the goal label, after the branch has commits. The agent does not open one."
-          python -c 'import json; print(json.load(open("response.json"))["agent"]["id"])' > agent_id.txt
-          python -c 'import json; print(json.load(open("response.json"))["run"]["id"])' > run_id.txt
+          # Recheck after branch setup and immediately before creating a worker.
+          if [ -n "$pr_url" ]; then
+            python scripts/goal_lineage.py --issue "$number" --pr "$pr_number" --head "$before" --launch --repository-ownership
+          else
+            python scripts/goal_lineage.py --issue "$number" --launch --repository-ownership
+          fi
+          python scripts/goal_initial_launch.py launch --issue "$number" --payload payload.json --out initial_state.json
+          python -c 'import json; print(json.load(open("initial_state.json"))["state"]["agent_id"])' > agent_id.txt
+          python -c 'import json; print(json.load(open("initial_state.json"))["state"]["run_id"])' > run_id.txt
       - name: Open the pull request after the agent finishes
         if: steps.build.outputs.launch == 'true' && steps.launch.outcome == 'success'
         env:
@@ -154,9 +169,15 @@ jobs:
           bash scripts/require_goal_github_token.sh
           status=$(bash scripts/wait_for_agent_run.sh "$(cat agent_id.txt)" "$(cat run_id.txt)")
           echo "agent run status: ${status}"
+          claim_id=$(python -c 'import json; print(json.load(open("initial_state.json"))["comment_id"])')
+          python scripts/goal_initial_launch.py recover --issue "${{ github.event.issue.number }}" --comment "$claim_id" --out initial_state.json
+          # Poll completion alone is not ownership evidence: bind the current
+          # service run to the source branch before publication or review.
+          status=$(python -c 'import json,sys; s=json.load(open("initial_state.json"))["state"]; sys.exit(1) if s["phase"] != "terminal" else print(s["status"])')
           before=$(tr -d '\n' < before_sha.txt)
           base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
           issue="${{ github.event.issue.number }}"
+          python scripts/goal_lineage.py --issue "$issue"
           title=$(gh issue view "$issue" --json title --jq .title)
           if [ -f pr_number.txt ]; then
             pr_number=$(tr -d '\n' < pr_number.txt)
@@ -212,6 +233,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           token: ${{ github.token }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
@@ -231,6 +253,7 @@ jobs:
             exit 0
           fi
           bash scripts/require_goal_github_token.sh
+          python scripts/goal_lineage.py --issue "$issue"
           base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
           git fetch origin "$base" "$branch"
           ahead=$(git rev-list --count "origin/${base}..origin/${branch}")
@@ -289,8 +312,10 @@ jobs:
     if: "github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment' || (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.login == 'chatgpt-codex-connector[bot]' && !(contains(github.event.comment.body, 'Codex Review: Didn''t find any major issues.') && contains(github.event.comment.body, '**Reviewed commit:**')))"
     runs-on: ubuntu-latest
     concurrency:
-      group: goal-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: tremelay-worker-admission
       cancel-in-progress: false
+    env:
+      TREMELAY_WORKER_ADMISSION: serialized-v1
     outputs:
       launch: ${{ steps.claim.outputs.launch }}
       claim_id: ${{ steps.launch.outputs.claim_id }}
@@ -410,6 +435,7 @@ jobs:
             echo "Approved automation identity is required."
             exit 1
           fi
+          python scripts/goal_lineage.py --pr "$number" --launch --repository-ownership
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > live_pull.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews?per_page=100" > reviews.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${number}/comments?per_page=100" > comments.json
@@ -525,6 +551,9 @@ jobs:
             echo "Independent review changed or became clean before create; refusing launch."
             exit 1
           fi
+          # Ignore only this job's reservation; older and supervisor claims
+          # across every PR in the source lineage still prevent a create.
+          python scripts/goal_lineage.py --pr "$number" --head "$expected" --launch --repository-ownership --ignore-comment-id "$claim_id"
           attempted=true
           set +e
           http_code=$(curl -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json -o response.json -w '%{http_code}' https://api.cursor.com/v1/agents)
@@ -568,8 +597,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     concurrency:
-      group: goal-review-${{ inputs.recovery_pr }}
+      group: tremelay-worker-admission
       cancel-in-progress: false
+    env:
+      TREMELAY_WORKER_ADMISSION: serialized-v1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -595,8 +626,10 @@ jobs:
     if: needs.review-launch.result == 'success' && needs.review-launch.outputs.launch == 'true'
     runs-on: ubuntu-latest
     concurrency:
-      group: goal-review-${{ needs.review-launch.outputs.pr_number }}
+      group: tremelay-worker-admission
       cancel-in-progress: false
+    env:
+      TREMELAY_WORKER_ADMISSION: serialized-v1
     steps:
       - uses: actions/checkout@v4
         with:

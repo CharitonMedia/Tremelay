@@ -15,7 +15,8 @@ import re
 import sys
 import uuid
 
-from automation_protocol import AmbiguousCheckpoint, is_checkpoint_evidence as protocol_checkpoint_evidence
+from automation_protocol import (AmbiguousCheckpoint, is_checkpoint_evidence as protocol_checkpoint_evidence,
+                                 supervisor_state, supervisor_owns_work)
 from checkpoint_supervisor import REPO, Stop, cursor, gh
 from goal_agent_request import (TRUSTED_AUTOMATION_LOGIN, accepted_launch_body, released_body,
                                 reservation_body, review_claim_marker)
@@ -35,6 +36,7 @@ PHASE_KEYS = {
     "review_reserved": {"run_id", "completed_head"},
     "completed": {"run_id", "completed_head"},
     "terminal": {"run_id", "status"},
+    "retired": {"run_id", "status"},
 }
 
 
@@ -93,13 +95,14 @@ def state_body(state):
         "review_reserved": "Worker finished; independent exact-head review reserved.",
         "completed": "Worker finished; independent exact-head review requested.",
         "terminal": "Worker stopped; ownership and the consumed cycle remain recorded.",
+        "retired": "Existing worker verified terminal after this goal became ineligible; no review or replacement requested.",
     }
     body += "\n\n" + descriptions[phase]
     if phase not in {"prepared", "dispatch_reserved"}:
         body += f"\nWorker: https://cursor.com/agents/{state['agent_id']}"
-    if phase == "terminal":
+    if phase in {"terminal", "retired"}:
         body += f"\nTerminal status: {state['status']}."
-        if state["status"] == "FINISHED":
+        if state["status"] == "FINISHED" and phase == "terminal":
             body += " No advancing commits; no replacement or review requested."
     return body + "\n\n" + MARKER + json.dumps(state, sort_keys=True, separators=(",", ":")) + " -->\n"
 
@@ -220,19 +223,38 @@ def parse_legacy_state(body):
     return state
 
 
-def pending_claim(comments, repository, pr, trusted_login):
-    """Keep newer reviews from replacing any unresolved ordinary worker."""
+def pending_claim(comments, repository, pr, trusted_login, *, include_supervisor=True, ignore_comment_id=None):
+    """Keep both launch paths from replacing any unresolved owner claim."""
     validate_target(repository, pr)
     if trusted_login != TRUSTED_AUTOMATION_LOGIN:
         raise Stop("Goal-review ownership requires the approved owner identity")
     if not isinstance(comments, list):
         raise Stop("Invalid goal-review comment list")
+    if include_supervisor:
+        # Also catches a standalone accepted/reserved receipt whose primary
+        # supervisor comment was removed or damaged. Never silently drop it.
+        from checkpoint_supervisor import records
+        records(comments)
     pending = False
     for comment in comments:
         if not owner_authored(comment):
             continue
+        if ignore_comment_id is not None and comment.get("id") == ignore_comment_id:
+            continue
         body = comment.get("body")
         if not isinstance(body, str) or checkpoint_evidence(body):
+            continue
+        if "<!-- tremelay-supervisor-" in body and include_supervisor:
+            try:
+                saved = supervisor_state(body)
+            except (ValueError, TypeError):
+                raise Stop("Malformed trusted supervisor ownership") from None
+            if saved is None:
+                continue
+            if (not positive_int(comment.get("id"))
+                    or comment.get("issue_url") != f"https://api.github.com/repos/{REPO}/issues/{pr}"):
+                raise Stop("Supervisor ownership comment does not match its PR")
+            pending = pending or supervisor_owns_work(saved)
             continue
         if "<!-- goal-review-launch" in body:
             saved = parse_body(body)
@@ -248,7 +270,7 @@ def pending_claim(comments, repository, pr, trusted_login):
                 or not positive_int(comment.get("id"))
                 or comment.get("issue_url") != f"https://api.github.com/repos/{REPO}/issues/{pr}"):
             raise Stop("Pending launch comment does not match its PR")
-        if saved["phase"] not in {"terminal", "completed"}:
+        if saved["phase"] not in {"terminal", "completed", "retired"}:
             pending = True
     return pending
 
@@ -303,8 +325,22 @@ def update_comment(comment, state):
         comment["body"] = body
 
 
-def pull_head(pr):
+def recovery_pages(path):
+    from goal_lineage import bounded_pages, LineageStop
+    try:
+        return bounded_pages(path, read=gh)
+    except LineageStop as error:
+        raise Stop(str(error)) from None
+
+
+def pull_head(pr, *, allow_ineligible=False):
     pull = gh(f"repos/{REPO}/pulls/{pr}")
+    if (allow_ineligible and isinstance(pull, dict) and pull.get("number") == pr
+            and pull.get("user", {}).get("login") == TRUSTED_AUTOMATION_LOGIN
+            and pull.get("head", {}).get("repo", {}).get("full_name") == REPO
+            and (pull.get("state") == "closed"
+                 or "goal" not in {item.get("name") for item in pull.get("labels", []) if isinstance(item, dict)})):
+        return None
     if (not isinstance(pull, dict) or pull.get("number") != pr or pull.get("state") != "open"
             or pull.get("draft") is not False
             or pull.get("user", {}).get("login") != TRUSTED_AUTOMATION_LOGIN
@@ -317,6 +353,13 @@ def pull_head(pr):
     head = pull.get("head", {}).get("sha")
     if not isinstance(head, str) or not SHA.fullmatch(head):
         raise Stop("Invalid current PR head")
+    from goal_lineage import LineageStop, source_issue, ensure_open_lineage
+    try:
+        ensure_open_lineage(source_issue(pull), read=gh, pages=recovery_pages)
+    except LineageStop as error:
+        if allow_ineligible:
+            return None
+        raise Stop(str(error)) from None
     return head
 
 
@@ -421,7 +464,7 @@ def recover_legacy(comment, state, repository, pr):
     return saved
 
 
-def recover(repository, pr, comment_id):
+def recover(repository, pr, comment_id, *, reconcile_only=False, legacy_only=False):
     """Reconcile one serialized claim. Cursor calls here are always GET-only."""
     validate_target(repository, pr)
     if not positive_int(comment_id):
@@ -441,6 +484,8 @@ def recover(repository, pr, comment_id):
     body = comment.get("body")
     if checkpoint_evidence(body):
         raise Stop("Checkpoint evidence is not an original worker claim")
+    if legacy_only and (not legacy_candidate(body) or "<!-- goal-review-launch" in body):
+        raise Stop("Automatic historical recovery requires the same legacy receipt")
     if isinstance(body, str) and "<!-- goal-review-legacy" in body:
         return recover_legacy(comment, parse_legacy_state(body), repository, pr)
     if not isinstance(body, str) or "<!-- goal-review-launch" not in body:
@@ -451,34 +496,49 @@ def recover(repository, pr, comment_id):
     if state["phase"] == "prepared":
         gh(f"repos/{REPO}/issues/comments/{comment_id}", method="PATCH", data={"body": released_body()})
         return {"phase": "released"}
-    if state["phase"] in {"terminal", "completed"}:
+    if state["phase"] in {"terminal", "completed", "retired"}:
         return state
-    if state["phase"] == "review_reserved":
-        return finish_review(comment, state)
+    prior = state
     agent_id = state["agent_id"]
     agent = cursor("/" + agent_id)
     if not isinstance(agent, dict) or agent.get("id") != agent_id:
         raise Stop("Cursor lookup did not establish reserved worker identity")
     run_id = state.get("run_id") or agent.get("latestRunId")
-    if not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+    if (not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id)
+            or agent.get("latestRunId") != run_id):
         raise Stop("Cursor lookup did not establish a safe worker run")
-    state = validate_state(dict(state, phase="working", run_id=run_id))
+    state = validate_state({**{key: value for key, value in state.items() if key != "completed_head"},
+                            "phase": "working", "run_id": run_id})
     # Persist recovered identity before the run lookup, including when that
     # lookup subsequently fails. A 404 never proves that no worker was created.
-    update_comment(comment, state)
+    if prior["phase"] != "review_reserved":
+        update_comment(comment, state)
     run = cursor(f"/{agent_id}/runs/{run_id}")
     if (not isinstance(run, dict) or run.get("id") != run_id or run.get("agentId") != agent_id
             or not isinstance(run.get("status"), str)
             or run["status"] not in TERMINAL | {"CREATING", "RUNNING"}):
         raise Stop("Cursor lookup did not establish the reserved run status")
     status = run["status"]
+    verify_legacy_target(agent, run, pr)
     if status not in TERMINAL:
+        update_comment(comment, state)
+        return state
+    current = cursor("/" + agent_id)
+    if (not isinstance(current, dict) or current.get("id") != agent_id
+            or current.get("latestRunId") != run_id):
+        raise Stop("Worker changed during terminal reconciliation")
+    verify_legacy_target(current, run, pr)
+    head = None if reconcile_only else pull_head(pr, allow_ineligible=True)
+    if head is None:
+        state = dict(state, phase="retired", status=status)
+        update_comment(comment, state)
         return state
     if status != "FINISHED":
         state = dict(state, phase="terminal", status=status)
         update_comment(comment, state)
         return state
-    head = pull_head(pr)
+    if prior["phase"] == "review_reserved":
+        return finish_review(comment, prior)
     if head == state["head"]:
         state = dict(state, phase="terminal", status=status)
         update_comment(comment, state)

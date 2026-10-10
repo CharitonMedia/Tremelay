@@ -16,6 +16,14 @@ on:
         description: One small billed Claude connection test; no worker launch
         type: boolean
         default: false
+      recovery_pr:
+        description: Optional PR for GET-only reconciliation of one existing supervisor worker
+        type: string
+        default: ''
+      recovery_comment:
+        description: Existing supervisor receipt comment ID; no model, launch, review, or label changes
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -36,6 +44,9 @@ jobs:
       id-token: write
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: tremelay-worker-admission
+      cancel-in-progress: false
     steps:
       # Every action in an OIDC-enabled job can request its identity token.
       # Keep first-party actions immutable; review a new full SHA before updates.
@@ -50,14 +61,25 @@ jobs:
         run: python -m unittest discover -s automation_tests -p 'test_*.py'
       - name: Assess stopped goal PRs
         env:
+          TREMELAY_WORKER_ADMISSION: serialized-v1
           GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           SUPERVISOR_MAX_CHECKPOINTS: '3'
           TREMELAY_SUPERVISOR_ACTIVATION: ${{ vars.TREMELAY_SUPERVISOR_ACTIVATION }}
           PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
           MODEL_SMOKE_ONLY: ${{ inputs.model_smoke_only }}
+          RECOVERY_PR: ${{ inputs.recovery_pr }}
+          RECOVERY_COMMENT: ${{ inputs.recovery_comment }}
         run: |
           set -euo pipefail
+          if [ -n "$RECOVERY_PR$RECOVERY_COMMENT" ]; then
+            if [ "$PREFLIGHT_ONLY" = "true" ] || [ "$MODEL_SMOKE_ONLY" = "true" ] || ! [[ "$RECOVERY_PR" =~ ^[1-9][0-9]*$ && "$RECOVERY_COMMENT" =~ ^[1-9][0-9]*$ ]]; then
+              echo 'Choose one recovery PR/comment pair without preflight or model smoke.' >&2
+              exit 1
+            fi
+            python scripts/checkpoint_supervisor.py --recover-pr "$RECOVERY_PR" --recover-comment "$RECOVERY_COMMENT"
+            exit 0
+          fi
           if [ "$PREFLIGHT_ONLY" = "true" ] && [ "$MODEL_SMOKE_ONLY" = "true" ]; then
             echo 'Choose either authentication preflight or the model smoke test.' >&2
             exit 1

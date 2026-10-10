@@ -134,3 +134,23 @@ To stop further controller calls, clear the activation variable or disable the
 `Checkpoint Supervisor` workflow in GitHub Actions. This also pauses its
 reconciliation and does not cancel an already-running Cursor worker; verify that
 worker separately before authorizing any replacement.
+
+## Closed goals and manual takeover
+
+The controller now separates receipt recovery from launch eligibility. It reads
+all PR states, but only already-recorded workers on closed/goal-removed PRs are
+reconciled. Those reads cannot call Claude, create Cursor, request Codex review,
+or remove labels. A terminal receipt records the verified current Cursor run;
+PR closure, merging, elapsed time and changed heads never prove worker shutdown.
+Old accepted receipts with only `completed` or `escalate` are upgraded by service
+lookup before they release ownership. Unknown/ambiguous results stay blocking.
+
+Manual dispatch may provide `recovery_pr` plus `recovery_comment` to reconcile
+one existing supervisor receipt without any assessment or follow-on work. The
+scheduled all-state pass provides the same recovery automatically. No activation,
+secret, federation, checkpoint allowance or three-cycle limit changes are needed.
+
+For a manual takeover, retain `human-review-required` and remove `goal`; the stop
+label alone intentionally invites this supervisor. Check both supervisor and
+ordinary worker receipts and verify terminal status before starting competing
+work or merging. See [shared ownership and deployment limits](automation.md#shared-ownership-and-manual-takeover).

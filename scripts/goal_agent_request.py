@@ -87,7 +87,7 @@ def _issue_payload(event: dict, repo_url: str, base_ref: str, open_prs: list) ->
     if label != GOAL_LABEL:
         return None
     issue = event.get("issue") or {}
-    if issue.get("pull_request"):
+    if issue.get("pull_request") or issue.get("state") == "closed":
         return None
     number = issue.get("number")
     if not isinstance(number, int):
@@ -279,6 +279,8 @@ def sync_plan(
     new_body = body if has_marker else _append_marker(body, marker)
     base_name = existing.get("baseRefName") or existing.get("base")
     labels = _label_names(existing)
+    if "human-review-required" in labels and GOAL_LABEL not in labels:
+        return None
     # A review can finish during the publish job's wait. That head is already
     # done, so syncing must not clear goal-ready or put the goal label back.
     stale_ready = head_changed and not head_accepted and GOAL_READY_LABEL in labels
@@ -686,9 +688,9 @@ def _cmd_head_already_reviewed(args: argparse.Namespace) -> int:
 
 
 def _cmd_apply_sync(args: argparse.Namespace) -> int:
-    pulls = _load_json(args.existing) or []
-    if isinstance(pulls, dict):
-        pulls = [pulls]
+    from goal_lineage import guard, open_pr_records
+    # A delayed publish snapshot cannot authorize recreating or retagging a goal.
+    pulls = open_pr_records(guard(issue_number=args.issue_number, pr_number=args.pr_number))
     if args.pr_number is not None:
         existing = next((pr for pr in pulls if pr.get("number") == args.pr_number), None)
         if existing is None:

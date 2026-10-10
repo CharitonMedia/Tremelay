@@ -24,7 +24,9 @@ import urllib.error
 import urllib.request
 
 from complete_codex_clean_review import is_terminal_clean_review
-from automation_protocol import AmbiguousCheckpoint, SUPERVISOR_MARKER, has_control_marker as _has_control_marker, supervisor_state
+from automation_protocol import (AmbiguousCheckpoint, SUPERVISOR_MARKER, WORKER_TERMINAL_STATUSES,
+                                 has_control_marker as _has_control_marker, supervisor_state,
+                                 supervisor_owns_work, validate_supervisor_receipts)
 
 MODEL = "claude-sonnet-5-5"
 BACKEND = "anthropic-wif"
@@ -123,7 +125,11 @@ def gh(path, *, method="GET", data=None, paginate=False):
 
 
 def pages(path):
-    return [row for page in gh(path + ("&" if "?" in path else "?") + "per_page=100", paginate=True) for row in page]
+    from goal_lineage import bounded_pages, LineageStop
+    try:
+        return bounded_pages(path, read=gh)
+    except LineageStop as error:
+        raise Stop(str(error)) from None
 
 
 def labels(pull):
@@ -140,6 +146,15 @@ def eligible(pull, *, require_stop=True):
             and re.search(r"^Goal-Issue: #[0-9]+$", pull.get("body") or "", re.M))
 
 
+def recovery_target(pull):
+    """Identity boundary for old receipts, independent of launch eligibility."""
+    return (type(pull.get("number")) is int and pull["number"] > 0
+            and pull.get("base", {}).get("ref") == "main"
+            and pull.get("head", {}).get("repo", {}).get("full_name") == REPO
+            and pull.get("user", {}).get("login") == AUTHOR
+            and len(re.findall(r"^Goal-Issue: #[1-9][0-9]*$", pull.get("body") or "", re.M)) == 1)
+
+
 def records(comments):
     found = []
     for comment in comments:
@@ -151,6 +166,10 @@ def records(comments):
             raise Stop("Malformed trusted supervisor state") from None
         if state is not None:
             found.append((comment, state))
+    try:
+        validate_supervisor_receipts(comments, [state for _, state in found], AUTHOR)
+    except (ValueError, TypeError):
+        raise Stop("Orphan or malformed trusted supervisor launch receipt") from None
     return found
 
 
@@ -513,11 +532,24 @@ def update_state(comment, state, text=None):
        data={"body": state_body(state, text)})
 
 
+def live_lineage(pull, *, require_unowned=False, ignore_comment_id=None):
+    from goal_lineage import (LineageStop, source_issue, ensure_open_lineage,
+                              ensure_unowned_repository)
+    from goal_review_launch import Stop as ClaimStop
+    try:
+        ensure_open_lineage(source_issue(pull), read=gh, pages=pages)
+        if require_unowned:
+            ensure_unowned_repository(pages=pages, ignore_comment_id=ignore_comment_id)
+    except (LineageStop, ClaimStop) as error:
+        raise Stop(str(error)) from None
+
+
 def finish_review(pull, comment, state):
     number, head = pull["number"], state["completed_head"]
     fresh = gh(f"repos/{REPO}/pulls/{number}")
     if not eligible(fresh, require_stop=False) or fresh["head"]["sha"] != head:
         raise Stop("PR changed before independent review request")
+    live_lineage(fresh)
     if active_goal_work(number, head):
         return
     if "human-review-required" in labels(fresh):
@@ -525,6 +557,7 @@ def finish_review(pull, comment, state):
     fresh = gh(f"repos/{REPO}/pulls/{number}")
     if not eligible(fresh, require_stop=False) or fresh["head"]["sha"] != head:
         raise Stop("PR changed before independent review request")
+    live_lineage(fresh)
     marker = f"<!-- tremelay-supervisor-review:{head} -->"
     comments = pages(f"repos/{REPO}/issues/{number}/comments")
     if not any(c.get("user", {}).get("login") == AUTHOR and has_control_marker(c.get("body"), marker) for c in comments):
@@ -535,41 +568,85 @@ def finish_review(pull, comment, state):
     print(f"PR #{number}: correction pushed; independent review requested")
 
 
-def recover_worker(pull, comment, state):
-    """Read-only reconciliation of a reserved/active launch, never another POST."""
-    number = pull["number"]
-    agent_id = state["agent_id"]
-    if not re.fullmatch(r"bc-[0-9a-f-]{36}", agent_id):
+def verified_worker_run(number, state):
+    """GET the recorded agent/run and verify its PR before accepting status."""
+    from goal_review_launch import RUN_ID, LEGACY_AGENT, verify_legacy_target, Stop as ClaimStop
+    agent_id = state.get("agent_id")
+    if not isinstance(agent_id, str) or not LEGACY_AGENT.fullmatch(agent_id):
         raise Stop("Invalid trusted worker identity")
     agent = cursor("/" + agent_id)
-    if agent.get("id") != agent_id:
+    if not isinstance(agent, dict) or agent.get("id") != agent_id:
         raise Stop("Cursor returned a different worker identity")
     run_id = state.get("run_id") or agent.get("latestRunId")
-    if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
-        raise Stop("Cannot reconcile worker run identity")
-    needs_record = state.get("phase") != "working" or state.get("run_id") != run_id
-    state.update(phase="working", run_id=run_id)
+    if (not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id)
+            or agent.get("latestRunId") != run_id):
+        raise Stop("Cannot reconcile the same current worker run")
     result = cursor(f"/{agent_id}/runs/{run_id}")
-    status = result.get("status")
-    age = datetime.now(timezone.utc) - datetime.fromisoformat(state["time"])
-    if status not in {"FINISHED", "ERROR", "CANCELLED", "EXPIRED"}:
+    if (not isinstance(result, dict) or result.get("id") != run_id
+            or result.get("agentId") != agent_id
+            or not isinstance(result.get("status"), str)
+            or result["status"] not in WORKER_TERMINAL_STATUSES | {"CREATING", "RUNNING"}):
+        raise Stop("Cursor returned an unverified worker run status")
+    try:
+        verify_legacy_target(agent, result, number)
+        if result["status"] in WORKER_TERMINAL_STATUSES:
+            current = cursor("/" + agent_id)
+            if (not isinstance(current, dict) or current.get("id") != agent_id
+                    or current.get("latestRunId") != run_id):
+                raise Stop("Worker changed during terminal reconciliation")
+            verify_legacy_target(current, result, number)
+    except ClaimStop as error:
+        raise Stop(str(error)) from None
+    return run_id, result["status"]
+
+
+def recover_worker(pull, comment, state, *, reconcile_only=False):
+    """Reconcile the same worker even after closure/hold; never replay create."""
+    number = pull["number"]
+    prior_phase = state.get("phase")
+    run_id, status = verified_worker_run(number, state)
+    needs_record = prior_phase != "working" or state.get("run_id") != run_id
+    state.update(phase="working", run_id=run_id)
+    if status not in WORKER_TERMINAL_STATUSES:
+        state.pop("terminal_status", None)
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(state["time"])
+        except (KeyError, TypeError, ValueError):
+            raise Stop("Invalid worker reservation time") from None
         if age.total_seconds() > 6 * 3600 and not state.get("timeout_escalated"):
-            # A timeout is not evidence that Cursor stopped. Keep ownership
-            # active across newer reviews/heads and reconcile this same worker.
             state["timeout_escalated"] = True
             update_state(comment, state, "Worker exceeded six hours. Input required: reconcile the existing Cursor worker before authorizing further launches.")
-        else:
-            if needs_record:
-                update_state(comment, state)
-            print(f"PR #{number}: Cursor worker is {status}; no duplicate launch")
+        elif needs_record:
+            update_state(comment, state)
+        print(f"PR #{number}: existing Cursor worker is {status}; ownership retained")
+        return
+    state["terminal_status"] = status
+    current = gh(f"repos/{REPO}/pulls/{number}")
+    # Lifecycle/labels only suppress further work. They never establish status.
+    if (reconcile_only or prior_phase in {"completed", "escalate", "terminal"}
+            or not eligible(current, require_stop=False)):
+        state["phase"] = "terminal"
+        text = comment["body"].split("\n\n" + MARKER)[0]
+        text += f"\n\nExisting Cursor run verified {status}. Historical/held goal: no launch, model call, independent review or label change authorized. Checkpoint and worker-cycle history remain consumed."
+        update_state(comment, state, text)
+        return
+    # A still-open PR may already belong to a closed/merged source goal. Keep
+    # the verified terminal receipt, suppressing downstream review and labels.
+    try:
+        live_lineage(current)
+    except Stop:
+        state["phase"] = "terminal"
+        text = comment["body"].split("\n\n" + MARKER)[0]
+        update_state(comment, state, text + f"\n\nExisting Cursor run verified {status}; source goal is retired or unavailable. No further review, launch or label change authorized.")
         return
     if status != "FINISHED":
         state["phase"] = "escalate"
         update_state(comment, state, f"Cursor worker ended {status}. Input required: resolve the worker service failure; no duplicate launch was made.")
         return
-    current = gh(f"repos/{REPO}/pulls/{number}")
-    if not eligible(current, require_stop=False):
-        raise Stop("PR no longer eligible for worker completion")
+    if prior_phase == "review_reserved":
+        state["phase"] = "review_reserved"
+        finish_review(current, comment, state)
+        return
     head = current["head"]["sha"]
     comparison = gh(f"repos/{REPO}/compare/{state['head']}...{head}")
     if head == state["head"] or comparison.get("status") != "ahead":
@@ -579,13 +656,17 @@ def recover_worker(pull, comment, state):
     if active_goal_work(number, head):
         print(f"PR #{number}: waiting for goal workflow before independent review")
         return
-    # Reserve the review request before its write; repeated wakes cannot post it twice.
     state.update(phase="review_reserved", completed_head=head)
     update_state(comment, state)
     finish_review(current, comment, state)
 
 
 def active_goal_work(number, head):
+    if os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1":
+        trusted_workflow_guard()
+        # This controller holds the shared job lock. Queued goal jobs cannot
+        # create; durable claims cover workers that outlive their originating job.
+        return False
     run_pages = gh(f"repos/{REPO}/actions/workflows/goal.yml/runs?per_page=100", paginate=True)
     runs = [run for page in run_pages for run in page["workflow_runs"]]
     # issue_comment runs execute main and often omit pull_requests. Conservatively
@@ -610,12 +691,12 @@ def ordinary_worker_pending(number, comments):
     # name, so translate its controlled exception into this caller's class.
     from goal_review_launch import pending_claim, Stop as ClaimStop
     try:
-        return pending_claim(comments, REPO, number, AUTHOR)
+        return pending_claim(comments, REPO, number, AUTHOR, include_supervisor=False)
     except ClaimStop as error:
         raise Stop(str(error)) from None
 
 
-def refresh_guard(number, head, review_id, *, require_stop=True, check_activity=True):
+def refresh_guard(number, head, review_id, *, require_stop=True, check_activity=True, ignore_comment_id=None):
     if check_activity:
         wait_for_goal_idle(number, head)
     pull = gh(f"repos/{REPO}/pulls/{number}")
@@ -623,6 +704,7 @@ def refresh_guard(number, head, review_id, *, require_stop=True, check_activity=
         raise Stop("PR changed during supervisor assessment")
     if ordinary_worker_pending(number, pages(f"repos/{REPO}/issues/{number}/comments")):
         raise Stop("An ordinary review worker still owns this PR")
+    live_lineage(pull, require_unowned=True, ignore_comment_id=ignore_comment_id)
     current = newest_review(pages(f"repos/{REPO}/pulls/{number}/reviews"), head)
     if current is None or current["id"] != review_id or (check_activity and active_goal_work(number, head)):
         raise Stop("Review changed or worker activity remains")
@@ -669,7 +751,7 @@ def dispatch_ready(pull, comment, state):
         raise Stop("Checkpoint is not ready for first dispatch")
     if retire_stale_assessment(number, comment, state):
         return
-    refresh_guard(number, head, review_id)
+    refresh_guard(number, head, review_id, ignore_comment_id=comment["id"])
     payload = worker_payload(number, head, review_id, decision)
     state.update(phase="dispatch_reserved", agent_id=payload["agentId"])
     update_state(comment, state)
@@ -680,7 +762,7 @@ def dispatch_ready(pull, comment, state):
     # Stop label is still present and the repository was idle immediately before
     # reserving. These writes create goal runs that cannot launch while stopped.
     # Recheck head/review/stop without waiting for our own newly queued runs.
-    refresh_guard(number, head, review_id, check_activity=False)
+    refresh_guard(number, head, review_id, check_activity=False, ignore_comment_id=comment["id"])
     result = cursor("", payload=payload)
     if result.get("agent", {}).get("id") != payload["agentId"]:
         raise Stop("Cursor create returned a different worker identity")
@@ -714,6 +796,9 @@ def run_one(pull, max_checkpoints):
         if not any(c.get("user", {}).get("login") == AUTHOR and has_control_marker(c.get("body"), "<!-- tremelay-supervisor-budget -->") for c in comments):
             gh(prefix + "/comments", method="POST", data={"body": "Automatic supervisor stopped at its total checkpoint budget. Patrick must decide whether to authorize more work or change the approach. No further model call or worker launch was made.\n\n<!-- tremelay-supervisor-budget -->"})
         print(f"PR #{number}: automatic checkpoint budget exhausted")
+        return
+    if any(supervisor_owns_work(saved) for _, saved in states):
+        print(f"PR #{number}: existing supervisor claim requires reconciliation")
         return
     findings = pages(f"repos/{REPO}/pulls/{number}/reviews/{review['id']}/comments")
     if not has_review_feedback(review, findings):
@@ -750,12 +835,60 @@ def run_one(pull, max_checkpoints):
         raise
 
 
+def recover_comment(number, comment_id):
+    """Explicit operator route: one trusted receipt, no eligibility or paid work."""
+    if (type(number) is not int or number <= 0
+            or type(comment_id) is not int or comment_id <= 0):
+        raise Stop("Recovery requires positive PR and comment IDs")
+    pull = gh(f"repos/{REPO}/pulls/{number}")
+    comment = gh(f"repos/{REPO}/issues/comments/{comment_id}")
+    if (not recovery_target(pull) or pull["number"] != number
+            or comment.get("id") != comment_id
+            or comment.get("issue_url") != f"https://api.github.com/repos/{REPO}/issues/{number}"):
+        raise Stop("Recovery comment or PR identity does not match")
+    saved = records([comment])
+    if len(saved) != 1 or "agent_id" not in saved[0][1]:
+        raise Stop("Recovery requires an existing accepted or reserved worker identity")
+    state = saved[0][1]
+    if not supervisor_owns_work(state):
+        print(f"PR #{number}: recorded worker already verified terminal")
+        return
+    recover_worker(pull, comment, state, reconcile_only=True)
+
+
+def recover_ordinary_receipts(pull, comments, *, reconcile_only=True):
+    """GET existing workers; only a live eligible goal may complete its review."""
+    from goal_review_launch import pending_claim, recover, legacy_candidate, owner_authored, Stop as ClaimStop
+    failed = False
+    seen = set()
+    for comment in comments:
+        if not owner_authored(comment) or comment.get("id") in seen:
+            continue
+        seen.add(comment.get("id"))
+        try:
+            body = comment.get("body") or ""
+            modern = "<!-- goal-review-launch" in body
+            serialized = os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1"
+            if (modern and not serialized) or (not modern and not legacy_candidate(body)):
+                continue
+            if pending_claim([comment], REPO, pull["number"], AUTHOR, include_supervisor=False):
+                recover(REPO, pull["number"], comment["id"], reconcile_only=reconcile_only, legacy_only=not modern)
+        except ClaimStop as error:
+            print(f"PR #{pull['number']}: ordinary receipt {comment.get('id')} retained: {error}", file=sys.stderr)
+            failed = True
+    return failed
+
+
 def main():
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--preflight", action="store_true")
     mode.add_argument("--model-smoke", action="store_true")
+    mode.add_argument("--recover-pr", type=int)
+    parser.add_argument("--recover-comment", type=int)
     args = parser.parse_args()
+    if (args.recover_pr is None) != (args.recover_comment is None):
+        raise Stop("Recovery requires both PR and comment IDs")
     if os.environ.get("GITHUB_REPOSITORY") != REPO:
         raise Stop("Supervisor repository is not authorized")
     if (not args.preflight and not args.model_smoke
@@ -782,23 +915,59 @@ def main():
         usage = result["usage"]
         print(f"Anthropic model smoke succeeded: {MODEL}; input tokens {usage['input_tokens']}, output tokens {usage['output_tokens']}. No worker launched.")
         return 0
-    pulls = pages(f"repos/{REPO}/pulls?state=open")
+    if args.recover_pr is not None:
+        recover_comment(args.recover_pr, args.recover_comment)
+        return 0
+    # Closed or de-labelled PRs can still have an accepted worker. Only their
+    # existing receipts are reconciled; launch/model eligibility stays separate.
     failed = False
+    if os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1":
+        from goal_initial_launch import recover_all, Stop as InitialStop
+        try:
+            failed = recover_all()
+        except InitialStop as error:
+            print(f"Initial ownership retained: {error}", file=sys.stderr)
+            failed = True
+    pulls = pages(f"repos/{REPO}/pulls?state=all")
     for pull in pulls:
-        if not eligible(pull, require_stop=False):
+        own_pr = (isinstance(pull, dict) and isinstance(pull.get("head"), dict)
+                  and (pull["head"].get("repo") or {}).get("full_name") == REPO)
+        if not recovery_target(pull) and not (own_pr and os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1"):
             continue
         try:
-            states = records(pages(f"repos/{REPO}/issues/{pull['number']}/comments"))
-            active = [(c, st) for c, st in states if st.get("phase") in {"dispatch_ready", "dispatch_reserved", "working", "review_reserved"}]
+            comments = pages(f"repos/{REPO}/issues/{pull['number']}/comments")
+            if os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1":
+                from generic_worker import pending_generic_claim, reconcile, Stop as GenericStop
+                try:
+                    if pending_generic_claim(comments, pull["number"]):
+                        reconcile(pull["number"])
+                except GenericStop as error:
+                    print(f"PR #{pull['number']}: generic ownership retained: {error}", file=sys.stderr)
+                    failed = True
+            if not recovery_target(pull):
+                continue
+            states = records(comments)
+            retired = not eligible(pull, require_stop=False)
+            if not retired:
+                try:
+                    live_lineage(pull)
+                except Stop:
+                    # Closed source issues and merged sibling PRs also retire
+                    # structurally open/goal PRs. Uncertain reads permit only GET.
+                    retired = True
+            if retired or os.environ.get("TREMELAY_WORKER_ADMISSION") == "serialized-v1":
+                failed = recover_ordinary_receipts(pull, comments, reconcile_only=retired) or failed
+            active = [(c, st) for c, st in states if supervisor_owns_work(st)
+                      and ("agent_id" in st or st.get("phase") in {"dispatch_ready", "dispatch_reserved", "working", "review_reserved"})]
             if active:
-                comment, state = active[-1]
-                if state["phase"] == "dispatch_ready":
-                    dispatch_ready(pull, comment, state)
-                elif state["phase"] == "review_reserved":
-                    finish_review(pull, comment, state)
-                else:
-                    recover_worker(pull, comment, state)
-            elif eligible(pull):
+                for comment, state in active:
+                    if state["phase"] == "dispatch_ready" and "agent_id" not in state:
+                        if len(active) == 1 and not retired and eligible(pull):
+                            dispatch_ready(pull, comment, state)
+                    else:
+                        recover_worker(pull, comment, state,
+                                       reconcile_only=len(active) > 1 or retired)
+            elif not retired and eligible(pull):
                 run_one(pull, int(raw_limit))
         except AssessmentCancelled:
             raise

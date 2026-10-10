@@ -31,8 +31,10 @@ jobs:
     # normalize that parent review and post a false automation-stopped comment.
     if: "github.event.pull_request.state == 'open' && (github.event_name == 'pull_request_review' || (github.event_name == 'pull_request_review_comment' && (github.event.comment.user.login == 'codex' || github.event.comment.user.login == 'chatgpt-codex-connector[bot]')))"
     concurrency:
-      group: codex-cursor-remediation-${{ github.event.pull_request.number }}
+      group: tremelay-worker-admission
       cancel-in-progress: false
+    env:
+      TREMELAY_WORKER_ADMISSION: serialized-v1
     runs-on: ubuntu-latest
     steps:
       - name: Check out automation from main
@@ -61,6 +63,16 @@ jobs:
             exit 1
           fi
           echo "login=$login" >> "$GITHUB_OUTPUT"
+
+      - name: Reconcile existing generic worker receipts
+        if: steps.marker_identity.outputs.login != ''
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          python scripts/generic_worker.py reconcile --pr "$PR_NUMBER"
 
       - name: Read live pull request and Codex review
         env:
@@ -153,131 +165,10 @@ jobs:
         if: steps.plan.outputs.action == 'launch'
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-          GOAL_GITHUB_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          planned_head=$(python -c 'import json; print(json.load(open("plan.json"))["head_sha"])')
-          live_head=$(GH_TOKEN="$GOAL_GITHUB_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha)
-          live_state=$(GH_TOKEN="$GOAL_GITHUB_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .state)
-          has_label=$(GH_TOKEN="$GOAL_GITHUB_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}" --jq '[.labels[].name] | index("codex-cursor-loop") != null')
-          if [ "$live_state" != "open" ] || [ "$live_head" != "$planned_head" ] || [ "$has_label" != "true" ]; then
-            echo "Live PR is no longer eligible for this exact-head remediation."
-            exit 1
-          fi
-
-          marker=$(python -c 'import json; print(json.load(open("plan.json"))["marker"])')
-          review_id=$(python -c 'import json; print(json.load(open("plan.json"))["review_id"])')
-          round=$(python -c 'import json; print(json.load(open("plan.json"))["round"])')
-          findings=$(python -c 'import json; print(json.load(open("plan.json"))["findings"])')
-          python -c 'import json; p=json.load(open("plan.json")); json.dump(p["payload"], open("payload.json","w"))'
-          agent_id=$(python -c 'import json; print(json.load(open("payload.json"))["agentId"])')
-          claim_marker="<!-- codex-cursor-claim review:${review_id} head:${planned_head} -->"
-
-          # A pending claim is deliberately different from the completed
-          # remediation marker. If a prior run ended ambiguously, reuse the
-          # trusted claim and reconcile the same deterministic Cursor agent id.
-          claim_id=$(CLAIM_MARKER="$claim_marker" TRUSTED_LOGIN="${{ steps.marker_identity.outputs.login }}" python - <<'PY'
-          import json, os
-          pages = json.load(open("issue_comments.json", encoding="utf-8"))
-          comments = [c for page in pages for c in page] if pages and isinstance(pages[0], list) else pages
-          marker = os.environ["CLAIM_MARKER"]
-          trusted = os.environ["TRUSTED_LOGIN"].casefold()
-          matches = [
-              c for c in comments
-              if marker in (c.get("body") or "")
-              and ((c.get("user") or {}).get("login") or "").casefold() == trusted
-          ]
-          print(matches[0]["id"] if matches else "")
-          PY
-          )
-          if [ -z "$claim_id" ]; then
-            claim_body=$(printf 'Cursor remediation round %s claimed for %s Codex finding(s). Agent id: %s\n\n%s' "$round" "$findings" "$agent_id" "$claim_marker")
-            claim_id=$(GH_TOKEN="$GOAL_GITHUB_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$claim_body" --jq .id)
-          else
-            echo "Resuming trusted pending claim comment $claim_id for deterministic agent $agent_id."
-          fi
-
-          cleanup_claim() {
-            GH_TOKEN="$GOAL_GITHUB_TOKEN" gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" >/dev/null 2>&1 || true
-          }
-
-          started=false
-          for attempt in 1 2 3; do
-            set +e
-            http_code=$(curl -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json -o cursor_response.json -w '%{http_code}' https://api.cursor.com/v1/agents)
-            curl_status=$?
-            set -e
-
-            if [ "$curl_status" -eq 0 ] && [[ "$http_code" =~ ^2 ]]; then
-              python -c 'import json; r=json.load(open("cursor_response.json")); print(r["agent"]["id"])' > agent_id.txt
-              python -c 'import json; r=json.load(open("cursor_response.json")); print(r["run"]["id"])' > run_id.txt
-              python -c 'import json; r=json.load(open("cursor_response.json")); print(r["agent"]["url"])' > agent_url.txt
-              started=true
-              break
-            fi
-
-            if [ "$curl_status" -eq 0 ] && [ "$http_code" = "409" ]; then
-              set +e
-              lookup_code=$(curl -sS -u "${CURSOR_API_KEY}:" -o agent_lookup.json -w '%{http_code}' "https://api.cursor.com/v1/agents/${agent_id}")
-              lookup_status=$?
-              set -e
-              if [ "$lookup_status" -eq 0 ] && [ "$lookup_code" = "200" ]; then
-                python -c 'import json; r=json.load(open("agent_lookup.json")); print(r["id"])' > agent_id.txt
-                python -c 'import json; r=json.load(open("agent_lookup.json")); print(r["latestRunId"])' > run_id.txt
-                python -c 'import json; r=json.load(open("agent_lookup.json")); print(r["url"])' > agent_url.txt
-                started=true
-                break
-              fi
-            fi
-
-            if [ "$curl_status" -eq 0 ] && [ "$http_code" -ge 400 ] && [ "$http_code" -lt 500 ] && [ "$http_code" != "409" ]; then
-              echo "Cursor definitively rejected create request with HTTP $http_code."
-              cat cursor_response.json || true
-              cleanup_claim
-              exit 1
-            fi
-
-            echo "Cursor create attempt $attempt had an ambiguous outcome (curl=$curl_status http=$http_code); retrying the same deterministic agent id."
-            sleep 5
-          done
-
-          if [ "$started" != "true" ]; then
-            # Final reconciliation: if the deterministic id exists, the remote
-            # create succeeded despite an ambiguous transport response.
-            for attempt in 1 2 3; do
-              set +e
-              lookup_code=$(curl -sS -u "${CURSOR_API_KEY}:" -o agent_lookup.json -w '%{http_code}' "https://api.cursor.com/v1/agents/${agent_id}")
-              lookup_status=$?
-              set -e
-              if [ "$lookup_status" -eq 0 ] && [ "$lookup_code" = "200" ]; then
-                python -c 'import json; r=json.load(open("agent_lookup.json")); print(r["id"])' > agent_id.txt
-                python -c 'import json; r=json.load(open("agent_lookup.json")); print(r["latestRunId"])' > run_id.txt
-                python -c 'import json; r=json.load(open("agent_lookup.json")); print(r["url"])' > agent_url.txt
-                started=true
-                break
-              fi
-              if [ "$lookup_status" -eq 0 ] && [ "$lookup_code" = "404" ]; then
-                sleep 5
-                continue
-              fi
-              echo "Cursor reconciliation remained ambiguous; preserving the claim to prevent duplicate agents."
-              exit 1
-            done
-          fi
-
-          if [ "$started" != "true" ]; then
-            echo "Deterministic Cursor agent id was not created after retries."
-            cleanup_claim
-            exit 1
-          fi
-
-          url=$(cat agent_url.txt)
-          started_body=$(printf 'Cursor remediation round %s started for %s Codex finding(s): %s\nAgent id: %s\n\n%s' "$round" "$findings" "$url" "$agent_id" "$marker")
-          GH_TOKEN="$GOAL_GITHUB_TOKEN" gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${claim_id}" -f body="$started_body" >/dev/null
-
-          echo "agent_id=$(cat agent_id.txt)" >> "$GITHUB_OUTPUT"
-          echo "run_id=$(cat run_id.txt)" >> "$GITHUB_OUTPUT"
+          python scripts/generic_worker.py launch --plan plan.json
 
       - name: Wait for Cursor remediation
         id: wait_cursor
@@ -289,6 +180,16 @@ jobs:
           status=$(bash scripts/wait_for_cursor_agent.sh "$(cat agent_id.txt)" "$(cat run_id.txt)")
           echo "status=$status" >> "$GITHUB_OUTPUT"
           echo "Cursor status: $status"
+
+      - name: Verify and persist generic worker terminal ownership
+        if: always() && steps.marker_identity.outputs.login != '' && steps.plan.outputs.action == 'launch'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          python scripts/generic_worker.py reconcile --pr "$PR_NUMBER"
 
       - name: Stop if Cursor did not finish
         if: steps.plan.outputs.action == 'launch' && steps.wait_cursor.outputs.status != 'FINISHED'
