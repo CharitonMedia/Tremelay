@@ -18,6 +18,8 @@ Before a signature, the stream requires `session-bind@openssh.com`: the pinned h
 
 Revoking or expiring the grant stops the next signature. It does not make an already released signature fail verification, and it does not close an SSH session that already authenticated. While the grant remains active, the same request may be signed again. Each request has its own audit rows. `completed` means the signature was approved for release. It does not mean the server accepted authentication or that the client received every response byte.
 
+The host owns transport cancellation. Calling the adapter's `Close` clears its binding but does not interrupt a blocked read or write. The host must also interrupt the transport and wait for `Serve` to return before using or locking the vault session. An already approved response may still be written until the transport is interrupted.
+
 Replacing the credential's key bytes does not move this stream onto a newer grant. The stream keeps the grant named at construction. Another active grant is not a fallback.
 
 ## Protocol subset

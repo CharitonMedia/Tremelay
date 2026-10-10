@@ -136,6 +136,10 @@ func (a *SSHUserAuth) Serve(rw io.ReadWriter) error {
 
 // Close drops the binding and wipes stream-owned buffers. It waits until an
 // in-flight roundTrip on this stream finishes, then rejects later requests.
+// It does not interrupt rw.Read or rw.Write in Serve. To cancel Serve, the
+// host must also interrupt its transport and wait for Serve to return before
+// reusing or locking the Session. A previously approved response may still
+// be written until the transport is interrupted.
 func (a *SSHUserAuth) Close() {
 	if a == nil {
 		return
@@ -301,7 +305,7 @@ func (a *SSHUserAuth) record(ev auditEvent, result string, resp []byte) ([]byte,
 }
 
 func stopSSH(err error) bool {
-	return errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrAudit) || errors.Is(err, ErrIO)
+	return errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrAudit) || errors.Is(err, ErrIO) || errors.Is(err, ErrCorrupt)
 }
 
 // fixedStreamErr drops reader and writer text. A short frame is ErrInvalid.

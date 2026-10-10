@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -518,7 +519,8 @@ func TestSSHUserAuthGrantPinOrder(t *testing.T) {
 }
 
 func TestSSHUserAuthMalformed(t *testing.T) {
-	env := newSSHEnv(t)
+	var logs bytes.Buffer
+	env := newSSHEnvLog(t, &logs)
 	sid := env.sessionID(32)
 	env.mustBind(t, sid)
 	sentinel := []byte("SSH-ADD-SENTINEL-" + randHex(t, 24))
@@ -679,17 +681,33 @@ func TestSSHUserAuthBindAuditAndTruncatedFrame(t *testing.T) {
 		t.Fatalf("partial header %v", err)
 	}
 
-	sentinel := "STREAM-SENTINEL-" + randHex(t, 16)
-	leak := &sentinelStream{text: sentinel}
-	noisy, err := env.principal.SSHUserAuth(env.grant.ID)
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+	}{
+		{"header", nil},
+		{"body", []byte{0, 0, 0, 4}},
+		{"partial_body", []byte{0, 0, 0, 4, 1, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sentinel := "STREAM-SENTINEL-" + randHex(t, 16)
+			reader := io.MultiReader(bytes.NewReader(tc.prefix), &sentinelStream{text: sentinel})
+			var output bytes.Buffer
+			noisy := env.secondStream(t)
+			before := sshCount(t, env.path, resultDenied)
+			err := noisy.Serve(struct {
+				io.Reader
+				io.Writer
+			}{reader, &output})
+			if !errors.Is(err, errSSHTransport) || strings.Contains(err.Error(), sentinel) || output.Len() != 0 {
+				t.Fatalf("reader error %v output length %d", err, output.Len())
+			}
+			if sshCount(t, env.path, resultDenied) != before+1 {
+				t.Fatal("reader failure was not audited")
+			}
+			env.assertClean(t, []byte(sentinel), sid, nil)
+		})
 	}
-	err = noisy.Serve(leak)
-	if !errors.Is(err, errSSHTransport) || strings.Contains(err.Error(), sentinel) {
-		t.Fatalf("reader error %v", err)
-	}
-	env.assertClean(t, []byte(sentinel), sid, nil)
 }
 
 type sentinelStream struct {
@@ -709,7 +727,8 @@ func TestSSHUserAuthAuditBoundaries(t *testing.T) {
 	env := newSSHEnvLog(t, &logs)
 	sid := env.sessionID(32)
 	env.mustBind(t, sid)
-	body := env.signBody(env.userBlob, env.preimage(sid, env.user, env.userBlob, env.hostBlob), 0)
+	preimage := env.preimage(sid, env.user, env.userBlob, env.hostBlob)
+	body := env.signBody(env.userBlob, preimage, 0)
 	allowed := sshCount(t, env.path, resultAllowed)
 	completed := sshCount(t, env.path, resultCompleted)
 	env.session.commitFault = func() error { return errors.New("induced " + env.user) }
@@ -776,9 +795,64 @@ func TestSSHUserAuthAuditBoundaries(t *testing.T) {
 		t.Fatalf("notice %+v", notes)
 	}
 	encoded, _ := json.Marshal(notes)
-	env.assertClean(t, append(encoded, logs.Bytes()...), sid, raw)
+	env.assertClean(t, preimage, sid, raw, encoded)
 	if _, err := VerifyAudit(env.path, env.pass); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSSHUserAuthCorruptAuditStopsStream(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		identities bool
+		completed  bool
+	}{
+		{name: "identities", identities: true},
+		{name: "sign_allowed"},
+		{name: "sign_completed", completed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newSSHEnv(t)
+			sid := env.sessionID(32)
+			env.mustBind(t, sid)
+			before := len(mustAudit(t, env.path))
+			cutoff := env.session.header.AuditSeq
+			wantRows, wantSigning := 0, 0
+			if tc.completed {
+				cutoff++
+				wantRows, wantSigning = 1, 1
+			}
+			// A no-row update returns ErrCorrupt from the real storage path.
+			// For completed, the preceding allowed commit must stay durable.
+			trigger := fmt.Sprintf(`CREATE TRIGGER ssh_no_vault_update BEFORE UPDATE ON vault WHEN OLD.audit_seq >= %d BEGIN SELECT RAISE(IGNORE); END;`, cutoff)
+			if _, err := env.session.db.Exec(trigger); err != nil {
+				t.Fatal(err)
+			}
+			signing := 0
+			env.session.sshFault = func() error { signing++; return nil }
+			body := env.signBody(env.userBlob, env.preimage(sid, env.user, env.userBlob, env.hostBlob), 0)
+			if tc.identities {
+				body = []byte{sshAgentRequestIdentities}
+			}
+			var output bytes.Buffer
+			err := env.stream.Serve(struct {
+				io.Reader
+				io.Writer
+			}{bytes.NewReader(frameSSH(body)), &output})
+			if !errors.Is(err, ErrCorrupt) || output.Len() != 0 {
+				t.Errorf("audit failure error %v output length %d", err, output.Len())
+			}
+			if signing != wantSigning {
+				t.Errorf("signing reached %d times, want %d", signing, wantSigning)
+			}
+			rows := mustAudit(t, env.path)[before:]
+			if len(rows) != wantRows || (wantRows == 1 && rows[0].Result != resultAllowed) {
+				t.Errorf("unexpected durable rows: %+v", rows)
+			}
+			if _, err := VerifyAudit(env.path, env.pass); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -1019,9 +1093,12 @@ func (e *sshEnv) secondStream(t *testing.T) *SSHUserAuth {
 	return s
 }
 
-func (e *sshEnv) assertClean(t *testing.T, extra []byte, sessionID, sig []byte) {
+func (e *sshEnv) assertClean(t *testing.T, extra []byte, sessionID, sig []byte, outputs ...[]byte) {
 	t.Helper()
 	secrets := [][]byte{e.der, e.userPriv.Seed(), append([]byte(nil), e.userPriv...), e.hostPriv.Seed(), sessionID, sig, []byte(e.user), []byte(e.resource), e.hostBlob, extra}
+	for _, output := range outputs {
+		assertNoSecrets(t, output, secrets)
+	}
 	if e.logs != nil {
 		assertNoSecrets(t, e.logs.Bytes(), secrets)
 	}
