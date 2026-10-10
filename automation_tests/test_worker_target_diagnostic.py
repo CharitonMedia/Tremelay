@@ -77,7 +77,8 @@ class WorkerTargetDiagnostic(unittest.TestCase):
         self.assertTrue(supervisor.supervisor_owns_work(supervisor.records([comment])[0][1]))
         self.assertEqual(cursor.call_count, 2)  # Failure precedes the terminal latest-run recheck.
         self.assertTrue(all(not call.kwargs for call in cursor.call_args_list))
-        github.assert_called_once_with('user')
+        self.assertEqual([call.args[0] for call in github.call_args_list],
+                         ['user', f'repos/{supervisor.REPO}/pulls/22'])
         update.assert_not_called(); model.assert_not_called(); review.assert_not_called()
 
     def test_secret_shaped_provider_fields_never_reach_the_failure_log(self):
@@ -174,7 +175,7 @@ class WorkerTargetDiagnostic(unittest.TestCase):
         state, agent, run, _, _ = fixture(other_pr=22)
         stderr = io.StringIO()
         with patch.object(supervisor, 'cursor', side_effect=[agent, run, agent]) as cursor, redirect_stderr(stderr):
-            self.assertEqual(supervisor.verified_worker_run(22, state), (RUN, 'FINISHED'))
+            self.assertEqual(supervisor.verified_worker_run(22, state), (RUN, 'FINISHED', None))
         self.assertEqual(stderr.getvalue(), '')
         self.assertEqual(cursor.call_count, 3)
 
