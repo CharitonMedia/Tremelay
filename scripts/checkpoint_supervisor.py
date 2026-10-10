@@ -568,7 +568,59 @@ def finish_review(pull, comment, state):
     print(f"PR #{number}: correction pushed; independent review requested")
 
 
-def verified_worker_run(number, state):
+def worker_target_diagnostic(number, state, agent, run, expected_branch=None):
+    """Project only bounded identifiers; this snapshot never proves ownership."""
+    slug = r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}"
+    uuid = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+
+    def repository(value):
+        if value in (f"https://github.com/{REPO}", f"github.com/{REPO}"):
+            return REPO
+        if isinstance(value, str) and re.fullmatch(r"(?:https://)?github\.com/" + slug, value):
+            return "foreign_repository"
+        return "missing" if value is None else "unrecognized_repository"
+
+    def pull(value):
+        match = (re.fullmatch(r"https://github\.com/(" + slug + r")/pull/([1-9][0-9]{0,9})", value)
+                 if isinstance(value, str) else None)
+        if match:
+            return {"repository": repository("github.com/" + match[1]), "number": int(match[2])}
+        return "missing" if value is None else "unrecognized_pr"
+
+    def branch(value):
+        if isinstance(value, str) and re.fullmatch(r"goal/issue-[1-9][0-9]{0,9}", value):
+            return value
+        return "missing" if value is None else "unrecognized_branch"
+
+    def recorded_uuid(key, prefix):
+        value = state.get(key)
+        if isinstance(value, str) and re.fullmatch(re.escape(prefix) + uuid, value):
+            return value
+        return "missing" if value is None else "unrecognized_uuid"
+
+    def rows(value, repo_key, branch_key):
+        if not isinstance(value, list):
+            return "missing" if value is None else "unrecognized_records"
+        return [{"repository": repository(row.get(repo_key)), "pr": pull(row.get("prUrl")),
+                 "goal_branch": branch(row.get(branch_key))} if isinstance(row, dict) else "unrecognized_record"
+                for row in value[:8]] + (["additional_records_omitted"] if len(value) > 8 else [])
+
+    status = run.get("status")
+    git = run.get("git")
+    current_branch = agent.get("workOnCurrentBranch")
+    return {"expected_repository": REPO,
+            "expected_pr": number if type(number) is int and 0 < number < 10 ** 10 else "unrecognized_pr",
+            "expected_goal_branch": branch(expected_branch),
+            "recorded_agent_id": recorded_uuid("agent_id", "bc-"),
+            "recorded_run_id": recorded_uuid("run_id", "run-"),
+            "observed_status": status if isinstance(status, str) and status in WORKER_TERMINAL_STATUSES | {"CREATING", "RUNNING"} else "unrecognized_status",
+            "observed_work_on_current_branch": ("true" if current_branch is True else "false" if current_branch is False
+                                                else "missing" if "workOnCurrentBranch" not in agent else "unrecognized"),
+            "agent_repositories": rows(agent.get("repos"), "url", "startingRef"),
+            "pushed_branches": rows(git.get("branches") if isinstance(git, dict) else None, "repoUrl", "branch")}
+
+
+def verified_worker_run(number, state, *, expected_branch=None):
     """GET the recorded agent/run and verify its PR before accepting status."""
     from goal_review_launch import RUN_ID, LEGACY_AGENT, verify_legacy_target, Stop as ClaimStop
     agent_id = state.get("agent_id")
@@ -587,16 +639,22 @@ def verified_worker_run(number, state):
             or not isinstance(result.get("status"), str)
             or result["status"] not in WORKER_TERMINAL_STATUSES | {"CREATING", "RUNNING"}):
         raise Stop("Cursor returned an unverified worker run status")
-    try:
-        verify_legacy_target(agent, result, number)
-        if result["status"] in WORKER_TERMINAL_STATUSES:
-            current = cursor("/" + agent_id)
-            if (not isinstance(current, dict) or current.get("id") != agent_id
-                    or current.get("latestRunId") != run_id):
-                raise Stop("Worker changed during terminal reconciliation")
-            verify_legacy_target(current, result, number)
-    except ClaimStop as error:
-        raise Stop(str(error)) from None
+    def verify_target(target):
+        try:
+            verify_legacy_target(target, result, number)
+        except ClaimStop as error:
+            diagnostic = worker_target_diagnostic(number, state, target, result, expected_branch)
+            print("Worker target mismatch (unverified snapshot): " +
+                  json.dumps(diagnostic, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+            raise Stop(str(error)) from None
+
+    verify_target(agent)
+    if result["status"] in WORKER_TERMINAL_STATUSES:
+        current = cursor("/" + agent_id)
+        if (not isinstance(current, dict) or current.get("id") != agent_id
+                or current.get("latestRunId") != run_id):
+            raise Stop("Worker changed during terminal reconciliation")
+        verify_target(current)
     return run_id, result["status"]
 
 
@@ -604,7 +662,7 @@ def recover_worker(pull, comment, state, *, reconcile_only=False):
     """Reconcile the same worker even after closure/hold; never replay create."""
     number = pull["number"]
     prior_phase = state.get("phase")
-    run_id, status = verified_worker_run(number, state)
+    run_id, status = verified_worker_run(number, state, expected_branch=(pull.get("head") or {}).get("ref"))
     needs_record = prior_phase != "working" or state.get("run_id") != run_id
     state.update(phase="working", run_id=run_id)
     if status not in WORKER_TERMINAL_STATUSES:
