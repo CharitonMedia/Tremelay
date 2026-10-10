@@ -233,6 +233,9 @@ func TestNoGetSecretMethod(t *testing.T) {
 	if _, ok := sessionType.MethodByName("LocalAttest"); ok {
 		t.Fatal("human session exports local attestation")
 	}
+	if _, ok := sessionType.MethodByName("SSHUserAuth"); ok {
+		t.Fatal("human session exports the SSH userauth stream")
+	}
 	for _, typ := range []reflect.Type{sessionType, reflect.TypeOf(&AgentPrincipal{})} {
 		for i := 0; i < typ.NumMethod(); i++ {
 			name := strings.ToLower(typ.Method(i).Name)
@@ -242,7 +245,7 @@ func TestNoGetSecretMethod(t *testing.T) {
 		}
 	}
 	typ := reflect.TypeOf(&AgentPrincipal{})
-	if typ.NumMethod() != 5 {
+	if typ.NumMethod() != 6 {
 		t.Fatalf("agent method count %d", typ.NumMethod())
 	}
 	for i := 0; i < typ.NumMethod(); i++ {
@@ -366,6 +369,16 @@ func TestNoGetSecretMethod(t *testing.T) {
 					t.Fatal(f.Name)
 				}
 			}
+		case "SSHUserAuth":
+			if m.Type.NumIn() != 2 || m.Type.NumOut() != 2 {
+				t.Fatalf("SSHUserAuth signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
+			}
+			if m.Type.In(1).Kind() != reflect.String {
+				t.Fatal("SSHUserAuth accepts more than a grant id")
+			}
+			if m.Type.Out(0) != reflect.TypeOf(&SSHUserAuth{}) {
+				t.Fatal(m.Type.Out(0))
+			}
 		default:
 			t.Fatal(m.Name)
 		}
@@ -380,6 +393,20 @@ func TestNoGetSecretMethod(t *testing.T) {
 	for i := 0; i < fields.NumField(); i++ {
 		if fields.Field(i).Type == reflect.TypeOf(&Session{}) {
 			t.Fatal("AgentPrincipal holds *Session")
+		}
+	}
+	stream := reflect.TypeOf(&SSHUserAuth{})
+	for i := 0; i < stream.NumMethod(); i++ {
+		name := stream.Method(i).Name
+		switch name {
+		case "Serve", "Close":
+		default:
+			t.Fatal(name)
+		}
+	}
+	for i := 0; i < stream.Elem().NumField(); i++ {
+		if stream.Elem().Field(i).Type == reflect.TypeOf(&Session{}) {
+			t.Fatal("SSHUserAuth holds *Session")
 		}
 	}
 }

@@ -26,6 +26,7 @@ const (
 	actionCapList      = "capability_list"
 	actionBroker       = "broker_http"
 	actionLocalAttest  = "local_attest"
+	actionSSHUserAuth  = "ssh_userauth"
 	actionNotify       = "notify"
 	actionContain      = "contain"
 	actionRespond      = "respond"
@@ -340,7 +341,7 @@ func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPut, actionGet, actionList,
 		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
-		actionBroker, actionLocalAttest, actionNotify, actionContain, actionRespond,
+		actionBroker, actionLocalAttest, actionSSHUserAuth, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
 		actionHealthGet, actionHealthList:
 		return true
@@ -355,7 +356,7 @@ func noticeAction(action string) bool {
 
 func capabilityAction(action string) bool {
 	switch action {
-	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker, actionLocalAttest:
+	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker, actionLocalAttest, actionSSHUserAuth:
 		return true
 	default:
 		return false
@@ -405,6 +406,7 @@ func validAuditShape(ev auditEvent) error {
 	default:
 		switch {
 		case ev.Action == actionLocalAttest && localAttestResult(ev.Result):
+		case ev.Action == actionSSHUserAuth && sshUserAuthResult(ev.Result):
 		case ev.Action == actionAuthorize && (ev.Result == resultFailed || ev.Result == resultDeniedKey):
 		case ev.Action == actionBroker && brokerOnlyResult(ev.Result):
 		default:
@@ -436,7 +438,7 @@ func validAuditShape(ev auditEvent) error {
 		}
 		switch ev.Result {
 		case resultDeniedKey, resultFailed:
-			if ev.Operation != OpLocalArtifactAttest || ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType != CredTypeEd25519 {
+			if (ev.Operation != OpLocalArtifactAttest && ev.Operation != OpSSHUserAuth) || ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType != CredTypeEd25519 {
 				return ErrAudit
 			}
 		default:
@@ -460,6 +462,10 @@ func validAuditShape(ev auditEvent) error {
 		}
 	case actionLocalAttest:
 		if err := validLocalAttestAudit(ev); err != nil {
+			return err
+		}
+	case actionSSHUserAuth:
+		if err := validSSHUserAuthAudit(ev); err != nil {
 			return err
 		}
 	default:
@@ -568,6 +574,28 @@ func localAttestResult(result string) bool {
 	default:
 		return false
 	}
+}
+
+func sshUserAuthResult(result string) bool {
+	switch result {
+	case resultAllowed, resultCompleted, resultFailed, resultDeniedKey, resultDenied,
+		resultDeniedAgent, resultDeniedExpired, resultDeniedRevoked:
+		return true
+	default:
+		return false
+	}
+}
+
+// validSSHUserAuthAudit keeps SSH userauth rows on fixed codes.
+// Username, host key, session id, preimage, and signature are not fields.
+func validSSHUserAuthAudit(ev auditEvent) error {
+	if ev.Operation != OpSSHUserAuth || ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType != CredTypeEd25519 {
+		return ErrAudit
+	}
+	if !sshUserAuthResult(ev.Result) {
+		return ErrAudit
+	}
+	return nil
 }
 
 // validLocalAttestAudit keeps attestation rows on fixed codes.

@@ -49,6 +49,14 @@ Preventing or delaying alerts following high-risk events.
 ### Host compromise
 Full host compromise may defeat software-only secrecy; the design SHOULD support external roots of trust and remote audit/checkpoint systems to reduce this risk.
 
+## SSH userauth reference limits
+
+The `ssh_userauth` adapter releases an Ed25519 signature for SSH account authentication. The trusted control plane pins one principal, one credential, that credential's public key, one opaque resource label, one username, and one Ed25519 server host public key. The resource label does not enforce a command, path, repository, SFTP session, shell, or forwarding channel. The enforceable destination is the host public key, not a DNS name, address, or port. Two destinations that share that host key and username are not distinguished. Pinning the host key is a control-plane action; the adapter does not discover hosts, trust on first use, edit known_hosts, or accept host certificates.
+
+The caller is treated as adversarial, including on a first hop. Signing requires `publickey-hostbound-v00@openssh.com` and a host signature over the session identifier with `is_forwarding` false. Ordinary publickey authentication is denied. The binding is checked cryptographically and can be replayed on a new in-memory stream. It is not evidence of a live local session, an honest forwarding path, server liveness, or global single use. A caller that relays bytes itself is outside what this stream can observe. Revocation and expiry stop later signatures. They do not invalidate a signature already released or close an SSH session that already authenticated. Each permitted request has its own audit rows.
+
+Wire messages cannot choose the principal, grant, credential, clock, or host key. One stream is tied to the grant selected at construction and is not retargeted when the vault key changes or another grant would match. The private key does not leave the broker. Username, host key, session identifier, preimage, and signature stay out of plaintext audit, notifications, logs, and errors. This is synthetic in-memory compatibility with a protocol subset, not a deployable general SSH agent and not a completed login.
+
 ## Out of scope for initial milestone
 
 The first vertical slice does not promise protection against an attacker with arbitrary kernel/hypervisor access to the host containing decrypted secrets.

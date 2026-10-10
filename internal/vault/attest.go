@@ -401,13 +401,16 @@ func validateGrantKey(g grantRecord, types map[string]string) error {
 		}
 	}
 	if !has {
-		if g.KeyID != "" {
+		if g.KeyID != "" && !soleSSH(g.Operations) {
 			return ErrCorrupt
 		}
-		return nil
+		return validateSSHGrant(g, types)
+	}
+	if g.SSHUsername != "" || len(g.SSHHostKey) != 0 {
+		return ErrCorrupt
 	}
 	if !soleLocalAttest(g.Operations) || g.CredentialClass != "" || g.CredentialID == "" || types[g.CredentialID] != CredTypeEd25519 || !canonicalKeyID(g.KeyID) {
 		return ErrCorrupt
 	}
-	return nil
+	return validateSSHGrant(g, types)
 }
