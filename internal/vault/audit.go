@@ -28,6 +28,7 @@ const (
 	actionBroker        = "broker_http"
 	actionLocalAttest   = "local_attest"
 	actionSSHUserAuth   = "ssh_userauth"
+	actionAgentCap      = "agent_capability"
 	actionNotify        = "notify"
 	actionContain       = "contain"
 	actionRespond       = "respond"
@@ -389,7 +390,7 @@ func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPut, actionGet, actionList,
 		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
-		actionBroker, actionLocalAttest, actionSSHUserAuth, actionNotify, actionContain, actionRespond,
+		actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
 		actionHealthGet, actionHealthList,
 		actionBootstrap, actionMemberAttach, actionMemberRemove, actionMemberRole,
@@ -418,7 +419,7 @@ func sharedAction(action string) bool {
 
 func capabilityAction(action string) bool {
 	switch action {
-	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker, actionLocalAttest, actionSSHUserAuth:
+	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap:
 		return true
 	default:
 		return false
@@ -534,6 +535,10 @@ func validAuditShape(ev auditEvent) error {
 		}
 	case actionSSHUserAuth:
 		if err := validSSHUserAuthAudit(ev); err != nil {
+			return err
+		}
+	case actionAgentCap:
+		if err := validAgentCapAudit(ev); err != nil {
 			return err
 		}
 	default:
@@ -672,6 +677,21 @@ func validSSHUserAuthAudit(ev auditEvent) error {
 	return nil
 }
 
+// validAgentCapAudit keeps adapter discovery and protocol denials on fixed codes.
+// Handles, payloads, and caller method text are not fields.
+func validAgentCapAudit(ev auditEvent) error {
+	if ev.Result == resultAllowed {
+		if ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType != CredTypeEd25519 || ev.Operation != OpLocalArtifactAttest {
+			return ErrAudit
+		}
+		return nil
+	}
+	if ev.Result != resultDenied || ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
+		return ErrAudit
+	}
+	return nil
+}
+
 // validLocalAttestAudit keeps attestation rows on fixed codes.
 // The operation is only local_artifact_attest. Caller payload is not a field.
 func validLocalAttestAudit(ev auditEvent) error {
@@ -684,7 +704,10 @@ func validLocalAttestAudit(ev auditEvent) error {
 			return ErrAudit
 		}
 	case resultDenied:
-		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
+		// A malformed attestation input stays unattributed. An adapter denial
+		// may name only the already-bound agent. Grant, credential, operation,
+		// and caller bytes stay empty.
+		if ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
 			return ErrAudit
 		}
 	case resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,

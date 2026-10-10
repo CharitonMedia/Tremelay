@@ -75,6 +75,8 @@ M9 is not complete. M9a is the local shared-vault authorization reference in [AD
 
 Representative operations: `list_capabilities`, `describe_capability`, `invoke_capability`, and `request_capability`.
 
+M10 is not complete. M10a is the in-process boundary in [ADR 0017](docs/adr/0017-agent-capability-interface.md) and [docs/m10a-agent-capability.md](docs/m10a-agent-capability.md). A trusted host binds one already-bound agent principal to a versioned byte interface. That interface lists, describes, and invokes only that principal's `local_artifact_attest` grants, each through a handle for one exact grant. `request_capability` is rejected and creates nothing. This is not a public SDK, a network listener, or a demonstrated MCP transport. Agent authentication and a real transport remain open.
+
 ## M11 — Hardened v1
 
 **Goal:** Produce a documented, reproducible, security-reviewed v1 suitable for serious self-hosting, including threat-model review, dependency audit, SBOM, signed releases, backup/recovery documentation, migration tests, hardened defaults, and independent security review where practical.
