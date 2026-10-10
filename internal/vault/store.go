@@ -48,6 +48,11 @@ CREATE TABLE audit (
   ref_seq INTEGER NOT NULL,
   reasons TEXT NOT NULL DEFAULT '',
   cred_gen INTEGER NOT NULL DEFAULT 0,
+  actor_id TEXT NOT NULL DEFAULT '',
+  org_id TEXT NOT NULL DEFAULT '',
+  target_id TEXT NOT NULL DEFAULT '',
+  request_id TEXT NOT NULL DEFAULT '',
+  decision TEXT NOT NULL DEFAULT '',
   FOREIGN KEY (vault_id) REFERENCES vault(id)
 );`
 
@@ -283,6 +288,11 @@ func migrateAudit(db *sql.DB) error {
 		{"ref_seq", `ALTER TABLE audit ADD COLUMN ref_seq INTEGER NOT NULL DEFAULT 0`},
 		{"reasons", `ALTER TABLE audit ADD COLUMN reasons TEXT NOT NULL DEFAULT ''`},
 		{"cred_gen", `ALTER TABLE audit ADD COLUMN cred_gen INTEGER NOT NULL DEFAULT 0`},
+		{"actor_id", `ALTER TABLE audit ADD COLUMN actor_id TEXT NOT NULL DEFAULT ''`},
+		{"org_id", `ALTER TABLE audit ADD COLUMN org_id TEXT NOT NULL DEFAULT ''`},
+		{"target_id", `ALTER TABLE audit ADD COLUMN target_id TEXT NOT NULL DEFAULT ''`},
+		{"request_id", `ALTER TABLE audit ADD COLUMN request_id TEXT NOT NULL DEFAULT ''`},
+		{"decision", `ALTER TABLE audit ADD COLUMN decision TEXT NOT NULL DEFAULT ''`},
 	}
 	missing := false
 	for _, col := range adds {
@@ -359,7 +369,7 @@ func backfillAuditVersion(tx *sql.Tx) error {
 }
 
 func readAuditRows(db *sql.DB) ([]auditEvent, error) {
-	rows, err := db.Query(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq, reasons, cred_gen FROM audit ORDER BY seq`)
+	rows, err := db.Query(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq, reasons, cred_gen, actor_id, org_id, target_id, request_id, decision FROM audit ORDER BY seq`)
 	if err != nil {
 		return nil, ErrCorrupt
 	}
@@ -369,10 +379,10 @@ func readAuditRows(db *sql.DB) ([]auditEvent, error) {
 	for rows.Next() {
 		var ev auditEvent
 		var seq, ref, gen int64
-		if err := rows.Scan(&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref, &ev.Reasons, &gen); err != nil {
+		if err := rows.Scan(&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref, &ev.Reasons, &gen, &ev.ActorID, &ev.OrgID, &ev.TargetID, &ev.RequestID, &ev.Decision); err != nil {
 			return nil, ErrCorrupt
 		}
-		if seq <= 0 || ref < 0 || gen < 0 || (ev.V != auditVersion && ev.V != auditCapabilityVersion && ev.V != auditNoticeVersion && ev.V != auditHealthVersion) {
+		if seq <= 0 || ref < 0 || gen < 0 || !knownAuditVersion(ev.V) {
 			return nil, ErrAudit
 		}
 		ev.Seq = uint64(seq)
@@ -395,7 +405,7 @@ func readAuditRows(db *sql.DB) ([]auditEvent, error) {
 // the transaction after the statements so tests can observe rollback.
 // A failure rolls every event in the call back; callers put a security
 // event, its response decision, and its containment row in one call.
-func writeTx(db *sql.DB, h fileHeader, events []auditEvent, fresh bool, fault func() error) error {
+func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fresh bool, fault func() error) error {
 	if len(events) == 0 {
 		return ErrAudit
 	}
@@ -413,7 +423,7 @@ func writeTx(db *sql.DB, h fileHeader, events []auditEvent, fresh bool, fault fu
 		if err := insertVault(tx, h); err != nil {
 			return err
 		}
-	} else if err := updateVault(tx, h); err != nil {
+	} else if err := updateVault(tx, h, prevSeq); err != nil {
 		return err
 	}
 	for _, ev := range events {
@@ -447,14 +457,19 @@ func insertVault(tx *sql.Tx, h fileHeader) error {
 	return nil
 }
 
-func updateVault(tx *sql.Tx, h fileHeader) error {
-	res, err := tx.Exec(`UPDATE vault SET data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=? WHERE id=?`,
-		h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), h.ID)
+func updateVault(tx *sql.Tx, h fileHeader, prevSeq uint64) error {
+	res, err := tx.Exec(`UPDATE vault SET data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=? WHERE id=? AND audit_seq=?`,
+		h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), h.ID, int64(prevSeq))
 	if err != nil {
 		return ErrIO
 	}
 	n, err := res.RowsAffected()
-	if err != nil || n != 1 {
+	if err != nil {
+		return ErrCorrupt
+	}
+	if n != 1 {
+		// A compare-and-swap miss, including a trigger that ignores the
+		// update, leaves the previous document in place.
 		return ErrCorrupt
 	}
 	return nil
@@ -462,9 +477,11 @@ func updateVault(tx *sql.Tx, h fileHeader) error {
 
 func insertAudit(tx *sql.Tx, ev auditEvent) error {
 	_, err := tx.Exec(`INSERT INTO audit (
-		seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq, reasons, cred_gen
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		int64(ev.Seq), ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Prev, ev.Hash, ev.AgentID, ev.GrantID, ev.Operation, ev.V, ev.Class, int64(ev.RefSeq), ev.Reasons, int64(ev.CredGen))
+		seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq, reasons, cred_gen,
+		actor_id, org_id, target_id, request_id, decision
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		int64(ev.Seq), ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Prev, ev.Hash, ev.AgentID, ev.GrantID, ev.Operation, ev.V, ev.Class, int64(ev.RefSeq), ev.Reasons, int64(ev.CredGen),
+		ev.ActorID, ev.OrgID, ev.TargetID, ev.RequestID, ev.Decision)
 	if err != nil {
 		return ErrIO
 	}
@@ -514,8 +531,8 @@ func appendDenial(db *sql.DB, vaultID string) error {
 func readAuditTip(tx *sql.Tx) (auditEvent, error) {
 	var ev auditEvent
 	var seq, ref, gen int64
-	err := tx.QueryRow(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq, reasons, cred_gen FROM audit ORDER BY seq DESC LIMIT 1`).Scan(
-		&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref, &ev.Reasons, &gen,
+	err := tx.QueryRow(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq, reasons, cred_gen, actor_id, org_id, target_id, request_id, decision FROM audit ORDER BY seq DESC LIMIT 1`).Scan(
+		&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref, &ev.Reasons, &gen, &ev.ActorID, &ev.OrgID, &ev.TargetID, &ev.RequestID, &ev.Decision,
 	)
 	if err != nil || seq <= 0 || ref < 0 || gen < 0 || ev.V != auditVersionFor(ev.Action) {
 		return auditEvent{}, ErrAudit

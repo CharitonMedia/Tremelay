@@ -96,9 +96,10 @@ func (m *MemoryNotifier) Snapshot() []Notification {
 // SetNotifier installs the alert sink. Nil clears it.
 // A nil sink leaves high-risk events audited and does not record a delivery failure.
 func (s *Session) SetNotifier(n Notifier) error {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return err
 	}
+	defer s.end()
 	s.notifier = n
 	return nil
 }
@@ -106,9 +107,10 @@ func (s *Session) SetNotifier(n Notifier) error {
 // SetResponsePolicy installs containment for later high-risk events.
 // It does not rewrite events that are already durable.
 func (s *Session) SetResponsePolicy(p ResponsePolicy) error {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return err
 	}
+	defer s.end()
 	switch p.High {
 	case ContainNotify, ContainFlag, ContainSuspendGrant, ContainSuspendAgent:
 	default:
@@ -129,9 +131,10 @@ func (s *Session) SetResponsePolicy(p ResponsePolicy) error {
 // A failure to persist the attempt or the outcome is returned. The sink
 // is not called when the attempt row cannot be written.
 func (s *Session) DeliverPending() error {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return err
 	}
+	defer s.end()
 	if s.notifier == nil || s.responding {
 		return nil
 	}
@@ -306,7 +309,11 @@ func (s *Session) deliverOne(src auditEvent, class Classification) error {
 		return err
 	}
 	result := resultDelivered
-	if err := s.notifier.Notify(notificationFrom(src, class)); err != nil {
+	var nerr error
+	s.duringCallback(func() {
+		nerr = s.notifier.Notify(notificationFrom(src, class))
+	})
+	if nerr != nil {
 		result = resultFailed
 	}
 	return s.writeNotice(actionNotify, result, src, class, s.creds, s.agents, s.grants)
@@ -437,6 +444,8 @@ func noticeAlertClass(src auditEvent, st noticeSrc) Classification {
 	case ClassHealth:
 		// Advisory. The recorded class asks for delivery and does not suspend.
 		return Classification{Class: ClassHealth, Severity: SeverityHigh}
+	case ClassApproval:
+		return Classification{Class: ClassApproval, Severity: SeverityHigh}
 	}
 	return base
 }

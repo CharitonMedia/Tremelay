@@ -57,6 +57,14 @@ The caller is treated as adversarial, including on a first hop. Signing requires
 
 Wire messages cannot choose the principal, grant, credential, clock, or host key. One stream is tied to the grant selected at construction and is not retargeted when the vault key changes or another grant would match. The private key does not leave the broker. Username, host key, session identifier, preimage, and signature stay out of plaintext audit, notifications, logs, and errors. This is synthetic in-memory compatibility with a protocol subset, not a deployable general SSH agent and not a completed login.
 
+## Shared-vault reference limits
+
+M9a is one local approval path for `local_artifact_attest`. The host that holds the process and the vault passphrase asserts synthetic human identities. Two records do not prove two people and do not confine that host. Bound humans cannot retrieve plaintext, switch actor, or mint assertions. Agents still cannot retrieve a raw secret.
+
+A shared grant is usable only while the requester and the approving owner remain active at the generations stored on the grant. Removal, demotion, re-enrollment, and re-promotion invalidate that authority. They do not recall a signature already released. Legacy single-user grants are not given approval provenance and are not accepted in a shared vault. An older reader fails closed on shared storage instead of treating it as an unrestricted single-user vault.
+
+This does not decide production enrollment, recovery, offboarding, or independent custody. Those remain open under M9.
+
 ## Out of scope for initial milestone
 
 The first vertical slice does not promise protection against an attacker with arbitrary kernel/hypervisor access to the host containing decrypted secrets.

@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 )
 
 const (
@@ -163,9 +164,10 @@ func canonicalKeyID(id string) bool {
 }
 
 func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAttestation, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return LocalAttestation{}, err
 	}
+	defer s.end()
 	// Suspension is decided before the payload is inspected, so a suspended
 	// agent cannot turn a secret-shaped payload into a different audit result.
 	if s.agentExists(agentID) && !s.agentActive(agentID) {
@@ -203,7 +205,13 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 		return LocalAttestation{}, err
 	}
 	if s.attestFault != nil {
-		if faultErr := s.attestFault(); faultErr != nil {
+		var faultErr error
+		s.duringCallback(func() {
+			if s.attestFault != nil {
+				faultErr = s.attestFault()
+			}
+		})
+		if faultErr != nil {
 			wipe(priv)
 			wipe(msg)
 			if werr := s.attestWrite(partial, resultFailed); werr != nil {
@@ -211,6 +219,21 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 			}
 			return LocalAttestation{}, ErrSignFailed
 		}
+	}
+	if err := s.sharedGrantLive(partial.GrantID); err != nil {
+		wipe(priv)
+		wipe(msg)
+		if errors.Is(err, ErrStale) {
+			return LocalAttestation{}, err
+		}
+		code := resultDeniedRevoked
+		if errors.Is(err, ErrDeniedExpired) {
+			code = resultDeniedExpired
+		}
+		if werr := s.attestWrite(partial, code); werr != nil {
+			return LocalAttestation{}, werr
+		}
+		return LocalAttestation{}, err
 	}
 	sigBytes := ed25519.Sign(priv, msg)
 	pub, _ := priv.Public().(ed25519.PublicKey)
@@ -292,7 +315,7 @@ func (s *Session) matchAttestKey(partial auditEvent) (ed25519.PrivateKey, auditE
 // retargetAttestGrant moves an allowed decision onto the grant bound to pub.
 // An empty match leaves partial unchanged.
 func (s *Session) retargetAttestGrant(partial auditEvent, resource string, pub ed25519.PublicKey) (auditEvent, error) {
-	matched := grantsForAttestKey(s.grants, partial.AgentID, partial.CredID, resource, hex.EncodeToString(pub))
+	matched := grantsForAttestKey(s.decisionGrants(), partial.AgentID, partial.CredID, resource, hex.EncodeToString(pub))
 	if len(matched) == 0 {
 		return partial, nil
 	}

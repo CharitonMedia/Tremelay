@@ -1280,6 +1280,9 @@ func reseal(t *testing.T, s *Session, creds []credential) {
 		Grants:       s.grants,
 		Detection:    s.detection,
 		HealthPolicy: s.hpolicy,
+		Organization: s.org,
+		Memberships:  s.members,
+		Requests:     s.requests,
 	})
 	if err != nil {
 		t.Fatal(err)

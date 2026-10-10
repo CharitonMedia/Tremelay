@@ -2,7 +2,9 @@
 //
 // Retrieval requires an unlocked session, which requires the vault passphrase.
 // Agent principals and capability grants are a separate authority from that
-// human session. AgentPrincipal can list capabilities, authorize them, invoke
+// human session. A shared vault binds host-asserted humans to owner and member
+// roles; those handles are not authentication and cannot retrieve plaintext.
+// AgentPrincipal can list capabilities, authorize them, invoke
 // the HTTP broker, request one local Ed25519 attestation, and open one
 // host-bound SSH userauth stream for one identity.
 // It cannot retrieve credential plaintext. This package must not grow an
@@ -27,6 +29,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -149,6 +153,11 @@ var (
 	// ErrConflict means a credential changed while it was being evaluated.
 	// The in-flight evaluation is discarded. The text is fixed.
 	ErrConflict = errors.New("credential changed during evaluation")
+	// ErrDenied is a fixed authorization denial. The text is not caller input.
+	ErrDenied = errors.New("denied")
+	// ErrStale means this unlocked session lost a race with a newer commit.
+	// It will not apply cached authority or return a signature. Reopen to continue.
+	ErrStale = errors.New("vault session is stale")
 )
 
 // Lifecycle is non-secret metadata stored with a credential.
@@ -243,6 +252,12 @@ type document struct {
 	// HealthPolicy is absent on vaults sealed before M6. Absence means the
 	// documented defaults, not a fabricated healthy assessment.
 	HealthPolicy healthPolicy `json:"health_policy,omitempty"`
+	// Organization is absent on a legacy single-user vault. Presence binds
+	// this database to one organization. A malformed member is corrupt;
+	// it is not a downgrade to legacy mode. See ADR 0015.
+	Organization *orgRecord         `json:"organization,omitempty"`
+	Memberships  []membershipRecord `json:"memberships,omitempty"`
+	Requests     []requestRecord    `json:"requests,omitempty"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -311,6 +326,21 @@ type Session struct {
 	// checker is the process-local compromise lookup. Nil means no lookup.
 	// It is not sealed, and a new process starts without one. See ADR 0010.
 	checker CompromiseChecker
+	// org, members, and requests are shared-mode state. Nil org means legacy
+	// single-user mode. They are sealed with every document write.
+	org      *orgRecord
+	members  []membershipRecord
+	requests []requestRecord
+	// mu serializes authorization and document writes on this session.
+	// Callbacks run outside it. A second unlocked session is not covered by
+	// mu; its commit must match the durable audit sequence or it fails closed.
+	mu     sync.Mutex
+	locked atomic.Bool
+	// defunct is set when a commit loses a race. Later calls return ErrStale.
+	defunct bool
+	// boundActor, when set, attributes the commit with one version-5 inventory
+	// row. Human inventory methods set it. It is not a caller-supplied audit id.
+	boundActor string
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -452,6 +482,10 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		wipe(dek)
 		return nil, deny(err)
 	}
+	if err := sharedMatchesVault(doc, header.ID); err != nil {
+		wipe(dek)
+		return nil, deny(err)
+	}
 	idx := indexFromAudit(events)
 	if err := matchDetection(idx.state(), doc.Detection); err != nil {
 		wipe(dek)
@@ -483,6 +517,9 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		logger:      logger,
 		db:          db,
 		hpolicy:     doc.HealthPolicy,
+		org:         doc.Organization,
+		members:     doc.Memberships,
+		requests:    doc.Requests,
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -500,6 +537,12 @@ func (s *Session) Lock() {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lockLocked()
+}
+
+func (s *Session) lockLocked() {
 	wipe(s.dek)
 	s.dek = nil
 	for i := range s.creds {
@@ -518,6 +561,10 @@ func (s *Session) Lock() {
 	s.responding = false
 	s.checker = nil
 	s.hpolicy = healthPolicy{}
+	s.org = nil
+	s.members = nil
+	s.requests = nil
+	s.locked.Store(false)
 	if s.redactor != nil {
 		s.redactor.Wipe()
 	}
@@ -530,9 +577,17 @@ func (s *Session) Lock() {
 // Put stores a new credential and returns its metadata. The secret is not echoed.
 // Invalid input is denied and audited with no secret and no free-form metadata.
 func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credential, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return Credential{}, err
 	}
+	defer s.end()
+	if s.shared() {
+		return s.denyPut(ErrDenied)
+	}
+	return s.putUnlocked(label, typ, secret, opt)
+}
+
+func (s *Session) putUnlocked(label, typ string, secret []byte, opt PutOptions) (Credential, error) {
 	if err := validateLabel(label); err != nil {
 		return s.denyPut(err)
 	}
@@ -596,9 +651,21 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 // Get returns one credential, including its secret, after committing an audit event.
 // A failed audit transaction does not return the secret.
 func (s *Session) Get(id string) (Credential, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return Credential{}, err
 	}
+	defer s.end()
+	if s.shared() {
+		if err := s.persistEvent(actionGet, "", "", resultDenied); err != nil {
+			return Credential{}, err
+		}
+		s.logf("credential_get result=denied")
+		return Credential{}, ErrDenied
+	}
+	return s.getUnlocked(id)
+}
+
+func (s *Session) getUnlocked(id string) (Credential, error) {
 	for i := range s.creds {
 		c := &s.creds[i]
 		if c.ID != id {
@@ -623,9 +690,21 @@ func (s *Session) Get(id string) (Credential, error) {
 
 // List returns credential metadata. Secrets are omitted.
 func (s *Session) List() ([]Credential, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return nil, err
 	}
+	defer s.end()
+	if s.shared() {
+		if err := s.persistEvent(actionList, "", "", resultDenied); err != nil {
+			return nil, err
+		}
+		s.logf("credential_list result=denied")
+		return nil, ErrDenied
+	}
+	return s.listUnlocked()
+}
+
+func (s *Session) listUnlocked() ([]Credential, error) {
 	if err := s.persistEvent(actionList, "", "", resultAllowed); err != nil {
 		return nil, err
 	}
@@ -662,11 +741,59 @@ func (s *Session) live() error {
 	return nil
 }
 
+// begin serializes use of this session. Callbacks must use duringCallback so
+// a notifier or health checker can reenter without deadlocking. Overlapping
+// calls on one session wait. A second unlocked session is rejected at commit
+// when its cached audit sequence is no longer current.
+func (s *Session) begin() error {
+	if s == nil {
+		return ErrUnauthenticated
+	}
+	s.mu.Lock()
+	if s.defunct {
+		s.mu.Unlock()
+		return ErrStale
+	}
+	if s.db == nil || len(s.dek) != keyLen {
+		s.mu.Unlock()
+		return ErrUnauthenticated
+	}
+	s.locked.Store(true)
+	return nil
+}
+
+func (s *Session) end() {
+	s.locked.Store(false)
+	s.mu.Unlock()
+}
+
+// duringCallback runs fn without the session lock. The caller holds the lock,
+// except during vault creation before any other goroutine can enter.
+func (s *Session) duringCallback(fn func()) {
+	if s == nil || fn == nil {
+		return
+	}
+	if !s.locked.CompareAndSwap(true, false) {
+		fn()
+		return
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.locked.Store(true)
+	}()
+	fn()
+}
+
 // RejectPut records a secret-free credential_put denial for a write rejected
 // before a secret was accepted, such as a secret file that cannot be read.
 // Caller input is not stored. A durable denial returns cause; a nil cause is
 // treated as ErrInvalid. A failed audit returns that error instead.
 func (s *Session) RejectPut(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionPut, cause)
 }
 
@@ -674,12 +801,20 @@ func (s *Session) RejectPut(cause error) error {
 // rejected before lookup, such as a malformed invocation. Caller input is
 // not stored.
 func (s *Session) RejectGet(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionGet, cause)
 }
 
 // RejectList records a metadata-free credential_list denial for a listing
 // rejected before it runs. Caller input is not stored.
 func (s *Session) RejectList(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionList, cause)
 }
 
@@ -729,13 +864,13 @@ func (s *Session) commit(ev auditEvent, creds []credential) error {
 }
 
 func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentRecord, grants []grantRecord) error {
-	return s.commitBatch([]auditEvent{ev}, creds, agents, grants, true, nil)
+	return s.commitBatch([]auditEvent{ev}, creds, agents, grants, true, nil, nil)
 }
 
 // commitBatch seals creds and events in one transaction.
 // withResp lets one ordinary security event pick up its M5 response.
 // policy, when non-nil, becomes the durable health policy only after commit.
-func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy) error {
+func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, shared *sharedSnap) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
@@ -759,6 +894,29 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 			}
 		}
 	}
+	if s.boundActor != "" && s.org != nil && safeID(s.boundActor) != "" {
+		partial := auditEvent{
+			Action: actionInventory, Result: resultAllowed, Decision: decisionInventory,
+			ActorID: s.boundActor, OrgID: s.org.ID,
+		}
+		for _, ev := range events {
+			if ev.Result == resultDenied {
+				partial.Result = resultDenied
+			}
+			if partial.CredID == "" && safeID(ev.CredID) != "" {
+				partial.CredID = ev.CredID
+				partial.CredType = ev.CredType
+			}
+			if partial.TargetID == "" && safeID(ev.AgentID) != "" {
+				partial.TargetID = ev.AgentID
+			}
+		}
+		ev, err := nextAudit(append(append([]auditEvent{}, s.audit...), events...), s.id, partial)
+		if err != nil {
+			return err
+		}
+		events = append(events, ev)
+	}
 	base := s.denials
 	if base == nil {
 		base = indexFromAudit(s.audit)
@@ -771,8 +929,18 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 	if err := validateDetection(det); err != nil {
 		return err
 	}
+	org, members, requests := s.org, s.members, s.requests
+	if shared != nil {
+		org, members, requests = shared.org, shared.members, shared.requests
+	}
+	if err := validateSharedState(org, members, requests, creds, agents, grants); err != nil {
+		return err
+	}
 	tip := events[len(events)-1]
-	plain, err := json.Marshal(document{Credentials: creds, Agents: agents, Grants: grants, Detection: det, HealthPolicy: pol})
+	plain, err := json.Marshal(document{
+		Credentials: creds, Agents: agents, Grants: grants, Detection: det, HealthPolicy: pol,
+		Organization: org, Memberships: members, Requests: requests,
+	})
 	if err != nil {
 		return ErrIO
 	}
@@ -789,7 +957,12 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 	h.Data = ct
 	h.AuditHead = tip.Hash
 	h.AuditSeq = tip.Seq
-	if err := writeTx(s.db, h, events, len(s.audit) == 0, s.commitFault); err != nil {
+	if err := writeTx(s.db, h, s.header.AuditSeq, events, len(s.audit) == 0, s.commitFault); err != nil {
+		if errors.Is(err, ErrCorrupt) {
+			// The durable sequence moved or the update was ignored. This
+			// cache must not approve, restore, or sign from its old view.
+			s.defunct = true
+		}
 		if errors.Is(err, ErrIO) {
 			s.logf("vault_write result=error")
 		}
@@ -813,6 +986,9 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 	s.detection = det
 	s.denials = nextDenials
 	s.hpolicy = pol
+	s.org = org
+	s.members = members
+	s.requests = requests
 	for _, row := range events {
 		applyNotice(s.notices, row)
 		s.suspensions.apply(s.audit, row)

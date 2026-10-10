@@ -266,9 +266,10 @@ func durationSeconds(d time.Duration) (int64, error) {
 // A lookup runs only when health policy has opted in. The checker is not
 // written into the vault.
 func (s *Session) SetCompromiseChecker(c CompromiseChecker) error {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return err
 	}
+	defer s.end()
 	s.checker = c
 	return nil
 }
@@ -276,6 +277,17 @@ func (s *Session) SetCompromiseChecker(c CompromiseChecker) error {
 // SetHealthPolicy persists thresholds and reevaluates current credentials.
 // Containment policy is not consulted. A failed commit leaves the previous policy.
 func (s *Session) SetHealthPolicy(p HealthPolicy) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	if s.shared() {
+		return s.denyAction(actionHealthPolicy, ErrDenied)
+	}
+	return s.setHealthPolicyUnlocked(p)
+}
+
+func (s *Session) setHealthPolicyUnlocked(p HealthPolicy) error {
 	if err := s.live(); err != nil {
 		return err
 	}
@@ -294,8 +306,15 @@ func (s *Session) SetHealthPolicy(p HealthPolicy) error {
 
 // Health returns one secret-free assessment. It does not reevaluate.
 func (s *Session) Health(id string) (Health, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return Health{}, err
+	}
+	defer s.end()
+	if s.shared() {
+		if err := s.denyAction(actionHealthGet, ErrDenied); err != nil {
+			return Health{}, err
+		}
+		return Health{}, ErrDenied
 	}
 	if safeID(id) == "" {
 		return Health{}, s.denyAction(actionHealthGet, ErrInvalid)
@@ -319,8 +338,15 @@ func (s *Session) Health(id string) (Health, error) {
 
 // ListHealth returns every assessment and the resolved policy.
 func (s *Session) ListHealth() ([]Health, HealthPolicy, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return nil, HealthPolicy{}, err
+	}
+	defer s.end()
+	if s.shared() {
+		if err := s.denyAction(actionHealthList, ErrDenied); err != nil {
+			return nil, HealthPolicy{}, err
+		}
+		return nil, HealthPolicy{}, ErrDenied
 	}
 	if err := s.persistEvent(actionHealthList, "", "", resultAllowed); err != nil {
 		return nil, HealthPolicy{}, err
@@ -336,8 +362,12 @@ func (s *Session) ListHealth() ([]Health, HealthPolicy, error) {
 // RefreshHealth reevaluates one credential, or every credential when id is empty.
 // It uses the session clock. There is no background schedule.
 func (s *Session) RefreshHealth(id string) error {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return err
+	}
+	defer s.end()
+	if s.shared() {
+		return s.denyAction(actionRefresh, ErrDenied)
 	}
 	if id != "" && safeID(id) == "" {
 		return s.denyAction(actionRefresh, ErrInvalid)
@@ -366,9 +396,20 @@ func (s *Session) RefreshHealth(id string) error {
 // Replace stores a new secret for an existing credential.
 // The id, type, creation time, and grants stay in place.
 func (s *Session) Replace(id string, secret []byte, opt LifecycleOptions) (Credential, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return Credential{}, err
 	}
+	defer s.end()
+	if s.shared() {
+		if err := s.denyAction(actionReplace, ErrDenied); err != nil {
+			return Credential{}, err
+		}
+		return Credential{}, ErrDenied
+	}
+	return s.replaceUnlocked(id, secret, opt)
+}
+
+func (s *Session) replaceUnlocked(id string, secret []byte, opt LifecycleOptions) (Credential, error) {
 	if safeID(id) == "" || validateSecret(secret) != nil {
 		return Credential{}, s.denyAction(actionReplace, ErrInvalid)
 	}
@@ -415,9 +456,20 @@ func (s *Session) Replace(id string, secret []byte, opt LifecycleOptions) (Crede
 // SetLifecycle updates lifecycle policy for one credential and reevaluates it.
 // The secret, type, id, and creation time stay in place.
 func (s *Session) SetLifecycle(id string, opt LifecycleOptions) (Credential, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return Credential{}, err
 	}
+	defer s.end()
+	if s.shared() {
+		if err := s.denyAction(actionLifecycle, ErrDenied); err != nil {
+			return Credential{}, err
+		}
+		return Credential{}, ErrDenied
+	}
+	return s.setLifecycleUnlocked(id, opt)
+}
+
+func (s *Session) setLifecycleUnlocked(id string, opt LifecycleOptions) (Credential, error) {
 	if safeID(id) == "" || !lifecycleTouched(opt) {
 		return Credential{}, s.denyAction(actionLifecycle, ErrInvalid)
 	}
@@ -446,26 +498,46 @@ func (s *Session) SetLifecycle(id string, opt LifecycleOptions) (Credential, err
 
 // RejectReplace records a secret-free replacement denial.
 func (s *Session) RejectReplace(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionReplace, cause)
 }
 
 // RejectLifecycle records a secret-free lifecycle denial.
 func (s *Session) RejectLifecycle(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionLifecycle, cause)
 }
 
 // RejectHealth records a secret-free health-read denial.
 func (s *Session) RejectHealth(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionHealthGet, cause)
 }
 
 // RejectRefresh records a secret-free refresh denial.
 func (s *Session) RejectRefresh(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionRefresh, cause)
 }
 
 // RejectHealthPolicy records a secret-free policy denial.
 func (s *Session) RejectHealthPolicy(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionHealthPolicy, cause)
 }
 
@@ -600,7 +672,7 @@ func (s *Session) commitPlans(rows []plannedRow, creds []credential, policy *hea
 		}
 		events = append(events, resp)
 	}
-	if err := s.commitBatch(events, creds, s.agents, s.grants, false, policy); err != nil {
+	if err := s.commitBatch(events, creds, s.agents, s.grants, false, policy, nil); err != nil {
 		return err
 	}
 	for _, ev := range events {
@@ -658,7 +730,11 @@ func (s *Session) checkCompromise(c credential, prev *storedHealth, pol resolved
 	}
 	prefix, suffix := splitHash(c.Secret)
 	seq := s.header.AuditSeq
-	suffixes, err := s.checker.Lookup(CompromiseQuery{Algorithm: "sha256", Prefix: prefix})
+	var suffixes []string
+	var err error
+	s.duringCallback(func() {
+		suffixes, err = s.checker.Lookup(CompromiseQuery{Algorithm: "sha256", Prefix: prefix})
+	})
 	if s.header.AuditSeq != seq {
 		return "", ErrConflict
 	}

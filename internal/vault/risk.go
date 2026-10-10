@@ -46,6 +46,9 @@ const (
 	ClassNotice = "notice"
 	// ClassHealth is an advisory credential-health alert. It does not contain.
 	ClassHealth = "health"
+	// ClassApproval is an owner notification for a shared grant approval.
+	// It references the audit row and does not contain.
+	ClassApproval = "approval"
 
 	// ponytail: one counter per agent over the last 32 broker rows, capped at
 	// 256 agents by dropping whoever has the oldest latest broker row.
@@ -73,7 +76,7 @@ func knownClass(class string) bool {
 	switch class {
 	case ClassRoutine, ClassExpectedDenial, ClassRepeatedDenial, ClassSecretProbe,
 		ClassOriginMismatch, ClassSSRF, ClassRedirectEscape, ClassPolicyViolation,
-		ClassReplay, ClassAuditTamper, ClassRate, ClassDestructive, ClassNotice, ClassHealth:
+		ClassReplay, ClassAuditTamper, ClassRate, ClassDestructive, ClassNotice, ClassHealth, ClassApproval:
 		return true
 	default:
 		return false
@@ -611,6 +614,11 @@ type AuditRecord struct {
 	RefSeq         uint64 `json:"ref_seq,omitempty"`
 	Reasons        string `json:"reasons,omitempty"`
 	CredGen        uint64 `json:"cred_gen,omitempty"`
+	ActorID        string `json:"actor_id,omitempty"`
+	OrgID          string `json:"org_id,omitempty"`
+	TargetID       string `json:"target_id,omitempty"`
+	RequestID      string `json:"request_id,omitempty"`
+	Decision       string `json:"decision,omitempty"`
 	Hash           string `json:"hash"`
 }
 
@@ -631,9 +639,17 @@ type AuditFilter struct {
 // AuditHistory returns a verified page of the audit chain.
 // It does not append a row and it does not return credential plaintext.
 func (s *Session) AuditHistory(f AuditFilter) ([]AuditRecord, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return nil, err
 	}
+	defer s.end()
+	if s.shared() {
+		return nil, ErrDenied
+	}
+	return s.auditHistoryUnlocked(f)
+}
+
+func (s *Session) auditHistoryUnlocked(f AuditFilter) ([]AuditRecord, error) {
 	if err := s.verified(); err != nil {
 		return nil, err
 	}
@@ -730,6 +746,17 @@ func noteAgentSuspension(suspended map[string]bool, events []auditEvent, ev audi
 // A non-empty hash that does not match the chain is ErrAudit.
 // An unknown sequence is ErrAuditNotFound.
 func (s *Session) AuditBySeq(seq uint64, hash string) (AuditRecord, error) {
+	if err := s.begin(); err != nil {
+		return AuditRecord{}, err
+	}
+	defer s.end()
+	if s.shared() {
+		return AuditRecord{}, ErrDenied
+	}
+	return s.auditBySeqUnlocked(seq, hash)
+}
+
+func (s *Session) auditBySeqUnlocked(seq uint64, hash string) (AuditRecord, error) {
 	if err := s.live(); err != nil {
 		return AuditRecord{}, err
 	}
@@ -785,6 +812,11 @@ func auditRecordClass(ev auditEvent, class Classification) AuditRecord {
 		RefSeq:         ev.RefSeq,
 		Reasons:        ev.Reasons,
 		CredGen:        ev.CredGen,
+		ActorID:        ev.ActorID,
+		OrgID:          ev.OrgID,
+		TargetID:       ev.TargetID,
+		RequestID:      ev.RequestID,
+		Decision:       ev.Decision,
 		Hash:           ev.Hash,
 	}
 }

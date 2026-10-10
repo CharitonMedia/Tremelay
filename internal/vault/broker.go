@@ -62,6 +62,14 @@ type brokerAttempt struct {
 // Credential bytes are copied only after policy, destination, and abuse-hook
 // checks succeed, and only into the outbound Authorization header.
 func (s *Session) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error) {
+	if err := s.begin(); err != nil {
+		return HTTPBrokerResponse{}, err
+	}
+	defer s.end()
+	return s.brokerHTTPUnlocked(agentID, req)
+}
+
+func (s *Session) brokerHTTPUnlocked(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error) {
 	status, err := s.brokerExchange(agentID, brokerAttempt{
 		credentialID: req.CredentialID,
 		method:       req.Method,
@@ -149,6 +157,7 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		partial.Result = resultUpstreamError
 		return s.failExchange(partial, call.method, ErrBrokerUpstream)
 	}
+	seq := s.header.AuditSeq
 	if err := s.abuseHook(AbuseDecision{
 		AgentID:      partial.AgentID,
 		GrantID:      partial.GrantID,
@@ -159,6 +168,9 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		partial.Result = resultDeniedAbuse
 		_, err := s.brokerAudit(partial, ErrDeniedAbuse)
 		return 0, err
+	}
+	if s.header.AuditSeq != seq || s.defunct {
+		return 0, ErrStale
 	}
 	secret, ok := s.copySecret(partial.CredID)
 	if !ok || !safeHeaderSecret(secret) {
@@ -346,6 +358,15 @@ func (s *Session) doBroker(req *http.Request, ip net.IP, port string) (*http.Res
 }
 
 func (s *Session) roundTrip(req *http.Request, ip net.IP, port string) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+	s.duringCallback(func() {
+		resp, err = s.roundTripInner(req, ip, port)
+	})
+	return resp, err
+}
+
+func (s *Session) roundTripInner(req *http.Request, ip net.IP, port string) (*http.Response, error) {
 	if s.httpDo != nil {
 		return s.httpDo(req)
 	}
