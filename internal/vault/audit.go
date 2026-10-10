@@ -540,15 +540,19 @@ func brokerOnlyResult(result string) bool {
 	}
 }
 
+func brokerOp(op string) bool {
+	return op == OpHTTPRequest || op == OpGitHubIssueState
+}
+
 // validBrokerAudit keeps broker rows on the closed result set. Free-form
 // caller text is not a legal result or operation.
 func validBrokerAudit(ev auditEvent) error {
-	if stringsContainComma(ev.Operation) || (ev.Operation != "" && ev.Operation != OpHTTPRequest) {
+	if stringsContainComma(ev.Operation) || (ev.Operation != "" && !brokerOp(ev.Operation)) {
 		return ErrAudit
 	}
 	switch ev.Result {
 	case resultAllowed, resultCompleted, resultUpstreamError, resultDeniedAbuse, resultDeniedDestructive:
-		if ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType == "" || ev.Operation != OpHTTPRequest {
+		if ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType == "" || !brokerOp(ev.Operation) {
 			return ErrAudit
 		}
 	case resultDenied:

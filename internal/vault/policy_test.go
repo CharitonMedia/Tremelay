@@ -32,31 +32,31 @@ func TestReclassifyScopeDeterministic(t *testing.T) {
 	legacy.ID = "dddddddddddddddddddddddddddddddd"
 	legacy.Resource = "svc:legacy"
 
-	class, id, ok := reclassifyScope([]grantRecord{get, post}, agent, cred, "api_key", http.MethodHead, "https://svc.example/v1/ping")
+	class, id, ok := reclassifyScope([]grantRecord{get, post}, agent, cred, "api_key", http.MethodHead, "https://svc.example/v1/ping", OpHTTPRequest)
 	if !ok || class != resultDeniedMethod || id != get.ID {
 		t.Fatalf("head class %s id %s ok %v", class, id, ok)
 	}
-	class, id, ok = reclassifyScope([]grantRecord{get, post}, agent, cred, "api_key", http.MethodDelete, "https://svc.example/v1/ping")
+	class, id, ok = reclassifyScope([]grantRecord{get, post}, agent, cred, "api_key", http.MethodDelete, "https://svc.example/v1/ping", OpHTTPRequest)
 	if !ok || class != resultDeniedMethod || id != post.ID {
 		t.Fatalf("delete class %s id %s ok %v", class, id, ok)
 	}
-	class, id, ok = reclassifyScope([]grantRecord{get}, agent, cred, "api_key", http.MethodDelete, "https://svc.example/v1/ping")
+	class, id, ok = reclassifyScope([]grantRecord{get}, agent, cred, "api_key", http.MethodDelete, "https://svc.example/v1/ping", OpHTTPRequest)
 	if !ok || class != resultDeniedAction || id != get.ID {
 		t.Fatalf("delete action class %s id %s ok %v", class, id, ok)
 	}
-	class, id, ok = reclassifyScope([]grantRecord{post}, agent, cred, "api_key", http.MethodPut, "https://svc.example/v1/ping")
+	class, id, ok = reclassifyScope([]grantRecord{post}, agent, cred, "api_key", http.MethodPut, "https://svc.example/v1/ping", OpHTTPRequest)
 	if !ok || class != resultDeniedMethod || id != post.ID {
 		t.Fatalf("put class %s id %s ok %v", class, id, ok)
 	}
-	class, id, ok = reclassifyScope([]grantRecord{other, get}, agent, cred, "api_key", http.MethodGet, "https://svc.example/v1/admin")
+	class, id, ok = reclassifyScope([]grantRecord{other, get}, agent, cred, "api_key", http.MethodGet, "https://svc.example/v1/admin", OpHTTPRequest)
 	if !ok || class != resultDeniedPath || id != get.ID {
 		t.Fatalf("path class %s id %s ok %v", class, id, ok)
 	}
-	class, id, ok = reclassifyScope([]grantRecord{other, legacy}, agent, cred, "api_key", http.MethodGet, "https://svc.example/v1/ping")
+	class, id, ok = reclassifyScope([]grantRecord{other, legacy}, agent, cred, "api_key", http.MethodGet, "https://svc.example/v1/ping", OpHTTPRequest)
 	if !ok || class != resultDeniedOrigin || id != other.ID {
 		t.Fatalf("origin class %s id %s ok %v", class, id, ok)
 	}
-	if _, _, ok = reclassifyScope([]grantRecord{legacy}, agent, cred, "api_key", http.MethodGet, "https://svc.example/v1/ping"); ok {
+	if _, _, ok = reclassifyScope([]grantRecord{legacy}, agent, cred, "api_key", http.MethodGet, "https://svc.example/v1/ping", OpHTTPRequest); ok {
 		t.Fatal("non-http resource was classified as an HTTP policy")
 	}
 	far := other
@@ -65,7 +65,7 @@ func TestReclassifyScopeDeterministic(t *testing.T) {
 	near := other
 	near.ID = "ffffffffffffffffffffffffffffffff"
 	near.Resource = "GET https://aaa.example/v1/ping"
-	class, id, ok = reclassifyScope([]grantRecord{near, far}, agent, cred, "api_key", http.MethodGet, "https://svc.example/v1/ping")
+	class, id, ok = reclassifyScope([]grantRecord{near, far}, agent, cred, "api_key", http.MethodGet, "https://svc.example/v1/ping", OpHTTPRequest)
 	if !ok || class != resultDeniedOrigin || id != far.ID {
 		t.Fatalf("tie class %s id %s ok %v", class, id, ok)
 	}

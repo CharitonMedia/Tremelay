@@ -227,6 +227,9 @@ func TestNoGetSecretMethod(t *testing.T) {
 	if _, ok := sessionType.MethodByName("BrokerHTTP"); ok {
 		t.Fatal("human session exports the broker")
 	}
+	if _, ok := sessionType.MethodByName("GitHubIssueState"); ok {
+		t.Fatal("human session exports the github issue read")
+	}
 	for _, typ := range []reflect.Type{sessionType, reflect.TypeOf(&AgentPrincipal{})} {
 		for i := 0; i < typ.NumMethod(); i++ {
 			name := strings.ToLower(typ.Method(i).Name)
@@ -236,7 +239,7 @@ func TestNoGetSecretMethod(t *testing.T) {
 		}
 	}
 	typ := reflect.TypeOf(&AgentPrincipal{})
-	if typ.NumMethod() != 3 {
+	if typ.NumMethod() != 4 {
 		t.Fatalf("agent method count %d", typ.NumMethod())
 	}
 	for i := 0; i < typ.NumMethod(); i++ {
@@ -281,6 +284,38 @@ func TestNoGetSecretMethod(t *testing.T) {
 			field := resp.Field(0)
 			if field.Name != "StatusCode" || field.Type.Kind() != reflect.Int {
 				t.Fatalf("broker response field %s", field.Name)
+			}
+		case "GitHubIssueState":
+			if m.Type.NumIn() != 2 || m.Type.NumOut() != 2 {
+				t.Fatalf("GitHubIssueState signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
+			}
+			ghReq := m.Type.In(1)
+			if ghReq != reflect.TypeOf(GitHubIssueRequest{}) || ghReq.NumField() != 4 {
+				t.Fatalf("github request %s", ghReq)
+			}
+			for j := 0; j < ghReq.NumField(); j++ {
+				f := ghReq.Field(j)
+				if f.Type.Kind() != reflect.String {
+					t.Fatal(f.Name)
+				}
+				switch f.Name {
+				case "CredentialID", "Owner", "Repository", "Number":
+				default:
+					t.Fatal(f.Name)
+				}
+			}
+			ghResp := m.Type.Out(0)
+			if ghResp != reflect.TypeOf(GitHubIssueState{}) || ghResp.NumField() != 4 {
+				t.Fatalf("github response %s", ghResp)
+			}
+			want := map[string]reflect.Kind{
+				"Number": reflect.Int64, "State": reflect.String, "Locked": reflect.Bool, "Comments": reflect.Int64,
+			}
+			for j := 0; j < ghResp.NumField(); j++ {
+				f := ghResp.Field(j)
+				if want[f.Name] != f.Type.Kind() {
+					t.Fatalf("github field %s", f.Name)
+				}
 			}
 		default:
 			t.Fatal(m.Name)

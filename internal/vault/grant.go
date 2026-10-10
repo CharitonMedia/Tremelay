@@ -18,6 +18,10 @@ const (
 	// OpSign authorizes a future signing operation. Authorizing it does not sign
 	// or reveal key material.
 	OpSign = "sign"
+	// OpGitHubIssueState authorizes one typed GitHub issue-state read.
+	// It does not authorize BrokerHTTP, and an http_request grant does not
+	// authorize this response projection.
+	OpGitHubIssueState = "github_issue_state"
 
 	// GrantActive, GrantRevoked, and GrantExpired are capability lifecycle states.
 	GrantActive  = "active"
@@ -27,7 +31,7 @@ const (
 
 // grantOperations is the closed set of capability operations. Secret retrieval
 // is not in the set.
-var grantOperations = []string{OpHTTPRequest, OpSign}
+var grantOperations = []string{OpHTTPRequest, OpSign, OpGitHubIssueState}
 
 // GrantOperations returns a copy of the operation allowlist.
 func GrantOperations() []string {
@@ -105,6 +109,7 @@ type capabilityView interface {
 	listCapabilities(agentID string) ([]Capability, error)
 	authorizeCapability(agentID, credentialID, operation, resource string) (string, error)
 	brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error)
+	githubIssueState(agentID string, req GitHubIssueRequest) (GitHubIssueState, error)
 }
 
 type agentBinder struct {
@@ -130,6 +135,13 @@ func (b agentBinder) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrok
 		return HTTPBrokerResponse{}, ErrUnauthenticated
 	}
 	return b.s.brokerHTTP(agentID, req)
+}
+
+func (b agentBinder) githubIssueState(agentID string, req GitHubIssueRequest) (GitHubIssueState, error) {
+	if b.s == nil {
+		return GitHubIssueState{}, ErrUnauthenticated
+	}
+	return b.s.githubIssueState(agentID, req)
 }
 
 // AgentPrincipal is the agent-facing handle for one identity.
@@ -170,12 +182,23 @@ func (a *AgentPrincipal) Authorize(credentialID, operation, resource string) (st
 
 // BrokerHTTP performs one authorized HTTP request with a stored credential.
 // The credential is applied inside the broker. The request and response carry
-// no credential plaintext, headers, or upstream URL dump.
+// no credential plaintext, headers, or upstream URL dump. The response is a
+// status code. It does not return a GitHub issue summary.
 func (a *AgentPrincipal) BrokerHTTP(req HTTPBrokerRequest) (HTTPBrokerResponse, error) {
 	if a == nil || a.view == nil {
 		return HTTPBrokerResponse{}, ErrUnauthenticated
 	}
 	return a.view.brokerHTTP(a.id, req)
+}
+
+// GitHubIssueState reads one authorized GitHub issue and returns its state
+// summary. The credential stays inside the broker. An http_request grant does
+// not authorize this call.
+func (a *AgentPrincipal) GitHubIssueState(req GitHubIssueRequest) (GitHubIssueState, error) {
+	if a == nil || a.view == nil {
+		return GitHubIssueState{}, ErrUnauthenticated
+	}
+	return a.view.githubIssueState(a.id, req)
 }
 
 // CreateAgent persists a new agent principal.
