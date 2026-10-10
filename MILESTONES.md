@@ -59,6 +59,10 @@ The reference capability is a scoped issue-state read. An agent with an expiring
 
 **Goal:** Allow authorized signing operations while keeping private key material inside Tremelay.
 
+The local slice is one Ed25519 attestation. An agent with an expiring `local_artifact_attest` grant for one credential and one resource receives a 64-byte signature and the public verification metadata for a bounded payload. The private key stays in the vault. A `sign`, `http_request`, or `github_issue_state` grant does not authorize it, including after the vault is reopened. Replacing the key bytes under the same credential id does not move the grant onto the new key. Revoking or expiring the grant stops later signatures and does not revoke a signature already returned. Acceptance is the synthetic test in [ADR 0012](docs/adr/0012-local-ed25519-attestation.md) and [docs/m8-local-attest.md](docs/m8-local-attest.md). That demonstration uses a disposable key and does not call a network.
+
+SSH-agent compatibility, SSH wire format, agent forwarding, OS sockets, and live keys are not part of this slice.
+
 ## M9 — Multi-user and shared vaults
 
 **Goal:** Support organizations, ownership, shared vaults, recovery, role separation, and approvals without weakening earlier invariants.

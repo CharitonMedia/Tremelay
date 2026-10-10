@@ -2,9 +2,10 @@
 //
 // Retrieval requires an unlocked session, which requires the vault passphrase.
 // Agent principals and capability grants are a separate authority from that
-// human session. AgentPrincipal can list capabilities, authorize them, and
-// invoke the HTTP broker for one identity. It cannot retrieve credential
-// plaintext. This package must not grow an agent-facing raw-secret retrieval API.
+// human session. AgentPrincipal can list capabilities, authorize them, invoke
+// the HTTP broker, and request one local Ed25519 attestation for one identity.
+// It cannot retrieve credential plaintext. This package must not grow an
+// agent-facing raw-secret retrieval API.
 package vault
 
 import (
@@ -73,6 +74,7 @@ var credentialTypes = []string{
 	"database",
 	"totp",
 	"generic",
+	CredTypeEd25519,
 }
 
 // CredentialTypes returns a copy of the credential-type allowlist.
@@ -138,6 +140,11 @@ var (
 	// ErrBrokerUpstream means the upstream call failed or could not be completed.
 	// The error text is fixed and does not include the credential or the URL.
 	ErrBrokerUpstream = errors.New("broker upstream failed")
+	// ErrDeniedKey means the stored key is not the key identity named by the grant.
+	ErrDeniedKey = errors.New("denied_key")
+	// ErrSignFailed means a local attestation did not produce a signature.
+	// The text is fixed. It does not include key bytes, payloads, or parser output.
+	ErrSignFailed = errors.New("signing failed")
 	// ErrConflict means a credential changed while it was being evaluated.
 	// The in-flight evaluation is discarded. The text is fixed.
 	ErrConflict = errors.New("credential changed during evaluation")
@@ -253,6 +260,10 @@ type Session struct {
 	// commitFault, when set, fails a credential-state transaction before commit.
 	// Tests use it to prove rollback. Production leaves it nil.
 	commitFault func() error
+	// attestFault, when set, runs after the local-attestation allowed row
+	// commits and before Ed25519 signing. A non-nil error withholds the
+	// signature. Tests use it. Production leaves it nil.
+	attestFault func() error
 	// clock, when set, is the trusted time for grant expiry and capability
 	// status. Production leaves it nil and uses time.Now. Agent-facing
 	// methods cannot set it.

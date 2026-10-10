@@ -25,6 +25,7 @@ const (
 	actionAuthorize    = "capability_authorize"
 	actionCapList      = "capability_list"
 	actionBroker       = "broker_http"
+	actionLocalAttest  = "local_attest"
 	actionNotify       = "notify"
 	actionContain      = "contain"
 	actionRespond      = "respond"
@@ -58,6 +59,7 @@ const (
 	resultDeniedDestructive = "denied_destructive"
 	resultUpstreamError     = "upstream_error"
 	resultCompleted         = "completed"
+	resultDeniedKey         = "denied_key"
 	resultDelivered         = "delivered"
 	resultFailed            = "failed"
 	resultAttempted         = "attempted"
@@ -338,7 +340,7 @@ func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPut, actionGet, actionList,
 		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
-		actionBroker, actionNotify, actionContain, actionRespond,
+		actionBroker, actionLocalAttest, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
 		actionHealthGet, actionHealthList:
 		return true
@@ -353,7 +355,7 @@ func noticeAction(action string) bool {
 
 func capabilityAction(action string) bool {
 	switch action {
-	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker:
+	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker, actionLocalAttest:
 		return true
 	default:
 		return false
@@ -401,7 +403,11 @@ func validAuditShape(ev auditEvent) error {
 	case resultAllowed, resultDenied, resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,
 		resultDeniedScope, resultDeniedExpired, resultDeniedRevoked, resultDeniedMissing, resultDeniedSecret:
 	default:
-		if ev.Action != actionBroker || !brokerOnlyResult(ev.Result) {
+		switch {
+		case ev.Action == actionLocalAttest && localAttestResult(ev.Result):
+		case ev.Action == actionAuthorize && (ev.Result == resultFailed || ev.Result == resultDeniedKey):
+		case ev.Action == actionBroker && brokerOnlyResult(ev.Result):
+		default:
 			return ErrAudit
 		}
 	}
@@ -428,8 +434,15 @@ func validAuditShape(ev auditEvent) error {
 		if stringsContainComma(ev.Operation) {
 			return ErrAudit
 		}
-		if ev.Result == resultAllowed && (ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType == "" || ev.Operation == "") {
-			return ErrAudit
+		switch ev.Result {
+		case resultDeniedKey, resultFailed:
+			if ev.Operation != OpLocalArtifactAttest || ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType != CredTypeEd25519 {
+				return ErrAudit
+			}
+		default:
+			if ev.Result == resultAllowed && (ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType == "" || ev.Operation == "") {
+				return ErrAudit
+			}
 		}
 	case actionCapList:
 		if ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
@@ -443,6 +456,10 @@ func validAuditShape(ev auditEvent) error {
 		}
 	case actionBroker:
 		if err := validBrokerAudit(ev); err != nil {
+			return err
+		}
+	case actionLocalAttest:
+		if err := validLocalAttestAudit(ev); err != nil {
 			return err
 		}
 	default:
@@ -542,6 +559,38 @@ func brokerOnlyResult(result string) bool {
 
 func brokerOp(op string) bool {
 	return op == OpHTTPRequest || op == OpGitHubIssueState
+}
+
+func localAttestResult(result string) bool {
+	switch result {
+	case resultCompleted, resultFailed, resultDeniedKey:
+		return true
+	default:
+		return false
+	}
+}
+
+// validLocalAttestAudit keeps attestation rows on fixed codes.
+// The operation is only local_artifact_attest. Caller payload is not a field.
+func validLocalAttestAudit(ev auditEvent) error {
+	if stringsContainComma(ev.Operation) || (ev.Operation != "" && ev.Operation != OpLocalArtifactAttest) {
+		return ErrAudit
+	}
+	switch ev.Result {
+	case resultAllowed, resultCompleted, resultFailed, resultDeniedKey:
+		if ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType != CredTypeEd25519 || ev.Operation != OpLocalArtifactAttest {
+			return ErrAudit
+		}
+	case resultDenied:
+		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
+			return ErrAudit
+		}
+	case resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,
+		resultDeniedScope, resultDeniedExpired, resultDeniedRevoked, resultDeniedMissing:
+	default:
+		return ErrAudit
+	}
+	return nil
 }
 
 // validBrokerAudit keeps broker rows on the closed result set. Free-form

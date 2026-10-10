@@ -338,10 +338,20 @@ func baseClass(ev auditEvent) Classification {
 	case resultDeniedDestructive:
 		return Classification{Class: ClassDestructive, Severity: SeverityHigh}
 	case resultDeniedRevoked:
-		if ev.Action == actionBroker || ev.Action == actionAuthorize {
+		if ev.Action == actionBroker || ev.Action == actionAuthorize || ev.Action == actionLocalAttest {
 			return Classification{Class: ClassReplay, Severity: SeverityHigh}
 		}
 		return Classification{Class: ClassExpectedDenial, Severity: SeverityLow}
+	case resultDeniedKey:
+		return Classification{Class: ClassExpectedDenial, Severity: SeverityLow}
+	case resultFailed:
+		// Notify rows are classified above. A failed attestation is an
+		// ordinary non-completion. It is not audit tampering and it does not
+		// enter the broker denial lookback.
+		if ev.Action == actionLocalAttest || ev.Action == actionAuthorize {
+			return Classification{Class: ClassExpectedDenial, Severity: SeverityLow}
+		}
+		return Classification{Class: ClassAuditTamper, Severity: SeverityCritical}
 	case resultDenied, resultDeniedAgent, resultDeniedCredential, resultDeniedOperation,
 		resultDeniedScope, resultDeniedExpired, resultDeniedMissing, resultDeniedDestination,
 		resultDeniedMalformed:
