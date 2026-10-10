@@ -65,6 +65,12 @@ A shared grant is usable only while the requester and the approving owner remain
 
 This does not decide production enrollment, recovery, offboarding, or independent custody. Those remain open under M9.
 
+## Local snapshot reference limits
+
+M9b copies one local SQLite vault with the driver's online backup API and restores that copy only when the host presents the existing passphrase and a checkpoint kept outside the file. The checkpoint binds vault identity, organization identity when the snapshot is shared, the audit tip including a valid locked-denial suffix, and the artifact digest. A filename, a sibling manifest, or a successful decrypt does not establish that the snapshot is current.
+
+The host is trusted to supply the current checkpoint, quiesce the source, and run one active instance. This reference does not enforce those duties across other processes or machines. An old authentic snapshot and the checkpoint issued for it still match. That pair is not detected as stale. A checkpoint the host treats as newer rejects every older artifact. Restore does not merge stale state, reset membership, reissue authority, or fail over. It does not recover a lost passphrase, a lost owner, or a compromised host. Backup and restore are not agent or member operations and do not append an audit row. A later unlock of a restored file remains an ordinary open.
+
 ## Out of scope for initial milestone
 
 The first vertical slice does not promise protection against an attacker with arbitrary kernel/hypervisor access to the host containing decrypted secrets.

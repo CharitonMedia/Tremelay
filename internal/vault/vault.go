@@ -158,6 +158,9 @@ var (
 	// ErrStale means this unlocked session lost a race with a newer commit.
 	// It will not apply cached authority or return a signature. Reopen to continue.
 	ErrStale = errors.New("vault session is stale")
+	// ErrCheckpoint means the host-supplied checkpoint does not describe the
+	// artifact. The text is fixed. It is not an authentication success.
+	ErrCheckpoint = errors.New("checkpoint rejected")
 )
 
 // Lifecycle is non-secret metadata stored with a credential.

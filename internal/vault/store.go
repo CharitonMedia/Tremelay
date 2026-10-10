@@ -116,6 +116,14 @@ func createDB(path string) (*sql.DB, error) {
 }
 
 func openDB(path string) (*sql.DB, error) {
+	return openSQLite(path, false)
+}
+
+func openDBRead(path string) (*sql.DB, error) {
+	return openSQLite(path, true)
+}
+
+func openSQLite(path string, readonly bool) (*sql.DB, error) {
 	if path == "" {
 		return nil, ErrInvalid
 	}
@@ -125,7 +133,13 @@ func openDB(path string) (*sql.DB, error) {
 		}
 		return nil, ErrIO
 	}
-	dsn, err := sqliteDSN(path)
+	var dsn string
+	var err error
+	if readonly {
+		dsn, err = sqliteReadDSN(path)
+	} else {
+		dsn, err = sqliteDSN(path)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -144,6 +158,30 @@ func openDB(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+func sqliteReadDSN(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", ErrInvalid
+	}
+	slash := filepath.ToSlash(abs)
+	if !strings.HasPrefix(slash, "/") {
+		slash = "/" + slash
+	}
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Set("_defensive", "1")
+	// No journal_mode or txlock setter. Those can write, and this connection
+	// must not change the file. synchronous is read back by assertDurable.
+	for _, pragma := range []string{
+		"busy_timeout(5000)",
+		"foreign_keys(ON)",
+		"query_only(ON)",
+	} {
+		q.Add("_pragma", pragma)
+	}
+	return (&url.URL{Scheme: "file", Path: slash, RawQuery: q.Encode()}).String(), nil
 }
 
 func assertDurable(db *sql.DB) error {
@@ -183,7 +221,21 @@ func assertDurable(db *sql.DB) error {
 }
 
 func loadVault(path string) (*sql.DB, fileHeader, []auditEvent, error) {
-	db, err := openDB(path)
+	return loadVaultMode(path, false)
+}
+
+func loadVaultRead(path string) (*sql.DB, fileHeader, []auditEvent, error) {
+	return loadVaultMode(path, true)
+}
+
+func loadVaultMode(path string, readonly bool) (*sql.DB, fileHeader, []auditEvent, error) {
+	var db *sql.DB
+	var err error
+	if readonly {
+		db, err = openDBRead(path)
+	} else {
+		db, err = openDB(path)
+	}
 	if err != nil {
 		return nil, fileHeader{}, nil, err
 	}
@@ -196,9 +248,14 @@ func loadVault(path string) (*sql.DB, fileHeader, []auditEvent, error) {
 		db.Close()
 		return nil, fileHeader{}, nil, err
 	}
-	// M1–M5 files predate later audit columns. Add the missing columns
-	// before the read so an older vault still unlocks. Hashes are not rewritten.
-	if err := migrateAudit(db); err != nil {
+	// A read-only open must not migrate. M1–M5 files still unlock through
+	// loadVault, which adds missing columns without rewriting hashes.
+	if readonly {
+		err = auditSchemaReady(db)
+	} else {
+		err = migrateAudit(db)
+	}
+	if err != nil {
 		db.Close()
 		return nil, fileHeader{}, nil, err
 	}
@@ -262,6 +319,23 @@ func auditColumnSet(db *sql.DB) (map[string]bool, error) {
 		return nil, ErrCorrupt
 	}
 	return cols, nil
+}
+
+func auditSchemaReady(db *sql.DB) error {
+	cols, err := auditColumnSet(db)
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{
+		"seq", "time", "action", "vault_id", "credential_id", "credential_type", "result", "prev_hash", "hash",
+		"agent_id", "grant_id", "operation", "v", "class", "ref_seq", "reasons", "cred_gen",
+		"actor_id", "org_id", "target_id", "request_id", "decision",
+	} {
+		if !cols[name] {
+			return ErrCorrupt
+		}
+	}
+	return nil
 }
 
 // migrateAudit adds audit columns introduced after M1. Existing rows keep
