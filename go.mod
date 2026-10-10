@@ -4,8 +4,8 @@ go 1.26.9
 
 require (
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	golang.org/x/crypto v0.41.0
-	golang.org/x/term v0.34.0
+	golang.org/x/crypto v0.56.0
+	golang.org/x/term v0.45.0
 	modernc.org/sqlite v1.60.1
 )
 

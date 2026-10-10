@@ -26,15 +26,33 @@ import (
 func TestSSHUserAuthInterop(t *testing.T) {
 	env := newSSHEnv(t)
 	client, server := net.Pipe()
+	done := make(chan struct{})
+	var serveErr error
+	before := runtime.NumGoroutine()
 	t.Cleanup(func() {
 		client.Close()
 		server.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("Serve did not stop after transport close")
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+			runtime.Gosched()
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := runtime.NumGoroutine(); got > before {
+			t.Errorf("goroutines %d -> %d", before, got)
+		}
 	})
-	before := runtime.NumGoroutine()
-	done := make(chan error, 1)
 	go func() {
-		done <- env.stream.Serve(server)
+		serveErr = env.stream.Serve(server)
+		close(done)
 	}()
+	if err := client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	peer := agent.NewClient(client)
 	keys, err := peer.List()
 	if err != nil || len(keys) != 0 {
@@ -84,17 +102,60 @@ func TestSSHUserAuthInterop(t *testing.T) {
 	if bytes.HasPrefix(preimage, []byte(attestMagic)) || ed25519.Verify(env.userPub, []byte(attestMagic), sig.Blob) {
 		t.Fatal("SSH preimage used the local-attestation domain")
 	}
+	// The official client pipelines requests on io.ReadWriteCloser transports.
+	// Exercise both response shapes concurrently; Serve must still serialize
+	// credential use and record every signature release.
+	const concurrentRequests = 32
+	results := make(chan error, concurrentRequests)
+	start := make(chan struct{})
+	for i := 0; i < concurrentRequests; i++ {
+		go func() {
+			<-start
+			if i%2 == 0 {
+				keys, err := peer.List()
+				if err == nil && (len(keys) != 1 || keys[0].Comment != "" || !bytes.Equal(keys[0].Blob, env.userBlob)) {
+					err = errors.New("concurrent list returned a different identity")
+				}
+				results <- err
+				return
+			}
+			sig, err := peer.Sign(sshPub, preimage)
+			if err == nil {
+				err = parsed.Verify(preimage, sig)
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	completionDeadline := time.NewTimer(5 * time.Second)
+	defer completionDeadline.Stop()
+	for i := 0; i < concurrentRequests; i++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Errorf("concurrent request: %v", err)
+			}
+		case <-completionDeadline.C:
+			t.Fatal("concurrent requests did not complete")
+		}
+	}
 	client.Close()
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not stop after client close")
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
-		runtime.Gosched()
-		time.Sleep(10 * time.Millisecond)
+	if serveErr != nil {
+		t.Fatal(serveErr)
 	}
-	if got := runtime.NumGoroutine(); got > before {
-		t.Fatalf("goroutines %d -> %d", before, got)
+	if got := sshCount(t, env.path, resultCompleted); got != 1+concurrentRequests/2 {
+		t.Fatalf("completed signature releases %d", got)
+	}
+	if got := sshCount(t, env.path, resultAllowed); got != 3+concurrentRequests {
+		t.Fatalf("allowed bind, lists and signatures %d", got)
+	}
+	if _, err := peer.List(); err == nil {
+		t.Fatal("closed client accepted another request")
 	}
 	env.assertClean(t, preimage, sessionID, sig.Blob)
 }
