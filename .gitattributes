@@ -1,0 +1,3 @@
+# Pinned CycloneDX schema bytes are content-addressed. Checkout must not rewrite newlines.
+tools/schema/cyclonedx/** -text
+tools/bootstrap-candidate.sh text eol=lf
