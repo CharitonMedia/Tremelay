@@ -46,6 +46,10 @@ const (
 	maxSSHExtName     = 64
 )
 
+// errSSHTransport is the fixed failure for a stream read or write.
+// The reader or writer error is not returned.
+var errSSHTransport = errors.New("ssh stream failed")
+
 // SSHUserAuth is one protocol stream bound to one existing principal and one
 // selected ssh_userauth grant. Wire messages cannot choose the principal,
 // grant, credential, resource, clock, or host key. The unlocked Session is not
@@ -99,9 +103,11 @@ func (a *AgentPrincipal) SSHUserAuth(grantID string) (*SSHUserAuth, error) {
 }
 
 // Serve reads SSH agent frames from rw until EOF. A clean EOF before the next
-// frame returns nil. A partial frame, an oversize length, an audit failure, or
-// a locked session returns a fixed error and writes no signature. Close runs
-// on every return and wipes the binding.
+// frame returns nil. EOF after a length, a partial frame, or an oversize
+// length returns ErrInvalid. Any other read or write failure returns
+// errSSHTransport. Neither path returns the reader or writer error. An audit
+// failure or a locked session returns that fixed error and writes no
+// signature. Close runs on every return and wipes the binding.
 func (a *SSHUserAuth) Serve(rw io.ReadWriter) error {
 	if a == nil || a.broker == nil {
 		return ErrUnauthenticated
@@ -122,7 +128,7 @@ func (a *SSHUserAuth) Serve(rw io.ReadWriter) error {
 		}
 		if _, werr := rw.Write(frameSSH(resp)); werr != nil {
 			wipe(resp)
-			return werr
+			return errSSHTransport
 		}
 		wipe(resp)
 	}
@@ -166,13 +172,13 @@ func (a *SSHUserAuth) noteFrameErr(err error) error {
 		if rec := a.broker.sshRecord(ev); rec != nil {
 			return rec
 		}
-		return err
+		return fixedStreamErr(err)
 	}
 	ev.Result = resultDenied
 	if rec := a.broker.sshRecord(ev); rec != nil {
 		return rec
 	}
-	return err
+	return fixedStreamErr(err)
 }
 
 func (a *SSHUserAuth) handle(body []byte) ([]byte, error) {
@@ -259,12 +265,17 @@ func (a *SSHUserAuth) extension(body []byte, ev auditEvent, pinned []byte) ([]by
 	if !ok || !sshBytesEq(host, pinned) || !verifyHostBind(pinned, sid, sig) {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
+	// The grant check already read the vault key. Record that attempt before
+	// the proof becomes authority. allowed is not a signature release.
+	resp, err := a.record(ev, resultAllowed, []byte{sshAgentSuccess})
+	if err != nil {
+		return nil, err
+	}
 	a.hostKey = dup(host)
 	a.sessionID = dup(sid)
 	a.hostSig = dup(sig)
 	a.bound = true
-	// A successful bind is not a signature release and writes no allow row.
-	return []byte{sshAgentSuccess}, nil
+	return resp, nil
 }
 
 func (a *SSHUserAuth) deny(result string) ([]byte, error) {
@@ -291,6 +302,27 @@ func (a *SSHUserAuth) record(ev auditEvent, result string, resp []byte) ([]byte,
 
 func stopSSH(err error) bool {
 	return errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrAudit) || errors.Is(err, ErrIO)
+}
+
+// fixedStreamErr drops reader and writer text. A short frame is ErrInvalid.
+// Any other transport failure is errSSHTransport.
+func fixedStreamErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrUnauthenticated):
+		return ErrUnauthenticated
+	case errors.Is(err, ErrAudit):
+		return ErrAudit
+	case errors.Is(err, ErrIO):
+		return ErrIO
+	case errors.Is(err, errSSHTransport):
+		return errSSHTransport
+	case errors.Is(err, ErrInvalid), errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return ErrInvalid
+	default:
+		return errSSHTransport
+	}
 }
 
 func (b agentBinder) sshConstruct(agentID, grantID string) error {
@@ -879,7 +911,10 @@ func appendSSHString(dst, v []byte) []byte {
 func readSSHFrame(r io.Reader) ([]byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
+		if err == io.EOF {
+			return nil, io.EOF
+		}
+		return nil, fixedStreamErr(err)
 	}
 	n := binary.BigEndian.Uint32(hdr[:])
 	if n == 0 || n > MaxSSHFrame {
@@ -888,7 +923,7 @@ func readSSHFrame(r io.Reader) ([]byte, error) {
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		wipe(buf)
-		return nil, err
+		return nil, fixedStreamErr(err)
 	}
 	return buf, nil
 }

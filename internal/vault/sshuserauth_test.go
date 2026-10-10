@@ -552,14 +552,20 @@ func TestSSHUserAuthMalformed(t *testing.T) {
 		t.Fatal("oversize frame consumed the payload")
 	}
 	short := bytes.NewReader([]byte{0, 0, 0, 10, 1, 2})
-	if _, err := readSSHFrame(short); !errors.Is(err, io.ErrUnexpectedEOF) {
+	if _, err := readSSHFrame(short); !errors.Is(err, ErrInvalid) {
 		t.Fatal(err)
+	}
+	if _, err := readSSHFrame(bytes.NewReader([]byte{0, 0, 0, 4})); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("length then EOF: %v", err)
+	}
+	if _, err := readSSHFrame(bytes.NewReader(nil)); err != io.EOF {
+		t.Fatalf("clean EOF: %v", err)
 	}
 	lengths := []uint32{0, 1 << 20, 1 << 31, 0xfffffffe}
 	for _, ln := range lengths {
 		var hdr [4]byte
 		binary.BigEndian.PutUint32(hdr[:], ln)
-		if _, err := readSSHFrame(bytes.NewReader(hdr[:])); !errors.Is(err, ErrInvalid) && !errors.Is(err, io.EOF) {
+		if _, err := readSSHFrame(bytes.NewReader(hdr[:])); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("length %d %v", ln, err)
 		}
 	}
@@ -588,7 +594,7 @@ func TestSSHUserAuthMalformed(t *testing.T) {
 		t.Fatalf("frames %d", len(frames))
 	}
 
-	fail := &failWriter{failOn: 2}
+	fail := &failWriter{failOn: 2, secret: "writer-sentinel-" + randHex(t, 8)}
 	var again bytes.Buffer
 	again.Write(frameSSH(env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, sid), 0)))
 	again.Write(frameSSH(env.signBody(env.userBlob, env.preimage(sid, env.user, env.userBlob, env.hostBlob), 0)))
@@ -600,7 +606,7 @@ func TestSSHUserAuthMalformed(t *testing.T) {
 		io.Reader
 		io.Writer
 	}{&again, fail})
-	if !errors.Is(err, io.ErrClosedPipe) {
+	if !errors.Is(err, errSSHTransport) || strings.Contains(err.Error(), fail.secret) {
 		t.Fatal(err)
 	}
 	if bytes.Contains(fail.got.Bytes(), []byte(sshAlgoEd25519)) {
@@ -609,6 +615,93 @@ func TestSSHUserAuthMalformed(t *testing.T) {
 	if sshCount(t, env.path, resultCompleted) == 0 {
 		t.Fatal("transport failure rewrote a completed release")
 	}
+	if bytes.Contains(readAll(t, env.path), []byte(fail.secret)) {
+		t.Fatal("writer error stored")
+	}
+}
+
+func TestSSHUserAuthBindAuditAndTruncatedFrame(t *testing.T) {
+	env := newSSHEnv(t)
+	sid := env.sessionID(16)
+	allowed := sshCount(t, env.path, resultAllowed)
+	env.mustBind(t, sid)
+	if sshCount(t, env.path, resultAllowed) != allowed+1 || sshCount(t, env.path, resultCompleted) != 0 {
+		t.Fatalf("bind audit allowed %d completed %d", sshCount(t, env.path, resultAllowed), sshCount(t, env.path, resultCompleted))
+	}
+	env.assertClean(t, nil, sid, nil)
+
+	stream := env.secondStream(t)
+	env.session.commitFault = func() error { return errors.New("induced " + env.user) }
+	resp, err := stream.roundTrip(env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, sid), 0))
+	env.session.commitFault = nil
+	if resp != nil || !errors.Is(err, ErrAudit) || stream.bound || strings.Contains(err.Error(), env.user) {
+		t.Fatalf("bind audit failure resp %x bound %v err %v", resp, stream.bound, err)
+	}
+	if sshCount(t, env.path, resultAllowed) != allowed+1 {
+		t.Fatal("failed bind wrote allowed")
+	}
+
+	denied := sshCount(t, env.path, resultDenied)
+	fresh, err := env.principal.SSHUserAuth(env.grant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Serve(bytes.NewBuffer(nil)); err != nil {
+		t.Fatalf("clean EOF %v", err)
+	}
+	if sshCount(t, env.path, resultDenied) != denied {
+		t.Fatal("clean EOF recorded a denial")
+	}
+
+	var truncated bytes.Buffer
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], 4)
+	truncated.Write(hdr[:])
+	cut, err := env.principal.SSHUserAuth(env.grant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cut.Serve(&truncated)
+	if !errors.Is(err, ErrInvalid) || err.Error() != ErrInvalid.Error() {
+		t.Fatalf("truncated body %v", err)
+	}
+	if sshCount(t, env.path, resultDenied) != denied+1 {
+		t.Fatal("truncated frame was not denied")
+	}
+
+	var partial bytes.Buffer
+	partial.Write([]byte{0, 0})
+	mid, err := env.principal.SSHUserAuth(env.grant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mid.Serve(&partial); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("partial header %v", err)
+	}
+
+	sentinel := "STREAM-SENTINEL-" + randHex(t, 16)
+	leak := &sentinelStream{text: sentinel}
+	noisy, err := env.principal.SSHUserAuth(env.grant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = noisy.Serve(leak)
+	if !errors.Is(err, errSSHTransport) || strings.Contains(err.Error(), sentinel) {
+		t.Fatalf("reader error %v", err)
+	}
+	env.assertClean(t, []byte(sentinel), sid, nil)
+}
+
+type sentinelStream struct {
+	text string
+}
+
+func (s *sentinelStream) Read([]byte) (int, error) {
+	return 0, errors.New(s.text)
+}
+
+func (s *sentinelStream) Write([]byte) (int, error) {
+	return 0, errors.New(s.text)
 }
 
 func TestSSHUserAuthAuditBoundaries(t *testing.T) {
@@ -1041,12 +1134,13 @@ type failWriter struct {
 	got    bytes.Buffer
 	failOn int
 	n      int
+	secret string
 }
 
 func (f *failWriter) Write(p []byte) (int, error) {
 	f.n++
 	if f.n >= f.failOn {
-		return 0, io.ErrClosedPipe
+		return 0, errors.New(f.secret)
 	}
 	return f.got.Write(p)
 }
