@@ -33,6 +33,7 @@ jobs:
     concurrency:
       group: tremelay-worker-admission
       cancel-in-progress: false
+      queue: max
     env:
       TREMELAY_WORKER_ADMISSION: serialized-v1
     runs-on: ubuntu-latest

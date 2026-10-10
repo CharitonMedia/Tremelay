@@ -48,8 +48,13 @@ All-state scans read only metadata/receipts; only eligible current checkpoints
 can consume the existing model budget. Every create path (initial goal, ordinary
 review, checkpoint supervisor and opted-in generic remediation), plus ownership
 recovery/completion, uses one job-level `tremelay-worker-admission` group with
-`cancel-in-progress: false`. The supervisor keeps its different workflow-level
-controller group. The fixed `serialized-v1` contract replaces its old coarse
+`cancel-in-progress: false` and `queue: max`. All six admission jobs use this
+configuration: `implement`, `review-launch`, `recover-review` and `request-codex`
+in `goal.yml`, `remediate` in `codex-cursor-remediation.yml`, and `supervise` in
+`checkpoint-supervisor.yml`. The supervisor keeps its separate workflow-level
+`tremelay-checkpoint-supervisor` group unchanged, with `cancel-in-progress: false`
+and the default single pending slot to coalesce controller wakes.
+The fixed `serialized-v1` contract replaces its old coarse
 active-workflow gate: queued jobs cannot dispatch while admission is held.
 
 Initial goal creates reserve a deterministic agent ID in a source-issue comment
@@ -77,13 +82,28 @@ remain status-only. Unknown legacy
 generic forms remain blocked for explicit assessment; the deployment inventory
 contained no such records. Missing service access never means terminal.
 
-GitHub may replace an unstarted pending job in a shared group. Durable receipts
-preserve safety across that cancellation, while scheduled completion of eligible ordinary claims and the explicit
-recovery inputs retain a route to progress. Superseded unstarted goals must be
-requeued only after existing ownership is settled. Previously created branches
-may contain older workflow YAML: a main-only merge does not retroactively replace
-that definition. Retired branches remain unqueued; future goals start from
-patched main. No production launch is part of patch validation.
+GitHub's default single pending slot can replace an actionable review job before
+its first step, leaving no durable claim for receipt recovery to reconcile.
+The shared job-level `queue: max` retains up to 100 pending jobs while admitting
+one active job at a time. GitHub processes them in FIFO order by when each job
+started waiting on the concurrency group, not workflow dispatch time. This is
+pending-work retention, not durable worker ownership: receipts and all existing
+fresh head, identity, eligibility, ownership and cycle guards remain required.
+No new replay path or launch authority is introduced.
+
+This is not an unlimited delivery guarantee. Overflow beyond 100 pending jobs
+is canceled; manual cancellation and other workflow failures remain possible.
+Durable receipts preserve safety after dispatch reservation, and scheduled
+completion of eligible ordinary claims plus explicit recovery inputs retain a
+route to progress. They cannot recover a never-started job that made no claim;
+such a job may be requeued only after existing ownership and eligibility are
+checked. A main-only merge cannot retroactively alter already queued jobs or
+feature-branch workflow YAML. Mixed or older definitions keep their original
+queue behavior until updated and revalidated. Refresh an active application
+branch only after its current worker is terminal. Retired branches remain
+unqueued; future goals start from patched main. No production launch is part
+of patch validation. Queue semantics follow GitHub's
+[workflow and job concurrency documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
 
 Supervisor association failures emit a bounded diagnostic on the existing GET
 recovery path. It contains the expected public repository, canonical numeric PR
@@ -137,3 +157,11 @@ migration, open-PR retirement recovery, all create/recovery job locks, and gener
 single-create/no-replay behavior. The read-only deployment inventory is 65
 unreconciled receipts, at most 195 Cursor GETs for successful terminal upgrades,
 not proof of live or terminal service state.
+
+Standard-library-only structure checks require the exact shared group,
+`cancel-in-progress: false`, `queue: max` and the existing `serialized-v1`
+environment at all six actual admission sites. Negative fixtures reject missing
+or single-slot queues, wrong workflow/job/step scope, duplicate, inline, quoted
+or incorrectly indented fields, altered admission environments and changes to
+the separate supervisor workflow lock. Both normal Python and `python -S`
+execute the full offline automation suite without a YAML dependency.

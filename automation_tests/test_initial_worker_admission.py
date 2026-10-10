@@ -19,7 +19,7 @@ import goal_initial_launch as initial
 import goal_lineage as lineage
 import goal_review_launch as ordinary
 import generic_worker as generic
-from test_admission_review_regressions import workflow_block, workflow_fields, workflow_job, assert_worker_concurrency
+from test_admission_review_regressions import WORKER_ADMISSION_JOBS, workflow_job, assert_workflow_admission
 from test_goal_lineage import pull
 from test_goal_review_recovery import Server as ReviewServer
 from test_shared_worker_ownership import ENV as SUPERVISOR_ENV, receipt as supervisor_receipt
@@ -421,42 +421,61 @@ class RetiredSourceRecovery(unittest.TestCase):
             with self.assertRaises(supervisor.Stop): supervisor.active_goal_work(11, 'a' * 40)
 
     def test_actual_jobs_share_admission_across_every_create_and_recovery_entry(self):
-        required = {'goal.yml': ['implement', 'review-launch', 'request-codex', 'recover-review'],
-                    'checkpoint-supervisor.yml': ['supervise'], 'codex-cursor-remediation.yml': ['remediate']}
-        for filename, jobs in required.items():
+        self.assertEqual(sum(map(len, WORKER_ADMISSION_JOBS.values())), 6)
+        for filename in WORKER_ADMISSION_JOBS:
             workflow = (ROOT / '.github/workflows' / filename).read_text()
-            top_lock = workflow_fields(workflow_block(workflow, 'concurrency:', 0, required=False), 2)
-            expected_top = ({'group': 'tremelay-checkpoint-supervisor', 'cancel-in-progress': 'false'}
-                            if filename == 'checkpoint-supervisor.yml' else {})
-            self.assertEqual(top_lock, expected_top)
-            for name in jobs:
-                job = workflow_job(workflow, name)
-                assert_worker_concurrency(self, job)
-                job_env = workflow_fields(workflow_block(job, 'env:', 4, required=False), 6)
-                admission = job_env.get('TREMELAY_WORKER_ADMISSION')
-                if filename == 'checkpoint-supervisor.yml':
-                    step = workflow_block(workflow_block(job, 'steps:', 4), '- name: Assess stopped goal PRs', 6)
-                    admission = workflow_fields(workflow_block(step, 'env:', 8), 10)['TREMELAY_WORKER_ADMISSION']
-                    self.assertNotIn('TREMELAY_WORKER_ADMISSION', job_env)
-                self.assertEqual(admission, 'serialized-v1')
+            with self.subTest(workflow=filename):
+                assert_workflow_admission(self, workflow, filename)
         goal = (ROOT / '.github/workflows/goal.yml').read_text()
         implement = goal.split('  implement:', 1)[1].split('  publish:', 1)[0]
         self.assertNotIn('curl ', implement)
         self.assertIn('goal_initial_launch.py launch', implement)
         self.assertLess(implement.index('goal_initial_launch.py recover'), implement.index('apply-sync'))
 
-    def test_quoted_workflow_group_cannot_hide_the_shared_job_lock(self):
-        read_text = Path.read_text
-        for quote in ["'", '"']:
-            def changed_workflow(path, *args, **kwargs):
-                text = read_text(path, *args, **kwargs)
-                if path.name == 'checkpoint-supervisor.yml':
-                    return text.replace('group: tremelay-checkpoint-supervisor',
-                                        'group: ' + quote + 'tremelay-worker-admission' + quote)
-                return text
-            with self.subTest(quote=quote), patch.object(Path, 'read_text', changed_workflow), \
-                    self.assertRaises(AssertionError):
-                self.test_actual_jobs_share_admission_across_every_create_and_recovery_entry()
+    def test_each_actual_job_requires_its_own_queue_and_admission_environment(self):
+        for filename, jobs in WORKER_ADMISSION_JOBS.items():
+            workflow = (ROOT / '.github/workflows' / filename).read_text()
+            for name in jobs:
+                job = workflow_job(workflow, name)
+                indent = 10 if filename == 'checkpoint-supervisor.yml' else 6
+                admission = ' ' * indent + 'TREMELAY_WORKER_ADMISSION: serialized-v1'
+                self.assertEqual(workflow.count(job), 1)
+                self.assertIn(admission, job)
+                mutations = [
+                    job.replace('      queue: max\n', ''),
+                    job.replace('queue: max', 'queue: single'),
+                    job.replace(admission, ''),
+                    job.replace(admission, admission.replace('serialized-v1', 'unknown')),
+                    job.replace(admission, admission + '\n' + admission),
+                    job.replace(admission, '  ' + admission),
+                    job.replace(admission, admission.replace('serialized-v1', '"serialized-v1"')),
+                    job.replace(admission, admission.replace('TREMELAY_WORKER_ADMISSION', '"TREMELAY_WORKER_ADMISSION"')),
+                ]
+                if filename == 'checkpoint-supervisor.yml':
+                    mutations.append('    env:\n      TREMELAY_WORKER_ADMISSION: serialized-v1\n' + job.replace(admission, ''))
+                else:
+                    mutations.append(job.replace(admission, '') + '\n    steps:\n      - name: Other\n'
+                                     '        env:\n          TREMELAY_WORKER_ADMISSION: serialized-v1\n')
+                for changed in mutations:
+                    with self.subTest(workflow=filename, job=name, mutation=changed), self.assertRaises(AssertionError):
+                        assert_workflow_admission(self, workflow.replace(job, changed), filename)
+
+    def test_workflow_lock_cannot_absorb_job_queue_or_change_wake_coalescing(self):
+        filename = 'checkpoint-supervisor.yml'
+        workflow = (ROOT / '.github/workflows' / filename).read_text()
+        top_lock = 'concurrency:\n  group: tremelay-checkpoint-supervisor\n  cancel-in-progress: false\n'
+        self.assertIn(top_lock, workflow)
+        mutations = [
+            '',
+            top_lock + '  queue: max\n',
+            top_lock.replace('cancel-in-progress: false', 'cancel-in-progress: true'),
+            top_lock.replace('tremelay-checkpoint-supervisor', 'tremelay-worker-admission'),
+            top_lock.replace('tremelay-checkpoint-supervisor', '"tremelay-worker-admission"'),
+            top_lock.replace('tremelay-checkpoint-supervisor', "'tremelay-worker-admission'"),
+        ]
+        for changed in mutations:
+            with self.subTest(lock=changed), self.assertRaises(AssertionError):
+                assert_workflow_admission(self, workflow.replace(top_lock, changed), filename)
 
 
 class RealInitialWorkflow(unittest.TestCase):
