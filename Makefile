@@ -15,5 +15,6 @@ build:
 	go build ./cmd/tremelay
 
 # Unsigned linux/amd64 candidate and evidence. Refuses a dirty tree.
+# The helper is verified and compiled by tools/bootstrap-candidate.sh.
 candidate:
-	cd tools && GOTOOLCHAIN=go1.26.9 go run -mod=readonly ./cmd/candidate
+	sh tools/bootstrap-candidate.sh

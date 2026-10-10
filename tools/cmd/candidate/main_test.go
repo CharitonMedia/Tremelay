@@ -4,6 +4,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -42,16 +44,16 @@ func TestGoEnvIgnoresPersistedConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	home := t.TempDir()
-	configDir := filepath.Join(home, ".config", "go")
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
+	configDir, identity := userConfigIdentity(home)
+	if err := os.MkdirAll(filepath.Join(configDir, "go"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	body := "GOEXPERIMENT=fieldtrack\nGOCACHEPROG=/tmp/evil-cacheprog\nGOFIPS140=latest\n"
-	if err := os.WriteFile(filepath.Join(configDir, "env"), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(configDir, "go", "env"), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	bare := exec.Command(goBin, "env", "GOEXPERIMENT", "GOCACHEPROG", "GOFIPS140")
-	bare.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH"), "GOTOOLCHAIN=" + evidence.GoToolchain}
+	bare.Env = append([]string{"PATH=" + os.Getenv("PATH"), "GOTOOLCHAIN=" + evidence.GoToolchain}, identity...)
 	out, err := bare.Output()
 	if err != nil {
 		t.Fatal(err)
@@ -60,10 +62,9 @@ func TestGoEnvIgnoresPersistedConfig(t *testing.T) {
 		t.Fatalf("poisoned go env was not readable: %q", out)
 	}
 	env := profileEnv(goBin, t.TempDir(), t.TempDir())
-	for i, e := range env {
-		if strings.HasPrefix(e, "HOME=") {
-			env[i] = "HOME=" + home
-		}
+	for _, e := range identity {
+		k, v, _ := strings.Cut(e, "=")
+		env = setEnv(env, k, v)
 	}
 	cmd := exec.Command(goBin, "env", "GOEXPERIMENT", "GOCACHEPROG", "GOFIPS140", "GOWORK")
 	cmd.Env = env
@@ -144,7 +145,7 @@ func TestScanFailureKeepsVerifiedDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta := evidence.ScanMeta{Scope: "binary", ExitStatus: 3, RawReport: evidence.ReportName("binary")}
-	err := persistScanFailure(out, "binary", []byte("{"), meta, errString("govulncheck json"))
+	err := persistScanFailure(out, []scanRecord{{scope: "binary", raw: []byte("{"), meta: meta}}, errString("govulncheck json"))
 	if err == nil {
 		t.Fatal("expected scan failure")
 	}
@@ -162,6 +163,140 @@ func TestScanFailureKeepsVerifiedDir(t *testing.T) {
 	}
 }
 
+func TestBlockedScansPersistEvidence(t *testing.T) {
+	called := govulncheckJSON("binary", "{\"finding\":{\"osv\":\"GO-2026-0001\",\"trace\":[{\"module\":\"example.com/dep\",\"function\":\"F\"}]}}\n")
+	clean := govulncheckJSON("binary", "")
+	moduleOnly := govulncheckJSON("binary", "{\"finding\":{\"osv\":\"GO-2026-0002\",\"trace\":[{\"module\":\"example.com/dep\",\"version\":\"v1.2.3\"}]}}\n")
+	now := time.Now().UTC()
+	if _, _, err := finishScan("binary", []string{"govulncheck"}, evidence.Identity{}, now, now, "", 0, moduleOnly); err != nil {
+		t.Fatalf("module finding is visible and does not fail the symbol gate: %v", err)
+	}
+	cases := []struct {
+		name string
+		exit int
+		raw  []byte
+		want string
+	}{
+		{"called finding exit zero", 0, called, "symbol-level"},
+		{"parseable nonzero exit", 1, clean, "exit status 1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, meta, err := finishScan("binary", []string{"govulncheck"}, evidence.Identity{}, now, now, "", tc.exit, tc.raw)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err %v", err)
+			}
+			if meta.ExitStatus != tc.exit || meta.SymbolGatePass {
+				t.Fatalf("exit %d gate %v", meta.ExitStatus, meta.SymbolGatePass)
+			}
+			out := filepath.Join(t.TempDir(), "m11a-candidate")
+			if err := os.MkdirAll(out, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(out, "tremelay"), []byte("keep"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := persistScanFailure(out, []scanRecord{{scope: "binary", raw: raw, meta: meta}}, err); err == nil {
+				t.Fatal("expected scan failure")
+			}
+			if b, err := os.ReadFile(filepath.Join(out, "tremelay")); err != nil || string(b) != "keep" {
+				t.Fatalf("verified evidence changed: %q %v", b, err)
+			}
+			dir := oneFailureDir(t, filepath.Dir(out))
+			saved, err := os.ReadFile(filepath.Join(dir, "govulncheck-binary.json"))
+			if err != nil || string(saved) != string(raw) {
+				t.Fatalf("raw report: %s %v", saved, err)
+			}
+			metaText, err := os.ReadFile(filepath.Join(dir, "govulncheck-binary-meta.json"))
+			if err != nil || !strings.Contains(string(metaText), "\"exit_status\": "+strconv.Itoa(tc.exit)) {
+				t.Fatalf("metadata: %s %v", metaText, err)
+			}
+		})
+	}
+}
+
+func TestLaterScanKeepsEarlierReport(t *testing.T) {
+	now := time.Now().UTC()
+	sourceRaw := govulncheckJSON("source", "")
+	raw, meta, err := finishScan("source", []string{"govulncheck"}, evidence.Identity{}, now, now, "", 0, sourceRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryRaw := []byte("not-json\n")
+	braw, bmeta, err := finishScan("binary", []string{"govulncheck"}, evidence.Identity{}, now, now, "", 2, binaryRaw)
+	if err == nil {
+		t.Fatal("expected binary parse failure")
+	}
+	if bmeta.ExitStatus != 2 {
+		t.Fatalf("exit %d", bmeta.ExitStatus)
+	}
+	out := filepath.Join(t.TempDir(), "m11a-candidate")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "tremelay"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistScanFailure(out, []scanRecord{
+		{scope: "source", raw: raw, meta: meta},
+		{scope: "binary", raw: braw, meta: bmeta},
+	}, err); err == nil {
+		t.Fatal("expected scan failure")
+	}
+	if b, err := os.ReadFile(filepath.Join(out, "tremelay")); err != nil || string(b) != "keep" {
+		t.Fatalf("verified evidence changed: %q %v", b, err)
+	}
+	dir := oneFailureDir(t, filepath.Dir(out))
+	saved, err := os.ReadFile(filepath.Join(dir, "govulncheck-source.json"))
+	if err != nil || string(saved) != string(sourceRaw) {
+		t.Fatalf("source report: %s %v", saved, err)
+	}
+	if _, err := os.ReadFile(filepath.Join(dir, "govulncheck-source-meta.json")); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = os.ReadFile(filepath.Join(dir, "govulncheck-binary.json"))
+	if err != nil || string(saved) != "not-json\n" {
+		t.Fatalf("binary report: %s %v", saved, err)
+	}
+}
+
+func TestPublishRechecksSource(t *testing.T) {
+	root := gitRepo(t)
+	writeRepoFile(t, root, "go.mod", "module example.com/x\n\ngo 1.26.9\n")
+	gitCommit(t, root, "one")
+	commit, err := gitOut(root, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := gitOut(root, "rev-parse", commit+"^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "m11a-candidate")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "tremelay"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	staging := t.TempDir()
+	if err := os.WriteFile(filepath.Join(staging, "tremelay"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeRepoFile(t, root, "go.mod", "module example.com/y\n\ngo 1.26.9\n")
+	gitCommit(t, root, "two")
+	if err := publishVerified(root, commit, tree, staging, out); err == nil {
+		t.Fatal("expected source drift to stop publication")
+	}
+	b, err := os.ReadFile(filepath.Join(out, "tremelay"))
+	if err != nil || string(b) != "old" {
+		t.Fatalf("verified candidate changed: %q %v", b, err)
+	}
+	if _, err := os.ReadFile(filepath.Join(staging, "tremelay")); err != nil {
+		t.Fatalf("unpublished staging was removed: %v", err)
+	}
+}
+
 func TestModVerifyDetectsCacheModification(t *testing.T) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
@@ -176,8 +311,10 @@ func TestModVerifyDetectsCacheModification(t *testing.T) {
 	}
 	cache := t.TempDir()
 	gocache := t.TempDir()
+	home := t.TempDir()
+	gopath := t.TempDir()
 	t.Cleanup(func() {
-		for _, root := range []string{cache, gocache} {
+		for _, root := range []string{cache, gocache, gopath, home} {
 			filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 				if err != nil {
 					return nil
@@ -197,13 +334,14 @@ func TestModVerifyDetectsCacheModification(t *testing.T) {
 			prep[i] = "GOFLAGS="
 		}
 	}
+	prep = applyPlatform(prep, home, gopath)
 	cmd := exec.Command(goBin, "mod", "tidy")
 	cmd.Dir = dir
 	cmd.Env = prep
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("tidy: %v\n%s", err, out)
 	}
-	env := profileEnv(goBin, cache, gocache)
+	env := applyPlatform(profileEnv(goBin, cache, gocache), home, gopath)
 	if err := requireModVerify(goBin, dir, env, "application"); err != nil {
 		t.Fatal(err)
 	}
@@ -226,6 +364,134 @@ func TestModVerifyDetectsCacheModification(t *testing.T) {
 	if err := requireModVerify(goBin, dir, env, "application"); err == nil {
 		t.Fatal("modified module cache was verified")
 	}
+}
+
+func TestBootstrapControlsHelper(t *testing.T) {
+	makefile, err := os.ReadFile(filepath.Join("..", "..", "..", "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(makefile), "sh tools/bootstrap-candidate.sh") || strings.Contains(string(makefile), "go run") {
+		t.Fatalf("make candidate still builds the helper with ambient go run:\n%s", makefile)
+	}
+	scriptPath := filepath.Join("..", "..", "bootstrap-candidate.sh")
+	script, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(script)
+	verifyAt := strings.Index(text, "go mod verify")
+	buildAt := strings.Index(text, "go build -mod=readonly")
+	if verifyAt < 0 || buildAt < 0 || verifyAt > buildAt {
+		t.Fatal("bootstrap must verify the tools module cache before building the helper")
+	}
+	for _, needle := range []string{
+		"GOENV=off", "GOWORK=off", "GOEXPERIMENT=", "GOCACHEPROG=", "GOFIPS140=off",
+		"GOFLAGS=-mod=readonly", "GOSUMDB=sum.golang.org", "go mod download",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("bootstrap missing %s", needle)
+		}
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		return
+	}
+	home := t.TempDir()
+	configDir, identity := userConfigIdentity(home)
+	if err := os.MkdirAll(filepath.Join(configDir, "go"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "go", "env"), []byte("GOEXPERIMENT=fieldtrack\nGOCACHEPROG=/tmp/evil-cacheprog\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(sh, scriptPath, "print-env")
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "TMPDIR=" + t.TempDir()}, identity...)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := append([]string{}, identity...)
+	env = append(env, "PATH="+os.Getenv("PATH"))
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimRight(line, "\r")
+		k, _, ok := strings.Cut(line, "=")
+		if !ok || k == "" {
+			t.Fatalf("print-env line %q", line)
+		}
+		env = setEnv(env, k, strings.TrimPrefix(line, k+"="))
+	}
+	if got := envValue(env, "GOENV"); got != "off" || envValue(env, "GOFLAGS") != "-mod=readonly" || envValue(env, "GOWORK") != "off" {
+		t.Fatalf("print-env %+v", env)
+	}
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := exec.Command(goBin, "env", "GOEXPERIMENT", "GOCACHEPROG")
+	probe.Env = env
+	out, err = probe.Output()
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "fieldtrack") || strings.Contains(string(out), "evil-cacheprog") {
+		t.Fatalf("bootstrap env read persisted Go settings: %q", out)
+	}
+}
+
+func userConfigIdentity(home string) (string, []string) {
+	switch runtime.GOOS {
+	case "windows":
+		appData := filepath.Join(home, "AppData", "Roaming")
+		return appData, []string{"HOME=" + home, "USERPROFILE=" + home, "APPDATA=" + appData}
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support"), []string{"HOME=" + home}
+	default:
+		return filepath.Join(home, ".config"), []string{"HOME=" + home}
+	}
+}
+
+func applyPlatform(env []string, home, gopath string) []string {
+	_, identity := userConfigIdentity(home)
+	for _, e := range identity {
+		k, v, _ := strings.Cut(e, "=")
+		env = setEnv(env, k, v)
+	}
+	return setEnv(env, "GOPATH", gopath)
+}
+
+func setEnv(env []string, key, val string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + val
+			return env
+		}
+	}
+	return append(env, prefix+val)
+}
+
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return strings.TrimPrefix(e, prefix)
+		}
+	}
+	return ""
+}
+
+func govulncheckJSON(mode, body string) []byte {
+	return []byte(`{"config":{"protocol_version":"v1.0.0","scanner_name":"govulncheck","scanner_version":"` + evidence.VulnVersion + `","db":"https://vuln.go.dev","db_last_modified":"2026-10-08T22:31:09Z","scan_level":"symbol","scan_mode":"` + mode + `"}}` + "\n" + body)
+}
+
+func oneFailureDir(t *testing.T, parent string) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(parent, "m11a-scan-failure-*"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("failure records: %v %v", matches, err)
+	}
+	return matches[0]
 }
 
 type errString string

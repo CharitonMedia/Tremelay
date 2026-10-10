@@ -365,12 +365,13 @@ func run(root, out string) error {
 		Note:                "This is the go list -m all graph of the application module, including test dependencies of that module, plus the pinned build-tool module graph. It is not the CLI binary inventory.",
 	}
 	sourceRaw, sourceMeta, err := scan(goBin, toolsDir, modCache, toolCache, "source", []string{"govulncheck", "-C", sides[0].src, "-format=json", "./..."}, id)
+	sourceRec := scanRecord{scope: "source", raw: sourceRaw, meta: sourceMeta}
 	if err != nil {
-		return persistScanFailure(out, "source", sourceRaw, sourceMeta, err)
+		return persistScanFailure(out, []scanRecord{sourceRec}, err)
 	}
 	binaryRaw, binaryMeta, err := scan(goBin, toolsDir, modCache, toolCache, "binary", []string{"govulncheck", "-mode=binary", "-format=json", binPath}, id)
 	if err != nil {
-		return persistScanFailure(out, "binary", binaryRaw, binaryMeta, err)
+		return persistScanFailure(out, []scanRecord{sourceRec, {scope: "binary", raw: binaryRaw, meta: binaryMeta}}, err)
 	}
 	if err := verifySharedModuleCache(goBin, sides[0].src, toolsDir, modCache); err != nil {
 		return fmt.Errorf("module cache changed after verification: %w", err)
@@ -427,7 +428,7 @@ func run(root, out string) error {
 	if err := evidence.Verify(staging, schemaDir); err != nil {
 		return err
 	}
-	return publishEvidence(staging, out)
+	return publishVerified(root, commit, tree, staging, out)
 }
 
 func scan(goBin, toolsDir, modCache, toolCache, scope string, args []string, id evidence.Identity) ([]byte, evidence.ScanMeta, error) {
@@ -461,7 +462,20 @@ func finishScan(scope string, args []string, id evidence.Identity, start, end ti
 		meta.ClaimsVulnerabilityAbsence = false
 		return raw, meta, fmt.Errorf("%s scan: %w", scope, aerr)
 	}
+	if assessed.Blocked || !assessed.SymbolGatePass {
+		reason := assessed.BlockReason
+		if reason == "" {
+			reason = "symbol gate did not pass"
+		}
+		return raw, meta, fmt.Errorf("%s scan: %s", scope, reason)
+	}
 	return raw, meta, nil
+}
+
+type scanRecord struct {
+	scope string
+	raw   []byte
+	meta  evidence.ScanMeta
 }
 
 func commandExit(err error) (int, error) {
@@ -475,7 +489,7 @@ func commandExit(err error) (int, error) {
 	return -1, err
 }
 
-func persistScanFailure(verifiedOut, scope string, raw []byte, meta evidence.ScanMeta, scanErr error) error {
+func persistScanFailure(verifiedOut string, scans []scanRecord, scanErr error) error {
 	parent := filepath.Dir(verifiedOut)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
@@ -489,19 +503,21 @@ func persistScanFailure(verifiedOut, scope string, raw []byte, meta evidence.Sca
 			return fmt.Errorf("%w (scan failure record: %v)", scanErr, derr)
 		}
 	}
-	name := evidence.ReportName(scope)
-	if name != "" && len(raw) > 0 {
-		if err := os.WriteFile(filepath.Join(dir, name), raw, 0o644); err != nil {
+	for _, sc := range scans {
+		name := evidence.ReportName(sc.scope)
+		if name != "" && len(sc.raw) > 0 {
+			if err := os.WriteFile(filepath.Join(dir, name), sc.raw, 0o644); err != nil {
+				return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
+			}
+		}
+		if err := evidence.WriteJSON(filepath.Join(dir, "govulncheck-"+sc.scope+"-meta.json"), sc.meta); err != nil {
 			return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
 		}
-	}
-	if err := evidence.WriteJSON(filepath.Join(dir, "govulncheck-"+scope+"-meta.json"), meta); err != nil {
-		return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "failure.txt"), []byte(scanErr.Error()+"\n"), 0o644); err != nil {
 		return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
 	}
-	return fmt.Errorf("%s scan failed; failure record %s: %w", scope, dir, scanErr)
+	return fmt.Errorf("scan failed; failure record %s: %w", dir, scanErr)
 }
 
 func listModules(goBin, dir, modCache string, tools bool) ([]evidence.Mod, error) {
@@ -821,6 +837,13 @@ func runGo(goBin, dir string, env []string, args ...string) error {
 		return fmt.Errorf("%s: %w: %s", strings.Join(args, " "), err, out)
 	}
 	return nil
+}
+
+func publishVerified(root, commit, tree, staging, out string) error {
+	if err := assertStableSource(root, commit, tree); err != nil {
+		return err
+	}
+	return publishEvidence(staging, out)
 }
 
 func publishEvidence(staging, out string) error {
