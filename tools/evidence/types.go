@@ -42,17 +42,18 @@ type BuildSide struct {
 
 // TwoBuildReceipt records the byte comparison. Only the executable must match.
 type TwoBuildReceipt struct {
-	SourceCommit    string      `json:"source_commit"`
-	SourceTree      string      `json:"source_tree"`
-	ArtifactSHA256  string      `json:"artifact_sha256"`
-	GoModSHA256     string      `json:"go_mod_sha256"`
-	GoSumSHA256     string      `json:"go_sum_sha256"`
-	GoVersion       string      `json:"go_version"`
-	ByteIdentical   bool        `json:"byte_identical"`
-	Builds          []BuildSide `json:"builds"`
-	ModuleCache     string      `json:"module_cache"`
-	ModuleCacheNote string      `json:"module_cache_note"`
-	Scope           string      `json:"scope"`
+	SourceCommit        string      `json:"source_commit"`
+	SourceTree          string      `json:"source_tree"`
+	ArtifactSHA256      string      `json:"artifact_sha256"`
+	GoModSHA256         string      `json:"go_mod_sha256"`
+	GoSumSHA256         string      `json:"go_sum_sha256"`
+	GoVersion           string      `json:"go_version"`
+	ByteIdentical       bool        `json:"byte_identical"`
+	Builds              []BuildSide `json:"builds"`
+	ModuleCache         string      `json:"module_cache"`
+	ModuleCacheNote     string      `json:"module_cache_note"`
+	ModuleCacheVerified string      `json:"module_cache_verified"`
+	Scope               string      `json:"scope"`
 }
 
 // BuildInputs is the recorded recipe. It is an allowlist, not an environment dump.
@@ -172,4 +173,7 @@ type Assessment struct {
 	SymbolGatePass                bool
 	Blocked                       bool
 	BlockReason                   string
+	ScanMode                      string
+	ScannerName                   string
+	ScannerVersion                string
 }

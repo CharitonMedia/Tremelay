@@ -54,6 +54,9 @@ func Verify(evidenceDir, schemaDir string) error {
 	if err := readJSON(filepath.Join(evidenceDir, "govulncheck-binary-meta.json"), &binaryMeta); err != nil {
 		return err
 	}
+	if inputs.ArtifactSHA256 != binHash {
+		return fmt.Errorf("build inputs artifact hash %s does not match the binary %s", inputs.ArtifactSHA256, binHash)
+	}
 	id := Identity{
 		SourceCommit:   inputs.SourceCommit,
 		SourceTree:     inputs.SourceTree,
@@ -178,8 +181,14 @@ func checkInputs(in BuildInputs) error {
 			return fmt.Errorf("build command missing %s", flag)
 		}
 	}
-	if in.BuildEnv["GOTOOLCHAIN"] != GoToolchain || in.BuildEnv["GOOS"] != TargetGOOS || in.BuildEnv["GOARCH"] != TargetGOARCH || in.BuildEnv["GOAMD64"] != TargetGOAMD64 || in.BuildEnv["CGO_ENABLED"] != TargetCGO {
-		return fmt.Errorf("recorded build environment does not match the profile")
+	if err := checkBuildEnv(in.BuildEnv); err != nil {
+		return err
+	}
+	if in.GoEnv["GOWORK"] != "off" || in.GoEnv["GOFIPS140"] != "off" || in.GoEnv["GOEXPERIMENT"] != "" || in.GoEnv["GOCACHEPROG"] != "" {
+		return fmt.Errorf("effective Go environment is not the pinned profile")
+	}
+	if in.GoEnv["GOTOOLCHAIN"] != GoToolchain || in.GoEnv["GOOS"] != TargetGOOS || in.GoEnv["GOARCH"] != TargetGOARCH || in.GoEnv["GOAMD64"] != TargetGOAMD64 || in.GoEnv["CGO_ENABLED"] != TargetCGO {
+		return fmt.Errorf("effective Go environment target does not match the profile")
 	}
 	if in.Tools["cyclonedx-gomod"] != CycloneDXModule+"@"+CycloneDXVer+" "+CycloneDXSum {
 		return fmt.Errorf("cyclonedx-gomod pin mismatch")
@@ -216,6 +225,32 @@ func checkReceipt(r TwoBuildReceipt, binHash string) error {
 	}
 	if r.ModuleCache == "" || r.ModuleCacheNote == "" {
 		return fmt.Errorf("module cache reuse was not recorded")
+	}
+	if r.ModuleCacheVerified != ModuleCacheVerified {
+		return fmt.Errorf("module cache verification was not recorded")
+	}
+	return nil
+}
+
+func checkBuildEnv(env map[string]string) error {
+	want := map[string]string{
+		"GOTOOLCHAIN":  GoToolchain,
+		"GOOS":         TargetGOOS,
+		"GOARCH":       TargetGOARCH,
+		"GOAMD64":      TargetGOAMD64,
+		"CGO_ENABLED":  TargetCGO,
+		"GOENV":        "off",
+		"GOWORK":       "off",
+		"GOEXPERIMENT": "",
+		"GOCACHEPROG":  "",
+		"GOFIPS140":    "off",
+		"GOFLAGS":      "-mod=readonly",
+	}
+	for k, v := range want {
+		got, ok := env[k]
+		if !ok || got != v {
+			return fmt.Errorf("recorded build environment %s=%q, want %q", k, got, v)
+		}
 	}
 	return nil
 }
@@ -297,13 +332,23 @@ func checkScan(dir, scope string, meta ScanMeta, readme []byte) error {
 	if meta.Scope != scope {
 		return fmt.Errorf("scan meta scope %s, want %s", meta.Scope, scope)
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, meta.RawReport))
+	name := ReportName(scope)
+	if name == "" || meta.RawReport != name {
+		return fmt.Errorf("%s scan report path %q, want %s", scope, meta.RawReport, name)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, name))
 	if err != nil {
 		return err
 	}
 	a, err := Assess(raw, meta.ExitStatus)
 	if err != nil {
 		return fmt.Errorf("%s scan: %w", scope, err)
+	}
+	if a.ScanMode != scope {
+		return fmt.Errorf("%s scan_mode %s, want %s", scope, a.ScanMode, scope)
+	}
+	if a.ScannerName != "govulncheck" || a.ScannerVersion != VulnVersion {
+		return fmt.Errorf("%s scan raw scanner identity does not match the pin", scope)
 	}
 	if meta.ClaimsVulnerabilityAbsence {
 		return fmt.Errorf("%s scan claims vulnerability absence", scope)

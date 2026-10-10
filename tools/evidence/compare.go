@@ -31,6 +31,8 @@ func CheckProfile(info *buildinfo.BuildInfo) error {
 		return fmt.Errorf("binary go version %s, want %s", info.GoVersion, GoVersion)
 	}
 	want := map[string]string{
+		"-buildmode":  "exe",
+		"-compiler":   "gc",
 		"-trimpath":   "true",
 		"CGO_ENABLED": TargetCGO,
 		"GOARCH":      TargetGOARCH,
@@ -41,6 +43,9 @@ func CheckProfile(info *buildinfo.BuildInfo) error {
 	for _, s := range info.Settings {
 		if strings.HasPrefix(s.Key, "vcs.") {
 			return fmt.Errorf("build setting %s is present; -buildvcs=false did not drop VCS metadata", s.Key)
+		}
+		if _, ok := want[s.Key]; !ok {
+			return fmt.Errorf("unexpected build setting %s=%s", s.Key, s.Value)
 		}
 		got[s.Key] = s.Value
 	}
@@ -217,6 +222,9 @@ func checkGenerator(md map[string]any) error {
 }
 
 func sbomModules(root map[string]any) (map[string]sbomMod, error) {
+	if err := rejectNestedComponents(root); err != nil {
+		return nil, err
+	}
 	raw, _ := root["components"].([]any)
 	out := map[string]sbomMod{}
 	std := 0
@@ -257,6 +265,41 @@ func sbomModules(root map[string]any) (map[string]sbomMod, error) {
 		return nil, fmt.Errorf("sbom stdlib components = %d, want 1", std)
 	}
 	return out, nil
+}
+
+func rejectNestedComponents(root map[string]any) error {
+	raw, _ := root["components"].([]any)
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if err := rejectChildComponents(m, "components"); err != nil {
+			return err
+		}
+	}
+	md, _ := root["metadata"].(map[string]any)
+	comp, _ := md["component"].(map[string]any)
+	if comp == nil {
+		return nil
+	}
+	return rejectChildComponents(comp, "metadata.component")
+}
+
+func rejectChildComponents(comp map[string]any, where string) error {
+	nested, exists := comp["components"]
+	if !exists || nested == nil {
+		return nil
+	}
+	list, ok := nested.([]any)
+	if !ok {
+		return fmt.Errorf("nested sbom components at %s are not an array", where)
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	name, _ := comp["name"].(string)
+	return fmt.Errorf("nested sbom component under %s (%s) is outside the flat module inventory", where, name)
 }
 
 func sha256Hash(v any) string {

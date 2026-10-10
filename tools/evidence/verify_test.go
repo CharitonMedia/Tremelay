@@ -1,12 +1,14 @@
 package evidence
 
 import (
+	"bytes"
 	"debug/buildinfo"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +136,160 @@ func TestEvidenceBundle(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	t.Run("manifest artifact hash mismatch", func(t *testing.T) {
+		dir := t.TempDir()
+		writeBundle(t, dir, schema, binBytes, info, id, nil)
+		path := filepath.Join(dir, "build-inputs.json")
+		var doc map[string]any
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(b, &doc); err != nil {
+			t.Fatal(err)
+		}
+		doc["artifact_sha256"] = strings.Repeat("e", 64)
+		if err := WriteJSON(path, doc); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteSHA256SUMS(dir); err != nil {
+			t.Fatal(err)
+		}
+		err = Verify(dir, schema)
+		if err == nil || !strings.Contains(err.Error(), "build inputs artifact hash") {
+			t.Fatal(err)
+		}
+	})
+	t.Run("binary metadata points at source report", func(t *testing.T) {
+		dir := t.TempDir()
+		writeBundle(t, dir, schema, binBytes, info, id, nil)
+		path := filepath.Join(dir, "govulncheck-binary-meta.json")
+		var meta ScanMeta
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(b, &meta); err != nil {
+			t.Fatal(err)
+		}
+		meta.RawReport = "govulncheck-source.json"
+		if err := WriteJSON(path, meta); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteSHA256SUMS(dir); err != nil {
+			t.Fatal(err)
+		}
+		err = Verify(dir, schema)
+		if err == nil || !strings.Contains(err.Error(), "report path") {
+			t.Fatal(err)
+		}
+	})
+	t.Run("binary report is a source scan", func(t *testing.T) {
+		dir := t.TempDir()
+		writeBundle(t, dir, schema, binBytes, info, id, nil)
+		if err := os.WriteFile(filepath.Join(dir, "govulncheck-binary.json"), scanFixture("source"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteSHA256SUMS(dir); err != nil {
+			t.Fatal(err)
+		}
+		err := Verify(dir, schema)
+		if err == nil || !strings.Contains(err.Error(), "scan_mode") {
+			t.Fatal(err)
+		}
+	})
+	t.Run("scanner identity mismatch", func(t *testing.T) {
+		dir := t.TempDir()
+		writeBundle(t, dir, schema, binBytes, info, id, nil)
+		raw := bytes.Replace(scanFixture("binary"), []byte(VulnVersion), []byte("v0.0.1"), 1)
+		if err := os.WriteFile(filepath.Join(dir, "govulncheck-binary.json"), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteSHA256SUMS(dir); err != nil {
+			t.Fatal(err)
+		}
+		err := Verify(dir, schema)
+		if err == nil || !strings.Contains(err.Error(), "scanner_version") {
+			t.Fatal(err)
+		}
+	})
+	t.Run("nested metadata component", func(t *testing.T) {
+		dir := t.TempDir()
+		writeBundle(t, dir, schema, binBytes, info, id, func(sbom map[string]any) {
+			md := sbom["metadata"].(map[string]any)
+			comp := md["component"].(map[string]any)
+			comp["components"] = []any{map[string]any{"type": "library", "name": "github.com/hidden/mod", "version": "v0.0.1"}}
+		})
+		sbom, err := os.ReadFile(filepath.Join(dir, "sbom.cdx.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateSBOM(schema, sbom); err != nil {
+			t.Fatal(err)
+		}
+		err = Verify(dir, schema)
+		if err == nil || !strings.Contains(err.Error(), "nested sbom component") {
+			t.Fatal(err)
+		}
+	})
+	t.Run("nested root component", func(t *testing.T) {
+		dir := t.TempDir()
+		writeBundle(t, dir, schema, binBytes, info, id, func(sbom map[string]any) {
+			comps := sbom["components"].([]any)
+			comps[0].(map[string]any)["components"] = []any{map[string]any{"type": "library", "name": "github.com/hidden/mod", "version": "v0.0.1"}}
+			sbom["components"] = comps
+		})
+		sbom, err := os.ReadFile(filepath.Join(dir, "sbom.cdx.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateSBOM(schema, sbom); err != nil {
+			t.Fatal(err)
+		}
+		err = Verify(dir, schema)
+		if err == nil || !strings.Contains(err.Error(), "nested sbom component") {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestCheckProfileRejectsExperiment(t *testing.T) {
+	info := &buildinfo.BuildInfo{
+		GoVersion: GoVersion,
+		Settings: []debug.BuildSetting{
+			{Key: "-buildmode", Value: "exe"},
+			{Key: "-compiler", Value: "gc"},
+			{Key: "-trimpath", Value: "true"},
+			{Key: "CGO_ENABLED", Value: "0"},
+			{Key: "GOARCH", Value: "amd64"},
+			{Key: "GOOS", Value: "linux"},
+			{Key: "GOAMD64", Value: "v1"},
+			{Key: "GOEXPERIMENT", Value: "fieldtrack"},
+		},
+	}
+	err := CheckProfile(info)
+	if err == nil || !strings.Contains(err.Error(), "GOEXPERIMENT") {
+		t.Fatal(err)
+	}
+}
+
+func TestSchemaBytesSurviveCheckout(t *testing.T) {
+	if err := CheckSchemaFiles(schemaDir(t)); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(schemaDir(t), "..", "..", "..")
+	for name := range SchemaSHA256 {
+		rel := filepath.ToSlash(filepath.Join("tools", "schema", "cyclonedx", name))
+		cmd := exec.Command("git", "check-attr", "text", "--", rel)
+		cmd.Dir = root
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%s: %v\n%s", rel, err, out)
+		}
+		if !bytes.Contains(out, []byte("text: unset")) {
+			t.Fatalf("%s checkout can rewrite pinned bytes: %s", rel, out)
+		}
+	}
 }
 
 func TestUnreadableBuildInfo(t *testing.T) {
@@ -203,6 +359,11 @@ func buildSynth(t *testing.T) (string, *buildinfo.BuildInfo) {
 	cmd := exec.Command("go", "build", "-trimpath", "-buildvcs=false", "-mod=readonly", "-pgo=off", "-o", bin, ".")
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
+		"GOENV=off",
+		"GOWORK=off",
+		"GOEXPERIMENT=",
+		"GOCACHEPROG=",
+		"GOFIPS140=off",
 		"GOTOOLCHAIN="+GoToolchain,
 		"GOOS=linux",
 		"GOARCH=amd64",
@@ -280,8 +441,8 @@ func writeBundle(t *testing.T, dir, schema string, bin []byte, info *buildinfo.B
 		GoModSHA256: id.GoModSHA256, GoSumSHA256: id.GoSumSHA256, GoModUnchanged: true, GoSumUnchanged: true,
 		GoVersion: GoVersion, Toolchain: GoToolchain, Target: Target, GOAMD64: TargetGOAMD64, CGOEnabled: TargetCGO,
 		BuildCommand:    []string{"go", "build", "-trimpath", "-buildvcs=false", "-mod=readonly", "-pgo=off", "-o", "<output>/tremelay", "./cmd/tremelay"},
-		BuildEnv:        map[string]string{"GOTOOLCHAIN": GoToolchain, "GOOS": TargetGOOS, "GOARCH": TargetGOARCH, "GOAMD64": TargetGOAMD64, "CGO_ENABLED": TargetCGO},
-		GoEnv:           map[string]string{"GOVERSION": GoVersion},
+		BuildEnv:        pinnedBuildEnv(),
+		GoEnv:           pinnedGoEnv(),
 		GoVersionOutput: "go version " + GoVersion + " linux/amd64",
 		ModuleCache:     filepath.Join(os.TempDir(), "modcache"),
 		Builder:         map[string]string{"runner_image_revision": "not exposed by this builder"},
@@ -303,16 +464,22 @@ func writeBundle(t *testing.T, dir, schema string, bin []byte, info *buildinfo.B
 			{Workspace: wsB, Output: filepath.Join(wsB, "tremelay"), Cache: cacheB, SHA256: id.ArtifactSHA256},
 		},
 		ModuleCache: filepath.Join(os.TempDir(), "modcache"), ModuleCacheNote: "shared download cache recorded",
-		Scope: twoBuildScope,
+		ModuleCacheVerified: ModuleCacheVerified,
+		Scope:               twoBuildScope,
 	}
-	scanRaw := []byte(`{"config":{"protocol_version":"v1.0.0","scanner_name":"govulncheck","scanner_version":"v1.8.0","db":"https://vuln.go.dev","db_last_modified":"2026-10-08T22:31:09Z","scan_level":"symbol","scan_mode":"source"}}` + "\n")
-	assessed, err := Assess(scanRaw, 0)
+	sourceRaw := scanFixture("source")
+	binaryRaw := scanFixture("binary")
+	sourceAssessed, err := Assess(sourceRaw, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryAssessed, err := Assess(binaryRaw, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
-	sourceMeta := ScanMetaFrom("source", "govulncheck-source.json", []string{"govulncheck", "-format=json", "./..."}, id, now, now, "", assessed)
-	binaryMeta := ScanMetaFrom("binary", "govulncheck-binary.json", []string{"govulncheck", "-mode=binary", "-format=json", "tremelay"}, id, now, now, "", assessed)
+	sourceMeta := ScanMetaFrom("source", ReportName("source"), []string{"govulncheck", "-format=json", "./..."}, id, now, now, "", sourceAssessed)
+	binaryMeta := ScanMetaFrom("binary", ReportName("binary"), []string{"govulncheck", "-mode=binary", "-format=json", "tremelay"}, id, now, now, "", binaryAssessed)
 	files := map[string]any{
 		"build-inputs.json":            inputs,
 		"two-build-receipt.json":       receipt,
@@ -327,10 +494,10 @@ func writeBundle(t *testing.T, dir, schema string, bin []byte, info *buildinfo.B
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, "govulncheck-source.json"), scanRaw, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "govulncheck-source.json"), sourceRaw, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "govulncheck-binary.json"), scanRaw, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "govulncheck-binary.json"), binaryRaw, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	readme := AssuranceREADME(READMEInput{ID: id, MCPSDKInBinary: false})
@@ -340,6 +507,27 @@ func writeBundle(t *testing.T, dir, schema string, bin []byte, info *buildinfo.B
 	if err := WriteSHA256SUMS(dir); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func pinnedBuildEnv() map[string]string {
+	return map[string]string{
+		"GOTOOLCHAIN": GoToolchain, "GOOS": TargetGOOS, "GOARCH": TargetGOARCH,
+		"GOAMD64": TargetGOAMD64, "CGO_ENABLED": TargetCGO, "GOENV": "off",
+		"GOWORK": "off", "GOEXPERIMENT": "", "GOCACHEPROG": "", "GOFIPS140": "off",
+		"GOFLAGS": "-mod=readonly",
+	}
+}
+
+func pinnedGoEnv() map[string]string {
+	return map[string]string{
+		"GOVERSION": GoVersion, "GOTOOLCHAIN": GoToolchain, "GOOS": TargetGOOS,
+		"GOARCH": TargetGOARCH, "GOAMD64": TargetGOAMD64, "CGO_ENABLED": TargetCGO,
+		"GOWORK": "off", "GOEXPERIMENT": "", "GOCACHEPROG": "", "GOFIPS140": "off",
+	}
+}
+
+func scanFixture(mode string) []byte {
+	return []byte(`{"config":{"protocol_version":"v1.0.0","scanner_name":"govulncheck","scanner_version":"` + VulnVersion + `","db":"https://vuln.go.dev","db_last_modified":"2026-10-08T22:31:09Z","scan_level":"symbol","scan_mode":"` + mode + `"}}` + "\n")
 }
 
 func stdComponent() map[string]any {

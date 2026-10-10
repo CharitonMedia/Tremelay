@@ -89,6 +89,18 @@ func Assess(raw []byte, exitStatus int) (Assessment, error) {
 	if cfg.ScanLevel != "" && cfg.ScanLevel != "symbol" {
 		return Assessment{}, fmt.Errorf("govulncheck scan_level %s, want symbol", cfg.ScanLevel)
 	}
+	if cfg.ScannerName != "govulncheck" {
+		return Assessment{}, fmt.Errorf("govulncheck scanner_name %q, want govulncheck", cfg.ScannerName)
+	}
+	if cfg.ScannerVersion != VulnVersion {
+		return Assessment{}, fmt.Errorf("govulncheck scanner_version %s, want %s", cfg.ScannerVersion, VulnVersion)
+	}
+	if cfg.ScanMode != "source" && cfg.ScanMode != "binary" {
+		return Assessment{}, fmt.Errorf("govulncheck scan_mode %q", cfg.ScanMode)
+	}
+	a.ScanMode = cfg.ScanMode
+	a.ScannerName = cfg.ScannerName
+	a.ScannerVersion = cfg.ScannerVersion
 	a.DatabaseEndpoint = cfg.DB
 	if cfg.DB == "" {
 		a.Blocked = true
@@ -114,6 +126,14 @@ func Assess(raw []byte, exitStatus int) (Assessment, error) {
 	}
 	a.SymbolGatePass = !a.Blocked && a.Called == 0 && exitStatus == 0
 	return a, nil
+}
+
+// ReportName is the only raw govulncheck filename accepted for a scope.
+func ReportName(scope string) string {
+	if scope != "source" && scope != "binary" {
+		return ""
+	}
+	return "govulncheck-" + scope + ".json"
 }
 
 // ScanMetaFrom fills the evidence record from an assessment.

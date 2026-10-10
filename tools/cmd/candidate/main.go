@@ -45,28 +45,6 @@ func run(root, out string) error {
 	if filepath.Base(out) != "m11a-candidate" {
 		return fmt.Errorf("refusing to replace %s", out)
 	}
-	toolsDir := filepath.Join(root, "tools")
-	schemaDir := filepath.Join(toolsDir, "schema", "cyclonedx")
-	if err := evidence.CheckSchemaFiles(schemaDir); err != nil {
-		return err
-	}
-	sumText, err := os.ReadFile(filepath.Join(toolsDir, "go.sum"))
-	if err != nil {
-		return err
-	}
-	for _, pin := range []struct{ module, version, sum string }{
-		{evidence.CycloneDXModule, evidence.CycloneDXVer, evidence.CycloneDXSum},
-		{evidence.VulnModule, evidence.VulnVersion, evidence.VulnSum},
-		{evidence.ValidatorModule, evidence.ValidatorVer, evidence.ValidatorSum},
-	} {
-		got, err := evidence.ModuleSum(sumText, pin.module, pin.version)
-		if err != nil {
-			return err
-		}
-		if got != pin.sum {
-			return fmt.Errorf("%s@%s sum %s, pin %s", pin.module, pin.version, got, pin.sum)
-		}
-	}
 	goBin, err := toolchainGo()
 	if err != nil {
 		return err
@@ -75,7 +53,7 @@ func run(root, out string) error {
 	if err != nil {
 		return err
 	}
-	tree, err := gitOut(root, "rev-parse", "HEAD^{tree}")
+	tree, err := gitOut(root, "rev-parse", commit+"^{tree}")
 	if err != nil {
 		return err
 	}
@@ -125,7 +103,7 @@ func run(root, out string) error {
 		if err := os.MkdirAll(cache, 0o755); err != nil {
 			return err
 		}
-		if err := extractArchive(root, src); err != nil {
+		if err := extractArchive(root, commit, src); err != nil {
 			return err
 		}
 		if got, err := evidence.FileSHA256(filepath.Join(src, "go.mod")); err != nil || got != modHash {
@@ -134,6 +112,48 @@ func run(root, out string) error {
 		if got, err := evidence.FileSHA256(filepath.Join(src, "go.sum")); err != nil || got != sumHash {
 			return fmt.Errorf("workspace %s go.sum hash %s, source %s (%v)", name, got, sumHash, err)
 		}
+		absSrc, err := filepath.Abs(src)
+		if err != nil {
+			return err
+		}
+		absBin, err := filepath.Abs(bin)
+		if err != nil {
+			return err
+		}
+		sides[i] = side{name: name, src: absSrc, bin: absBin}
+	}
+	if err := assertStableSource(root, commit, tree); err != nil {
+		return err
+	}
+	toolsDir := filepath.Join(sides[0].src, "tools")
+	schemaDir := filepath.Join(toolsDir, "schema", "cyclonedx")
+	if err := evidence.CheckSchemaFiles(schemaDir); err != nil {
+		return err
+	}
+	sumText, err := os.ReadFile(filepath.Join(toolsDir, "go.sum"))
+	if err != nil {
+		return err
+	}
+	for _, pin := range []struct{ module, version, sum string }{
+		{evidence.CycloneDXModule, evidence.CycloneDXVer, evidence.CycloneDXSum},
+		{evidence.VulnModule, evidence.VulnVersion, evidence.VulnSum},
+		{evidence.ValidatorModule, evidence.ValidatorVer, evidence.ValidatorSum},
+	} {
+		got, err := evidence.ModuleSum(sumText, pin.module, pin.version)
+		if err != nil {
+			return err
+		}
+		if got != pin.sum {
+			return fmt.Errorf("%s@%s sum %s, pin %s", pin.module, pin.version, got, pin.sum)
+		}
+	}
+	if err := verifySharedModuleCache(goBin, sides[0].src, toolsDir, modCache); err != nil {
+		return err
+	}
+	for i, name := range []string{"a", "b"} {
+		src := sides[i].src
+		cache := filepath.Join(parent, name, "gocache")
+		bin := sides[i].bin
 		if err := build(goBin, src, cache, modCache, bin); err != nil {
 			return fmt.Errorf("build %s: %w", name, err)
 		}
@@ -147,15 +167,7 @@ func run(root, out string) error {
 		if err != nil {
 			return err
 		}
-		absSrc, err := filepath.Abs(src)
-		if err != nil {
-			return err
-		}
-		absBin, err := filepath.Abs(bin)
-		if err != nil {
-			return err
-		}
-		sides[i] = side{name: name, src: absSrc, bin: absBin, sum: sum}
+		sides[i].sum = sum
 	}
 	caches := [2]string{
 		mustAbs(filepath.Join(parent, "a", "gocache")),
@@ -174,13 +186,15 @@ func run(root, out string) error {
 	if got, err := evidence.FileSHA256(goSum); err != nil || got != sumHash {
 		return fmt.Errorf("preparing the candidate changed go.sum")
 	}
-	if err := os.RemoveAll(out); err != nil {
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(out, 0o755); err != nil {
+	staging, err := os.MkdirTemp("", "tremelay-m11a-evidence-")
+	if err != nil {
 		return err
 	}
-	binPath := filepath.Join(out, "tremelay")
+	defer os.RemoveAll(staging)
+	binPath := filepath.Join(staging, "tremelay")
 	if err := copyFile(binPath, sides[0].bin, 0o755); err != nil {
 		return err
 	}
@@ -202,7 +216,7 @@ func run(root, out string) error {
 		return err
 	}
 	infoDoc := evidence.BuildInfoDocFrom(info, id)
-	sbomPath := filepath.Join(out, "sbom.cdx.json")
+	sbomPath := filepath.Join(staging, "sbom.cdx.json")
 	toolCache, err := os.MkdirTemp("", "tremelay-m11a-tool-")
 	if err != nil {
 		return err
@@ -228,11 +242,11 @@ func run(root, out string) error {
 	if err := evidence.CompareBuildInfo(info, bound); err != nil {
 		return err
 	}
-	mainGraph, err := listModules(goBin, sides[0].src, modCache)
+	mainGraph, err := listModules(goBin, sides[0].src, modCache, false)
 	if err != nil {
 		return fmt.Errorf("source module graph: %w", err)
 	}
-	toolGraph, err := listModules(goBin, toolsDir, modCache)
+	toolGraph, err := listModules(goBin, toolsDir, modCache, true)
 	if err != nil {
 		return fmt.Errorf("build-tool module graph: %w", err)
 	}
@@ -311,9 +325,10 @@ func run(root, out string) error {
 			{Workspace: sides[0].src, Output: sides[0].bin, Cache: caches[0], SHA256: sides[0].sum},
 			{Workspace: sides[1].src, Output: sides[1].bin, Cache: caches[1], SHA256: sides[1].sum},
 		},
-		ModuleCache:     modCache,
-		ModuleCacheNote: "The module download cache was shared and recorded. Compiled output caches were separate and initially empty.",
-		Scope:           "two workspaces and two compilation caches on one builder; not independent-builder or cross-platform reproducibility",
+		ModuleCache:         modCache,
+		ModuleCacheNote:     "The module download cache was shared, populated from the committed application and tools graphs, and checked with go mod verify before either build. Compiled output caches were separate and initially empty.",
+		ModuleCacheVerified: evidence.ModuleCacheVerified,
+		Scope:               "two workspaces and two compilation caches on one builder; not independent-builder or cross-platform reproducibility",
 	}
 	validation := evidence.ValidationReport{
 		SourceCommit:     commit,
@@ -351,10 +366,16 @@ func run(root, out string) error {
 	}
 	sourceRaw, sourceMeta, err := scan(goBin, toolsDir, modCache, toolCache, "source", []string{"govulncheck", "-C", sides[0].src, "-format=json", "./..."}, id)
 	if err != nil {
-		return err
+		return persistScanFailure(out, "source", sourceRaw, sourceMeta, err)
 	}
 	binaryRaw, binaryMeta, err := scan(goBin, toolsDir, modCache, toolCache, "binary", []string{"govulncheck", "-mode=binary", "-format=json", binPath}, id)
 	if err != nil {
+		return persistScanFailure(out, "binary", binaryRaw, binaryMeta, err)
+	}
+	if err := verifySharedModuleCache(goBin, sides[0].src, toolsDir, modCache); err != nil {
+		return fmt.Errorf("module cache changed after verification: %w", err)
+	}
+	if err := assertStableSource(root, commit, tree); err != nil {
 		return err
 	}
 	readme := evidence.AssuranceREADME(evidence.READMEInput{
@@ -364,37 +385,37 @@ func run(root, out string) error {
 		MCPSDKInBinary: inBinary,
 		MCPSDKVersion:  binVer,
 	})
-	if err := evidence.WriteJSON(filepath.Join(out, "build-inputs.json"), inputs); err != nil {
+	if err := evidence.WriteJSON(filepath.Join(staging, "build-inputs.json"), inputs); err != nil {
 		return err
 	}
-	if err := evidence.WriteJSON(filepath.Join(out, "two-build-receipt.json"), receipt); err != nil {
+	if err := evidence.WriteJSON(filepath.Join(staging, "two-build-receipt.json"), receipt); err != nil {
 		return err
 	}
-	if err := evidence.WriteJSON(filepath.Join(out, "binary-buildinfo.json"), infoDoc); err != nil {
+	if err := evidence.WriteJSON(filepath.Join(staging, "binary-buildinfo.json"), infoDoc); err != nil {
 		return err
 	}
-	if err := evidence.WriteJSON(filepath.Join(out, "source-inventory.json"), inventory); err != nil {
+	if err := evidence.WriteJSON(filepath.Join(staging, "source-inventory.json"), inventory); err != nil {
 		return err
 	}
-	if err := evidence.WriteJSON(filepath.Join(out, "sbom-validation.json"), validation); err != nil {
+	if err := evidence.WriteJSON(filepath.Join(staging, "sbom-validation.json"), validation); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(out, "govulncheck-source.json"), sourceRaw, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(staging, evidence.ReportName("source")), sourceRaw, 0o644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(out, "govulncheck-binary.json"), binaryRaw, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(staging, evidence.ReportName("binary")), binaryRaw, 0o644); err != nil {
 		return err
 	}
-	if err := evidence.WriteJSON(filepath.Join(out, "govulncheck-source-meta.json"), sourceMeta); err != nil {
+	if err := evidence.WriteJSON(filepath.Join(staging, "govulncheck-source-meta.json"), sourceMeta); err != nil {
 		return err
 	}
-	if err := evidence.WriteJSON(filepath.Join(out, "govulncheck-binary-meta.json"), binaryMeta); err != nil {
+	if err := evidence.WriteJSON(filepath.Join(staging, "govulncheck-binary-meta.json"), binaryMeta); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(out, "README.md"), []byte(readme), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(staging, "README.md"), []byte(readme), 0o644); err != nil {
 		return err
 	}
-	if err := evidence.WriteSHA256SUMS(out); err != nil {
+	if err := evidence.WriteSHA256SUMS(staging); err != nil {
 		return err
 	}
 	if got, err := evidence.FileSHA256(goMod); err != nil || got != modHash {
@@ -403,7 +424,10 @@ func run(root, out string) error {
 	if got, err := evidence.FileSHA256(goSum); err != nil || got != sumHash {
 		return fmt.Errorf("preparing the candidate changed go.sum")
 	}
-	return evidence.Verify(out, schemaDir)
+	if err := evidence.Verify(staging, schemaDir); err != nil {
+		return err
+	}
+	return publishEvidence(staging, out)
 }
 
 func scan(goBin, toolsDir, modCache, toolCache, scope string, args []string, id evidence.Identity) ([]byte, evidence.ScanMeta, error) {
@@ -416,17 +440,22 @@ func scan(goBin, toolsDir, modCache, toolCache, scope string, args []string, id 
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	end := time.Now().UTC()
-	exit := 0
-	if err != nil {
-		var ee *exec.ExitError
-		if !errors.As(err, &ee) {
-			return nil, evidence.ScanMeta{}, err
-		}
-		exit = ee.ExitCode()
-	}
+	exit, runErr := commandExit(err)
 	raw := stdout.Bytes()
+	if runErr != nil {
+		meta := evidence.ScanMetaFrom(scope, evidence.ReportName(scope), args, id, start, end, stderr.String(), evidence.Assessment{})
+		meta.ExitStatus = exit
+		meta.SymbolGatePass = false
+		meta.ClaimsVulnerabilityAbsence = false
+		return raw, meta, runErr
+	}
+	return finishScan(scope, args, id, start, end, stderr.String(), exit, raw)
+}
+
+func finishScan(scope string, args []string, id evidence.Identity, start, end time.Time, stderr string, exit int, raw []byte) ([]byte, evidence.ScanMeta, error) {
 	assessed, aerr := evidence.Assess(raw, exit)
-	meta := evidence.ScanMetaFrom(scope, "govulncheck-"+scope+".json", args, id, start, end, stderr.String(), assessed)
+	meta := evidence.ScanMetaFrom(scope, evidence.ReportName(scope), args, id, start, end, stderr, assessed)
+	meta.ExitStatus = exit
 	if aerr != nil {
 		meta.SymbolGatePass = false
 		meta.ClaimsVulnerabilityAbsence = false
@@ -435,7 +464,47 @@ func scan(goBin, toolsDir, modCache, toolCache, scope string, args []string, id 
 	return raw, meta, nil
 }
 
-func listModules(goBin, dir, modCache string) ([]evidence.Mod, error) {
+func commandExit(err error) (int, error) {
+	if err == nil {
+		return 0, nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode(), nil
+	}
+	return -1, err
+}
+
+func persistScanFailure(verifiedOut, scope string, raw []byte, meta evidence.ScanMeta, scanErr error) error {
+	parent := filepath.Dir(verifiedOut)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
+	}
+	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	dir := filepath.Join(parent, "m11a-scan-failure-"+stamp)
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		var derr error
+		dir, derr = os.MkdirTemp(parent, "m11a-scan-failure-"+stamp+"-")
+		if derr != nil {
+			return fmt.Errorf("%w (scan failure record: %v)", scanErr, derr)
+		}
+	}
+	name := evidence.ReportName(scope)
+	if name != "" && len(raw) > 0 {
+		if err := os.WriteFile(filepath.Join(dir, name), raw, 0o644); err != nil {
+			return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
+		}
+	}
+	if err := evidence.WriteJSON(filepath.Join(dir, "govulncheck-"+scope+"-meta.json"), meta); err != nil {
+		return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "failure.txt"), []byte(scanErr.Error()+"\n"), 0o644); err != nil {
+		return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
+	}
+	return fmt.Errorf("%s scan failed; failure record %s: %w", scope, dir, scanErr)
+}
+
+func listModules(goBin, dir, modCache string, tools bool) ([]evidence.Mod, error) {
 	cache, err := os.MkdirTemp("", "tremelay-m11a-list-")
 	if err != nil {
 		return nil, err
@@ -443,7 +512,11 @@ func listModules(goBin, dir, modCache string) ([]evidence.Mod, error) {
 	defer os.RemoveAll(cache)
 	cmd := exec.Command(goBin, "list", "-m", "-json", "all")
 	cmd.Dir = dir
-	cmd.Env = profileEnv(goBin, modCache, cache)
+	if tools {
+		cmd.Env = toolEnv(goBin, modCache, cache)
+	} else {
+		cmd.Env = profileEnv(goBin, modCache, cache)
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		var ee *exec.ExitError
@@ -499,13 +572,27 @@ func runTool(goBin, toolsDir, modCache, toolCache string, args ...string) error 
 }
 
 func profileEnv(goBin, modCache, goCache string) []string {
-	env := baseEnv(goBin)
-	env = append(env,
-		"GOTOOLCHAIN="+evidence.GoToolchain,
+	return append(controlledEnv(goBin, modCache, goCache),
 		"GOOS="+evidence.TargetGOOS,
 		"GOARCH="+evidence.TargetGOARCH,
 		"GOAMD64="+evidence.TargetGOAMD64,
 		"CGO_ENABLED="+evidence.TargetCGO,
+	)
+}
+
+func toolEnv(goBin, modCache, cache string) []string {
+	return controlledEnv(goBin, modCache, cache)
+}
+
+func controlledEnv(goBin, modCache, goCache string) []string {
+	env := baseEnv(goBin)
+	return append(env,
+		"GOENV=off",
+		"GOWORK=off",
+		"GOEXPERIMENT=",
+		"GOCACHEPROG=",
+		"GOFIPS140=off",
+		"GOTOOLCHAIN="+evidence.GoToolchain,
 		"GO111MODULE=on",
 		"GOFLAGS=-mod=readonly",
 		"GOCACHE="+goCache,
@@ -514,22 +601,6 @@ func profileEnv(goBin, modCache, goCache string) []string {
 		"GOSUMDB=sum.golang.org",
 		"GOTELEMETRY=off",
 	)
-	return env
-}
-
-func toolEnv(goBin, modCache, cache string) []string {
-	env := baseEnv(goBin)
-	env = append(env,
-		"GOTOOLCHAIN="+evidence.GoToolchain,
-		"GO111MODULE=on",
-		"GOFLAGS=-mod=readonly",
-		"GOCACHE="+cache,
-		"GOMODCACHE="+modCache,
-		"GOPROXY=https://proxy.golang.org,direct",
-		"GOSUMDB=sum.golang.org",
-		"GOTELEMETRY=off",
-	)
-	return env
 }
 
 func baseEnv(goBin string) []string {
@@ -589,7 +660,7 @@ func goEnvOne(goBin, dir, key string) (string, error) {
 }
 
 func goEnvJSON(goBin, dir string, env []string) (map[string]string, error) {
-	keys := []string{"GOVERSION", "GOOS", "GOARCH", "GOAMD64", "CGO_ENABLED", "GOTOOLCHAIN", "GO111MODULE", "GOPROXY", "GOSUMDB", "GOMODCACHE", "GOFLAGS"}
+	keys := []string{"GOVERSION", "GOOS", "GOARCH", "GOAMD64", "CGO_ENABLED", "GOTOOLCHAIN", "GO111MODULE", "GOPROXY", "GOSUMDB", "GOMODCACHE", "GOFLAGS", "GOWORK", "GOEXPERIMENT", "GOCACHEPROG", "GOFIPS140", "GOTELEMETRY"}
 	cmd := exec.Command(goBin, append([]string{"env", "-json"}, keys...)...)
 	cmd.Dir = dir
 	cmd.Env = env
@@ -629,11 +700,14 @@ func gitOut(root string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func extractArchive(root, dest string) error {
+func extractArchive(root, commit, dest string) error {
+	if !commitHex(commit) {
+		return fmt.Errorf("refusing to archive moving revision %q", commit)
+	}
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
 	}
-	archive := exec.Command("git", "archive", "--format=tar", "HEAD")
+	archive := exec.Command("git", "archive", "--format=tar", commit)
 	archive.Dir = root
 	extract := exec.Command("tar", "-xf", "-", "-C", dest)
 	pipe, err := archive.StdoutPipe()
@@ -657,6 +731,156 @@ func extractArchive(root, dest string) error {
 		return fmt.Errorf("tar: %w: %s", err, terr.String())
 	}
 	return nil
+}
+
+func commitHex(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func assertStableSource(root, commit, tree string) error {
+	got, err := gitOut(root, "rev-parse", "HEAD")
+	if err != nil {
+		return err
+	}
+	if got != commit {
+		return fmt.Errorf("source commit drifted from %s to %s", commit, got)
+	}
+	gotTree, err := gitOut(root, "rev-parse", commit+"^{tree}")
+	if err != nil {
+		return err
+	}
+	if gotTree != tree {
+		return fmt.Errorf("source tree drifted from %s to %s", tree, gotTree)
+	}
+	status, err := gitOut(root, "status", "--porcelain")
+	if err != nil {
+		return err
+	}
+	if status != "" {
+		return fmt.Errorf("source changed during the candidate build:\n%s", status)
+	}
+	return nil
+}
+
+func verifySharedModuleCache(goBin, appDir, toolsDir, modCache string) error {
+	appCache, err := os.MkdirTemp("", "tremelay-m11a-modapp-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(appCache)
+	toolCache, err := os.MkdirTemp("", "tremelay-m11a-modtool-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(toolCache)
+	appEnv := profileEnv(goBin, modCache, appCache)
+	toolsEnv := toolEnv(goBin, modCache, toolCache)
+	if err := runGo(goBin, appDir, appEnv, "mod", "download"); err != nil {
+		return fmt.Errorf("application module download: %w", err)
+	}
+	if err := runGo(goBin, toolsDir, toolsEnv, "mod", "download"); err != nil {
+		return fmt.Errorf("tools module download: %w", err)
+	}
+	if err := requireModVerify(goBin, appDir, appEnv, "application"); err != nil {
+		return err
+	}
+	return requireModVerify(goBin, toolsDir, toolsEnv, "tools")
+}
+
+func requireModVerify(goBin, dir string, env []string, what string) error {
+	cmd := exec.Command(goBin, "mod", "verify")
+	cmd.Dir = dir
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		return fmt.Errorf("%s go mod verify: %w: %s", what, err, text)
+	}
+	if text != "all modules verified" {
+		return fmt.Errorf("%s go mod verify: %s", what, text)
+	}
+	return nil
+}
+
+func runGo(goBin, dir string, env []string, args ...string) error {
+	cmd := exec.Command(goBin, args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %w: %s", strings.Join(args, " "), err, out)
+	}
+	return nil
+}
+
+func publishEvidence(staging, out string) error {
+	parent := filepath.Dir(out)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	incoming, err := os.MkdirTemp(parent, ".m11a-publish-")
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(incoming); err != nil {
+		return err
+	}
+	if err := os.Rename(staging, incoming); err != nil {
+		if err := copyTree(staging, incoming); err != nil {
+			os.RemoveAll(incoming)
+			return err
+		}
+	}
+	if _, err := os.Lstat(out); errors.Is(err, os.ErrNotExist) {
+		return os.Rename(incoming, out)
+	} else if err != nil {
+		os.RemoveAll(incoming)
+		return err
+	}
+	backup := out + ".previous"
+	if err := os.RemoveAll(backup); err != nil {
+		os.RemoveAll(incoming)
+		return err
+	}
+	if err := os.Rename(out, backup); err != nil {
+		os.RemoveAll(incoming)
+		return err
+	}
+	if err := os.Rename(incoming, out); err != nil {
+		os.RemoveAll(incoming)
+		if rb := os.Rename(backup, out); rb != nil {
+			return fmt.Errorf("publish evidence: %w (restore failed: %v)", err, rb)
+		}
+		return err
+	}
+	return os.RemoveAll(backup)
+}
+
+func copyTree(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		return copyFile(target, path, info.Mode().Perm())
+	})
 }
 
 func builderIdentity() map[string]string {
