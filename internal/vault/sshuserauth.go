@@ -88,6 +88,8 @@ type sshBroker interface {
 // ssh_userauth grant for this principal. Construction does not sign, does not
 // write an allow row, and does not make an expired, revoked, or otherwise
 // unusable grant usable. A different grant needs a different stream.
+// Rejected construction records a fixed denial with no grant or credential
+// fields and only a verified principal ID. Audit failure replaces the denial.
 func (a *AgentPrincipal) SSHUserAuth(grantID string) (*SSHUserAuth, error) {
 	if a == nil || a.view == nil {
 		return nil, ErrUnauthenticated
@@ -369,26 +371,34 @@ func (s *Session) sshConstruct(agentID, grantID string) error {
 		return err
 	}
 	if safeID(agentID) == "" || safeID(grantID) == "" {
-		return ErrInvalid
+		return s.denySSHConstruct(agentID, ErrInvalid)
 	}
 	if !s.agentExists(agentID) {
-		return ErrDeniedAgent
+		return s.denySSHConstruct(agentID, ErrDeniedAgent)
 	}
 	g, ok := s.grantByID(grantID)
 	if !ok {
-		return ErrGrantNotFound
+		return s.denySSHConstruct(agentID, ErrGrantNotFound)
 	}
 	if g.AgentID != agentID {
-		return ErrDeniedAgent
+		return s.denySSHConstruct(agentID, ErrDeniedAgent)
 	}
 	if !sshGrantShape(g) {
-		return ErrDeniedOperation
+		return s.denySSHConstruct(agentID, ErrDeniedOperation)
 	}
 	c, ok := s.credByID(g.CredentialID)
 	if !ok || c.Type != CredTypeEd25519 {
-		return ErrInvalid
+		return s.denySSHConstruct(agentID, ErrInvalid)
 	}
 	return nil
+}
+
+func (s *Session) denySSHConstruct(agentID string, cause error) error {
+	ev := auditEvent{Action: actionSSHUserAuth, Operation: OpSSHUserAuth, Result: resultDenied}
+	if safeID(agentID) != "" && s.agentExists(agentID) {
+		ev.AgentID = agentID
+	}
+	return s.finish(ev, cause)
 }
 
 // sshJudge re-reads the selected grant. It does not look for another grant,
