@@ -50,4 +50,4 @@ ok := vault.VerifyLocalAttestation(pub, "artifact:demo", []byte("demo-artifact")
 
 ## What remains
 
-SSH-agent compatibility, SSH certificates, agent forwarding, and deployment with real keys are a separate scope. General-purpose signing, decryption, and HMAC are not this operation.
+Host-bound SSH user authentication is a separate operation, `ssh_userauth`, specified in [ADR 0013](adr/0013-ssh-userauth.md) and [m8-ssh-userauth.md](m8-ssh-userauth.md). This attestation does not authorize it. General-purpose signing, decryption, and HMAC are not this operation.

@@ -31,7 +31,7 @@ const (
 
 // grantOperations is the closed set of capability operations. Secret retrieval
 // is not in the set.
-var grantOperations = []string{OpHTTPRequest, OpSign, OpGitHubIssueState, OpLocalArtifactAttest}
+var grantOperations = []string{OpHTTPRequest, OpSign, OpGitHubIssueState, OpLocalArtifactAttest, OpSSHUserAuth}
 
 // GrantOperations returns a copy of the operation allowlist.
 func GrantOperations() []string {
@@ -54,6 +54,10 @@ type GrantSpec struct {
 	Operations      []string
 	Resource        string
 	ExpiresAt       time.Time
+	// SSHUsername and SSHHostKey are required for ssh_userauth and forbidden
+	// on every other operation. SSHHostKey is the canonical ssh-ed25519 blob.
+	SSHUsername string
+	SSHHostKey  []byte
 }
 
 // Grant is a persisted capability. It does not carry credential plaintext.
@@ -68,8 +72,14 @@ type Grant struct {
 	ExpiresAt       time.Time
 	RevokedAt       *time.Time
 	// KeyID is the hex-encoded Ed25519 public key bound at issuance.
-	// It is empty for grants that do not attest.
+	// It is empty for grants that do not attest or authenticate SSH.
 	KeyID string
+	// SSHUsername is the exact account name bound to an ssh_userauth grant.
+	// SSHHostKey is the canonical ssh-ed25519 server host public key blob.
+	// Both are empty for every other operation. The resource string does not
+	// constrain the account, the host, or anything that happens after authentication.
+	SSHUsername string
+	SSHHostKey  []byte
 }
 
 // Capability is the agent-visible description of one grant.
@@ -84,8 +94,12 @@ type Capability struct {
 	ExpiresAt       time.Time
 	RevokedAt       *time.Time
 	Status          string
-	// KeyID is the public key identity bound to an attestation grant.
+	// KeyID is the public key identity bound to an attestation or SSH grant.
 	KeyID string
+	// SSHUsername and SSHHostKey describe an ssh_userauth grant.
+	// They are empty for every other operation.
+	SSHUsername string
+	SSHHostKey  []byte
 }
 
 type agentRecord struct {
@@ -107,6 +121,8 @@ type grantRecord struct {
 	ExpiresAt       time.Time  `json:"expires_at"`
 	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
 	KeyID           string     `json:"key_id,omitempty"`
+	SSHUsername     string     `json:"ssh_username,omitempty"`
+	SSHHostKey      []byte     `json:"ssh_host_key,omitempty"`
 }
 
 // capabilityView is the slice of the vault an agent principal can call.
@@ -160,7 +176,7 @@ func (b agentBinder) localAttest(agentID string, req LocalAttestRequest) (LocalA
 
 // AgentPrincipal is the agent-facing handle for one identity.
 // Its method set is capability listing, authorization, the HTTP broker, the
-// GitHub issue read, and local attestation.
+// GitHub issue read, local attestation, and one host-bound SSH userauth stream.
 // It has no credential retrieval, grant issuance, clock, or way to select a different principal.
 type AgentPrincipal struct {
 	view capabilityView
@@ -295,8 +311,11 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 	if err := attestGrantOK(ops, spec, credType); err != nil {
 		return deny(err)
 	}
+	if err := sshGrantOK(ops, spec, credType); err != nil {
+		return deny(err)
+	}
 	keyID := ""
-	if soleLocalAttest(ops) {
+	if soleLocalAttest(ops) || soleSSH(ops) {
 		secret, ok := s.copySecret(credID)
 		if !ok {
 			return deny(ErrInvalid)
@@ -312,13 +331,15 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 		return Grant{}, err
 	}
 	rec := grantRecord{
-		ID:         id,
-		AgentID:    agentID,
-		Operations: ops,
-		Resource:   spec.Resource,
-		CreatedAt:  now,
-		ExpiresAt:  expires,
-		KeyID:      keyID,
+		ID:          id,
+		AgentID:     agentID,
+		Operations:  ops,
+		Resource:    spec.Resource,
+		CreatedAt:   now,
+		ExpiresAt:   expires,
+		KeyID:       keyID,
+		SSHUsername: spec.SSHUsername,
+		SSHHostKey:  dup(spec.SSHHostKey),
 	}
 	if spec.CredentialID != "" {
 		rec.CredentialID = credID
@@ -443,6 +464,9 @@ func (s *Session) authorizeCapability(agentID, credentialID, operation, resource
 	partial, cause := s.judge(agentID, credentialID, operation, resource)
 	if cause == nil && operation == OpLocalArtifactAttest {
 		partial, cause = s.screenAttestKey(partial)
+	}
+	if cause == nil && operation == OpSSHUserAuth {
+		partial, cause = s.screenSSHKey(partial)
 	}
 	partial.Action = actionAuthorize
 	if err := s.finish(partial, cause); err != nil {
@@ -621,7 +645,7 @@ func decideAccess(grants []grantRecord, agentOK bool, agentID, credID, credType 
 		}
 		// A class grant or a grant with no key id is not signing authority.
 		// Checked after the operation so a sign or http grant stays denied_operation.
-		if !attestCredScope(g, op) {
+		if !attestCredScope(g, op) || !sshCredScope(g, op) {
 			credMismatch = preferID(credMismatch, g.ID)
 			continue
 		}
@@ -715,6 +739,8 @@ func (g grantRecord) capability(now time.Time) Capability {
 		RevokedAt:       cloneTime(g.RevokedAt),
 		Status:          grantStatus(g, now),
 		KeyID:           g.KeyID,
+		SSHUsername:     g.SSHUsername,
+		SSHHostKey:      dup(g.SSHHostKey),
 	}
 }
 
@@ -744,6 +770,8 @@ func (g grantRecord) public() Grant {
 		ExpiresAt:       g.ExpiresAt.UTC(),
 		RevokedAt:       cloneTime(g.RevokedAt),
 		KeyID:           g.KeyID,
+		SSHUsername:     g.SSHUsername,
+		SSHHostKey:      dup(g.SSHHostKey),
 	}
 }
 

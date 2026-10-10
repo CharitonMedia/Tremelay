@@ -3,7 +3,8 @@
 // Retrieval requires an unlocked session, which requires the vault passphrase.
 // Agent principals and capability grants are a separate authority from that
 // human session. AgentPrincipal can list capabilities, authorize them, invoke
-// the HTTP broker, and request one local Ed25519 attestation for one identity.
+// the HTTP broker, request one local Ed25519 attestation, and open one
+// host-bound SSH userauth stream for one identity.
 // It cannot retrieve credential plaintext. This package must not grow an
 // agent-facing raw-secret retrieval API.
 package vault
@@ -264,6 +265,10 @@ type Session struct {
 	// commits and before Ed25519 signing. A non-nil error withholds the
 	// signature. Tests use it. Production leaves it nil.
 	attestFault func() error
+	// sshFault, when set, runs after the SSH userauth allowed row commits and
+	// before Ed25519 signing. A non-nil error withholds the signature.
+	// Tests use it. Production leaves it nil.
+	sshFault func() error
 	// clock, when set, is the trusted time for grant expiry and capability
 	// status. Production leaves it nil and uses time.Now. Agent-facing
 	// methods cannot set it.

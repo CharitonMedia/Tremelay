@@ -4,7 +4,7 @@ Status: Accepted
 
 ## Context
 
-M8 asks for authorized signing while private key material stays inside Tremelay. This ADR is the local slice only. It does not implement SSH-agent compatibility, SSH wire format, agent forwarding, OS sockets, or live keys.
+M8 asks for authorized signing while private key material stays inside Tremelay. This ADR is the local slice only. Host-bound SSH user authentication is a separate operation in [ADR 0013](0013-ssh-userauth.md). This operation does not implement SSH wire format, agent forwarding, OS sockets, or live keys.
 
 The security criteria for this slice are:
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -61,7 +62,7 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay credential refresh --path PATH [--id ID]
   tremelay credential policy --path PATH [--min-length N] [--pattern-run N] [--freshness DURATION] [--reminder-lead DURATION] [--compromise-opt-in true|false]
   tremelay agent create --path PATH --label LABEL
-  tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339
+  tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339 [--ssh-user USER --ssh-host-key HEX]
   tremelay grant revoke --path PATH --id ID
   tremelay capability list --path PATH --agent ID
   tremelay capability authorize --path PATH --agent ID --credential ID --operation OP --resource SCOPE
@@ -784,6 +785,8 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 	class := fs.String("class", "", "credential class")
 	resource := fs.String("resource", "", "resource scope")
 	expires := fs.String("expires", "", "expiration time (RFC3339)")
+	sshUser := fs.String("ssh-user", "", "exact SSH username for ssh_userauth")
+	sshHost := fs.String("ssh-host-key", "", "hex ssh-ed25519 host public key blob for ssh_userauth")
 	var ops opsFlag
 	fs.Var(&ops, "operation", "permitted operation")
 	if err := fs.Parse(args); err != nil {
@@ -803,6 +806,14 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 		if err != nil {
 			return session.RejectGrantCreate(vault.ErrInvalid)
 		}
+		var hostKey []byte
+		if *sshHost != "" {
+			var err error
+			hostKey, err = hex.DecodeString(*sshHost)
+			if err != nil {
+				return session.RejectGrantCreate(vault.ErrInvalid)
+			}
+		}
 		grant, err := session.IssueGrant(vault.GrantSpec{
 			AgentID:         *agent,
 			CredentialID:    *cred,
@@ -810,6 +821,8 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 			Operations:      ops,
 			Resource:        *resource,
 			ExpiresAt:       exp.UTC(),
+			SSHUsername:     *sshUser,
+			SSHHostKey:      hostKey,
 		})
 		if err != nil {
 			return err
@@ -901,6 +914,8 @@ func cmdCapabilityList(args []string, getenv func(string) string, stdin io.Reade
 				RevokedAt:       cap.RevokedAt,
 				Status:          cap.Status,
 				KeyID:           cap.KeyID,
+				SSHUsername:     cap.SSHUsername,
+				SSHHostKey:      cap.SSHHostKey,
 			}
 			if err := enc.Encode(view); err != nil {
 				return errors.New("stdout write failed")
@@ -956,6 +971,8 @@ type capabilityEntry struct {
 	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
 	Status          string     `json:"status"`
 	KeyID           string     `json:"key_id,omitempty"`
+	SSHUsername     string     `json:"ssh_username,omitempty"`
+	SSHHostKey      []byte     `json:"ssh_host_key,omitempty"`
 }
 
 type opsFlag []string
