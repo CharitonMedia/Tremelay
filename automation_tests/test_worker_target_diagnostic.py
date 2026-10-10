@@ -67,6 +67,7 @@ class WorkerTargetDiagnostic(unittest.TestCase):
         self.assertEqual(observed['recorded_agent_id'], AGENT)
         self.assertEqual(observed['recorded_run_id'], RUN)
         self.assertEqual(observed['observed_status'], 'FINISHED')
+        self.assertEqual(observed['observed_work_on_current_branch'], 'true')
         self.assertEqual(observed['agent_repositories'][0]['pr']['number'], 22)
         self.assertEqual(observed['pushed_branches'][0], {
             'repository': supervisor.REPO, 'pr': {'repository': supervisor.REPO, 'number': 23},
@@ -81,7 +82,7 @@ class WorkerTargetDiagnostic(unittest.TestCase):
 
     def test_secret_shaped_provider_fields_never_reach_the_failure_log(self):
         state, agent, run, pull, comment = fixture()
-        agent.update(prompt=SECRET, authorization=SECRET, result=SECRET)
+        agent.update(prompt=SECRET, authorization=SECRET, result=SECRET, workOnCurrentBranch=SECRET)
         agent['repos'][0].update(extra=SECRET, startingRef=SECRET)
         run.update(result=SECRET, prompt={'text': SECRET}, token=SECRET)
         run['git']['branches'] = [{'repoUrl': f'github.com/{SECRET}/private-repo',
@@ -103,6 +104,29 @@ class WorkerTargetDiagnostic(unittest.TestCase):
         self.assertEqual(branch['goal_branch'], 'unrecognized_branch')
         self.assertEqual(state['phase'], 'working')
         update.assert_not_called()
+
+    def test_branch_ownership_flag_uses_typed_categories_without_accepting_mismatches(self):
+        cases = [({}, 'missing'), ({'workOnCurrentBranch': False}, 'false')]
+        cases.extend(({'workOnCurrentBranch': value}, 'unrecognized')
+                     for value in [None, 0, 1, 'true', 'false', SECRET, [], {}])
+        for fields, category in cases:
+            with self.subTest(fields=fields):
+                state, agent, run, pull, comment = fixture(other_pr=22)
+                before = copy.deepcopy(state)
+                agent.pop('workOnCurrentBranch')
+                agent.update(fields)
+                stderr = io.StringIO()
+                with patch.object(supervisor, 'cursor', side_effect=[agent, run]) as cursor, \
+                        patch.object(supervisor, 'update_state') as update, redirect_stderr(stderr), \
+                        self.assertRaisesRegex(supervisor.Stop, 'repository or branch ownership is unverified'):
+                    supervisor.recover_worker(pull, comment, state, reconcile_only=True)
+                observed = self.parse_output(stderr.getvalue())
+                self.assertEqual(observed['observed_work_on_current_branch'], category)
+                self.assertNotIn(SECRET, stderr.getvalue())
+                self.assertEqual(state, before)
+                self.assertTrue(supervisor.supervisor_owns_work(state))
+                self.assertEqual(cursor.call_count, 2)
+                update.assert_not_called()
 
     def test_only_bounded_canonical_pr_urls_and_goal_branches_are_emitted(self):
         state, agent, run, _, _ = fixture()

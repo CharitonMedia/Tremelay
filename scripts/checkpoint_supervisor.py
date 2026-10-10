@@ -607,12 +607,15 @@ def worker_target_diagnostic(number, state, agent, run, expected_branch=None):
 
     status = run.get("status")
     git = run.get("git")
+    current_branch = agent.get("workOnCurrentBranch")
     return {"expected_repository": REPO,
             "expected_pr": number if type(number) is int and 0 < number < 10 ** 10 else "unrecognized_pr",
             "expected_goal_branch": branch(expected_branch),
             "recorded_agent_id": recorded_uuid("agent_id", "bc-"),
             "recorded_run_id": recorded_uuid("run_id", "run-"),
             "observed_status": status if isinstance(status, str) and status in WORKER_TERMINAL_STATUSES | {"CREATING", "RUNNING"} else "unrecognized_status",
+            "observed_work_on_current_branch": ("true" if current_branch is True else "false" if current_branch is False
+                                                else "missing" if "workOnCurrentBranch" not in agent else "unrecognized"),
             "agent_repositories": rows(agent.get("repos"), "url", "startingRef"),
             "pushed_branches": rows(git.get("branches") if isinstance(git, dict) else None, "repoUrl", "branch")}
 

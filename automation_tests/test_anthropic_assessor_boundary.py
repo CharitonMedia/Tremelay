@@ -461,10 +461,47 @@ class AssessorBoundary(unittest.TestCase):
         # reaps it. It cannot execute or retain the credential-bearing runtime.
         path = Path(f'/proc/{pid}/stat')
         for _ in range(50):
-            if not path.exists() or path.read_text().split()[2] == 'Z':
+            try:
+                if not path.exists() or path.read_text().split()[2] == 'Z':
+                    return
+            except (FileNotFoundError, ProcessLookupError):
+                # The process can exit between the existence check and read.
                 return
             time.sleep(0.02)
         self.fail(f'Owned helper process {pid} is still running')
+
+    def test_cleanup_observation_accepts_disappearance_after_exists(self):
+        for error in [FileNotFoundError(2, 'process disappeared'), ProcessLookupError(3, 'process disappeared')]:
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(Path, 'exists', return_value=True) as exists, \
+                    patch.object(Path, 'read_text', side_effect=error) as read, patch.object(time, 'sleep') as sleep:
+                self.assert_not_running(123)
+                exists.assert_called_once_with()
+                read.assert_called_once_with()
+                sleep.assert_not_called()
+
+    def test_cleanup_observation_retains_unexpected_read_errors(self):
+        for error in [PermissionError(13, 'permission denied'), OSError(5, 'read failed')]:
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(Path, 'exists', return_value=True), \
+                    patch.object(Path, 'read_text', side_effect=error), patch.object(time, 'sleep') as sleep:
+                with self.assertRaises(type(error)) as raised:
+                    self.assert_not_running(123)
+                self.assertIs(raised.exception, error)
+                sleep.assert_not_called()
+
+    def test_cleanup_observation_still_rejects_running_process_and_accepts_zombie(self):
+        with patch.object(Path, 'exists', return_value=True), \
+                patch.object(Path, 'read_text', return_value='123 (helper) S') as read, \
+                patch.object(time, 'sleep') as sleep:
+            with self.assertRaisesRegex(AssertionError, 'Owned helper process 123 is still running'):
+                self.assert_not_running(123)
+            self.assertEqual(read.call_count, 50)
+            self.assertEqual(sleep.call_count, 50)
+            read.return_value = '123 (helper) Z'
+            sleep.reset_mock()
+            self.assert_not_running(123)
+            sleep.assert_not_called()
 
     def test_timeout_terminates_ignoring_child_and_grandchild_as_one_group(self):
         with tempfile.TemporaryDirectory() as directory:

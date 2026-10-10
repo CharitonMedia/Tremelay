@@ -87,8 +87,9 @@ patched main. No production launch is part of patch validation.
 
 Supervisor association failures emit a bounded diagnostic on the existing GET
 recovery path. It contains the expected public repository, canonical numeric PR
-and goal-branch identifiers, trusted recorded worker/run UUIDs, and a finite
-observed-status snapshot. Returned foreign or malformed repositories and other
+and goal-branch identifiers, trusted recorded worker/run UUIDs, a finite
+observed-status snapshot, and a strict `workOnCurrentBranch` category (`true`,
+`false`, `missing`, or `unrecognized`). Returned foreign or malformed repositories and other
 unrecognized strings become fixed categories; response bodies, result text,
 prompts, credentials and arbitrary fields are never logged. This snapshot is
 not terminal ownership evidence: the same association failure still stops
