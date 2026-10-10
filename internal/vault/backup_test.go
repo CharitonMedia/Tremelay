@@ -656,7 +656,16 @@ func TestBackupRestorePublication(t *testing.T) {
 		destDir := publishDir(t)
 		dest := filepath.Join(destDir, "vault.db")
 		err := Restore(art, dest, pass, cp, log.New(&logged, "", 0))
-		if !errors.Is(err, ErrIO) || errors.Is(err, ErrPublished) || strings.Contains(logged.String(), "sentinel") {
+		wantErr := ErrIO
+		wantLog := "vault_restore result=failed"
+		if runtime.GOOS == "windows" {
+			// The read-only directory handle cannot confirm FlushFileBuffers.
+			// A removed name must not be called a durably completed rollback.
+			wantErr = ErrPublicationUncertain
+			wantLog = "vault_restore result=publication_uncertain"
+		}
+		if !errors.Is(err, wantErr) || errors.Is(err, ErrPublished) || strings.Contains(logged.String(), "sentinel") ||
+			!strings.Contains(logged.String(), wantLog) {
 			t.Fatalf("%v %s", err, logged.String())
 		}
 		if _, statErr := os.Lstat(dest); !errors.Is(statErr, os.ErrNotExist) {
@@ -674,12 +683,34 @@ func TestBackupRestorePublication(t *testing.T) {
 		if !errors.Is(err, ErrPublished) || errors.Is(err, ErrIO) || strings.Contains(logged.String(), "sentinel") {
 			t.Fatalf("%v %s", err, logged.String())
 		}
+		if !strings.Contains(logged.String(), "vault_restore result=published") {
+			t.Fatalf("publication outcome missing: %s", logged.String())
+		}
 		if !bytes.Equal(readAll(t, dest), artBytes) {
 			t.Fatal("remaining destination bytes")
 		}
 		opened := mustUnlock(t, dest, pass)
 		if opened.id != id {
 			t.Fatal("remaining destination identity")
+		}
+		assertNoIncomplete(t, destDir)
+	})
+
+	t.Run("rollback durability uncertain", func(t *testing.T) {
+		restoreFault(t, "sync", "rollback-sync")
+		var logged bytes.Buffer
+		destDir := publishDir(t)
+		dest := filepath.Join(destDir, "vault.db")
+		err := Restore(art, dest, pass, cp, log.New(&logged, "", 0))
+		if !errors.Is(err, ErrPublicationUncertain) || errors.Is(err, ErrPublished) || errors.Is(err, ErrIO) {
+			t.Fatalf("rollback outcome %v", err)
+		}
+		if strings.Contains(err.Error(), "sentinel") || strings.Contains(logged.String(), "sentinel") ||
+			!strings.Contains(logged.String(), "vault_restore result=publication_uncertain") {
+			t.Fatalf("%v %s", err, logged.String())
+		}
+		if _, statErr := os.Lstat(dest); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal("rollback did not remove the destination at return")
 		}
 		assertNoIncomplete(t, destDir)
 	})
@@ -692,6 +723,9 @@ func TestBackupRestorePublication(t *testing.T) {
 		err := Restore(art, dest, pass, cp, log.New(&logged, "", 0))
 		if !errors.Is(err, ErrPublished) || errors.Is(err, ErrIO) || strings.Contains(logged.String(), "sentinel") {
 			t.Fatalf("%v %s", err, logged.String())
+		}
+		if !strings.Contains(logged.String(), "vault_restore result=published") {
+			t.Fatalf("publication outcome missing: %s", logged.String())
 		}
 		if !bytes.Equal(readAll(t, dest), artBytes) {
 			t.Fatal("remaining destination bytes")

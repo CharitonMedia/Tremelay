@@ -36,8 +36,15 @@ var ioFault func(step string) error
 // ErrPublished means Restore linked the destination and left that name in
 // place. A later directory sync or staging cleanup failed, and the
 // destination was not removed. The destination is the restored vault.
-// Any other error from Restore means the destination name was not left in place.
+// Its directory durability or staging cleanup may be incomplete. Do not
+// blindly retry Restore after this result.
 var ErrPublished = errors.New("vault restore destination remains")
+
+// ErrPublicationUncertain means Restore removed a newly linked destination,
+// but could not establish that removal's directory durability. The name is
+// absent now and may reappear after a crash. The host must reconcile its
+// destination and active-instance state before any retry or cutover.
+var ErrPublicationUncertain = errors.New("vault restore publication uncertain")
 
 // Checkpoint is the host-held binding for one backup artifact.
 // Backup returns it. Restore trusts only the value the host passes in.
@@ -182,9 +189,12 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 // the destination name is published.
 //
 // The link is the commit. ErrPublished means destPath remains after a later
-// directory sync or staging cleanup failed. Any other error means destPath
-// was not left in place. A failure before the link removes private staging
-// data. Restore does not return a session or append an audit event. A later
+// directory sync or staging cleanup failed. ErrPublicationUncertain means
+// a linked destination was removed but rollback durability is unconfirmed.
+// Neither outcome is safe to retry blindly. Other errors mean this call did
+// not leave a newly restored destination; pre-existing collisions stay intact.
+// A failure before the link removes private staging data. Restore does not
+// return a session or append an audit event. A later
 // Unlock of destPath is an ordinary open, including trusted-time expiry.
 //
 // want is the host's current checkpoint, supplied independently of the
@@ -548,8 +558,10 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 }
 
 // finishPublish syncs the destination directory, then drops the staging name.
-// It runs only after the link. ErrIO means the destination was removed.
-// ErrPublished means the destination remains.
+// It runs only after the link. ErrIO means the destination was removed and
+// the strict rollback directory sync succeeded.
+// ErrPublished means the destination remains. ErrPublicationUncertain means
+// it was removed but the rollback directory sync failed.
 func finishPublish(staging, dest string) error {
 	if err := syncDir(filepath.Dir(dest)); err != nil || ioFaultStep("sync") != nil {
 		if ioFaultStep("rollback") != nil || os.Remove(dest) != nil {
@@ -561,7 +573,9 @@ func finishPublish(staging, dest string) error {
 		}
 		os.Remove(staging)
 		removeSidecars(staging)
-		_ = syncDir(filepath.Dir(dest))
+		if err := syncDirStrict(filepath.Dir(dest)); err != nil || ioFaultStep("rollback-sync") != nil {
+			return ErrPublicationUncertain
+		}
 		return ErrIO
 	}
 	if ioFaultStep("unlink") != nil || os.Remove(staging) != nil {
@@ -591,7 +605,7 @@ func createStaging(dir string) (string, error) {
 	return path, nil
 }
 
-func streamCopy(src, dst string) error {
+func streamCopy(src, dst string) (err error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return ErrIO
@@ -601,7 +615,11 @@ func streamCopy(src, dst string) error {
 	if err != nil {
 		return ErrIO
 	}
-	defer out.Close()
+	defer func() {
+		if closeErr := out.Close(); err == nil && closeErr != nil {
+			err = ErrIO
+		}
+	}()
 	buf := make([]byte, copyBuf)
 	if _, err := io.CopyBuffer(out, in, buf); err != nil {
 		return ErrIO
@@ -613,27 +631,45 @@ func streamCopy(src, dst string) error {
 }
 
 func syncFile(path string) error {
-	f, err := os.Open(path)
+	// Only Backup's already-created artifact reaches this helper. Do not
+	// create or truncate it, or request write access to the caller's source.
+	// Windows FlushFileBuffers requires a write-capable handle.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return ErrIO
 	}
-	defer f.Close()
-	if err := f.Sync(); err != nil {
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if syncErr != nil || closeErr != nil {
 		return ErrIO
 	}
 	return nil
 }
 
 func syncDir(dir string) error {
+	return syncDirectory(dir, true)
+}
+
+// Rollback may promise durable absence only after an actual directory flush.
+// Unsupported Windows directory sync is uncertainty, not confirmed rollback.
+func syncDirStrict(dir string) error {
+	return syncDirectory(dir, false)
+}
+
+func syncDirectory(dir string, allowUnsupportedWindows bool) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return ErrIO
 	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if closeErr != nil {
+		return ErrIO
+	}
+	if syncErr != nil {
 		// Windows directory handles often reject Sync. The file sync above
 		// is the data barrier. The directory entry still depends on the OS.
-		if runtime.GOOS == "windows" {
+		if runtime.GOOS == "windows" && allowUnsupportedWindows {
 			return nil
 		}
 		return ErrIO
@@ -773,6 +809,12 @@ func canonicalHexN(s string, n int) bool {
 func resultLine(action string, err error) string {
 	if err == nil {
 		return action + " result=ok"
+	}
+	if errors.Is(err, ErrPublished) {
+		return action + " result=published"
+	}
+	if errors.Is(err, ErrPublicationUncertain) {
+		return action + " result=publication_uncertain"
 	}
 	return action + " result=failed"
 }
