@@ -75,7 +75,13 @@ The host is trusted to supply the current checkpoint, quiesce the source, and ru
 
 M10a is one in-process message boundary for `local_artifact_attest`. The trusted host constructs it from an already-bound agent principal. Messages cannot choose or replace that principal, a human identity, the session, the vault path, unlock material, the clock, or a host callback. A handle locates one exact grant inside that adapter. It is not a new authentication credential and it is not accepted by a different adapter. Discovery metadata is advisory. Invocation rechecks the selected grant and does not move the handle onto another grant or key.
 
-The interface does not carry HTTP, SSH, or another principal's grants, and it does not accept `request_capability`. There is no socket, network listener, or MCP transport in this slice. A compromised host still holds the unlocked vault. This does not complete M9 or M10.
+The interface does not carry HTTP, SSH, or another principal's grants, and it does not accept `request_capability`. M10a itself has no socket, network listener, or MCP transport. A compromised host still holds the unlocked vault. This does not complete M9 or M10.
+
+## Local MCP reference limits
+
+M10b puts that same bound adapter behind one in-memory MCP peer ([ADR 0018](docs/adr/0018-local-mcp-capability.md)). The trusted host constructs the peer from an already-bound `AgentCapability`. Client identity, protocol metadata, tool arguments, and handles cannot select the agent, a human, the session, the vault, unlock material, the clock, or a callback. `tools/list` describes three fixed tools. It is not the caller's grant catalogue. `request_capability` is not a tool and does not create a request, a grant, or a human assertion.
+
+The peer speaks MCP `2026-07-28` on newline-delimited JSON through an in-memory pipe and the official Go SDK v1.8.0. It is not a socket, a listener, a process launch, or an account. Legacy initialize is rejected before the SDK can answer it with an older revision. One call is admitted at a time. A second call fails closed and does not wait. Cancellation and close do not recall a signature that was already released, and a missing response is not a signal to replay the call. The host must still coordinate its own session; this process does not enforce that duty for any other process. A compromised host still holds the unlocked vault. This does not complete M9 or M10.
 
 ## Out of scope for initial milestone
 

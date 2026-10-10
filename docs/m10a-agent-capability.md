@@ -2,7 +2,7 @@
 
 This is a partial slice of M10. A trusted host binds one `AgentPrincipal` to an in-process adapter. The client lists, describes, and invokes that principal's `local_artifact_attest` grants by sending one versioned message to `Exchange`. Each handle names one exact grant, credential, key identity, and resource. Invocation does not move an old handle onto a newer grant or key. `request_capability` is rejected and does not create a request, a grant, or a human assertion.
 
-This is not a public SDK, a socket, a network listener, or a demonstrated MCP transport. It does not authenticate the agent. The host that unlocked the vault remains the custody boundary. M9 is also not complete. See [ADR 0017](adr/0017-agent-capability-interface.md).
+This is not a public SDK, a socket, or a network listener. It does not authenticate the agent. The host that unlocked the vault remains the custody boundary. M10b is a separate in-memory MCP peer over this same adapter. It is not a network service and it does not complete M9 or M10. See [ADR 0017](adr/0017-agent-capability-interface.md) and [M10b](m10b-local-mcp.md).
 
 The message is one object: version `1`, a method byte, a field count, and length-prefixed fields. Duplicate fields, unknown fields, trailing bytes, and input above `MaxAgentCapMessage` fail closed. The attestation payload limit remains 64 KiB and is not truncated. Error responses use a fixed code and a fixed message. A locked session, a stale session, or a failed audit returns no response and is not a claim that an event was stored.
 

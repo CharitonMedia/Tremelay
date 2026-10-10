@@ -122,7 +122,7 @@ An invoke of a known handle records `local_attest` for that grant, including `al
 ## Consequences
 
 - Operators do not get a new CLI command. The demonstration is in-process.
-- M10 remains open for a real transport, SDK distribution, and `request_capability`.
+- M10 remains open for a network transport, SDK distribution, and `request_capability`. M10b adds an in-memory MCP peer for this adapter and does not close M10.
 - M9 remains open for authentication, recovery, and production shared access.
 - Callers of `LocalAttest` keep the previous selection behavior.
 
