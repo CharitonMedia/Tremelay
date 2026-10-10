@@ -168,7 +168,7 @@ func TestMCPSyntheticDemo(t *testing.T) {
 		}
 	}
 	sawList, sawDescribe, sawAllowed, sawCompleted := false, false, false, false
-	for _, ev := range env.s.audit {
+	for _, ev := range mcpAuditSnapshot(env.s) {
 		switch {
 		case ev.Action == actionCapList && ev.Result == resultAllowed && ev.AgentID == env.agent.ID && ev.GrantID == "":
 			sawList = true
@@ -217,12 +217,12 @@ func TestMCPWireAdmission(t *testing.T) {
 		"name": toolInvoke, "arguments": map[string]any{},
 		"_meta": map[string]any{metaProtocolVersion: "2025-11-25", metaClientCapabilities: map[string]any{}, metaClientInfo: map[string]string{"name": "n", "version": "1"}},
 	})
-	before := len(env.s.audit)
+	before := len(mcpAuditSnapshot(env.s))
 	got = raw.round(t, badRev)
 	if !bytes.Contains(got, []byte("unsupported protocol version")) || !bytes.Contains(got, []byte(`"supported":["2026-07-28"]`)) || !bytes.Contains(got, []byte(`"requested":"2025-11-25"`)) || bytes.Contains(got, []byte(`"2025-11-25","2026-07-28"`)) || bytes.Contains(got, []byte(`"2026-07-28","2025-11-25"`)) {
 		t.Fatalf("mismatched revision %s", got)
 	}
-	if env.s.audit[len(env.s.audit)-1].Action != actionLocalAttest || len(env.s.audit) != before+1 {
+	if mcpAuditSnapshot(env.s)[len(mcpAuditSnapshot(env.s))-1].Action != actionLocalAttest || len(mcpAuditSnapshot(env.s)) != before+1 {
 		t.Fatal("mismatched invoke was not a sparse local_attest denial")
 	}
 
@@ -236,13 +236,13 @@ func TestMCPWireAdmission(t *testing.T) {
 		"name": toolInvoke, "_meta": mcpMeta(),
 		"arguments": map[string]any{"handle": handle, "payload": base64.StdEncoding.EncodeToString(payload), "extra": sentinel},
 	})
-	before = len(env.s.audit)
+	before = len(mcpAuditSnapshot(env.s))
 	got = raw.round(t, unknown)
 	if bytes.Contains(got, []byte(sentinel)) || !bytes.Contains(got, []byte("invalid params")) {
 		t.Fatalf("unknown field %s", got)
 	}
-	ev := env.s.audit[len(env.s.audit)-1]
-	if ev.Action != actionLocalAttest || ev.Result != resultDenied || ev.GrantID != "" || len(env.s.audit) != before+1 {
+	ev := mcpAuditSnapshot(env.s)[len(mcpAuditSnapshot(env.s))-1]
+	if ev.Action != actionLocalAttest || ev.Result != resultDenied || ev.GrantID != "" || len(mcpAuditSnapshot(env.s)) != before+1 {
 		t.Fatalf("unknown-field audit %+v", ev)
 	}
 	badB64 := rpcFrame(t, 8, "tools/call", map[string]any{
@@ -272,15 +272,16 @@ func TestMCPWireAdmission(t *testing.T) {
 		"name": toolRequest, "arguments": map[string]any{}, "_meta": mcpMeta(),
 	})
 	nReq, nGrant := len(env.s.requests), len(env.s.grants)
-	before = len(env.s.audit)
+	before = len(mcpAuditSnapshot(env.s))
 	got = raw.round(t, ask)
 	if !bytes.Contains(got, []byte("invalid params")) || bytes.Contains(got, []byte(toolRequest)) {
 		t.Fatalf("request_capability %s", got)
 	}
-	if len(env.s.requests) != nReq || len(env.s.grants) != nGrant || env.s.audit[len(env.s.audit)-1].Action != actionAgentCap || len(env.s.audit) != before+1 {
+	if len(env.s.requests) != nReq || len(env.s.grants) != nGrant || mcpAuditSnapshot(env.s)[len(mcpAuditSnapshot(env.s))-1].Action != actionAgentCap || len(mcpAuditSnapshot(env.s)) != before+1 {
 		t.Fatal("request_capability mutated authority or skipped the denial")
 	}
 
+	waitMCPIdle(t, raw.ep)
 	blocked := make(chan struct{})
 	release := make(chan struct{})
 	env.s.attestFault = func() error {
@@ -533,10 +534,10 @@ func TestMCPAuthority(t *testing.T) {
 		if _, err := bob2.RequestAccess(stale.requestSpec(time.Hour, 10*time.Minute)); err != nil {
 			t.Fatal(err)
 		}
-		before := len(stale.s.audit)
+		before := len(mcpAuditSnapshot(stale.s))
 		res, err := staleSess.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolInvoke, Arguments: invokeArgs(staleHandle, []byte("stale-artifact"))})
-		if err == nil || (res != nil && !res.IsError) || strings.Contains(err.Error(), "stale-artifact") || len(stale.s.audit) != before {
-			t.Fatalf("stale %v %+v rows %d", err, res, len(stale.s.audit)-before)
+		if err == nil || (res != nil && !res.IsError) || strings.Contains(err.Error(), "stale-artifact") || len(mcpAuditSnapshot(stale.s)) != before {
+			t.Fatalf("stale %v %+v rows %d", err, res, len(mcpAuditSnapshot(stale.s))-before)
 		}
 
 		locked := approvedShared(t)
@@ -593,6 +594,7 @@ func startMCP(t *testing.T, cap *AgentCapability) *mcpSession {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = cs.Close() })
+	waitMCPIdle(t, ep)
 	return &mcpSession{ep: ep, cs: cs, clientLog: logs, cancel: cancel}
 }
 
@@ -629,6 +631,7 @@ func startRaw(t *testing.T, cap *AgentCapability) *rawPipe {
 
 func (p *rawPipe) round(t *testing.T, frame []byte) []byte {
 	t.Helper()
+	waitMCPIdle(t, p.ep)
 	if len(frame) == 0 || frame[len(frame)-1] != '\n' {
 		frame = append(append([]byte{}, frame...), '\n')
 	}
@@ -674,10 +677,12 @@ func (p *rawPipe) read(t *testing.T) []byte {
 
 func mustCall(t *testing.T, sess *mcpSession, name string, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
+	waitMCPIdle(t, sess.ep)
 	res, err := sess.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: name, Arguments: args})
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitMCPIdle(t, sess.ep)
 	return res
 }
 
@@ -800,7 +805,7 @@ func TestMCPReviewFixes(t *testing.T) {
 			"arguments": map[string]any{"handle": "aaaa", "payload": "aaaa"},
 			"_meta":     mcpMeta(),
 		})
-		before := len(env.s.audit)
+		before := len(mcpAuditSnapshot(env.s))
 		if _, err := raw.w.Write(frame); err != nil {
 			t.Fatal(err)
 		}
@@ -813,7 +818,7 @@ func TestMCPReviewFixes(t *testing.T) {
 	t.Run("partial-unparsed", func(t *testing.T) {
 		env := approvedShared(t)
 		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
-		before := len(env.s.audit)
+		before := len(mcpAuditSnapshot(env.s))
 		if _, err := raw.w.Write([]byte("{")); err != nil {
 			t.Fatal(err)
 		}
@@ -835,7 +840,7 @@ func TestMCPReviewFixes(t *testing.T) {
 				"payload": base64.StdEncoding.EncodeToString([]byte("x")),
 			},
 		}), ' ', '\n')
-		before := len(env.s.audit)
+		before := len(mcpAuditSnapshot(env.s))
 		if _, err := raw.w.Write(frame); err != nil {
 			t.Fatal(err)
 		}
@@ -847,14 +852,14 @@ func TestMCPReviewFixes(t *testing.T) {
 		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 		meta := string(mustJSON(t, mcpMeta()))
 		outer := []byte(`{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"invoke_capability","extra":true,"_meta":` + meta + `}}`)
-		before := len(env.s.audit)
+		before := len(mcpAuditSnapshot(env.s))
 		got := raw.round(t, outer)
 		if !bytes.Contains(got, []byte("invalid params")) {
 			t.Fatalf("outer field %s", got)
 		}
 		assertSparse(t, env.s, before, actionLocalAttest)
 		badID := []byte(`{"jsonrpc":"2.0","id":{"n":1},"method":"tools/call","params":{"name":"invoke_capability"}}`)
-		before = len(env.s.audit)
+		before = len(mcpAuditSnapshot(env.s))
 		got = raw.round(t, badID)
 		if !bytes.Contains(got, []byte("invalid request")) || bytes.Contains(got, []byte("invoke_capability")) {
 			t.Fatalf("bad id %s", got)
@@ -907,13 +912,13 @@ func TestMCPReviewFixes(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("response write did not block")
 		}
-		before := len(env.s.audit)
+		before := len(mcpAuditSnapshot(env.s))
 		second := append(rpcFrame(t, 8, "tools/list", map[string]any{"_meta": mcpMeta()}), '\n')
 		if _, err := clientWrite.Write(second); err != nil {
 			t.Fatal(err)
 		}
 		deadline := time.Now().Add(5 * time.Second)
-		for len(env.s.audit) == before {
+		for len(mcpAuditSnapshot(env.s)) == before {
 			if time.Now().After(deadline) {
 				t.Fatal("second call was not rejected while the response write was blocked")
 			}
@@ -930,6 +935,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		if !bytes.Contains(busy, []byte(`"id":8`)) || !bytes.Contains(busy, []byte("endpoint busy")) || !bytes.Contains(busy, []byte("-31010")) || bytes.Contains(busy, []byte("-32010")) {
 			t.Fatalf("busy %s", busy)
 		}
+		waitMCPIdle(t, ep)
 		again := append(rpcFrame(t, 9, "tools/list", map[string]any{"_meta": mcpMeta()}), '\n')
 		if _, err := clientWrite.Write(again); err != nil {
 			t.Fatal(err)
@@ -952,8 +958,10 @@ func TestMCPReviewFixes(t *testing.T) {
 		if !ep.beginCall(callKey{num: 9, isNum: true}, true) {
 			t.Fatal("admit")
 		}
-		before := len(env.s.audit)
-		c := &admitConn{ep: ep, rawW: &bufWC{}}
+		before := len(mcpAuditSnapshot(env.s))
+		c := &admitConn{ep: ep, raw: io.NopCloser(bytes.NewReader(nil)), rawW: &bufWC{}}
+		c.startWriter()
+		defer func() { _ = c.Close(); <-c.writerDone }()
 		msg := &jsonrpc.Response{ID: id, Error: &jsonrpc.Error{Code: mcpCodeCancelled, Message: "request cancelled"}}
 		if err := c.Write(context.Background(), msg); err != nil {
 			t.Fatal(err)
@@ -962,8 +970,8 @@ func TestMCPReviewFixes(t *testing.T) {
 		if err := c.Write(context.Background(), msg); err != nil {
 			t.Fatal(err)
 		}
-		if len(env.s.audit) != before+1 {
-			t.Fatalf("duplicate pre-handler denial rows %d", len(env.s.audit)-before)
+		if len(mcpAuditSnapshot(env.s)) != before+1 {
+			t.Fatalf("duplicate pre-handler denial rows %d", len(mcpAuditSnapshot(env.s))-before)
 		}
 		id2, err := jsonrpc.MakeID(float64(10))
 		if err != nil {
@@ -976,12 +984,12 @@ func TestMCPReviewFixes(t *testing.T) {
 		if err := ep.cap.denyBound(true); err != nil {
 			t.Fatal(err)
 		}
-		n := len(env.s.audit)
+		n := len(mcpAuditSnapshot(env.s))
 		handled := &jsonrpc.Response{ID: id2, Error: &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "invalid params"}}
 		if err := c.Write(context.Background(), handled); err != nil {
 			t.Fatal(err)
 		}
-		if len(env.s.audit) != n {
+		if len(mcpAuditSnapshot(env.s)) != n {
 			t.Fatal("handler denial was recorded again")
 		}
 	})
@@ -1024,7 +1032,7 @@ func TestMCPReviewFixes(t *testing.T) {
 	t.Run("notification-drop", func(t *testing.T) {
 		env := approvedShared(t)
 		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
-		before := len(env.s.audit)
+		before := len(mcpAuditSnapshot(env.s))
 		note := []byte("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
 		if _, err := raw.w.Write(note); err != nil {
 			t.Fatal(err)
@@ -1038,7 +1046,7 @@ func TestMCPReviewFixes(t *testing.T) {
 			t.Fatalf("notification drew a response %s", got)
 		}
 		var denied int
-		for _, ev := range env.s.audit[before:] {
+		for _, ev := range mcpAuditSnapshot(env.s)[before:] {
 			if ev.Result == resultDenied && ev.GrantID == "" && ev.CredID == "" {
 				denied++
 			}
@@ -1085,7 +1093,7 @@ func TestMCPReviewFixes(t *testing.T) {
 				"payload": base64.StdEncoding.EncodeToString([]byte("x")),
 			},
 		}), '\n')
-		before := len(env.s.audit)
+		before := len(mcpAuditSnapshot(env.s))
 		if _, err := clientWrite.Write(frame); err != nil {
 			t.Fatal(err)
 		}
@@ -1126,7 +1134,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		ask := append(rpcFrame(t, 11, "tools/call", map[string]any{
 			"name": toolRequest, "arguments": map[string]any{}, "_meta": mcpMeta(),
 		}), '\n')
-		before := len(env.s.audit)
+		before := len(mcpAuditSnapshot(env.s))
 		if _, err := clientWrite.Write(ask); err != nil {
 			t.Fatal(err)
 		}
@@ -1142,8 +1150,8 @@ func TestMCPReviewFixes(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("Serve kept running after the denial audit failed")
 		}
-		if len(env.s.audit) != before {
-			t.Fatalf("fault persisted rows %d", len(env.s.audit)-before)
+		if len(mcpAuditSnapshot(env.s)) != before {
+			t.Fatalf("fault persisted rows %d", len(mcpAuditSnapshot(env.s))-before)
 		}
 	})
 	t.Run("broken-output", func(t *testing.T) {
@@ -1165,7 +1173,7 @@ func TestMCPReviewFixes(t *testing.T) {
 				"payload": base64.StdEncoding.EncodeToString([]byte("x")),
 			},
 		})
-		before := len(env.s.audit)
+		before := len(mcpAuditSnapshot(env.s))
 		if _, err := clientWrite.Write(append(append(bad, '\n'), append(invoke, '\n')...)); err != nil {
 			t.Fatal(err)
 		}
@@ -1174,18 +1182,58 @@ func TestMCPReviewFixes(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("failed error write did not stop the session")
 		}
-		if len(env.s.audit) != before+1 || env.s.audit[len(env.s.audit)-1].Action != actionAgentCap {
-			t.Fatalf("later call ran after a broken write %+v", env.s.audit[before:])
+		rows := mcpAuditSnapshot(env.s)[before:]
+		if len(rows) < 1 || len(rows) > 2 || rows[0].Action != actionAgentCap {
+			t.Fatalf("broken-output audit %+v", rows)
+		}
+		// The reader can audit a second frame before the failed Write returns.
+		// It must never execute it or emit a credential result.
+		for _, row := range rows {
+			if row.Result != resultDenied || row.GrantID != "" || row.CredID != "" {
+				t.Fatalf("later call ran after a broken write %+v", row)
+			}
 		}
 	})
 }
 
+// Sequential success fixtures wait for the host-side delivery transition.
+// A generic writer can return after the client sees the bytes. These helpers
+// never replay a request; the dedicated lifecycle tests exercise that interval.
+func waitMCPIdle(t *testing.T, ep *MCPEndpoint) {
+	t.Helper()
+	waitMCPState(t, ep, func() bool { return !ep.inCall && ep.active == nil && ep.pending == nil })
+}
+
+func waitMCPState(t *testing.T, ep *MCPEndpoint, ready func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ep.mu.Lock()
+		ok := ready()
+		ep.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("MCP state transition did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func mcpAuditSnapshot(s *Session) []auditEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]auditEvent(nil), s.audit...)
+}
+
 func assertSparse(t *testing.T, s *Session, before int, action string) {
 	t.Helper()
-	if len(s.audit) != before+1 {
-		t.Fatalf("rows %d", len(s.audit)-before)
+	rows := mcpAuditSnapshot(s)
+	if len(rows) != before+1 {
+		t.Fatalf("rows %d", len(rows)-before)
 	}
-	ev := s.audit[len(s.audit)-1]
+	ev := rows[len(rows)-1]
 	if ev.Action != action || ev.Result != resultDenied || ev.GrantID != "" || ev.CredID != "" {
 		t.Fatalf("audit %+v", ev)
 	}
