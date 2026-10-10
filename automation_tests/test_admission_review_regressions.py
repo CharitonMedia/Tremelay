@@ -1,5 +1,6 @@
 """Review findings reproduced against both the previous and corrected trees."""
 import copy
+import json
 import os
 import re
 from pathlib import Path
@@ -73,9 +74,17 @@ def assert_worker_concurrency(test, job):
 
 def assert_workflow_admission(test, workflow, filename):
     top_lock = workflow_fields(workflow_block(workflow, 'concurrency:', 0, required=False), 2)
-    expected_top = ({'group': 'tremelay-checkpoint-supervisor', 'cancel-in-progress': 'false'}
-                    if filename == 'checkpoint-supervisor.yml' else {})
-    test.assertEqual(top_lock, expected_top)
+    if filename == 'checkpoint-supervisor.yml':
+        test.assertEqual(top_lock, {'group': 'tremelay-checkpoint-supervisor', 'cancel-in-progress': 'false'})
+    else:
+        test.assertEqual(set(top_lock), {'group', 'cancel-in-progress', 'queue'})
+        test.assertEqual(top_lock['cancel-in-progress'], 'false')
+        test.assertEqual(top_lock['queue'], 'single')
+        group = json.loads(top_lock['group'])
+        mode = 'goal' if filename == 'goal.yml' else 'generic'
+        test.assertTrue(group.startswith('${{ (github.repository == '))
+        test.assertIn("format('tremelay-" + mode + "-review-{0}-{1}-{2}-{3}'", group)
+        test.assertTrue(group.endswith(" || format('tremelay-" + mode + "-run-{0}', github.run_id) }}"))
     for name in WORKER_ADMISSION_JOBS[filename]:
         job = workflow_job(workflow, name)
         assert_worker_concurrency(test, job)

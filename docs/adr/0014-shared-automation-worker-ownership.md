@@ -91,6 +91,48 @@ pending-work retention, not durable worker ownership: receipts and all existing
 fresh head, identity, eligibility, ownership and cycle guards remain required.
 No new replay path or launch authority is introduced.
 
+Review events must be authenticated and coalesced before entering that shared
+queue. The goal and generic workflows admit only GitHub event records whose
+review/comment author is a trusted Codex login, whose snapshot identifies an
+eligible open, non-draft, same-repository PR, and whose reviewed commit matches
+the snapshot head. Goal markers remain an alternative to the goal label;
+generic work still requires its opt-in label and excludes goal/held PRs.
+Completed goal-summary events require the connector author, canonical summary
+marker and completed state; body text never supplies actor identity.
+
+Each workflow holds a separate workflow-level, single-pending concurrency group
+through preflight, shared admission, dispatch and completion. Submitted reviews
+and inline events share a PR/review/head key. Approvals have a separate completion
+namespace, and summaries use their comment ID and are reread live. A delayed
+inline event for an older review cannot replace a newer review's pending run,
+even on the same head. An undifferentiated per-PR key would lose that newer
+review under the existing event-bound current-review checks. Untrusted,
+ineligible and non-review events receive unique run-ID groups, so main pushes,
+issue launches and manual recovery cannot displace review work. The supervisor's
+existing workflow-level wake-coalescing group is unchanged.
+
+The preflight has only read permissions and the ordinary Actions token. It
+settles review bursts and polls pending review submission outside shared worker
+admission, then rereads the PR, source lineage, review and complete inline
+findings. A completed preflight grants no durable ownership or write authority.
+The admitted job repeats these live checks without sleeping before entering its
+existing mutation path; all existing create-time ownership, head, eligibility,
+review-current and cycle guards remain. Generic reconciliation remains before
+planning, and the scheduled supervisor continues recovering existing receipts
+on closed, held or otherwise retired PRs. Clean-summary completion remains
+independent, and repeated approvals cannot be displaced by inline events.
+Both review modes reject superseded reviews at preflight and locked recheck,
+including an older same-head finding followed by a newer approval. Goal reviews
+retain substantive review-body findings without inline comments, using the
+existing feedback predicate to exclude clean and boilerplate-only bodies.
+
+This coalesces duplicates of a review, not distinct legitimate reviews. Those
+still share the finite 100-pending-job limit. Inline events remain subscribed,
+and all findings are reread after settling and again after admission. Findings
+posted after worker dispatch remain subject to the existing review/head receipt
+deduplication and worker snapshot behavior; this change promises no additional
+late-after-dispatch delivery or replay.
+
 This is not an unlimited delivery guarantee. Overflow beyond 100 pending jobs
 is canceled; manual cancellation and other workflow failures remain possible.
 Durable receipts preserve safety after dispatch reservation, and scheduled
@@ -165,3 +207,7 @@ or single-slot queues, wrong workflow/job/step scope, duplicate, inline, quoted
 or incorrectly indented fields, altered admission environments and changes to
 the separate supervisor workflow lock. Both normal Python and `python -S`
 execute the full offline automation suite without a YAML dependency.
+Event-gate fixtures exercise actual workflow expressions and mocked read-only
+preflight calls, including untrusted/irrelevant bursts, duplicate events, newer
+reviews followed by old inline events, approvals and clean completion, findings
+arriving during settling, moved heads and lost source/PR eligibility.

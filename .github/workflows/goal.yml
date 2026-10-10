@@ -29,6 +29,14 @@ permissions:
   issues: write
   pull-requests: write
 
+# Hold this event's coalescing slot through downstream global admission and
+# completion. Distinct reviews/heads and approvals cannot replace each other.
+# Non-review or ineligible events get a unique group, including manual recovery.
+concurrency:
+  group: "${{ (github.repository == 'CharitonMedia/Tremelay' && ((((github.event_name == 'pull_request_review' && github.event.action == 'submitted' && (github.event.review.user.login == 'codex' || github.event.review.user.login == 'chatgpt-codex-connector[bot]') && github.event.review.id && github.event.review.commit_id == github.event.pull_request.head.sha && (github.event.review.state == 'commented' || github.event.review.state == 'changes_requested' || github.event.review.state == 'approved')) || (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && (github.event.comment.user.login == 'codex' || github.event.comment.user.login == 'chatgpt-codex-connector[bot]') && github.event.comment.id && github.event.comment.pull_request_review_id && github.event.comment.body != '' && github.event.comment.commit_id == github.event.pull_request.head.sha)) && github.event.pull_request.state == 'open' && !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'human-review-required') && github.event.pull_request.user.login == 'pattalkslaw-del' && github.event.pull_request.base.ref == 'main' && (contains(github.event.pull_request.labels.*.name, 'goal') || contains(github.event.pull_request.body, 'Goal-Issue: #'))) || (github.event_name == 'issue_comment' && (github.event.action == 'created' || github.event.action == 'edited') && github.event.issue.pull_request && github.event.issue.state == 'open' && github.event.issue.user.login == 'pattalkslaw-del' && (contains(github.event.issue.labels.*.name, 'goal') || contains(github.event.issue.body, 'Goal-Issue: #')) && !contains(github.event.issue.labels.*.name, 'human-review-required') && github.event.comment.user.login == 'chatgpt-codex-connector[bot]' && github.event.comment.id && contains(github.event.comment.body, '<!-- codex-pull-request-review-summary -->') && contains(github.event.comment.body, '✅ **Completed**') && !(contains(github.event.comment.body, 'Codex Review: Didn''t find any major issues.') && contains(github.event.comment.body, '**Reviewed commit:**'))))) && format('tremelay-goal-review-{0}-{1}-{2}-{3}', github.event.pull_request.number || github.event.issue.number, github.event.review.state == 'approved' && 'approval' || 'remediation', github.event.review.id || github.event.comment.pull_request_review_id || format('summary-{0}', github.event.comment.id), github.event.review.commit_id || github.event.comment.commit_id || 'summary') || format('tremelay-goal-run-{0}', github.run_id) }}"
+  cancel-in-progress: false
+  queue: single
+
 jobs:
   ensure-label:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -309,8 +317,32 @@ jobs:
             exit "$code"
           fi
 
+  review-preflight:
+    if: "github.repository == 'CharitonMedia/Tremelay' && ((((github.event_name == 'pull_request_review' && github.event.action == 'submitted' && (github.event.review.user.login == 'codex' || github.event.review.user.login == 'chatgpt-codex-connector[bot]') && github.event.review.id && github.event.review.commit_id == github.event.pull_request.head.sha && (github.event.review.state == 'commented' || github.event.review.state == 'changes_requested' || github.event.review.state == 'approved')) || (github.event_name == 'pull_request_review_comment' && github.event.action == 'created' && (github.event.comment.user.login == 'codex' || github.event.comment.user.login == 'chatgpt-codex-connector[bot]') && github.event.comment.id && github.event.comment.pull_request_review_id && github.event.comment.body != '' && github.event.comment.commit_id == github.event.pull_request.head.sha)) && github.event.pull_request.state == 'open' && !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository && !contains(github.event.pull_request.labels.*.name, 'human-review-required') && github.event.pull_request.user.login == 'pattalkslaw-del' && github.event.pull_request.base.ref == 'main' && (contains(github.event.pull_request.labels.*.name, 'goal') || contains(github.event.pull_request.body, 'Goal-Issue: #'))) || (github.event_name == 'issue_comment' && (github.event.action == 'created' || github.event.action == 'edited') && github.event.issue.pull_request && github.event.issue.state == 'open' && github.event.issue.user.login == 'pattalkslaw-del' && (contains(github.event.issue.labels.*.name, 'goal') || contains(github.event.issue.body, 'Goal-Issue: #')) && !contains(github.event.issue.labels.*.name, 'human-review-required') && github.event.comment.user.login == 'chatgpt-codex-connector[bot]' && github.event.comment.id && contains(github.event.comment.body, '<!-- codex-pull-request-review-summary -->') && contains(github.event.comment.body, '✅ **Completed**') && !(contains(github.event.comment.body, 'Codex Review: Didn''t find any major issues.') && contains(github.event.comment.body, '**Reviewed commit:**'))))"
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.admission.outputs.allowed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Settle and authenticate current review without worker admission
+        id: admission
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/review_admission.py --mode goal --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --out preflight_event.json --settle
+
   review-launch:
-    if: "github.event_name == 'pull_request_review' || github.event_name == 'pull_request_review_comment' || (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.login == 'chatgpt-codex-connector[bot]' && !(contains(github.event.comment.body, 'Codex Review: Didn''t find any major issues.') && contains(github.event.comment.body, '**Reviewed commit:**')))"
+    needs: review-preflight
+    if: needs.review-preflight.outputs.allowed == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: tremelay-worker-admission
@@ -333,8 +365,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Recheck review admission before writes
+        id: admission
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/review_admission.py --mode goal --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --out admitted_event.json
       - name: Enforce remediation circuit breaker
         id: cycle
+        if: steps.admission.outputs.allowed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
@@ -367,14 +405,11 @@ jobs:
           else
             echo "allowed=true" >> "$GITHUB_OUTPUT"
           fi
-      - name: Wait for the rest of this review
-        if: steps.cycle.outputs.allowed == 'true'
-        run: sleep 20
       - name: Build Cloud Agent request
         id: build
         if: steps.cycle.outputs.allowed == 'true'
         run: |
-          if python scripts/goal_agent_request.py build --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --out payload.json; then
+          if python scripts/goal_agent_request.py build --event admitted_event.json --event-name "$GITHUB_EVENT_NAME" --out payload.json; then
             echo "launch=true" >> "$GITHUB_OUTPUT"
           else
             code=$?
@@ -391,9 +426,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GOAL_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if python scripts/goal_agent_request.py complete --dry-run --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME"; then
+          if python scripts/goal_agent_request.py complete --dry-run --event admitted_event.json --event-name "$GITHUB_EVENT_NAME"; then
             bash scripts/require_goal_github_token.sh
-            python scripts/goal_agent_request.py complete --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" && exit 0
+            python scripts/goal_agent_request.py complete --event admitted_event.json --event-name "$GITHUB_EVENT_NAME" && exit 0
             code=$?
             if [ "$code" -eq 2 ]; then
               exit 0
@@ -442,7 +477,7 @@ jobs:
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews?per_page=100" > reviews.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${number}/comments?per_page=100" > comments.json
           python -c 'import json,sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; json.dump({"pull": json.load(open("live_pull.json")), "reviews": g.flatten_pages(json.load(open("reviews.json"))), "comments": g.flatten_pages(json.load(open("comments.json")))}, open("ownership.json", "w"))'
-          python scripts/goal_agent_request.py review-claim --event "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" --state ownership.json --trusted-login "${{ steps.marker_identity.outputs.login }}" --out claim.json
+          python scripts/goal_agent_request.py review-claim --event admitted_event.json --event-name "$GITHUB_EVENT_NAME" --state ownership.json --trusted-login "${{ steps.marker_identity.outputs.login }}" --out claim.json
           status=$(python -c 'import json; print(json.load(open("claim.json"))["status"])')
           if [ "$status" = "free" ]; then
             echo "launch=true" >> "$GITHUB_OUTPUT"
