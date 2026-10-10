@@ -14,8 +14,10 @@ supervisor's still-owning receipt, preventing trustworthy terminal reconciliatio
 
 Treat both trusted claim families as shared repository ownership before any
 initial, ordinary-review or supervisor worker create. Preserve strict canonical
-control parsing and fail closed on malformed trusted state or an orphan launch
-receipt. Do not release an accepted/ambiguous worker based on age, review/head
+control parsing and fail closed on unknown-version or malformed trusted state,
+or an orphan launch receipt. Only the existing canonical standalone review and
+budget markers are exempt non-state controls; checkpoint evidence remains inert.
+Do not release an accepted/ambiguous worker based on age, review/head
 changes, labels, PR closure or merge. Historical supervisor completed/escalated
 records without a verified terminal receipt require GET-only reconciliation.
 
@@ -31,7 +33,8 @@ remove a hold, reset a cycle or reset a checkpoint budget.
 
 Fresh source-issue and all-state PR history checks prevent any launch/publication
 for a closed issue or a lineage with a merged PR. Recheck immediately before
-create/publication. The trusted `main` implement/publish checkout supplies the
+create/publication, including the initial goal-branch push after branch setup.
+The trusted `main` implement/publish checkout supplies the
 new guards for newly deployed workflow definitions. A manual takeover retains
 `human-review-required` and removes `goal`; the label alone is intentionally a
 supervisor checkpoint. Publication must not restore `goal` to that manual hold.

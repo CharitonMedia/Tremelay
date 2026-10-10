@@ -99,6 +99,8 @@ jobs:
       - name: Ensure goal branch
         id: ensure
         if: steps.build.outputs.launch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
@@ -110,6 +112,9 @@ jobs:
           if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
             echo "branch exists"
           else
+            # Branch publication can itself trigger goal workflows. Recheck
+            # live ownership and lineage after setup, immediately before push.
+            python scripts/goal_lineage.py --issue "${{ github.event.issue.number }}" --launch --repository-ownership
             git push origin "refs/remotes/origin/${base}:refs/heads/${branch}"
           fi
       - name: Launch Cloud Agent

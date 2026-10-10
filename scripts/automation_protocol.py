@@ -12,7 +12,10 @@ import re
 HUMAN_RESUME_MARKER = "<!-- tremelay-human-resume -->"
 SUPERVISOR_MARKER = "<!-- tremelay-supervisor-v1 "
 WORKER_TERMINAL_STATUSES = frozenset({"FINISHED", "ERROR", "CANCELLED", "EXPIRED"})
-_SUPERVISOR_PREFIX = "<!-- tremelay-supervisor-v1"
+_SUPERVISOR_PREFIX = "<!-- tremelay-supervisor-"
+_SUPERVISOR_NON_STATE = re.compile(
+    r"<!-- tremelay-supervisor-(?:budget|review:[0-9a-f]{40}) -->"
+)
 _CHECKPOINT_HEADER = re.compile(
     r"Automation stopped after [0-9]+ counted attempts(?: in this segment)? "
     r"\(limit (?P<limit>[0-9]+)\)\."
@@ -113,8 +116,16 @@ def supervisor_state(body: str) -> dict | None:
     """
     if not isinstance(body, str) or is_checkpoint_evidence(body) or _SUPERVISOR_PREFIX not in body:
         return None
+    # Only the two existing standalone non-state controls are exempt. Unknown
+    # versions and malformed intended envelopes must not disappear from either
+    # ownership or checkpoint-budget readers.
+    candidates = [line for line in body.splitlines()
+                  if _SUPERVISOR_PREFIX in line and not _SUPERVISOR_NON_STATE.fullmatch(line)]
+    if not candidates:
+        return None
     line = body.rstrip("\r\n").splitlines()[-1]
-    if (body.count(_SUPERVISOR_PREFIX) != 1 or not line.startswith(SUPERVISOR_MARKER)
+    if (len(candidates) != 1 or candidates[0] != line or line.count(_SUPERVISOR_PREFIX) != 1
+            or not line.startswith(SUPERVISOR_MARKER)
             or not line.endswith(" -->")):
         raise ValueError("Expected one final supervisor state envelope")
     state = json.loads(line[len(SUPERVISOR_MARKER):-4], object_pairs_hook=_unique_object)
