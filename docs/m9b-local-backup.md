@@ -8,6 +8,8 @@ The checkpoint binds the vault id, the organization id when the snapshot is shar
 
 The host path must not contain a symlink. These calls do not resolve aliases. A macOS temporary path under `/var` (a symlink to `/private/var`) is invalid; pass the canonical path, such as the result of resolving that directory.
 
+Backup and restore refuse a path whose SQLite `-journal`, `-wal`, or `-shm` file already exists, and they do not delete or rewrite that file. Backup syncs the artifact and its directory before it returns a checkpoint. A sync failure removes the artifact. Restore checks that namespace again immediately before it links the destination. The link commits the destination. If a later directory sync fails and the destination can be removed, the call returns an error and leaves no destination. If the destination remains, the error is `ErrPublished`: that name is the restored vault, not an absent one. A fault before the link still leaves no destination.
+
 ## Local demonstration
 
 The demonstration uses a temporary database, a disposable Ed25519 key, synthetic identities, and the session clock. It does not call a network or read a live credential.
@@ -18,7 +20,7 @@ go test ./internal/vault/ -run 'TestBackupRestore|TestBackupMigratesLegacyAuditS
 
 `TestBackupRestoreSyntheticDemo` is the acceptance path: a current shared snapshot restores, the existing broker still attests, shared plaintext and direct-grant denials remain, approval provenance remains, and expiry and revocation still stop later use after reopen.
 
-`TestBackupRestoreNegative` covers a snapshot that predates request consumption, revocation, membership removal and re-promotion, key replacement, or containment. Each of those artifacts is rejected against the later checkpoint. The same test covers a wrong passphrase, a corrupt file, a missing or mismatched checkpoint, destination collision, a destination alias, and a publication that fails before the destination name exists. `TestCheckpointFormat` checks the checkpoint text.
+`TestBackupRestoreNegative` covers a snapshot that predates request consumption, revocation, membership removal and re-promotion, key replacement, or containment. Each of those artifacts is rejected against the later checkpoint. The same test covers a wrong passphrase, a corrupt file, a missing or mismatched checkpoint, destination collision, a destination alias, and a publication that fails before the destination name exists. `TestBackupRestorePublication` covers a sidecar collision, a backup directory sync that fails closed, and a linked destination that remains after a later sync or cleanup failure. `TestCheckpointFormat` checks the checkpoint text.
 
 ## What was not run
 

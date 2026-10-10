@@ -29,6 +29,16 @@ const (
 // leaves it nil. The error value is not returned or logged.
 var restorePublishFault func() error
 
+// ioFault, when set, fails one named Backup or Restore step. Tests use it.
+// Production leaves it nil. The error value is not returned or logged.
+var ioFault func(step string) error
+
+// ErrPublished means Restore linked the destination and left that name in
+// place. A later directory sync or staging cleanup failed, and the
+// destination was not removed. The destination is the restored vault.
+// Any other error from Restore means the destination name was not left in place.
+var ErrPublished = errors.New("vault restore destination remains")
+
 // Checkpoint is the host-held binding for one backup artifact.
 // Backup returns it. Restore trusts only the value the host passes in.
 // Nothing in the artifact, and no file stored next to it, supplies this value.
@@ -63,12 +73,23 @@ type Checkpoint struct {
 // symlink is rejected and is not resolved. On macOS the usual temporary
 // directory is under /var, which is a symlink to /private/var; pass the
 // canonical path.
+//
+// artifactPath and its SQLite sidecars (journal, wal, shm) must not exist.
+// An existing sidecar is left unchanged. The artifact file and its parent
+// directory are synced before a checkpoint is returned. If that sync fails,
+// the artifact is removed and Backup returns an error.
 func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger) (cp Checkpoint, err error) {
 	var created string
+	var ownSidecars bool
 	defer func() {
 		if err != nil && created != "" {
 			os.Remove(created)
-			removeSidecars(created)
+			// A sidecar is removed only after this call has opened the
+			// destination. An earlier failure must not delete a recovery
+			// file this call did not create.
+			if ownSidecars {
+				removeSidecars(created)
+			}
 		}
 		logLine(logger, resultLine("vault_backup", err))
 	}()
@@ -86,6 +107,9 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 	if src == dst {
 		return Checkpoint{}, ErrInvalid
 	}
+	if err = requireFreshSQLiteName(dst); err != nil {
+		return Checkpoint{}, err
+	}
 	f, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
@@ -98,7 +122,11 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 		return Checkpoint{}, ErrIO
 	}
 	created = dst
-	if err = snapshotDB(src, dst); err != nil {
+	opened, err := snapshotDB(src, dst)
+	if opened {
+		ownSidecars = true
+	}
+	if err != nil {
 		return Checkpoint{}, err
 	}
 	if err = os.Chmod(dst, 0o600); err != nil {
@@ -107,7 +135,11 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 	// Migrate the private artifact before hashing it. A read-only check of
 	// the source would reject an M1–M5 audit table, and writing the source
 	// would change the vault the host did not ask to upgrade.
-	if err = migrateCopiedAudit(dst); err != nil {
+	wrote, err := migrateCopiedAudit(dst)
+	if wrote {
+		ownSidecars = true
+	}
+	if err != nil {
 		return Checkpoint{}, err
 	}
 	sum, err := fileSHA256(dst)
@@ -129,6 +161,12 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 	if err = cp.canonical(); err != nil {
 		return Checkpoint{}, ErrCorrupt
 	}
+	if err = syncFile(dst); err != nil || ioFaultStep("backup-sync-file") != nil {
+		return Checkpoint{}, ErrIO
+	}
+	if err = syncDir(filepath.Dir(dst)); err != nil || ioFaultStep("backup-sync-dir") != nil {
+		return Checkpoint{}, ErrIO
+	}
 	created = ""
 	return cp, nil
 }
@@ -136,12 +174,18 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 // Restore publishes artifactPath at destPath when passphrase unlocks that
 // artifact and want is the checkpoint for it.
 //
-// destPath must not exist. A symlink component, including an ancestor, an
-// existing file, or an existing directory is rejected and left unchanged.
-// The path is not resolved. The artifact is read, not written. Validation runs before the destination name is published.
-// A failure removes private staging data and does not return a session.
-// Restore does not append an audit event. A later Unlock of destPath is an
-// ordinary open, including trusted-time expiry.
+// destPath must not exist, and neither may its SQLite journal, wal, or shm
+// sidecar. An existing sidecar is left unchanged. A symlink component,
+// including an ancestor, an existing file, or an existing directory is
+// rejected and left unchanged. The path is not resolved. The artifact is
+// read, not written. Validation, mode 0600, and the sidecar check run before
+// the destination name is published.
+//
+// The link is the commit. ErrPublished means destPath remains after a later
+// directory sync or staging cleanup failed. Any other error means destPath
+// was not left in place. A failure before the link removes private staging
+// data. Restore does not return a session or append an audit event. A later
+// Unlock of destPath is an ordinary open, including trusted-time expiry.
 //
 // want is the host's current checkpoint, supplied independently of the
 // artifact. A snapshot from before revocation, membership change, request
@@ -354,51 +398,54 @@ type sqliteBackuper interface {
 // table predates the current columns. A current schema is not opened for
 // write, so those bytes stay the online-backup image. Existing row hashes
 // are not rewritten. The caller hashes the artifact after this returns.
-func migrateCopiedAudit(path string) error {
+func migrateCopiedAudit(path string) (wrote bool, err error) {
 	db, err := openDBRead(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	ready := auditSchemaReady(db)
 	closeErr := db.Close()
 	if ready == nil {
 		if closeErr != nil {
-			return ErrIO
+			return false, ErrIO
 		}
-		return nil
+		return false, nil
 	}
 	if closeErr != nil {
-		return ErrIO
+		return false, ErrIO
 	}
+	// openDB may create a journal before it returns. The caller owns
+	// sidecars from this point, including when the open fails.
+	wrote = true
 	db, err = openDB(path)
 	if err != nil {
-		return err
+		return true, err
 	}
 	err = migrateAudit(db)
 	closeErr = db.Close()
 	if err != nil {
-		return err
+		return true, err
 	}
 	if closeErr != nil {
-		return ErrIO
+		return true, ErrIO
 	}
 	removeSidecars(path)
-	return nil
+	return true, nil
 }
 
-func snapshotDB(srcPath, dstPath string) error {
+func snapshotDB(srcPath, dstPath string) (destOpened bool, err error) {
 	db, err := openDBRead(srcPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer db.Close()
 	uri, err := sqliteFileURI(dstPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	conn, err := db.Conn(context.Background())
 	if err != nil {
-		return ErrIO
+		return false, ErrIO
 	}
 	defer conn.Close()
 	err = conn.Raw(func(driverConn any) error {
@@ -406,6 +453,8 @@ func snapshotDB(srcPath, dstPath string) error {
 		if !ok {
 			return ErrIO
 		}
+		// NewBackup opens the destination and may create a sidecar.
+		destOpened = true
 		bk, err := backuper.NewBackup(uri)
 		if err != nil {
 			return ErrIO
@@ -425,9 +474,9 @@ func snapshotDB(srcPath, dstPath string) error {
 		}
 	})
 	if err != nil {
-		return ErrIO
+		return destOpened, ErrIO
 	}
-	return nil
+	return destOpened, nil
 }
 
 func sqliteFileURI(path string) (string, error) {
@@ -478,10 +527,13 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 			return ErrIO
 		}
 	}
-	if _, err := os.Lstat(dest); err == nil {
-		return ErrInvalid
-	} else if !errors.Is(err, os.ErrNotExist) {
+	// Mode is on the inode the link will share. A failure here is still
+	// before the destination name exists.
+	if ioFaultStep("chmod") != nil || os.Chmod(staging, 0o600) != nil {
 		return ErrIO
+	}
+	if err := requireFreshSQLiteName(dest); err != nil {
+		return err
 	}
 	if err := os.Link(staging, dest); err != nil {
 		if errors.Is(err, os.ErrExist) {
@@ -489,19 +541,32 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 		}
 		return ErrIO
 	}
-	if err := os.Remove(staging); err != nil {
-		os.Remove(dest)
-		return ErrIO
-	}
-	if err := os.Chmod(dest, 0o600); err != nil {
-		os.Remove(dest)
-		return ErrIO
-	}
-	if err := syncDir(filepath.Dir(dest)); err != nil {
-		os.Remove(dest)
-		return err
-	}
+	// The destination name is committed. Later steps must not report
+	// absence while this name remains.
 	published = true
+	return finishPublish(staging, dest)
+}
+
+// finishPublish syncs the destination directory, then drops the staging name.
+// It runs only after the link. ErrIO means the destination was removed.
+// ErrPublished means the destination remains.
+func finishPublish(staging, dest string) error {
+	if err := syncDir(filepath.Dir(dest)); err != nil || ioFaultStep("sync") != nil {
+		if ioFaultStep("rollback") != nil || os.Remove(dest) != nil {
+			// The destination name is still there. Dropping the staging
+			// link is cleanup; it does not make this absence.
+			os.Remove(staging)
+			removeSidecars(staging)
+			return ErrPublished
+		}
+		os.Remove(staging)
+		removeSidecars(staging)
+		_ = syncDir(filepath.Dir(dest))
+		return ErrIO
+	}
+	if ioFaultStep("unlink") != nil || os.Remove(staging) != nil {
+		return ErrPublished
+	}
 	return nil
 }
 
@@ -547,6 +612,18 @@ func streamCopy(src, dst string) error {
 	return nil
 }
 
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return ErrIO
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		return ErrIO
+	}
+	return nil
+}
+
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
@@ -582,9 +659,41 @@ func fileSHA256(path string) (string, error) {
 }
 
 func removeSidecars(path string) {
-	os.Remove(path + "-journal")
-	os.Remove(path + "-wal")
-	os.Remove(path + "-shm")
+	for _, name := range sqliteSidecars(path) {
+		os.Remove(name)
+	}
+}
+
+func sqliteSidecars(path string) []string {
+	return []string{path + "-journal", path + "-wal", path + "-shm"}
+}
+
+// requireFreshSQLiteName rejects path and its rollback or WAL sidecars.
+// It does not create, modify, or delete any of them.
+//
+// ponytail: the check and the later create or link are not one directory
+// operation. A sidecar that appears after this returns can still sit beside
+// the new name. Upgrade path: exclusive-create each sidecar before the
+// database file is published.
+func requireFreshSQLiteName(path string) error {
+	names := append([]string{path}, sqliteSidecars(path)...)
+	for _, name := range names {
+		_, err := os.Lstat(name)
+		if err == nil {
+			return ErrInvalid
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return ErrIO
+		}
+	}
+	return nil
+}
+
+func ioFaultStep(step string) error {
+	if ioFault == nil {
+		return nil
+	}
+	return ioFault(step)
 }
 
 func cleanPath(path string, create bool) (string, error) {

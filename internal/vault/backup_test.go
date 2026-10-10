@@ -542,6 +542,190 @@ func TestBackupPathRequiresCanonicalAncestor(t *testing.T) {
 	}
 }
 
+func TestBackupRestorePublication(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	id := session.id
+	session.Lock()
+	path = canonicalExisting(t, path)
+	source := readAll(t, path)
+	dir := canonicalTemp(t)
+	artPath := filepath.Join(dir, "art.db")
+	for _, suffix := range []string{"-journal", "-wal", "-shm"} {
+		side := artPath + suffix
+		payload := []byte("keep" + suffix)
+		if err := os.WriteFile(side, payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Backup(path, artPath, pass, nil); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s %v", suffix, err)
+		}
+		if _, statErr := os.Lstat(artPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("%s backup created an artifact", suffix)
+		}
+		if !bytes.Equal(readAll(t, side), payload) || !bytes.Equal(readAll(t, path), source) {
+			t.Fatalf("%s backup changed an unowned file", suffix)
+		}
+		if err := os.Remove(side); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	art, cp := mustBackup(t, path, dir, pass, nil)
+	artBytes := readAll(t, art)
+	for _, suffix := range []string{"-journal", "-wal", "-shm"} {
+		dest := filepath.Join(dir, "sidecollide.db")
+		side := dest + suffix
+		payload := []byte("keep" + suffix)
+		if err := os.WriteFile(side, payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := Restore(art, dest, pass, cp, nil); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s %v", suffix, err)
+		}
+		if _, statErr := os.Lstat(dest); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("%s restore published beside a sidecar", suffix)
+		}
+		if !bytes.Equal(readAll(t, side), payload) || !bytes.Equal(readAll(t, art), artBytes) {
+			t.Fatalf("%s restore changed an unowned file", suffix)
+		}
+		assertNoIncomplete(t, dir)
+		if err := os.Remove(side); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("backup sync", func(t *testing.T) {
+		ioFault = func(step string) error {
+			if step == "backup-sync-dir" {
+				return errors.New("backup-sync-sentinel")
+			}
+			return nil
+		}
+		t.Cleanup(func() { ioFault = nil })
+		var logged bytes.Buffer
+		dst := filepath.Join(canonicalTemp(t), "unsynced.db")
+		_, err := Backup(path, dst, pass, log.New(&logged, "", 0))
+		if !errors.Is(err, ErrIO) || strings.Contains(err.Error(), "sentinel") || strings.Contains(logged.String(), "sentinel") {
+			t.Fatalf("%v %s", err, logged.String())
+		}
+		if _, statErr := os.Lstat(dst); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal("unsynced backup left an artifact")
+		}
+		for _, suffix := range []string{"-journal", "-wal", "-shm"} {
+			if _, statErr := os.Lstat(dst + suffix); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("unsynced backup left %s", suffix)
+			}
+		}
+	})
+
+	restoreFault := func(t *testing.T, steps ...string) {
+		t.Helper()
+		ioFault = func(step string) error {
+			for _, want := range steps {
+				if step == want {
+					return errors.New(want + "-sentinel")
+				}
+			}
+			return nil
+		}
+		t.Cleanup(func() { ioFault = nil })
+	}
+	publishDir := func(t *testing.T) string {
+		t.Helper()
+		return canonicalTemp(t)
+	}
+
+	t.Run("chmod", func(t *testing.T) {
+		restoreFault(t, "chmod")
+		var logged bytes.Buffer
+		destDir := publishDir(t)
+		dest := filepath.Join(destDir, "vault.db")
+		err := Restore(art, dest, pass, cp, log.New(&logged, "", 0))
+		if !errors.Is(err, ErrIO) || errors.Is(err, ErrPublished) || strings.Contains(logged.String(), "sentinel") {
+			t.Fatalf("%v %s", err, logged.String())
+		}
+		if _, statErr := os.Lstat(dest); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal("chmod fault published a destination")
+		}
+		assertNoIncomplete(t, destDir)
+	})
+
+	t.Run("sync rollback", func(t *testing.T) {
+		restoreFault(t, "sync")
+		var logged bytes.Buffer
+		destDir := publishDir(t)
+		dest := filepath.Join(destDir, "vault.db")
+		err := Restore(art, dest, pass, cp, log.New(&logged, "", 0))
+		if !errors.Is(err, ErrIO) || errors.Is(err, ErrPublished) || strings.Contains(logged.String(), "sentinel") {
+			t.Fatalf("%v %s", err, logged.String())
+		}
+		if _, statErr := os.Lstat(dest); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatal("rolled-back sync left a destination")
+		}
+		assertNoIncomplete(t, destDir)
+	})
+
+	t.Run("sync remains", func(t *testing.T) {
+		restoreFault(t, "sync", "rollback")
+		var logged bytes.Buffer
+		destDir := publishDir(t)
+		dest := filepath.Join(destDir, "vault.db")
+		err := Restore(art, dest, pass, cp, log.New(&logged, "", 0))
+		if !errors.Is(err, ErrPublished) || errors.Is(err, ErrIO) || strings.Contains(logged.String(), "sentinel") {
+			t.Fatalf("%v %s", err, logged.String())
+		}
+		if !bytes.Equal(readAll(t, dest), artBytes) {
+			t.Fatal("remaining destination bytes")
+		}
+		opened := mustUnlock(t, dest, pass)
+		if opened.id != id {
+			t.Fatal("remaining destination identity")
+		}
+		assertNoIncomplete(t, destDir)
+	})
+
+	t.Run("unlink remains", func(t *testing.T) {
+		restoreFault(t, "unlink")
+		var logged bytes.Buffer
+		destDir := publishDir(t)
+		dest := filepath.Join(destDir, "vault.db")
+		err := Restore(art, dest, pass, cp, log.New(&logged, "", 0))
+		if !errors.Is(err, ErrPublished) || errors.Is(err, ErrIO) || strings.Contains(logged.String(), "sentinel") {
+			t.Fatalf("%v %s", err, logged.String())
+		}
+		if !bytes.Equal(readAll(t, dest), artBytes) {
+			t.Fatal("remaining destination bytes")
+		}
+		names := incompleteNames(t, destDir)
+		if len(names) != 1 || !bytes.Equal(readAll(t, filepath.Join(destDir, names[0])), artBytes) {
+			t.Fatalf("staging name %v", names)
+		}
+		opened := mustUnlock(t, dest, pass)
+		if opened.id != id {
+			t.Fatal("remaining destination identity")
+		}
+	})
+
+	if !bytes.Equal(readAll(t, art), artBytes) || !bytes.Equal(readAll(t, path), source) {
+		t.Fatal("publication tests changed the artifact or the source")
+	}
+}
+
+func incompleteNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), "restore-incomplete") {
+			names = append(names, entry.Name())
+		}
+	}
+	return names
+}
+
 func mustBackup(t *testing.T, src, dir string, pass []byte, logger *log.Logger) (string, Checkpoint) {
 	t.Helper()
 	src = canonicalExisting(t, src)
