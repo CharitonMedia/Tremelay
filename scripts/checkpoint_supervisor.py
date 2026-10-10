@@ -620,7 +620,60 @@ def worker_target_diagnostic(number, state, agent, run, expected_branch=None):
             "pushed_branches": rows(git.get("branches") if isinstance(git, dict) else None, "repoUrl", "branch")}
 
 
-def verified_worker_run(number, state, *, expected_branch=None):
+def retired_worker_target(agent, run, number):
+    """Read a singular mutable branch association, never a reviewed commit."""
+    repos = agent.get("repos")
+    git = run.get("git")
+    branches = git.get("branches") if isinstance(git, dict) else None
+    if (agent.get("workOnCurrentBranch") is not True
+            or not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict)
+            or repos[0].get("url") != f"https://github.com/{REPO}"
+            or not isinstance(branches, list) or len(branches) != 1 or not isinstance(branches[0], dict)
+            or branches[0].get("repoUrl") != f"github.com/{REPO}"):
+        raise Stop("Retired worker requires one exact repository and pushed branch")
+    branch, url = branches[0].get("branch"), branches[0].get("prUrl")
+    source = re.fullmatch(r"goal/issue-([1-9][0-9]{0,9})", branch) if isinstance(branch, str) else None
+    alias = re.fullmatch(r"https://github\.com/" + re.escape(REPO) + r"/pull/([1-9][0-9]{0,9})", url) if isinstance(url, str) else None
+    if not source or not alias or int(alias[1]) == number:
+        raise Stop("Retired worker lacks a canonical alternate PR and source branch")
+    if (("prUrl" in repos[0] and repos[0]["prUrl"] not in (f"https://github.com/{REPO}/pull/{number}", url))
+            or ("startingRef" in repos[0] and repos[0]["startingRef"] != branch)):
+        raise Stop("Retired worker has conflicting repository target metadata")
+    return int(alias[1]), branch, int(source[1])
+
+
+def verify_retired_lineage(number, alias, branch, issue):
+    """Fresh GitHub identity proof is solely for retiring this existing worker."""
+    if type(number) is not int or not 0 < number < 10 ** 10:
+        raise Stop("Invalid original retired PR identity")
+    for expected in (number, alias):
+        pull = gh(f"repos/{REPO}/pulls/{expected}")
+        if not isinstance(pull, dict):
+            raise Stop("Missing retired goal PR evidence")
+        head, base, user = (pull.get(key) for key in ("head", "base", "user"))
+        if (type(pull.get("number")) is not int or pull["number"] != expected
+                or pull.get("html_url") != f"https://github.com/{REPO}/pull/{expected}"
+                or not isinstance(user, dict) or user.get("login") != AUTHOR
+                or not isinstance(head, dict) or not isinstance(base, dict)
+                or not isinstance(head.get("repo"), dict) or head["repo"].get("full_name") != REPO
+                or not isinstance(base.get("repo"), dict) or base["repo"].get("full_name") != REPO
+                or head.get("ref") != branch or base.get("ref") != "main"):
+            raise Stop("Retired goal PR repository, owner or branch is unverified")
+        body = pull.get("body")
+        markers = ([line.strip() for line in body.splitlines() if re.match(r"\s*Goal-Issue\b", line)]
+                   if isinstance(body, str) else [])
+        if markers != [f"Goal-Issue: #{issue}"]:
+            raise Stop("Retired goal PR source issue is missing or ambiguous")
+        if (pull.get("state") not in ("open", "closed") or type(pull.get("merged")) is not bool
+                or "merged_at" not in pull
+                or (pull["merged"] and (pull["state"] != "closed" or not isinstance(pull["merged_at"], str) or not pull["merged_at"]))
+                or (not pull["merged"] and pull["merged_at"] is not None)):
+            raise Stop("Retired goal PR lifecycle is unverified")
+        if expected == number and pull["merged"] is not True:
+            raise Stop("Original goal PR is not verified merged")
+
+
+def verified_worker_run(number, state, *, expected_branch=None, retired_recovery=False):
     """GET the recorded agent/run and verify its PR before accepting status."""
     from goal_review_launch import RUN_ID, LEGACY_AGENT, verify_legacy_target, Stop as ClaimStop
     agent_id = state.get("agent_id")
@@ -639,14 +692,29 @@ def verified_worker_run(number, state, *, expected_branch=None):
             or not isinstance(result.get("status"), str)
             or result["status"] not in WORKER_TERMINAL_STATUSES | {"CREATING", "RUNNING"}):
         raise Stop("Cursor returned an unverified worker run status")
+    retired_target = None
     def verify_target(target):
+        nonlocal retired_target
         try:
             verify_legacy_target(target, result, number)
         except ClaimStop as error:
+            reason = str(error)
+            if (retired_recovery and state.get("run_id") == run_id
+                    and result["status"] in WORKER_TERMINAL_STATUSES):
+                try:
+                    candidate = retired_worker_target(target, result, number)
+                    if retired_target is None:
+                        verify_retired_lineage(number, *candidate)
+                        retired_target = candidate
+                    elif candidate != retired_target:
+                        raise Stop("Retired worker association changed during reconciliation")
+                    return
+                except Stop as retired_error:
+                    reason += "; " + str(retired_error)
             diagnostic = worker_target_diagnostic(number, state, target, result, expected_branch)
             print("Worker target mismatch (unverified snapshot): " +
                   json.dumps(diagnostic, sort_keys=True, separators=(",", ":")), file=sys.stderr)
-            raise Stop(str(error)) from None
+            raise Stop(reason) from None
 
     verify_target(agent)
     if result["status"] in WORKER_TERMINAL_STATUSES:
@@ -655,14 +723,15 @@ def verified_worker_run(number, state, *, expected_branch=None):
                 or current.get("latestRunId") != run_id):
             raise Stop("Worker changed during terminal reconciliation")
         verify_target(current)
-    return run_id, result["status"]
+    return run_id, result["status"], retired_target[0] if retired_target else None
 
 
 def recover_worker(pull, comment, state, *, reconcile_only=False):
     """Reconcile the same worker even after closure/hold; never replay create."""
     number = pull["number"]
     prior_phase = state.get("phase")
-    run_id, status = verified_worker_run(number, state, expected_branch=(pull.get("head") or {}).get("ref"))
+    run_id, status, retired_alias = verified_worker_run(
+        number, state, expected_branch=(pull.get("head") or {}).get("ref"), retired_recovery=reconcile_only)
     needs_record = prior_phase != "working" or state.get("run_id") != run_id
     state.update(phase="working", run_id=run_id)
     if status not in WORKER_TERMINAL_STATUSES:
@@ -681,11 +750,14 @@ def recover_worker(pull, comment, state, *, reconcile_only=False):
     state["terminal_status"] = status
     current = gh(f"repos/{REPO}/pulls/{number}")
     # Lifecycle/labels only suppress further work. They never establish status.
-    if (reconcile_only or prior_phase in {"completed", "escalate", "terminal"}
+    if (retired_alias is not None or reconcile_only or prior_phase in {"completed", "escalate", "terminal"}
             or not eligible(current, require_stop=False)):
         state["phase"] = "terminal"
         text = comment["body"].split("\n\n" + MARKER)[0]
         text += f"\n\nExisting Cursor run verified {status}. Historical/held goal: no launch, model call, independent review or label change authorized. Checkpoint and worker-cycle history remain consumed."
+        if retired_alias is not None:
+            text += (f"\n\nMerged PR #{number} and alternate PR #{retired_alias} were independently verified as the same retired goal lineage. "
+                     "This reconciles terminal ownership only; agent-wide branch metadata does not prove a reviewed commit or output.")
         update_state(comment, state, text)
         return
     # A still-open PR may already belong to a closed/merged source goal. Keep

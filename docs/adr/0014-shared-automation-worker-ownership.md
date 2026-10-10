@@ -92,9 +92,22 @@ observed-status snapshot, and a strict `workOnCurrentBranch` category (`true`,
 `false`, `missing`, or `unrecognized`). Returned foreign or malformed repositories and other
 unrecognized strings become fixed categories; response bodies, result text,
 prompts, credentials and arbitrary fields are never logged. This snapshot is
-not terminal ownership evidence: the same association failure still stops
-recovery before ownership updates. No alias acceptance or target relaxation is
-introduced, and no additional service request or credential is required.
+not terminal ownership evidence. The diagnostic adds no service request or
+credential and cannot itself release ownership.
+
+Status-only supervisor recovery may reconcile an alternate API-returned PR for
+a retired goal. This requires the exact stored run ID, an explicit terminal run
+status, and matching recorded agent/current-run identities both before and after
+the run lookup. One exact agent repository and one complete canonical pushed
+branch must identify the alternate PR. Missing agent `prUrl`/`startingRef` is
+permitted only with that complete branch evidence; present conflicting values,
+multiple branches, foreign repositories and malformed fields fail closed.
+Fresh GitHub GETs must independently prove the original PR merged and both PRs
+have the approved owner, exact base/head repository, base `main`, identical
+canonical goal branch and one unambiguous canonical source-issue marker.
+Live-goal association checks remain strict. A successful alternate association
+can only retire the existing receipt, never complete a review, change labels,
+authorize a worker, or bypass fresh launch/lineage checks.
 
 ## Validation
 
@@ -110,8 +123,12 @@ is part of this validation.
 The response checks follow Cursor's current [Get An Agent and Get A Run
 reference](https://cursor.com/docs/cloud-agent/api/endpoints#get-a-run): run ID,
 agent ID and status are explicit fields; pushed-branch metadata is per-agent.
-The retained PR-association check accepts the recorded agent repository PR URL
-or its run's matching pushed-branch PR URL, never a guessed branch-to-PR mapping.
+The ordinary PR-association check accepts the recorded agent repository PR URL
+or matching pushed-branch PR URL. The retired exception above requires separate
+GitHub proof, never a guessed branch-to-PR mapping. `git.branches` is mutable
+per-agent state, shared by every run's response. It is association metadata only:
+it proves neither a reviewed commit nor that the alternate PR's contents came
+from the recorded run. Terminal execution status comes from the exact run.
 
 Additional offline regressions cover two queued initial labels, initial versus
 ordinary/supervisor/generic admission, accepted and ambiguous initial creates,
