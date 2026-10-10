@@ -191,7 +191,14 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 		partial.Result = resultFailed
 		return s.attestDeny(partial, ErrSignFailed)
 	}
-	msg, err := AttestMessage(g.Resource, req.Payload)
+	return s.releaseAttestation(partial, priv, g.Resource, req.Payload)
+}
+
+// releaseAttestation signs payload for the grant already chosen in partial.
+// It does not select another grant. The allowed row commits before signing.
+// The completed row commits before the signature is returned.
+func (s *Session) releaseAttestation(partial auditEvent, priv ed25519.PrivateKey, resource string, payload []byte) (LocalAttestation, error) {
+	msg, err := AttestMessage(resource, payload)
 	if err != nil {
 		wipe(priv)
 		partial.Result = resultFailed
@@ -227,7 +234,7 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 	// The callback, or another session, may have replaced the key, revoked the
 	// grant, or removed a member. Recheck this grant and this key. Do not
 	// retarget onto a grant that appeared during the callback.
-	if err := s.attestStillBound(partial, priv, boundGen, g.Resource); err != nil {
+	if err := s.attestStillBound(partial, priv, boundGen, resource); err != nil {
 		wipe(priv)
 		wipe(msg)
 		if errors.Is(err, ErrStale) {
@@ -265,7 +272,7 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 	}
 	out.Domain = AttestDomain
 	out.Purpose = AttestPurpose
-	out.Resource = g.Resource
+	out.Resource = resource
 	return out, nil
 }
 

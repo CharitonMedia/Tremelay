@@ -7,8 +7,9 @@
 // AgentPrincipal can list capabilities, authorize them, invoke
 // the HTTP broker, request one local Ed25519 attestation, and open one
 // host-bound SSH userauth stream for one identity.
-// It cannot retrieve credential plaintext. This package must not grow an
-// agent-facing raw-secret retrieval API.
+// BindAgentCapability is a separate in-process byte interface for that
+// principal's local attestation grants. It cannot retrieve credential plaintext.
+// This package must not grow an agent-facing raw-secret retrieval API.
 package vault
 
 import (
