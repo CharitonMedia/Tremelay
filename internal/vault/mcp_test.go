@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -284,7 +285,7 @@ func TestMCPWireAdmission(t *testing.T) {
 	before = len(env.s.audit)
 	got = raw.round(t, ask)
 	env.s.commitFault = nil
-	if bytes.Contains(got, []byte(sentinel)) || bytes.Contains(got, []byte("persist")) || bytes.Contains(got, []byte("recorded")) || !bytes.Contains(got, []byte("internal error")) || len(env.s.audit) != before {
+	if bytes.Contains(got, []byte(sentinel)) || bytes.Contains(got, []byte("persist")) || bytes.Contains(got, []byte("recorded")) || !bytes.Contains(got, []byte("internal error")) || bytes.Contains(got, []byte(`"id":null`)) || !bytes.Contains(got, []byte(`"id":11`)) || len(env.s.audit) != before {
 		t.Fatalf("audit fault %s rows %d", got, len(env.s.audit)-before)
 	}
 
@@ -444,7 +445,11 @@ func TestMCPAuthority(t *testing.T) {
 		if err := env.alice.RevokeGrant(env.s.grants[len(env.s.grants)-1].ID); err != nil {
 			t.Fatal(err)
 		}
-		if code := toolObject(t, mustCall(t, sess, toolInvoke, invokeArgs(handle, []byte("revoked"))))["code"]; code != capDeniedRevoked {
+		revoked := mustCall(t, sess, toolInvoke, invokeArgs(handle, []byte("revoked")))
+		if !revoked.IsError || revoked.StructuredContent != nil {
+			t.Fatalf("error result carried structured content %+v", revoked.StructuredContent)
+		}
+		if code := toolObject(t, revoked)["code"]; code != capDeniedRevoked {
 			t.Fatal(code)
 		}
 		exp := newSharedEnv(t)
@@ -689,9 +694,24 @@ func toolObject(t *testing.T, res *mcp.CallToolResult) map[string]any {
 	if res == nil {
 		t.Fatal("nil tool result")
 	}
-	raw, err := json.Marshal(res.StructuredContent)
-	if err != nil {
-		t.Fatal(err)
+	var raw []byte
+	var err error
+	if res.StructuredContent != nil {
+		raw, err = json.Marshal(res.StructuredContent)
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		for _, block := range res.Content {
+			text, ok := block.(*mcp.TextContent)
+			if ok && text.Text != "" {
+				raw = []byte(text.Text)
+				break
+			}
+		}
+		if len(raw) == 0 {
+			t.Fatal("tool result has no content")
+		}
 	}
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -778,3 +798,271 @@ func signatureFrom(t *testing.T, frame []byte) []byte {
 	}
 	return mustB64(t, resp.Result.Structured["signature"])
 }
+
+func TestMCPReviewFixes(t *testing.T) {
+	t.Run("partial-invoke", func(t *testing.T) {
+		env := approvedShared(t)
+		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
+		frame := rpcFrame(t, 4, "tools/call", map[string]any{
+			"name":      toolInvoke,
+			"arguments": map[string]any{"handle": "aaaa", "payload": "aaaa"},
+			"_meta":     mcpMeta(),
+		})
+		before := len(env.s.audit)
+		if _, err := raw.w.Write(frame); err != nil {
+			t.Fatal(err)
+		}
+		if err := raw.w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		waitRaw(t, raw)
+		assertSparse(t, env.s, before, actionLocalAttest)
+	})
+	t.Run("partial-unparsed", func(t *testing.T) {
+		env := approvedShared(t)
+		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
+		before := len(env.s.audit)
+		if _, err := raw.w.Write([]byte("{")); err != nil {
+			t.Fatal(err)
+		}
+		if err := raw.w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		waitRaw(t, raw)
+		assertSparse(t, env.s, before, actionAgentCap)
+	})
+	t.Run("trailing-space", func(t *testing.T) {
+		env := approvedShared(t)
+		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
+		handle := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+		frame := append(rpcFrame(t, 5, "tools/call", map[string]any{
+			"name":  toolInvoke,
+			"_meta": mcpMeta(),
+			"arguments": map[string]any{
+				"handle":  handle,
+				"payload": base64.StdEncoding.EncodeToString([]byte("x")),
+			},
+		}), ' ', '\n')
+		before := len(env.s.audit)
+		if _, err := raw.w.Write(frame); err != nil {
+			t.Fatal(err)
+		}
+		waitRaw(t, raw)
+		assertSparse(t, env.s, before, actionLocalAttest)
+	})
+	t.Run("recognized-invoke", func(t *testing.T) {
+		env := approvedShared(t)
+		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
+		meta := string(mustJSON(t, mcpMeta()))
+		outer := []byte(`{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"invoke_capability","extra":true,"_meta":` + meta + `}}`)
+		before := len(env.s.audit)
+		got := raw.round(t, outer)
+		if !bytes.Contains(got, []byte("invalid params")) {
+			t.Fatalf("outer field %s", got)
+		}
+		assertSparse(t, env.s, before, actionLocalAttest)
+		badID := []byte(`{"jsonrpc":"2.0","id":{"n":1},"method":"tools/call","params":{"name":"invoke_capability"}}`)
+		before = len(env.s.audit)
+		got = raw.round(t, badID)
+		if !bytes.Contains(got, []byte("invalid request")) || bytes.Contains(got, []byte("invoke_capability")) {
+			t.Fatalf("bad id %s", got)
+		}
+		assertSparse(t, env.s, before, actionLocalAttest)
+	})
+	t.Run("numeric-id", func(t *testing.T) {
+		env := approvedShared(t)
+		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
+		meta := string(mustJSON(t, mcpMeta()))
+		unsafe := []byte(`{"jsonrpc":"2.0","id":9007199254740993,"method":"tools/list","params":{"_meta":` + meta + `}}`)
+		got := raw.round(t, unsafe)
+		if !bytes.Contains(got, []byte("invalid request")) || bytes.Contains(got, []byte("9007199254740993")) {
+			t.Fatalf("unsafe id %s", got)
+		}
+		safe := []byte(`{"jsonrpc":"2.0","id":9007199254740991,"method":"tools/list","params":{"_meta":` + meta + `}}`)
+		got = raw.round(t, safe)
+		if !bytes.Contains(got, []byte(toolList)) || !bytes.Contains(got, []byte("9007199254740991")) || bytes.Contains(got, []byte("endpoint busy")) {
+			t.Fatalf("safe id %s", got)
+		}
+	})
+	t.Run("admission-held", func(t *testing.T) {
+		env := approvedShared(t)
+		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := jsonrpc.MakeID(float64(7))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ep.beginCall(callKey{num: 7, isNum: true}, true) {
+			t.Fatal("admit")
+		}
+		before := len(env.s.audit)
+		started := make(chan struct{})
+		release := make(chan struct{})
+		c := &admitConn{ep: ep, rawW: &blockWriter{started: started, release: release}}
+		errc := make(chan error, 1)
+		go func() {
+			errc <- c.Write(context.Background(), &jsonrpc.Response{ID: id, Result: json.RawMessage(`{"ok":true}`)})
+		}()
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("write did not block")
+		}
+		if ep.beginCall(callKey{num: 8, isNum: true}, false) {
+			t.Fatal("second call admitted while the response write was blocked")
+		}
+		if len(env.s.audit) != before {
+			t.Fatal("success write recorded a denial")
+		}
+		close(release)
+		if err := <-errc; err != nil {
+			t.Fatal(err)
+		}
+		if len(env.s.audit) != before {
+			t.Fatal("completed write recorded a denial")
+		}
+		if !ep.beginCall(callKey{num: 8, isNum: true}, false) {
+			t.Fatal("slot stayed held after the write returned")
+		}
+	})
+	t.Run("pre-handler-once", func(t *testing.T) {
+		env := approvedShared(t)
+		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := jsonrpc.MakeID(float64(9))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ep.beginCall(callKey{num: 9, isNum: true}, true) {
+			t.Fatal("admit")
+		}
+		before := len(env.s.audit)
+		c := &admitConn{ep: ep, rawW: &bufWC{}}
+		msg := &jsonrpc.Response{ID: id, Error: &jsonrpc.Error{Code: mcpCodeCancelled, Message: "request cancelled"}}
+		if err := c.Write(context.Background(), msg); err != nil {
+			t.Fatal(err)
+		}
+		assertSparse(t, env.s, before, actionLocalAttest)
+		if err := c.Write(context.Background(), msg); err != nil {
+			t.Fatal(err)
+		}
+		if len(env.s.audit) != before+1 {
+			t.Fatalf("duplicate pre-handler denial rows %d", len(env.s.audit)-before)
+		}
+		id2, err := jsonrpc.MakeID(float64(10))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ep.beginCall(callKey{num: 10, isNum: true}, true) {
+			t.Fatal("readmit")
+		}
+		ep.markHandled()
+		if err := ep.cap.denyBound(true); err != nil {
+			t.Fatal(err)
+		}
+		n := len(env.s.audit)
+		handled := &jsonrpc.Response{ID: id2, Error: &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "invalid params"}}
+		if err := c.Write(context.Background(), handled); err != nil {
+			t.Fatal(err)
+		}
+		if len(env.s.audit) != n {
+			t.Fatal("handler denial was recorded again")
+		}
+	})
+	t.Run("close-unblocks", func(t *testing.T) {
+		env := approvedShared(t)
+		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		serverRead, clientWrite := io.Pipe()
+		gw := &gateWriter{entered: make(chan struct{}), release: make(chan struct{})}
+		ctx, cancel := context.WithCancel(context.Background())
+		errc := make(chan error, 1)
+		go func() { errc <- ep.Serve(ctx, serverRead, gw) }()
+		defer func() {
+			cancel()
+			_ = clientWrite.Close()
+			_ = serverRead.Close()
+			select {
+			case <-errc:
+			case <-time.After(5 * time.Second):
+			}
+		}()
+		frame := append(rpcFrame(t, 1, "tools/list", map[string]any{"_meta": mcpMeta()}), '\n')
+		if _, err := clientWrite.Write(frame); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-gw.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("response write did not start")
+		}
+		cancel()
+		select {
+		case <-errc:
+		case <-time.After(3 * time.Second):
+			t.Fatal("Serve did not return while a response write was blocked")
+		}
+	})
+}
+
+func assertSparse(t *testing.T, s *Session, before int, action string) {
+	t.Helper()
+	if len(s.audit) != before+1 {
+		t.Fatalf("rows %d", len(s.audit)-before)
+	}
+	ev := s.audit[len(s.audit)-1]
+	if ev.Action != action || ev.Result != resultDenied || ev.GrantID != "" || ev.CredID != "" {
+		t.Fatalf("audit %+v", ev)
+	}
+}
+
+func waitRaw(t *testing.T, raw *rawPipe) {
+	t.Helper()
+	select {
+	case <-raw.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session did not end")
+	}
+}
+
+type blockWriter struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.started) })
+	<-w.release
+	return len(p), nil
+}
+
+func (w *blockWriter) Close() error { return nil }
+
+type gateWriter struct {
+	entered   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+	closeOnce sync.Once
+}
+
+func (g *gateWriter) Write(p []byte) (int, error) {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	return len(p), nil
+}
+
+func (g *gateWriter) Close() error {
+	g.closeOnce.Do(func() { close(g.release) })
+	return nil
+}
+
+type bufWC struct{ bytes.Buffer }
+
+func (w *bufWC) Close() error { return nil }
