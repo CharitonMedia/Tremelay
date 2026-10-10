@@ -55,7 +55,7 @@ Successful approval also appends the existing version-3 `respond` / `notify` row
 
 ### Atomicity
 
-`commitBatch` is still the only encrypted-document writer. It seals the current organization, memberships, and requests unless the caller passes a replacement snapshot. A credential, health, grant, agent, or audit commit therefore cannot drop shared state. The snapshot and its audit rows commit in the existing SQLite transaction. A fault leaves both unapplied. A failed approval does not leave a grant. A failed required audit does not return a signature. The locked-state denial suffix contract is unchanged.
+`commitBatch` is still the only encrypted-document writer. It seals the current organization, memberships, and requests unless the caller passes a replacement snapshot. A credential, health, grant, agent, or audit commit therefore cannot drop shared state. The snapshot and its audit rows commit in the existing SQLite transaction. A fault leaves both unapplied. A failed approval does not leave a grant. A failed required audit does not return a signature. The locked-state denial suffix contract is unchanged. Unlock derives the allowed bootstrap binding from the chain. A commit extends that binding with its new rows and stores the extension only after the transaction succeeds. It does not copy the existing audit prefix. Load and verify still read the chain.
 
 Load and verify check owner count, human/agent separation, organization/vault binding, generations, request status, and grant provenance. Authenticated ciphertext alone is not a valid state machine. Missing shared fields mean a legacy vault. Malformed or partial shared fields fail closed and are not read as legacy mode.
 

@@ -331,6 +331,11 @@ type Session struct {
 	org      *orgRecord
 	members  []membershipRecord
 	requests []requestRecord
+	// bootstrap is the allowed shared-bootstrap binding derived from the
+	// audit chain. Unlock builds it once. A commit extends it with the new
+	// rows and stores the result only after that commit succeeds, so the
+	// existing prefix is not copied. Reopen builds it again.
+	bootstrap bootstrapBind
 	// mu serializes authorization and document writes on this session.
 	// Callbacks run outside it. A second unlocked session is not covered by
 	// mu; its commit must match the durable audit sequence or it fails closed.
@@ -488,7 +493,12 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		wipe(dek)
 		return nil, deny(err)
 	}
-	if err := sharedHistoryBound(events, doc.Organization, doc.Memberships, doc.Requests, doc.Grants); err != nil {
+	bind, err := (bootstrapBind{}).extend(events)
+	if err != nil {
+		wipe(dek)
+		return nil, deny(err)
+	}
+	if err := bind.check(doc.Organization, doc.Memberships, doc.Requests, doc.Grants); err != nil {
 		wipe(dek)
 		return nil, deny(err)
 	}
@@ -526,6 +536,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		org:         doc.Organization,
 		members:     doc.Memberships,
 		requests:    doc.Requests,
+		bootstrap:   bind,
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -570,6 +581,7 @@ func (s *Session) lockLocked() {
 	s.org = nil
 	s.members = nil
 	s.requests = nil
+	s.bootstrap = bootstrapBind{}
 	s.locked.Store(false)
 	if s.redactor != nil {
 		s.redactor.Wipe()
@@ -942,7 +954,11 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 	if err := validateSharedState(org, members, requests, creds, agents, grants); err != nil {
 		return err
 	}
-	if err := sharedHistoryBound(append(append([]auditEvent{}, s.audit...), events...), org, members, requests, grants); err != nil {
+	nextBind, err := s.bootstrap.extend(events)
+	if err != nil {
+		return err
+	}
+	if err := nextBind.check(org, members, requests, grants); err != nil {
 		return err
 	}
 	tip := events[len(events)-1]
@@ -998,6 +1014,7 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 	s.org = org
 	s.members = members
 	s.requests = requests
+	s.bootstrap = nextBind
 	for _, row := range events {
 		applyNotice(s.notices, row)
 		s.suspensions.apply(s.audit, row)

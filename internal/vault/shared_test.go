@@ -774,6 +774,101 @@ func TestSharedMemberViewAndGrantStatus(t *testing.T) {
 	}
 }
 
+func TestCommitExtendsBootstrapBinding(t *testing.T) {
+	_, _, legacy := mustCreate(t, nil)
+	t.Cleanup(legacy.Lock)
+	for i := 0; i < 24; i++ {
+		if err := legacy.persistEvent(actionList, "", "", resultAllowed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := len(legacy.audit)
+	bootstrapApplyVisits = 0
+	if err := legacy.persistEvent(actionList, "", "", resultAllowed); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := bootstrapApplyVisits, len(legacy.audit)-before; got != want {
+		t.Fatalf("legacy commit visited %d rows, wrote %d", got, want)
+	}
+	if legacy.bootstrap.shared {
+		t.Fatal("legacy binding became shared")
+	}
+	legacy.commitFault = func() error { return errors.New("full") }
+	if err := legacy.BootstrapShared(mustID(t)); err == nil {
+		t.Fatal("faulted bootstrap succeeded")
+	}
+	legacy.commitFault = nil
+	if legacy.bootstrap.shared || legacy.org != nil {
+		t.Fatal("faulted bootstrap published shared mode")
+	}
+	if _, err := legacy.Put("label", "generic", []byte("secret"), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	env := newSharedEnv(t)
+	before = len(env.s.audit)
+	bootstrapApplyVisits = 0
+	req, err := env.bob.RequestAccess(env.requestSpec(time.Hour, 20*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := bootstrapApplyVisits, len(env.s.audit)-before; got != want {
+		t.Fatalf("request visited %d rows, wrote %d", got, want)
+	}
+	marked := len(env.s.audit)
+	saved := env.s.bootstrap
+	org, members, requests := env.s.org, env.s.members, env.s.requests
+	env.s.org, env.s.members, env.s.requests = nil, nil, nil
+	ev, err := nextEvent(env.s.audit, actionList, env.s.id, "", "", resultDenied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.s.commitBatch([]auditEvent{ev}, env.s.creds, env.s.agents, env.s.grants, false, nil, nil); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("downgrade commit %v", err)
+	}
+	if len(env.s.audit) != marked || env.s.bootstrap != saved {
+		t.Fatal("rejected downgrade published state")
+	}
+	env.s.org, env.s.members, env.s.requests = org, members, requests
+	if _, err := saved.extend([]auditEvent{{
+		Action: actionBootstrap, Result: resultAllowed, OrgID: mustID(t), VaultID: env.s.id,
+	}}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("conflicting bootstrap %v", err)
+	}
+	again, err := saved.extend([]auditEvent{{
+		Action: actionBootstrap, Result: resultAllowed, OrgID: saved.orgID, VaultID: saved.vaultID,
+	}})
+	if err != nil || again != saved {
+		t.Fatalf("repeat bootstrap %+v %v", again, err)
+	}
+
+	if _, err := env.alice.Approve(req.ID); err != nil {
+		t.Fatal(err)
+	}
+	before = len(env.s.audit)
+	bootstrapApplyVisits = 0
+	env.attest(t, []byte("payload"))
+	if got, want := bootstrapApplyVisits, len(env.s.audit)-before; got != want {
+		t.Fatalf("attest visited %d rows, wrote %d", got, want)
+	}
+	bound, err := (bootstrapBind{}).extend(env.s.audit)
+	if err != nil || env.s.bootstrap != bound {
+		t.Fatalf("binding %+v chain %+v %v", env.s.bootstrap, bound, err)
+	}
+	env.reopen(t)
+	if env.s.bootstrap != bound {
+		t.Fatalf("reopen binding %+v", env.s.bootstrap)
+	}
+	before = len(env.s.audit)
+	bootstrapApplyVisits = 0
+	if _, err := env.bob.RequestAccess(env.requestSpec(time.Hour, 20*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := bootstrapApplyVisits, len(env.s.audit)-before; got != want {
+		t.Fatalf("reopen commit visited %d rows, wrote %d", got, want)
+	}
+}
+
 func TestSharedExpiryAndHistoryDowngrade(t *testing.T) {
 	env := newSharedEnv(t)
 	rows, err := env.alice.Audit(AuditFilter{})

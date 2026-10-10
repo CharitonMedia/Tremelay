@@ -967,15 +967,35 @@ func (s *Session) sharedGrantLive(id string) error {
 	return nil
 }
 
-// sharedHistoryBound keeps shared mode attached to an allowed bootstrap in
-// the verified chain. Missing shared fields after that bootstrap are not a
-// legacy vault. A chain with no allowed bootstrap stays single-user.
-func sharedHistoryBound(events []auditEvent, org *orgRecord, members []membershipRecord, requests []requestRecord, grants []grantRecord) error {
-	orgID, vaultID, shared, err := bootstrapBinding(events)
-	if err != nil {
-		return err
+// bootstrapApplyVisits counts audit rows read while extending the bootstrap
+// binding. A commit extends the new rows. Unlock and verify read the chain once.
+var bootstrapApplyVisits int
+
+// bootstrapBind is the allowed shared bootstrap derived from the audit chain.
+// A chain with no allowed bootstrap stays single-user. Missing shared fields
+// after an allowed bootstrap are not a legacy vault.
+type bootstrapBind struct {
+	shared  bool
+	orgID   string
+	vaultID string
+}
+
+func (b bootstrapBind) extend(events []auditEvent) (bootstrapBind, error) {
+	for _, ev := range events {
+		bootstrapApplyVisits++
+		if ev.Action != actionBootstrap || ev.Result != resultAllowed {
+			continue
+		}
+		if b.shared && (b.orgID != ev.OrgID || b.vaultID != ev.VaultID) {
+			return bootstrapBind{}, ErrCorrupt
+		}
+		b.orgID, b.vaultID, b.shared = ev.OrgID, ev.VaultID, true
 	}
-	if !shared {
+	return b, nil
+}
+
+func (b bootstrapBind) check(org *orgRecord, members []membershipRecord, requests []requestRecord, grants []grantRecord) error {
+	if !b.shared {
 		if org != nil || len(members) != 0 || len(requests) != 0 {
 			return ErrCorrupt
 		}
@@ -986,23 +1006,21 @@ func sharedHistoryBound(events []auditEvent, org *orgRecord, members []membershi
 		}
 		return nil
 	}
-	if org == nil || org.ID != orgID || org.VaultID != vaultID || safeID(orgID) == "" {
+	if org == nil || org.ID != b.orgID || org.VaultID != b.vaultID || safeID(b.orgID) == "" {
 		return ErrCorrupt
 	}
 	return nil
 }
 
-func bootstrapBinding(events []auditEvent) (orgID, vaultID string, shared bool, err error) {
-	for _, ev := range events {
-		if ev.Action != actionBootstrap || ev.Result != resultAllowed {
-			continue
-		}
-		if shared && (orgID != ev.OrgID || vaultID != ev.VaultID) {
-			return "", "", false, ErrCorrupt
-		}
-		orgID, vaultID, shared = ev.OrgID, ev.VaultID, true
+// sharedHistoryBound keeps shared mode attached to an allowed bootstrap in
+// the verified chain. Load and verify pass the chain. A commit extends the
+// session binding with the new rows instead of copying the prefix.
+func sharedHistoryBound(events []auditEvent, org *orgRecord, members []membershipRecord, requests []requestRecord, grants []grantRecord) error {
+	b, err := (bootstrapBind{}).extend(events)
+	if err != nil {
+		return err
 	}
-	return orgID, vaultID, shared, nil
+	return b.check(org, members, requests, grants)
 }
 
 func validateDocument(doc document) error {
