@@ -53,7 +53,7 @@ Rows use action `local_attest` and hash version 2. The version-1 through version
 
 `allowed` commits before `ed25519.Sign`. `completed` commits before the signature is returned. `denied` and `denied_key` commit instead of `allowed` when the call is refused. `failed` records an unusable key, a non-active credential lifecycle state, or a signing fault after `allowed`. A fault after `allowed` still withholds the signature.
 
-If the `allowed` write fails, nothing is signed and the caller receives `ErrAudit`. That attempt is not in the chain. If the process stops after `allowed` and before `completed`, the chain shows an authorization and not a completion. The signature is not stored, so it cannot be recovered from the vault. The grant remains usable for a later call. If the `completed` write fails, the signature is discarded. The earlier `allowed` row is not rewritten into a completion. A locked session cannot write; the caller receives `ErrUnauthenticated` and no new row.
+If the `allowed` write fails, nothing is signed and the caller receives a fixed error: `ErrAudit` for audit validation or the audit fault hook, or `ErrIO` for a storage-write failure. That attempt is not in the chain. If the process stops after `allowed` and before `completed`, the chain shows an authorization and not a completion. The signature is not stored, so it cannot be recovered from the vault. The grant remains usable for a later call. If the `completed` write fails, the signature is discarded. The earlier `allowed` row is not rewritten into a completion. A locked session cannot write; the caller receives `ErrUnauthenticated` and no new row.
 
 `denied_revoked` on this action is `replay` / `high`, the same class used for a revoked broker or authorize call, so the existing notify and containment policy applies. `denied_key`, `failed`, and the other ordinary denials are `expected_denial` / `low`. These rows are not `broker_http` rows. They do not enter the broker denial lookback, so they do not create or suppress a repeated HTTP denial. Health findings, including credential expiry, do not allow or deny the signature.
 
@@ -79,7 +79,7 @@ A suspended agent is `denied_agent` before the payload is inspected. A credentia
 - `sign`, `http_request`, and `github_issue_state` stay on their previous meaning after reopen.
 - The signed bytes do not verify as a raw signature over the payload, or under another domain or purpose.
 - Private keys and payloads stay out of audit rows, errors, logs, and notifications. Tests use unique sentinels, including on malformed input.
-- An allowed row without a completed row is not a released signature. A failed audit write is `ErrAudit`, not success.
+- An allowed row without a completed row is not a released signature. A failed audit write returns a fixed error such as `ErrAudit` or `ErrIO`, never success.
 - Revocation is replay and can notify or suspend through the existing policy. Ordinary attestation denials do not weaken broker detection. Health remains advisory.
 
 ## Consequences
@@ -102,4 +102,5 @@ A suspended agent is `denied_agent` before the payload is inspected. A credentia
 - `TestLocalAttestDetection` shows attestation denials do not move the broker repeated-denial threshold.
 - `TestLocalAttestContainment` notifies `replay` for a revoked grant and does not put the payload or private key in the alert. An ordinary scope denial does not notify.
 - `TestLocalAttestInvalidLifecycle` refuses a non-active credential state, records `failed`, and does not reopen that document as valid.
+- `TestLocalAttestRotationOrderReopenAndLifecycle` checks both relative grant-ID orderings, successful reopening, and current-key revocation/expiry while stale-key grants remain present. It verifies the selected public key and grant IDs in the audit rows.
 - `ExampleVerifyLocalAttestation` verifies the published test vector.
