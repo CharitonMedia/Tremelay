@@ -26,6 +26,13 @@ DECISION = {'decision': 'resume', 'head': HEAD, 'assessment': 'Implementation bu
             'correction': 'Update the derived index and test rollback.', 'reason_for_user': ''}
 
 
+def worker_lookup(state, status):
+    agent = {'id': state['agent_id'], 'latestRunId': 'run-1', 'workOnCurrentBranch': True,
+             'repos': [{'url': f'https://github.com/{s.REPO}', 'prUrl': f'https://github.com/{s.REPO}/pull/11'}]}
+    run = {'id': 'run-1', 'agentId': state['agent_id'], 'status': status}
+    return [agent, run] + ([agent] if status in s.WORKER_TERMINAL_STATUSES else [])
+
+
 class Gates(unittest.TestCase):
     def test_fork_other_author_closed_and_non_goal_are_ineligible(self):
         self.assertTrue(s.eligible(PULL))
@@ -135,7 +142,8 @@ class Controller(unittest.TestCase):
         self.assertFalse(any(method == 'DELETE' for _, method, _ in writes))
         self.assertIn('"phase":"working"', writes[4][2]['body'])
 
-    def test_idle_timeout_preserves_paid_decision_and_recovers_one_first_create(self):
+    @patch.object(s, 'live_lineage')
+    def test_idle_timeout_preserves_paid_decision_and_recovers_one_first_create(self, _lineage):
         state = {'phase': 'dispatch_ready', 'head': HEAD, 'review': 4, 'decision': DECISION}
         comment = {'id': 100, 'body': s.state_body(state, 'Recorded assessment')}
         with patch.object(s, 'gh', return_value=PULL), patch.object(s, 'pages', return_value=[REVIEW]), patch.object(s, 'active_goal_work', return_value=True), patch.object(s.time, 'sleep'), patch.object(s, 'cursor') as api, patch.object(s, 'update_state') as write:
@@ -208,7 +216,7 @@ class Controller(unittest.TestCase):
         state = {'phase': 'dispatch_reserved', 'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
                  'time': s.datetime.now(s.timezone.utc).isoformat(), 'head': HEAD}
         comment = {'id': 100, 'body': s.state_body(state, 'assessment')}
-        with patch.object(s, 'cursor', side_effect=[{'id': state['agent_id'], 'latestRunId': 'run-1'}, {'status': 'RUNNING'}]) as api, patch.object(s, 'update_state'):
+        with patch.object(s, 'cursor', side_effect=worker_lookup(state, 'RUNNING')) as api, patch.object(s, 'update_state'):
             s.recover_worker(PULL, comment, state)
             self.assertEqual(state['phase'], 'working')
             self.assertTrue(all(not call.kwargs for call in api.call_args_list))
@@ -216,14 +224,15 @@ class Controller(unittest.TestCase):
     def test_already_recorded_running_worker_does_not_create_event_feedback(self):
         state = {'phase': 'working', 'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
                  'run_id': 'run-1', 'time': s.datetime.now(s.timezone.utc).isoformat(), 'head': HEAD}
-        with patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'RUNNING'}]), patch.object(s, 'update_state') as write:
+        with patch.object(s, 'cursor', side_effect=worker_lookup(state, 'RUNNING')), patch.object(s, 'update_state') as write:
             s.recover_worker(PULL, {'id': 100}, state)
             write.assert_not_called()
 
-    def test_noop_worker_does_not_clear_stop_or_request_review(self):
+    @patch.object(s, 'live_lineage')
+    def test_noop_worker_does_not_clear_stop_or_request_review(self, _lineage):
         state = {'phase': 'working', 'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
                  'run_id': 'run-1', 'time': s.datetime.now(s.timezone.utc).isoformat(), 'head': HEAD}
-        with patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'FINISHED'}]), patch.object(s, 'gh', side_effect=[PULL, {'status': 'identical'}]) as api, patch.object(s, 'update_state'):
+        with patch.object(s, 'cursor', side_effect=worker_lookup(state, 'FINISHED')), patch.object(s, 'gh', side_effect=[PULL, {'status': 'identical'}]) as api, patch.object(s, 'update_state'):
             s.recover_worker(PULL, {'id': 100}, state)
             self.assertEqual(state['phase'], 'escalate')
             self.assertTrue(all(not call.kwargs for call in api.call_args_list))
@@ -290,7 +299,8 @@ class Controller(unittest.TestCase):
             with self.assertRaises(s.Stop):
                 s.refresh_guard(11, HEAD, 4, require_stop=False)
 
-    def test_own_comment_workflows_settle_before_final_guard(self):
+    @patch.object(s, 'live_lineage')
+    def test_own_comment_workflows_settle_before_final_guard(self, _lineage):
         with patch.object(s, 'active_goal_work', side_effect=[True, True, False, False]), patch.object(s.time, 'sleep') as sleep, patch.object(s, 'gh', return_value=PULL), patch.object(s, 'pages', return_value=[REVIEW]):
             s.refresh_guard(11, HEAD, 4)
             self.assertEqual(sleep.call_count, 2)
@@ -300,7 +310,8 @@ class Controller(unittest.TestCase):
             with self.assertRaises(s.Stop):
                 s.wait_for_goal_idle(11, HEAD)
 
-    def test_review_recovery_uses_trusted_marker_without_duplicate_request(self):
+    @patch.object(s, 'live_lineage')
+    def test_review_recovery_uses_trusted_marker_without_duplicate_request(self, _lineage):
         state = {'completed_head': HEAD, 'phase': 'review_reserved'}
         marker = f'<!-- tremelay-supervisor-review:{HEAD} -->'
         with patch.object(s, 'gh', return_value=PULL) as api, patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'pages', return_value=[{'user': {'login': s.AUTHOR}, 'body': marker}]), patch.object(s, 'update_state'):
@@ -308,7 +319,8 @@ class Controller(unittest.TestCase):
             self.assertFalse(any(c.kwargs.get('method') == 'POST' for c in api.call_args_list))
             self.assertEqual(state['phase'], 'completed')
 
-    def test_forged_review_marker_cannot_suppress_independent_review(self):
+    @patch.object(s, 'live_lineage')
+    def test_forged_review_marker_cannot_suppress_independent_review(self, _lineage):
         state = {'completed_head': HEAD, 'phase': 'review_reserved'}
         marker = f'<!-- tremelay-supervisor-review:{HEAD} -->'
         with patch.object(s, 'gh', return_value=PULL) as api, patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'pages', return_value=[{'user': {'login': 'outsider'}, 'body': marker}]), patch.object(s, 'update_state'):
@@ -415,7 +427,7 @@ class Controller(unittest.TestCase):
         processed = []
         run_one = s.run_one
         def paged(path):
-            if path.endswith('/pulls?state=open'):
+            if path.endswith('/pulls?state=all'):
                 return [PULL, next_pull]
             if path.endswith('/reviews'):
                 return [REVIEW]
@@ -465,7 +477,7 @@ class Controller(unittest.TestCase):
                 self.assertEqual(method, 'GET')
                 return {'login': s.AUTHOR} if path == 'user' else live
             def paged(path):
-                if path.endswith('/pulls?state=open'):
+                if path.endswith('/pulls?state=all'):
                     return [live]
                 if path.endswith('/reviews'):
                     return [review]
@@ -529,14 +541,14 @@ class Controller(unittest.TestCase):
             self.assertEqual(method, 'GET')
             return {'login': s.AUTHOR} if path == 'user' else live
         def paged(path):
-            if path.endswith('/pulls?state=open'):
+            if path.endswith('/pulls?state=all'):
                 return [live]
             if path.endswith('/comments'):
                 return [claim]
             if path.endswith('/reviews'):
                 return [newer_review]
             raise AssertionError(path)
-        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': s.REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'test-token', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'RUNNING'}] * 2) as worker, patch.object(s, 'run_one') as assess:
+        with patch.dict(s.os.environ, {'GITHUB_REPOSITORY': s.REPO, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_WORKFLOW_REF': s.REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main', 'GH_TOKEN': 'test-token', 'CURSOR_API_KEY': 'test-cursor', 'SUPERVISOR_MAX_CHECKPOINTS': '3', 'TREMELAY_SUPERVISOR_ACTIVATION': s.ACTIVATION_VALUE}), patch.object(sys, 'argv', ['checkpoint_supervisor.py']), patch.object(s, 'gh', side_effect=api), patch.object(s, 'pages', side_effect=paged), patch.object(s, 'cursor', side_effect=worker_lookup(state, 'RUNNING') * 2) as worker, patch.object(s, 'run_one') as assess:
             self.assertEqual(s.main(), 0)
             live['head']['sha'] = 'b' * 40
             newer_review['commit_id'] = 'b' * 40
@@ -549,13 +561,14 @@ class Controller(unittest.TestCase):
             assess.assert_not_called()
             self.assertTrue(all(not call.kwargs for call in worker.call_args_list))
 
-    def test_timed_out_worker_can_finish_without_a_replacement(self):
+    @patch.object(s, 'live_lineage')
+    def test_timed_out_worker_can_finish_without_a_replacement(self, _lineage):
         state = {'phase': 'working', 'timeout_escalated': True,
                  'agent_id': s.worker_payload(11, HEAD, 4, DECISION)['agentId'],
                  'run_id': 'run-1', 'time': '2000-01-01T00:00:00+00:00', 'head': HEAD, 'review': 4}
         advanced = copy.deepcopy(PULL)
         advanced['head']['sha'] = 'b' * 40
-        with patch.object(s, 'cursor', side_effect=[{'id': state['agent_id']}, {'status': 'FINISHED'}]) as worker, patch.object(s, 'gh', side_effect=[advanced, {'status': 'ahead'}]), patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'update_state'), patch.object(s, 'finish_review') as review:
+        with patch.object(s, 'cursor', side_effect=worker_lookup(state, 'FINISHED')) as worker, patch.object(s, 'gh', side_effect=[advanced, {'status': 'ahead'}]), patch.object(s, 'active_goal_work', return_value=False), patch.object(s, 'update_state'), patch.object(s, 'finish_review') as review:
             s.recover_worker(PULL, {'id': 100}, state)
             self.assertEqual(state['phase'], 'review_reserved')
             self.assertEqual(state['completed_head'], 'b' * 40)

@@ -107,3 +107,60 @@ or changed head does not justify discarding that reservation or launching again.
 ## CI
 
 Tremelay runs general Go CI plus dedicated `Test Linux` and `Test Windows` workflows used by exact-head review orchestration. CI also verifies the pinned Ponytail Cursor rule, compiles the Python automation helpers, and runs all automation regression test files. The launch tests execute the actual workflow shell with mocked GitHub/Cursor commands; no live workers are used.
+
+## Shared ownership and manual takeover
+
+Before any initial goal, ordinary review, or supervisor worker create, read the
+full repository PR history and both trusted claim families. A normal reservation,
+legacy accepted-worker receipt, supervisor assessment reservation, or accepted
+supervisor worker may still own work after a newer head/review, label removal,
+PR closure, or merge. Malformed trusted state and orphan supervisor launch
+receipts fail closed. An old supervisor `completed`/`escalate` phase without a
+verified terminal receipt does not release ownership.
+
+The source issue must still be open, and no earlier PR in its canonical branch
+or Goal-Issue lineage may already be merged. Publication rechecks this live
+history immediately before planning writes; a late worker push cannot recreate
+that completed goal. Launch guards also check other goal PRs in the repository,
+so a newly queued milestone waits for earlier recorded workers to be reconciled.
+
+`human-review-required` is a checkpoint invitation to the deployed supervisor,
+not an exclusive manual takeover. For manual work, retain that label and remove
+`goal` from the PR. Publication preserves this hold. Inspect both ordinary and
+supervisor ownership before editing/pushing/merging; the labels do not cancel an
+accepted worker. Wait for a verified terminal result before competing work.
+Restore `goal` only after ownership and the next authorized action are settled.
+
+The scheduled supervisor reads all PR states for existing supervisor receipts
+and legacy accepted ordinary receipts. Modern ordinary claims retain their
+serialized per-PR `goal` recovery job, so an active prepared claim cannot be
+released by another controller. Closed or held PRs only receive GET-only worker
+reconciliation and updates to their existing receipt; they cannot trigger assessment, create, review requests or label changes.
+Agent identity, its current run, repository/PR association and terminal status
+must all match, including a second current-run lookup before recording terminal
+ownership. A missing lookup, unknown status or newer run preserves the claim.
+No create is replayed. Existing checkpoint/cycle history remains consumed.
+
+For a specific supervisor receipt, run Checkpoint Supervisor on `main` with
+`recovery_pr` and `recovery_comment`, leaving preflight and smoke disabled. This
+uses the same serialized controller and activation gate and only reconciles that
+existing worker. The ordinary `goal` recovery inputs remain supported, including
+closed/held PRs. Neither recovery mode authorizes a replacement worker.
+
+Deployment limits: the new implement/publish definitions check out trusted main,
+but an already-created goal branch can still carry an old workflow definition.
+Do not requeue a retired goal or assume a main-only merge retroactively changes
+its old push workflow. Keep old duplicates held until their workers are verified
+terminal; create future milestone branches from the patched main. Initial issue
+workers now honor shared review/supervisor ownership, but their own first-create
+receipt protocol is unchanged. An ambiguous initial issue-worker create still
+needs explicit service reconciliation; relabeling/retrying is not proof it failed.
+
+History reads stop after 100 pages of 100 records and fail closed if the history
+cannot be completed within that bound. Historical receipt upgrade is incremental: a verified terminal receipt is not
+looked up again; one unknown receipt does not prevent independent legacy receipts
+on that PR from being checked. An inaccessible/deleted agent, missing run or
+unverifiable PR association remains blocking and is reported with its receipt
+ID for an explicit owner retirement assessment. No automatic retirement or new
+worker is authorized by that report. A terminal upgrade uses three Cursor GETs
+and one existing-comment update; running receipts need two GETs per check.

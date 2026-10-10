@@ -189,7 +189,7 @@ class LegacyOwnershipTests(unittest.TestCase):
                     'labels': [{'name': 'goal'}, {'name': 'human-review-required'}], 'body': 'Goal-Issue: #10'}
         def pages(path):
             seen.append(path)
-            if path.endswith('/pulls?state=open'):
+            if path.endswith('/pulls?state=all'):
                 return [pull(PR), pull(13)]
             if f'/issues/{PR}/comments' in path:
                 return [comment(body)]

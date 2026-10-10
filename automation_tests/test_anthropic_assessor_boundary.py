@@ -387,11 +387,11 @@ class AssessorBoundary(unittest.TestCase):
         comment, state = {'id': 100}, {'phase': 'working'}
         with patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', ['supervisor']), \
                 patch.object(s, 'gh', return_value={'login': s.AUTHOR}), \
-                patch.object(s, 'pages', side_effect=[[pull], []]), patch.object(s, 'eligible', return_value=True), \
+                patch.object(s, 'pages', side_effect=[[pull], []]), patch.object(s, 'recovery_target', return_value=True), patch.object(s, 'eligible', return_value=True), \
                 patch.object(s, 'records', return_value=[(comment, state)]), \
                 patch.object(s, 'recover_worker') as recovery, patch.object(s, 'invoke_assessor') as helper:
             self.assertEqual(s.main(), 0)
-            recovery.assert_called_once_with(pull, comment, state)
+            recovery.assert_called_once_with(pull, comment, state, reconcile_only=False)
             helper.assert_not_called()
 
     def test_cancellation_ends_scan_before_assessing_another_pr(self):
@@ -399,7 +399,7 @@ class AssessorBoundary(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', ['supervisor']), \
                 patch.object(s, 'gh', return_value={'login': s.AUTHOR}), \
                 patch.object(s, 'pages', side_effect=[[{'number': 11}, {'number': 12}], []]), \
-                patch.object(s, 'eligible', return_value=True), patch.object(s, 'records', return_value=[]), \
+                patch.object(s, 'recovery_target', return_value=True), patch.object(s, 'eligible', return_value=True), patch.object(s, 'records', return_value=[]), \
                 patch.object(s, 'run_one', side_effect=s.AssessmentCancelled('Cancelled')) as assess:
             with self.assertRaises(s.AssessmentCancelled):
                 s.main()

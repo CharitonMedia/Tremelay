@@ -11,6 +11,7 @@ import re
 
 HUMAN_RESUME_MARKER = "<!-- tremelay-human-resume -->"
 SUPERVISOR_MARKER = "<!-- tremelay-supervisor-v1 "
+WORKER_TERMINAL_STATUSES = frozenset({"FINISHED", "ERROR", "CANCELLED", "EXPIRED"})
 _SUPERVISOR_PREFIX = "<!-- tremelay-supervisor-v1"
 _CHECKPOINT_HEADER = re.compile(
     r"Automation stopped after [0-9]+ counted attempts(?: in this segment)? "
@@ -121,6 +122,49 @@ def supervisor_state(body: str) -> dict | None:
             or line != SUPERVISOR_MARKER + json.dumps(state, sort_keys=True, separators=(",", ":")) + " -->"):
         raise ValueError("Noncanonical supervisor state envelope")
     return state
+
+
+def supervisor_owns_work(state: dict) -> bool:
+    """A lifecycle change is never evidence that an accepted worker stopped.
+
+    Old completed/escalated records lack a verified terminal receipt. Retain
+    their ownership until GET-only reconciliation upgrades that same record.
+    A review reservation remains owning until its final durable write.
+    """
+    phase = state.get("phase")
+    if not isinstance(phase, str):
+        return True
+    if phase in {"reserved", "dispatch_ready", "dispatch_reserved", "working", "review_reserved"}:
+        return True
+    if "agent_id" in state or "run_id" in state:
+        if (phase not in {"terminal", "completed", "escalate"}
+                or not isinstance(state.get("terminal_status"), str)
+                or state["terminal_status"] not in WORKER_TERMINAL_STATUSES
+                or not isinstance(state.get("agent_id"), str)
+                or not re.fullmatch(r"bc-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", state["agent_id"])
+                or not isinstance(state.get("run_id"), str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", state["run_id"])):
+            return True
+        return False
+    # Unknown or malformed owning state fails closed instead of granting work.
+    return phase not in {"obsolete", "escalate"}
+
+
+def validate_supervisor_receipts(comments, states, author):
+    """A separate launch receipt cannot disappear with its state comment."""
+    prefix = "Cursor remediation round 1: supervisor worker launch reserved."
+    pattern = (re.escape(prefix) + r"\n\nAgent: `(bc-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})`\. "
+               r"Correction is recorded above\. An ambiguous create is reconciled by this identity, never replayed\.")
+    identities = {state.get("agent_id") for state in states if isinstance(state.get("agent_id"), str)}
+    for comment in comments:
+        if not isinstance(comment, dict) or comment.get("user", {}).get("login") != author:
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str) or is_checkpoint_evidence(body) or prefix not in body:
+            continue
+        match = re.fullmatch(pattern, body.rstrip("\r\n"))
+        if not match or match[1] not in identities:
+            raise ValueError("Orphan or malformed supervisor launch receipt; reconcile existing worker")
 
 
 def has_control_marker(body: str, marker: str) -> bool:

@@ -73,15 +73,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           token: ${{ github.token }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: List open pull requests
+      - name: Check source goal and worker ownership
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh pr list --state open --limit 100 --json number,url,body,labels,headRefName,baseRefName > open_prs.json
+        run: python scripts/goal_lineage.py --issue "${{ github.event.issue.number }}" --launch --repository-ownership --open-prs-out open_prs.json
       - name: Build Cloud Agent request
         id: build
         run: |
@@ -138,6 +139,12 @@ jobs:
             before=$(git rev-parse "origin/${base}")
           fi
           printf '%s\n' "$before" > before_sha.txt
+          # Recheck after branch setup and immediately before creating a worker.
+          if [ -n "$pr_url" ]; then
+            python scripts/goal_lineage.py --issue "$number" --pr "$pr_number" --head "$before" --launch --repository-ownership
+          else
+            python scripts/goal_lineage.py --issue "$number" --launch --repository-ownership
+          fi
           curl --fail-with-body -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json https://api.cursor.com/v1/agents > response.json
           url=$(python -c 'import json; print(json.load(open("response.json"))["agent"]["url"])')
           gh issue comment "$number" --body "A cloud agent is implementing this issue: ${url}. The workflow opens the pull request, with the Goal-Issue line and the goal label, after the branch has commits. The agent does not open one."
@@ -157,6 +164,7 @@ jobs:
           before=$(tr -d '\n' < before_sha.txt)
           base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
           issue="${{ github.event.issue.number }}"
+          python scripts/goal_lineage.py --issue "$issue"
           title=$(gh issue view "$issue" --json title --jq .title)
           if [ -f pr_number.txt ]; then
             pr_number=$(tr -d '\n' < pr_number.txt)
@@ -212,6 +220,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           token: ${{ github.token }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
@@ -231,6 +240,7 @@ jobs:
             exit 0
           fi
           bash scripts/require_goal_github_token.sh
+          python scripts/goal_lineage.py --issue "$issue"
           base=$(python -c 'import sys; sys.path.insert(0, "scripts"); import goal_agent_request as g; print(g.DEFAULT_BASE_REF)')
           git fetch origin "$base" "$branch"
           ahead=$(git rev-list --count "origin/${base}..origin/${branch}")
@@ -410,6 +420,7 @@ jobs:
             echo "Approved automation identity is required."
             exit 1
           fi
+          python scripts/goal_lineage.py --pr "$number" --launch --repository-ownership
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}" > live_pull.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${number}/reviews?per_page=100" > reviews.json
           gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/issues/${number}/comments?per_page=100" > comments.json
@@ -525,6 +536,9 @@ jobs:
             echo "Independent review changed or became clean before create; refusing launch."
             exit 1
           fi
+          # Ignore only this job's reservation; older and supervisor claims
+          # across every PR in the source lineage still prevent a create.
+          python scripts/goal_lineage.py --pr "$number" --head "$expected" --launch --repository-ownership --ignore-comment-id "$claim_id"
           attempted=true
           set +e
           http_code=$(curl -sS -u "${CURSOR_API_KEY}:" -H "Content-Type: application/json" --data @payload.json -o response.json -w '%{http_code}' https://api.cursor.com/v1/agents)

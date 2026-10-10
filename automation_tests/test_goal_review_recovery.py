@@ -20,9 +20,9 @@ PAYLOAD = {"name": "Goal review on PR #11", "prompt": {"text": "Repair the legit
            "repos": [{"url": f"https://github.com/{launch.REPO}",
                       "prUrl": f"https://github.com/{launch.REPO}/pull/{PR}"}],
            "workOnCurrentBranch": True, "autoCreatePR": False, "skipReviewerRequest": True}
-PULL = {"number": PR, "state": "open", "draft": False,
+PULL = {"number": PR, "state": "open", "draft": False, "merged_at": None,
         "user": {"login": goal.TRUSTED_AUTOMATION_LOGIN},
-        "head": {"sha": AFTER, "repo": {"full_name": launch.REPO}},
+        "head": {"sha": AFTER, "ref": "goal/issue-10", "repo": {"full_name": launch.REPO}},
         "base": {"ref": "main", "repo": {"full_name": launch.REPO}},
         "body": "Goal-Issue: #10", "labels": [{"name": "goal"}, {"name": "human-review-required"}]}
 
@@ -52,8 +52,11 @@ class Server:
         self.writes = []
         self.reads = []
         self.cursor_calls = []
+        status = "FINISHED" if phase == "review_reserved" else status
         self.status = status
-        self.agent = {"id": self.state["agent_id"], "latestRunId": "run-1"}
+        self.agent = {"id": self.state["agent_id"], "latestRunId": "run-1", "workOnCurrentBranch": True,
+                      "repos": [{"url": f"https://github.com/{launch.REPO}",
+                                 "prUrl": f"https://github.com/{launch.REPO}/pull/{PR}"}]}
         self.run = {"id": "run-1", "agentId": self.state["agent_id"], "status": status}
         self.compare = {"status": "ahead"}
         self.login = goal.TRUSTED_AUTOMATION_LOGIN
@@ -69,6 +72,10 @@ class Server:
                 return {"login": self.login}
             if path == f"repos/{launch.REPO}/issues/comments/100":
                 return copy.deepcopy(self.claim)
+            if path == f"repos/{launch.REPO}/issues/10":
+                return {"number": 10, "state": "open"}
+            if path == f"repos/{launch.REPO}/pulls?state=all&per_page=100&page=1":
+                return [copy.deepcopy(self.pull)]
             if path == f"repos/{launch.REPO}/pulls/{PR}":
                 return copy.deepcopy(self.pull)
             if path == f"repos/{launch.REPO}/compare/{HEAD}...{AFTER}":
@@ -369,8 +376,9 @@ class RecoveryTests(unittest.TestCase):
     def test_persisted_run_is_not_replaced_by_latest_run(self):
         server = Server("working")
         server.agent["latestRunId"] = "run-unrelated"
-        server.recover()
-        self.assertEqual(server.cursor_calls[-1], f"/{server.state['agent_id']}/runs/run-1")
+        with self.assertRaises(launch.Stop):
+            server.recover()
+        self.assertEqual(server.cursor_calls, ["/" + server.state["agent_id"]])
         self.assertEqual(server.writes, [])
 
     def test_terminal_errors_are_recorded_once_and_never_replaced(self):
@@ -415,11 +423,11 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(len(server.writes), 3)
 
     def test_finished_rejects_closed_foreign_non_goal_or_moved_author(self):
-        cases = [("state", "closed"), ("draft", True), ("user", {"login": "other"}),
+        cases = [("draft", True), ("user", {"login": "other"}),
                  ("head", {"sha": AFTER, "repo": {"full_name": "other/repo"}}),
                  ("base", {"ref": "main", "repo": {"full_name": "other/repo"}}),
                  ("base", {"ref": "dev", "repo": {"full_name": launch.REPO}}),
-                 ("body", "ordinary PR"), ("labels", []), ("number", 12)]
+                 ("body", "ordinary PR"), ("number", 12)]
         for key, value in cases:
             server = Server("working", "FINISHED")
             server.pull[key] = value
@@ -460,7 +468,7 @@ class RecoveryTests(unittest.TestCase):
         cursor_calls = list(server.cursor_calls)
         self.assertEqual(server.recover()["phase"], "completed")
         self.assertEqual(len(server.posts()), 1)
-        self.assertEqual(server.cursor_calls, cursor_calls)
+        self.assertEqual(len(server.cursor_calls), len(cursor_calls) + 3)
 
     def test_ambiguous_completed_write_recovery_never_duplicates_review(self):
         server = Server("working", "FINISHED")
@@ -479,7 +487,7 @@ class RecoveryTests(unittest.TestCase):
             server.comments.append({"user": {"login": user}, "body": text})
             self.assertEqual(server.recover()["phase"], "completed")
             self.assertEqual(len(server.posts()), 1)
-            self.assertEqual(server.cursor_calls, [])
+            self.assertEqual(len(server.cursor_calls), 3)
 
     def test_head_change_after_reservation_or_during_pagination_blocks_review(self):
         for stage in ["reserved", "pagination"]:

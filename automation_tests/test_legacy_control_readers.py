@@ -294,7 +294,8 @@ class SupervisorDedupe(unittest.TestCase):
         api.assert_called_once()
         self.assertIn("<!-- tremelay-supervisor-budget -->", api.call_args.kwargs["data"]["body"])
 
-    def test_old_evidence_cannot_suppress_independent_review_request(self):
+    @patch.object(supervisor, 'live_lineage')
+    def test_old_evidence_cannot_suppress_independent_review_request(self, _lineage):
         live = dict(PULL, labels=[{"name": "goal"}])
         marker = f"<!-- tremelay-supervisor-review:{HEAD} -->"
         state = {"phase": "review_reserved", "completed_head": HEAD}
