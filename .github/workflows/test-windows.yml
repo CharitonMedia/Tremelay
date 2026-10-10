@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  GOTOOLCHAIN: go1.26.9
+
 jobs:
   test:
     name: Windows core suite
@@ -22,3 +25,7 @@ jobs:
         run: go test ./...
       - name: Vet
         run: go vet ./...
+      - name: Test build-evidence verifier
+        run: cd tools && go test ./...
+      - name: Vet build-evidence verifier
+        run: cd tools && go vet ./...
