@@ -16,7 +16,7 @@ const (
 	// resource. Authorizing it does not perform a request or reveal the credential.
 	OpHTTPRequest = "http_request"
 	// OpSign authorizes a future signing operation. Authorizing it does not sign
-	// or reveal key material.
+	// or reveal key material, and it does not authorize local attestation.
 	OpSign = "sign"
 	// OpGitHubIssueState authorizes one typed GitHub issue-state read.
 	// It does not authorize BrokerHTTP, and an http_request grant does not
@@ -31,7 +31,7 @@ const (
 
 // grantOperations is the closed set of capability operations. Secret retrieval
 // is not in the set.
-var grantOperations = []string{OpHTTPRequest, OpSign, OpGitHubIssueState}
+var grantOperations = []string{OpHTTPRequest, OpSign, OpGitHubIssueState, OpLocalArtifactAttest}
 
 // GrantOperations returns a copy of the operation allowlist.
 func GrantOperations() []string {
@@ -67,6 +67,9 @@ type Grant struct {
 	CreatedAt       time.Time
 	ExpiresAt       time.Time
 	RevokedAt       *time.Time
+	// KeyID is the hex-encoded Ed25519 public key bound at issuance.
+	// It is empty for grants that do not attest.
+	KeyID string
 }
 
 // Capability is the agent-visible description of one grant.
@@ -81,6 +84,8 @@ type Capability struct {
 	ExpiresAt       time.Time
 	RevokedAt       *time.Time
 	Status          string
+	// KeyID is the public key identity bound to an attestation grant.
+	KeyID string
 }
 
 type agentRecord struct {
@@ -101,6 +106,7 @@ type grantRecord struct {
 	CreatedAt       time.Time  `json:"created_at"`
 	ExpiresAt       time.Time  `json:"expires_at"`
 	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
+	KeyID           string     `json:"key_id,omitempty"`
 }
 
 // capabilityView is the slice of the vault an agent principal can call.
@@ -110,6 +116,7 @@ type capabilityView interface {
 	authorizeCapability(agentID, credentialID, operation, resource string) (string, error)
 	brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error)
 	githubIssueState(agentID string, req GitHubIssueRequest) (GitHubIssueState, error)
+	localAttest(agentID string, req LocalAttestRequest) (LocalAttestation, error)
 }
 
 type agentBinder struct {
@@ -144,9 +151,17 @@ func (b agentBinder) githubIssueState(agentID string, req GitHubIssueRequest) (G
 	return b.s.githubIssueState(agentID, req)
 }
 
+func (b agentBinder) localAttest(agentID string, req LocalAttestRequest) (LocalAttestation, error) {
+	if b.s == nil {
+		return LocalAttestation{}, ErrUnauthenticated
+	}
+	return b.s.localAttest(agentID, req)
+}
+
 // AgentPrincipal is the agent-facing handle for one identity.
-// Its method set is capability listing, authorization, and the HTTP broker.
-// It has no credential retrieval, grant issuance, or way to select a different principal.
+// Its method set is capability listing, authorization, the HTTP broker, the
+// GitHub issue read, and local attestation.
+// It has no credential retrieval, grant issuance, clock, or way to select a different principal.
 type AgentPrincipal struct {
 	view capabilityView
 	id   string
@@ -199,6 +214,16 @@ func (a *AgentPrincipal) GitHubIssueState(req GitHubIssueRequest) (GitHubIssueSt
 		return GitHubIssueState{}, ErrUnauthenticated
 	}
 	return a.view.githubIssueState(a.id, req)
+}
+
+// LocalAttest signs one bounded payload with the vault-held Ed25519 key named
+// by an exact local_artifact_attest grant. The private key is not returned.
+// A sign, http_request, or github_issue_state grant does not authorize this call.
+func (a *AgentPrincipal) LocalAttest(req LocalAttestRequest) (LocalAttestation, error) {
+	if a == nil || a.view == nil {
+		return LocalAttestation{}, ErrUnauthenticated
+	}
+	return a.view.localAttest(a.id, req)
 }
 
 // CreateAgent persists a new agent principal.
@@ -267,6 +292,21 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 	if err != nil {
 		return deny(err)
 	}
+	if err := attestGrantOK(ops, spec, credType); err != nil {
+		return deny(err)
+	}
+	keyID := ""
+	if soleLocalAttest(ops) {
+		secret, ok := s.copySecret(credID)
+		if !ok {
+			return deny(ErrInvalid)
+		}
+		keyID, err = attestKeyID(secret)
+		wipe(secret)
+		if err != nil {
+			return deny(ErrInvalid)
+		}
+	}
 	id, err := newID()
 	if err != nil {
 		return Grant{}, err
@@ -278,6 +318,7 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 		Resource:   spec.Resource,
 		CreatedAt:  now,
 		ExpiresAt:  expires,
+		KeyID:      keyID,
 	}
 	if spec.CredentialID != "" {
 		rec.CredentialID = credID
@@ -400,6 +441,9 @@ func (s *Session) authorizeCapability(agentID, credentialID, operation, resource
 		return "", err
 	}
 	partial, cause := s.judge(agentID, credentialID, operation, resource)
+	if cause == nil && operation == OpLocalArtifactAttest {
+		partial, cause = s.screenAttestKey(partial)
+	}
 	partial.Action = actionAuthorize
 	if err := s.finish(partial, cause); err != nil {
 		return "", err
@@ -575,6 +619,12 @@ func decideAccess(grants []grantRecord, agentOK bool, agentID, credID, credType 
 			opMismatch = preferID(opMismatch, g.ID)
 			continue
 		}
+		// A class grant or a grant with no key id is not signing authority.
+		// Checked after the operation so a sign or http grant stays denied_operation.
+		if !attestCredScope(g, op) {
+			credMismatch = preferID(credMismatch, g.ID)
+			continue
+		}
 		if g.Resource != resource {
 			scopeMismatch = preferID(scopeMismatch, g.ID)
 			continue
@@ -664,6 +714,7 @@ func (g grantRecord) capability(now time.Time) Capability {
 		ExpiresAt:       g.ExpiresAt.UTC(),
 		RevokedAt:       cloneTime(g.RevokedAt),
 		Status:          grantStatus(g, now),
+		KeyID:           g.KeyID,
 	}
 }
 
@@ -692,6 +743,7 @@ func (g grantRecord) public() Grant {
 		CreatedAt:       g.CreatedAt.UTC(),
 		ExpiresAt:       g.ExpiresAt.UTC(),
 		RevokedAt:       cloneTime(g.RevokedAt),
+		KeyID:           g.KeyID,
 	}
 }
 
@@ -711,6 +763,8 @@ func denialError(result string) error {
 		return ErrDeniedRevoked
 	case resultDeniedMissing:
 		return ErrDeniedMissing
+	case resultDeniedKey:
+		return ErrDeniedKey
 	default:
 		return ErrInvalid
 	}
@@ -812,8 +866,10 @@ func validateAgentsAndGrants(doc document) error {
 		agents[a.ID] = struct{}{}
 	}
 	creds := make(map[string]struct{}, len(doc.Credentials))
+	credTypes := make(map[string]string, len(doc.Credentials))
 	for _, c := range doc.Credentials {
 		creds[c.ID] = struct{}{}
+		credTypes[c.ID] = c.Type
 	}
 	seen := make(map[string]struct{}, len(doc.Grants))
 	for _, g := range doc.Grants {
@@ -865,6 +921,9 @@ func validateAgentsAndGrants(doc document) error {
 			if err != nil || revoked.Before(created) {
 				return ErrCorrupt
 			}
+		}
+		if err := validateGrantKey(g, credTypes); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -900,6 +900,7 @@ func cmdCapabilityList(args []string, getenv func(string) string, stdin io.Reade
 				ExpiresAt:       cap.ExpiresAt,
 				RevokedAt:       cap.RevokedAt,
 				Status:          cap.Status,
+				KeyID:           cap.KeyID,
 			}
 			if err := enc.Encode(view); err != nil {
 				return errors.New("stdout write failed")
@@ -954,6 +955,7 @@ type capabilityEntry struct {
 	ExpiresAt       time.Time  `json:"expires_at"`
 	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
 	Status          string     `json:"status"`
+	KeyID           string     `json:"key_id,omitempty"`
 }
 
 type opsFlag []string

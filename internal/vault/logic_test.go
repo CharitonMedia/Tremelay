@@ -230,6 +230,9 @@ func TestNoGetSecretMethod(t *testing.T) {
 	if _, ok := sessionType.MethodByName("GitHubIssueState"); ok {
 		t.Fatal("human session exports the github issue read")
 	}
+	if _, ok := sessionType.MethodByName("LocalAttest"); ok {
+		t.Fatal("human session exports local attestation")
+	}
 	for _, typ := range []reflect.Type{sessionType, reflect.TypeOf(&AgentPrincipal{})} {
 		for i := 0; i < typ.NumMethod(); i++ {
 			name := strings.ToLower(typ.Method(i).Name)
@@ -239,7 +242,7 @@ func TestNoGetSecretMethod(t *testing.T) {
 		}
 	}
 	typ := reflect.TypeOf(&AgentPrincipal{})
-	if typ.NumMethod() != 4 {
+	if typ.NumMethod() != 5 {
 		t.Fatalf("agent method count %d", typ.NumMethod())
 	}
 	for i := 0; i < typ.NumMethod(); i++ {
@@ -315,6 +318,52 @@ func TestNoGetSecretMethod(t *testing.T) {
 				f := ghResp.Field(j)
 				if want[f.Name] != f.Type.Kind() {
 					t.Fatalf("github field %s", f.Name)
+				}
+			}
+		case "LocalAttest":
+			if m.Type.NumIn() != 2 || m.Type.NumOut() != 2 {
+				t.Fatalf("LocalAttest signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
+			}
+			req := m.Type.In(1)
+			if req != reflect.TypeOf(LocalAttestRequest{}) || req.NumField() != 3 {
+				t.Fatalf("attest request %s", req)
+			}
+			for j := 0; j < req.NumField(); j++ {
+				f := req.Field(j)
+				switch f.Name {
+				case "CredentialID", "Resource":
+					if f.Type.Kind() != reflect.String {
+						t.Fatal(f.Name)
+					}
+				case "Payload":
+					if f.Type.Kind() != reflect.Slice || f.Type.Elem().Kind() != reflect.Uint8 {
+						t.Fatal(f.Name)
+					}
+				default:
+					t.Fatal(f.Name)
+				}
+			}
+			resp := m.Type.Out(0)
+			if resp != reflect.TypeOf(LocalAttestation{}) || resp.NumField() != 5 {
+				t.Fatalf("attest response %s", resp)
+			}
+			for j := 0; j < resp.NumField(); j++ {
+				f := resp.Field(j)
+				switch f.Name {
+				case "Signature":
+					if f.Type.Kind() != reflect.Array || f.Type.Len() != 64 {
+						t.Fatal(f.Name)
+					}
+				case "PublicKey":
+					if f.Type.Kind() != reflect.Array || f.Type.Len() != 32 {
+						t.Fatal(f.Name)
+					}
+				case "Domain", "Purpose", "Resource":
+					if f.Type.Kind() != reflect.String {
+						t.Fatal(f.Name)
+					}
+				default:
+					t.Fatal(f.Name)
 				}
 			}
 		default:
