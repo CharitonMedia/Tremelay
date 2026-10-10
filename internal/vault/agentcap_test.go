@@ -92,7 +92,7 @@ func TestAgentCapSyntheticDemo(t *testing.T) {
 }
 
 func TestAgentCapSchemaAndFixedErrors(t *testing.T) {
-	session, cap, _, pub, resource := newSingleAttestCap(t)
+	session, cap, grant, pub, resource := newSingleAttestCap(t)
 	sentinel := "sentinel-schema-" + strings.Repeat("Z", 24)
 	cases := []struct {
 		name string
@@ -108,10 +108,13 @@ func TestAgentCapSchemaAndFixedErrors(t *testing.T) {
 		{"type", okBytes(t)(encodeCap(capMethodDescribe, []capWire{{id: capFieldHandle, typ: capTypeString, val: []byte(sentinel)}})), capMalformed},
 		{"short", []byte{AgentCapVersion, capMethodInvoke}, capMalformed},
 		{"oversize", bytes.Repeat([]byte{AgentCapVersion}, MaxAgentCapMessage+1), capMalformed},
+		{"oversize-invoke", append([]byte{AgentCapVersion, capMethodInvoke}, bytes.Repeat([]byte{0}, MaxAgentCapMessage-1)...), capMalformed},
+		{"oversize-version", append([]byte{9, capMethodInvoke}, bytes.Repeat([]byte{0}, MaxAgentCapMessage-1)...), capMalformed},
 		{"payload", okBytes(t)(encodeCapInvoke([32]byte{}, append([]byte(sentinel), bytes.Repeat([]byte{1}, MaxAttestPayload)...))), capMalformed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			before := len(session.audit)
 			raw, err := cap.Exchange(tc.msg)
 			if err != nil {
 				t.Fatal(err)
@@ -123,6 +126,17 @@ func TestAgentCapSchemaAndFixedErrors(t *testing.T) {
 			text, ok := capText(tc.code)
 			if !ok || resp.message != text || bytes.Contains(raw, []byte(sentinel)) {
 				t.Fatalf("reflected %q in %q", sentinel, resp.message)
+			}
+			want := actionAgentCap
+			if len(tc.msg) >= 2 && tc.msg[0] == AgentCapVersion && tc.msg[1] == capMethodInvoke && tc.code == capMalformed {
+				want = actionLocalAttest
+			}
+			if len(session.audit) != before+1 {
+				t.Fatalf("audit rows %d", len(session.audit)-before)
+			}
+			ev := session.audit[len(session.audit)-1]
+			if ev.Action != want || ev.Result != resultDenied || ev.AgentID != grant.AgentID || ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" {
+				t.Fatalf("audit %+v want %s", ev, want)
 			}
 		})
 	}

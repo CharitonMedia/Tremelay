@@ -606,14 +606,26 @@ type capResponse struct {
 }
 
 func parseCapRequest(msg []byte) (capRequest, string) {
-	if len(msg) == 0 || len(msg) > MaxAgentCapMessage {
+	if len(msg) == 0 {
+		return capRequest{}, capMalformed
+	}
+	// Keep a version-1 method byte when the body is not parsed. A malformed
+	// invoke is audited as local_attest; other methods stay agent_capability.
+	if len(msg) > MaxAgentCapMessage {
+		if msg[0] == AgentCapVersion && len(msg) >= 2 {
+			return capRequest{method: msg[1]}, capMalformed
+		}
 		return capRequest{}, capMalformed
 	}
 	if msg[0] != AgentCapVersion {
 		return capRequest{}, capUnsupportedVersion
 	}
 	if len(msg) < 4 {
-		return capRequest{}, capMalformed
+		var req capRequest
+		if len(msg) >= 2 {
+			req.method = msg[1]
+		}
+		return req, capMalformed
 	}
 	method := msg[1]
 	n := binary.BigEndian.Uint16(msg[2:4])
