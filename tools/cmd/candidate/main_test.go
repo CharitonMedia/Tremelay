@@ -145,7 +145,7 @@ func TestScanFailureKeepsVerifiedDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	meta := evidence.ScanMeta{Scope: "binary", ExitStatus: 3, RawReport: evidence.ReportName("binary")}
-	err := persistScanFailure(out, []scanRecord{{scope: "binary", raw: []byte("{"), meta: meta}}, errString("govulncheck json"))
+	err := persistAttemptFailure(out, []scanRecord{{scope: "binary", raw: []byte("{"), meta: meta}}, errString("govulncheck json"))
 	if err == nil {
 		t.Fatal("expected scan failure")
 	}
@@ -153,7 +153,7 @@ func TestScanFailureKeepsVerifiedDir(t *testing.T) {
 	if err != nil || string(b) != "keep" {
 		t.Fatalf("verified evidence changed: %q %v", b, err)
 	}
-	matches, err := filepath.Glob(filepath.Join(filepath.Dir(out), "m11a-scan-failure-*"))
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(out), "m11a-failed-attempt-*"))
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("failure records: %v %v", matches, err)
 	}
@@ -196,7 +196,7 @@ func TestBlockedScansPersistEvidence(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(out, "tremelay"), []byte("keep"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if err := persistScanFailure(out, []scanRecord{{scope: "binary", raw: raw, meta: meta}}, err); err == nil {
+			if err := persistAttemptFailure(out, []scanRecord{{scope: "binary", raw: raw, meta: meta}}, err); err == nil {
 				t.Fatal("expected scan failure")
 			}
 			if b, err := os.ReadFile(filepath.Join(out, "tremelay")); err != nil || string(b) != "keep" {
@@ -237,7 +237,7 @@ func TestLaterScanKeepsEarlierReport(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(out, "tremelay"), []byte("keep"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := persistScanFailure(out, []scanRecord{
+	if err := persistAttemptFailure(out, []scanRecord{
 		{scope: "source", raw: raw, meta: meta},
 		{scope: "binary", raw: braw, meta: bmeta},
 	}, err); err == nil {
@@ -487,7 +487,7 @@ func govulncheckJSON(mode, body string) []byte {
 
 func oneFailureDir(t *testing.T, parent string) string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(parent, "m11a-scan-failure-*"))
+	matches, err := filepath.Glob(filepath.Join(parent, "m11a-failed-attempt-*"))
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("failure records: %v %v", matches, err)
 	}

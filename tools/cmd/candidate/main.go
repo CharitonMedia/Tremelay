@@ -17,6 +17,10 @@ import (
 	"github.com/CharitonMedia/Tremelay/tools/evidence"
 )
 
+// Bound by bootstrap-candidate.sh to the immutable source used to compile this helper.
+// An ordinary go build/run cannot produce authoritative candidate evidence.
+var bootstrapCommit, bootstrapTree string
+
 func main() {
 	root := flag.String("root", "..", "repository root")
 	out := flag.String("out", "", "evidence directory (default <root>/dist/m11a-candidate)")
@@ -49,23 +53,9 @@ func run(root, out string) error {
 	if err != nil {
 		return err
 	}
-	commit, err := gitOut(root, "rev-parse", "HEAD")
-	if err != nil {
+	commit, tree := bootstrapCommit, bootstrapTree
+	if err := checkBootstrapSource(root, commit, tree); err != nil {
 		return err
-	}
-	tree, err := gitOut(root, "rev-parse", commit+"^{tree}")
-	if err != nil {
-		return err
-	}
-	if len(commit) != 40 || len(tree) != 40 {
-		return fmt.Errorf("refusing ambiguous git identity commit=%q tree=%q", commit, tree)
-	}
-	status, err := gitOut(root, "status", "--porcelain")
-	if err != nil {
-		return err
-	}
-	if status != "" {
-		return fmt.Errorf("refusing modified source:\n%s", status)
 	}
 	goMod := filepath.Join(root, "go.mod")
 	goSum := filepath.Join(root, "go.sum")
@@ -364,71 +354,74 @@ func run(root, out string) error {
 		MCPSDKSourceVersion: srcVer,
 		Note:                "This is the go list -m all graph of the application module, including test dependencies of that module, plus the pinned build-tool module graph. It is not the CLI binary inventory.",
 	}
-	sourceRaw, sourceMeta, err := scan(goBin, toolsDir, modCache, toolCache, "source", []string{"govulncheck", "-C", sides[0].src, "-format=json", "./..."}, id)
-	sourceRec := scanRecord{scope: "source", raw: sourceRaw, meta: sourceMeta}
-	if err != nil {
-		return persistScanFailure(out, []scanRecord{sourceRec}, err)
-	}
-	binaryRaw, binaryMeta, err := scan(goBin, toolsDir, modCache, toolCache, "binary", []string{"govulncheck", "-mode=binary", "-format=json", binPath}, id)
-	if err != nil {
-		return persistScanFailure(out, []scanRecord{sourceRec, {scope: "binary", raw: binaryRaw, meta: binaryMeta}}, err)
-	}
-	if err := verifySharedModuleCache(goBin, sides[0].src, toolsDir, modCache); err != nil {
-		return fmt.Errorf("module cache changed after verification: %w", err)
-	}
-	if err := assertStableSource(root, commit, tree); err != nil {
-		return err
-	}
-	readme := evidence.AssuranceREADME(evidence.READMEInput{
-		ID:             id,
-		SourceFindings: sourceMeta.FindingIDs,
-		BinaryFindings: binaryMeta.FindingIDs,
-		MCPSDKInBinary: inBinary,
-		MCPSDKVersion:  binVer,
+	return withScanEvidence(out, func(record func(scanRecord)) error {
+		sourceRaw, sourceMeta, err := scan(goBin, toolsDir, modCache, toolCache, "source", []string{"govulncheck", "-C", sides[0].src, "-format=json", "./..."}, id)
+		record(scanRecord{scope: "source", raw: sourceRaw, meta: sourceMeta})
+		if err != nil {
+			return err
+		}
+		binaryRaw, binaryMeta, err := scan(goBin, toolsDir, modCache, toolCache, "binary", []string{"govulncheck", "-mode=binary", "-format=json", binPath}, id)
+		record(scanRecord{scope: "binary", raw: binaryRaw, meta: binaryMeta})
+		if err != nil {
+			return err
+		}
+		if err := verifySharedModuleCache(goBin, sides[0].src, toolsDir, modCache); err != nil {
+			return fmt.Errorf("module cache changed after verification: %w", err)
+		}
+		if err := assertStableSource(root, commit, tree); err != nil {
+			return err
+		}
+		readme := evidence.AssuranceREADME(evidence.READMEInput{
+			ID:             id,
+			SourceFindings: sourceMeta.FindingIDs,
+			BinaryFindings: binaryMeta.FindingIDs,
+			MCPSDKInBinary: inBinary,
+			MCPSDKVersion:  binVer,
+		})
+		if err := evidence.WriteJSON(filepath.Join(staging, "build-inputs.json"), inputs); err != nil {
+			return err
+		}
+		if err := evidence.WriteJSON(filepath.Join(staging, "two-build-receipt.json"), receipt); err != nil {
+			return err
+		}
+		if err := evidence.WriteJSON(filepath.Join(staging, "binary-buildinfo.json"), infoDoc); err != nil {
+			return err
+		}
+		if err := evidence.WriteJSON(filepath.Join(staging, "source-inventory.json"), inventory); err != nil {
+			return err
+		}
+		if err := evidence.WriteJSON(filepath.Join(staging, "sbom-validation.json"), validation); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(staging, evidence.ReportName("source")), sourceRaw, 0o644); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(staging, evidence.ReportName("binary")), binaryRaw, 0o644); err != nil {
+			return err
+		}
+		if err := evidence.WriteJSON(filepath.Join(staging, "govulncheck-source-meta.json"), sourceMeta); err != nil {
+			return err
+		}
+		if err := evidence.WriteJSON(filepath.Join(staging, "govulncheck-binary-meta.json"), binaryMeta); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(staging, "README.md"), []byte(readme), 0o644); err != nil {
+			return err
+		}
+		if err := evidence.WriteSHA256SUMS(staging); err != nil {
+			return err
+		}
+		if got, err := evidence.FileSHA256(goMod); err != nil || got != modHash {
+			return fmt.Errorf("preparing the candidate changed go.mod")
+		}
+		if got, err := evidence.FileSHA256(goSum); err != nil || got != sumHash {
+			return fmt.Errorf("preparing the candidate changed go.sum")
+		}
+		if err := evidence.Verify(staging, schemaDir); err != nil {
+			return err
+		}
+		return publishVerified(root, commit, tree, staging, out)
 	})
-	if err := evidence.WriteJSON(filepath.Join(staging, "build-inputs.json"), inputs); err != nil {
-		return err
-	}
-	if err := evidence.WriteJSON(filepath.Join(staging, "two-build-receipt.json"), receipt); err != nil {
-		return err
-	}
-	if err := evidence.WriteJSON(filepath.Join(staging, "binary-buildinfo.json"), infoDoc); err != nil {
-		return err
-	}
-	if err := evidence.WriteJSON(filepath.Join(staging, "source-inventory.json"), inventory); err != nil {
-		return err
-	}
-	if err := evidence.WriteJSON(filepath.Join(staging, "sbom-validation.json"), validation); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(staging, evidence.ReportName("source")), sourceRaw, 0o644); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(staging, evidence.ReportName("binary")), binaryRaw, 0o644); err != nil {
-		return err
-	}
-	if err := evidence.WriteJSON(filepath.Join(staging, "govulncheck-source-meta.json"), sourceMeta); err != nil {
-		return err
-	}
-	if err := evidence.WriteJSON(filepath.Join(staging, "govulncheck-binary-meta.json"), binaryMeta); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(staging, "README.md"), []byte(readme), 0o644); err != nil {
-		return err
-	}
-	if err := evidence.WriteSHA256SUMS(staging); err != nil {
-		return err
-	}
-	if got, err := evidence.FileSHA256(goMod); err != nil || got != modHash {
-		return fmt.Errorf("preparing the candidate changed go.mod")
-	}
-	if got, err := evidence.FileSHA256(goSum); err != nil || got != sumHash {
-		return fmt.Errorf("preparing the candidate changed go.sum")
-	}
-	if err := evidence.Verify(staging, schemaDir); err != nil {
-		return err
-	}
-	return publishVerified(root, commit, tree, staging, out)
 }
 
 func scan(goBin, toolsDir, modCache, toolCache, scope string, args []string, id evidence.Identity) ([]byte, evidence.ScanMeta, error) {
@@ -489,35 +482,43 @@ func commandExit(err error) (int, error) {
 	return -1, err
 }
 
-func persistScanFailure(verifiedOut string, scans []scanRecord, scanErr error) error {
+// Once a scan has run, every subsequent error retains the accumulated reports.
+// Keeping the entire scan/finalization phase inside this scope avoids bypasses
+// when a new late verification or publication step is added.
+func withScanEvidence(out string, work func(record func(scanRecord)) error) error {
+	var scans []scanRecord
+	err := work(func(sc scanRecord) { scans = append(scans, sc) })
+	if err != nil && len(scans) > 0 {
+		return persistAttemptFailure(out, scans, err)
+	}
+	return err
+}
+
+func persistAttemptFailure(verifiedOut string, scans []scanRecord, attemptErr error) error {
 	parent := filepath.Dir(verifiedOut)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
+		return fmt.Errorf("%w (failed attempt evidence could not be saved: %v)", attemptErr, err)
 	}
 	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
-	dir := filepath.Join(parent, "m11a-scan-failure-"+stamp)
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		var derr error
-		dir, derr = os.MkdirTemp(parent, "m11a-scan-failure-"+stamp+"-")
-		if derr != nil {
-			return fmt.Errorf("%w (scan failure record: %v)", scanErr, derr)
-		}
+	dir, err := os.MkdirTemp(parent, "m11a-failed-attempt-"+stamp+"-")
+	if err != nil {
+		return fmt.Errorf("%w (failed attempt evidence could not be saved: %v)", attemptErr, err)
 	}
+	// Mark failure first. Try every record even if one write fails; never label
+	// a partial failure bundle as successful candidate evidence.
+	message := "FAILED candidate attempt. No successful completion is claimed.\n" +
+		"The retained scans keep their actual individual results, including passing scans.\n" +
+		"Publication or cleanup may be incomplete as described by the error below.\n\n" + attemptErr.Error() + "\n"
+	var writeErrs []error
+	writeErrs = append(writeErrs, os.WriteFile(filepath.Join(dir, "FAILED.txt"), []byte(message), 0o644))
 	for _, sc := range scans {
-		name := evidence.ReportName(sc.scope)
-		if name != "" && len(sc.raw) > 0 {
-			if err := os.WriteFile(filepath.Join(dir, name), sc.raw, 0o644); err != nil {
-				return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
-			}
-		}
-		if err := evidence.WriteJSON(filepath.Join(dir, "govulncheck-"+sc.scope+"-meta.json"), sc.meta); err != nil {
-			return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
-		}
+		writeErrs = append(writeErrs, os.WriteFile(filepath.Join(dir, evidence.ReportName(sc.scope)), sc.raw, 0o644))
+		writeErrs = append(writeErrs, evidence.WriteJSON(filepath.Join(dir, "govulncheck-"+sc.scope+"-meta.json"), sc.meta))
 	}
-	if err := os.WriteFile(filepath.Join(dir, "failure.txt"), []byte(scanErr.Error()+"\n"), 0o644); err != nil {
-		return fmt.Errorf("%w (scan failure record: %v)", scanErr, err)
+	if err := errors.Join(writeErrs...); err != nil {
+		return fmt.Errorf("candidate attempt failed; partial failure evidence %s: %w (evidence write failures: %v)", dir, attemptErr, err)
 	}
-	return fmt.Errorf("scan failed; failure record %s: %w", dir, scanErr)
+	return fmt.Errorf("candidate attempt failed; failure evidence %s: %w", dir, attemptErr)
 }
 
 func listModules(goBin, dir, modCache string, tools bool) ([]evidence.Mod, error) {
@@ -763,6 +764,16 @@ func commitHex(s string) bool {
 	return true
 }
 
+func checkBootstrapSource(root, commit, tree string) error {
+	if !commitHex(commit) || !commitHex(tree) {
+		return fmt.Errorf("helper has no valid bootstrap source identity; use make candidate")
+	}
+	if err := assertStableSource(root, commit, tree); err != nil {
+		return fmt.Errorf("bootstrap source: %w", err)
+	}
+	return nil
+}
+
 func assertStableSource(root, commit, tree string) error {
 	got, err := gitOut(root, "rev-parse", "HEAD")
 	if err != nil {
@@ -840,13 +851,25 @@ func runGo(goBin, dir string, env []string, args ...string) error {
 }
 
 func publishVerified(root, commit, tree, staging, out string) error {
+	return publishWithPreparation(root, commit, tree, staging, out, func(src, dst string) error {
+		return prepareIncoming(src, dst, os.Rename)
+	})
+}
+
+func prepareIncoming(staging, incoming string, rename func(string, string) error) error {
+	if err := rename(staging, incoming); err != nil {
+		return copyTree(staging, incoming)
+	}
+	return nil
+}
+
+// The preparation function keeps the potentially long cross-filesystem copy
+// separate from the final source check and the short replacement sequence.
+func publishWithPreparation(root, commit, tree, staging, out string, prepare func(string, string) error) (err error) {
+	// Reject already stale inputs without consuming staging.
 	if err := assertStableSource(root, commit, tree); err != nil {
 		return err
 	}
-	return publishEvidence(staging, out)
-}
-
-func publishEvidence(staging, out string) error {
 	parent := filepath.Dir(out)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return err
@@ -855,38 +878,51 @@ func publishEvidence(staging, out string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.RemoveAll(incoming); err != nil {
+	defer func() {
+		if cleanup := os.RemoveAll(incoming); cleanup != nil {
+			err = errors.Join(err, fmt.Errorf("incoming evidence cleanup failed at %s: %w", incoming, cleanup))
+		}
+	}()
+	if err := os.Remove(incoming); err != nil {
 		return err
 	}
-	if err := os.Rename(staging, incoming); err != nil {
-		if err := copyTree(staging, incoming); err != nil {
-			os.RemoveAll(incoming)
-			return err
-		}
+	if err := prepare(staging, incoming); err != nil {
+		return err
 	}
 	if _, err := os.Lstat(out); errors.Is(err, os.ErrNotExist) {
+		if err := assertStableSource(root, commit, tree); err != nil {
+			return err
+		}
 		return os.Rename(incoming, out)
 	} else if err != nil {
-		os.RemoveAll(incoming)
 		return err
 	}
-	backup := out + ".previous"
-	if err := os.RemoveAll(backup); err != nil {
-		os.RemoveAll(incoming)
+	// A unique backup never removes a prior attempt's recovery evidence.
+	backup, err := os.MkdirTemp(parent, ".m11a-previous-")
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	// This is the last source observation, after incoming preparation and
+	// immediately before touching the old candidate. The host must stay quiescent.
+	if err := assertStableSource(root, commit, tree); err != nil {
 		return err
 	}
 	if err := os.Rename(out, backup); err != nil {
-		os.RemoveAll(incoming)
 		return err
 	}
 	if err := os.Rename(incoming, out); err != nil {
-		os.RemoveAll(incoming)
 		if rb := os.Rename(backup, out); rb != nil {
-			return fmt.Errorf("publish evidence: %w (restore failed: %v)", err, rb)
+			return fmt.Errorf("publish evidence: %w (restore failed: %v; previous evidence remains at %s; reconcile output before retry)", err, rb, backup)
 		}
-		return err
+		return fmt.Errorf("publish evidence: %w (previous evidence restored)", err)
 	}
-	return os.RemoveAll(backup)
+	if err := os.RemoveAll(backup); err != nil {
+		return fmt.Errorf("new candidate installed at %s, but previous evidence cleanup failed at %s: %w", out, backup, err)
+	}
+	return nil
 }
 
 func copyTree(src, dst string) error {
