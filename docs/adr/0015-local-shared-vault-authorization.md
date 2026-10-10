@@ -63,6 +63,10 @@ Load and verify check owner count, human/agent separation, organization/vault bi
 
 One session mutex serializes authorization, shared transitions, and release decisions. Overlapping calls on that session wait. Notifier, compromise-checker, abuse-guard, attestation-fault, SSH-fault, and broker transport callbacks run outside the mutex, then the session rechecks its state. A callback that commits causes `ErrConflict` on the in-flight evaluation, which is the existing health rule.
 
+Human inventory attribution is cleared before releasing an owned session mutex and restored for that call only after reacquiring it. Reentrant or concurrent operations cannot inherit the suspended call's actor. The final local-attestation check includes current agent activity as well as the selected grant, membership, expiry and credential/key binding. A failed check returns no signature and must durably record its fixed denial result.
+
+Shared event hashing passes the current audit tip without copying the historical prefix. Bootstrap binding is derived on load and extended with committed new rows; production code has no shared test counter. The committed cache-consistency checks compare that binding with a full-chain derivation in tests.
+
 A second unlocked session is not covered by that mutex. Its update matches the durable `audit_seq`. A miss leaves the previous document in place, returns the existing corrupt-update error, and marks the stale session so later calls do not release authority from the cache. SQLite serialization alone is not treated as sufficient.
 
 ### Legacy compatibility

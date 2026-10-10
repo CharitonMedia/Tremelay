@@ -686,6 +686,22 @@ func TestSharedMemberViewAndGrantStatus(t *testing.T) {
 			t.Fatalf("member view %+v", member[i])
 		}
 	}
+	ownerAgents, err := env.alice.Agents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberAgents, err := env.bob.Agents()
+	if err != nil || len(ownerAgents) == 0 || len(memberAgents) != len(ownerAgents) {
+		t.Fatalf("agent inventory owner %d member %d: %v", len(ownerAgents), len(memberAgents), err)
+	}
+	for i := range ownerAgents {
+		if ownerAgents[i].Label == "" || ownerAgents[i].CreatedAt.IsZero() {
+			t.Fatalf("owner agent view %+v", ownerAgents[i])
+		}
+		if memberAgents[i] != (Agent{ID: ownerAgents[i].ID}) {
+			t.Fatalf("member agent view %+v", memberAgents[i])
+		}
+	}
 	spec := env.requestSpec(time.Hour, 20*time.Minute)
 	req, err := env.bob.RequestAccess(spec)
 	if err != nil {
@@ -775,6 +791,15 @@ func TestSharedMemberViewAndGrantStatus(t *testing.T) {
 }
 
 func TestCommitExtendsBootstrapBinding(t *testing.T) {
+	// Compare cached state with the verified-chain derivation without shared
+	// production instrumentation. Ordinary commits extend only their new rows.
+	checkBinding := func(s *Session) {
+		t.Helper()
+		want, err := (bootstrapBind{}).extend(s.audit)
+		if err != nil || s.bootstrap != want {
+			t.Fatalf("cached binding %+v chain %+v %v", s.bootstrap, want, err)
+		}
+	}
 	_, _, legacy := mustCreate(t, nil)
 	t.Cleanup(legacy.Lock)
 	for i := 0; i < 24; i++ {
@@ -782,14 +807,10 @@ func TestCommitExtendsBootstrapBinding(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	before := len(legacy.audit)
-	bootstrapApplyVisits = 0
 	if err := legacy.persistEvent(actionList, "", "", resultAllowed); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := bootstrapApplyVisits, len(legacy.audit)-before; got != want {
-		t.Fatalf("legacy commit visited %d rows, wrote %d", got, want)
-	}
+	checkBinding(legacy)
 	if legacy.bootstrap.shared {
 		t.Fatal("legacy binding became shared")
 	}
@@ -806,15 +827,11 @@ func TestCommitExtendsBootstrapBinding(t *testing.T) {
 	}
 
 	env := newSharedEnv(t)
-	before = len(env.s.audit)
-	bootstrapApplyVisits = 0
 	req, err := env.bob.RequestAccess(env.requestSpec(time.Hour, 20*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := bootstrapApplyVisits, len(env.s.audit)-before; got != want {
-		t.Fatalf("request visited %d rows, wrote %d", got, want)
-	}
+	checkBinding(env.s)
 	marked := len(env.s.audit)
 	saved := env.s.bootstrap
 	org, members, requests := env.s.org, env.s.members, env.s.requests
@@ -845,12 +862,8 @@ func TestCommitExtendsBootstrapBinding(t *testing.T) {
 	if _, err := env.alice.Approve(req.ID); err != nil {
 		t.Fatal(err)
 	}
-	before = len(env.s.audit)
-	bootstrapApplyVisits = 0
 	env.attest(t, []byte("payload"))
-	if got, want := bootstrapApplyVisits, len(env.s.audit)-before; got != want {
-		t.Fatalf("attest visited %d rows, wrote %d", got, want)
-	}
+	checkBinding(env.s)
 	bound, err := (bootstrapBind{}).extend(env.s.audit)
 	if err != nil || env.s.bootstrap != bound {
 		t.Fatalf("binding %+v chain %+v %v", env.s.bootstrap, bound, err)
@@ -859,14 +872,10 @@ func TestCommitExtendsBootstrapBinding(t *testing.T) {
 	if env.s.bootstrap != bound {
 		t.Fatalf("reopen binding %+v", env.s.bootstrap)
 	}
-	before = len(env.s.audit)
-	bootstrapApplyVisits = 0
 	if _, err := env.bob.RequestAccess(env.requestSpec(time.Hour, 20*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := bootstrapApplyVisits, len(env.s.audit)-before; got != want {
-		t.Fatalf("reopen commit visited %d rows, wrote %d", got, want)
-	}
+	checkBinding(env.s)
 }
 
 func TestSharedExpiryAndHistoryDowngrade(t *testing.T) {

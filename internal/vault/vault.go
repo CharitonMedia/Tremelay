@@ -795,9 +795,14 @@ func (s *Session) duringCallback(fn func()) {
 		fn()
 		return
 	}
+	// Attribution belongs to this call, not to another operation admitted
+	// while its callback runs. Restore it only after owning the lock again.
+	actor := s.boundActor
+	s.boundActor = ""
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
+		s.boundActor = actor
 		s.locked.Store(true)
 	}()
 	fn()
@@ -929,7 +934,7 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 				partial.TargetID = ev.AgentID
 			}
 		}
-		ev, err := nextAudit(append(append([]auditEvent{}, s.audit...), events...), s.id, partial)
+		ev, err := nextAudit(events, s.id, partial)
 		if err != nil {
 			return err
 		}

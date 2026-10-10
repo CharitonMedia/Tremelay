@@ -235,6 +235,8 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 		}
 		code := resultFailed
 		switch {
+		case errors.Is(err, ErrDeniedAgent):
+			code = resultDeniedAgent
 		case errors.Is(err, ErrDeniedRevoked):
 			code = resultDeniedRevoked
 		case errors.Is(err, ErrDeniedExpired):
@@ -273,6 +275,9 @@ func (s *Session) localAttest(agentID string, req LocalAttestRequest) (LocalAtte
 func (s *Session) attestStillBound(partial auditEvent, priv ed25519.PrivateKey, gen uint64, resource string) error {
 	if err := s.requireCurrent(); err != nil {
 		return err
+	}
+	if !s.agentActive(partial.AgentID) {
+		return ErrDeniedAgent
 	}
 	if err := s.sharedGrantLive(partial.GrantID); err != nil {
 		return err

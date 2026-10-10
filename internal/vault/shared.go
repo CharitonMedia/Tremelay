@@ -629,10 +629,11 @@ func (h *HumanPrincipal) Agents() ([]Agent, error) {
 	}
 	out := make([]Agent, len(h.s.agents))
 	for i := range h.s.agents {
-		out[i] = h.s.agents[i].public()
 		if m.Role != RoleOwner {
-			out[i].Label = ""
+			out[i] = Agent{ID: h.s.agents[i].ID}
+			continue
 		}
+		out[i] = h.s.agents[i].public()
 	}
 	return out, nil
 }
@@ -836,14 +837,16 @@ func (s *Session) commitShared(partials []auditEvent, agents []agentRecord, gran
 	events := make([]auditEvent, 0, len(partials)+1)
 	chain := s.audit
 	for _, partial := range partials {
-		ev, err := nextAudit(append(append([]auditEvent{}, chain...), events...), s.id, partial)
+		// nextAudit reads only the tip; no historical prefix copy is needed.
+		ev, err := nextAudit(chain, s.id, partial)
 		if err != nil {
 			return err
 		}
 		events = append(events, ev)
+		chain = events
 	}
 	if notify && len(events) > 0 {
-		resp, err := nextAudit(append(append([]auditEvent{}, chain...), events...), s.id, noticePartial(actionRespond, resultDecisionNotify, events[0], Classification{Class: ClassApproval, Severity: SeverityHigh}))
+		resp, err := nextAudit(chain, s.id, noticePartial(actionRespond, resultDecisionNotify, events[0], Classification{Class: ClassApproval, Severity: SeverityHigh}))
 		if err != nil {
 			return err
 		}
@@ -967,10 +970,6 @@ func (s *Session) sharedGrantLive(id string) error {
 	return nil
 }
 
-// bootstrapApplyVisits counts audit rows read while extending the bootstrap
-// binding. A commit extends the new rows. Unlock and verify read the chain once.
-var bootstrapApplyVisits int
-
 // bootstrapBind is the allowed shared bootstrap derived from the audit chain.
 // A chain with no allowed bootstrap stays single-user. Missing shared fields
 // after an allowed bootstrap are not a legacy vault.
@@ -982,7 +981,6 @@ type bootstrapBind struct {
 
 func (b bootstrapBind) extend(events []auditEvent) (bootstrapBind, error) {
 	for _, ev := range events {
-		bootstrapApplyVisits++
 		if ev.Action != actionBootstrap || ev.Result != resultAllowed {
 			continue
 		}
