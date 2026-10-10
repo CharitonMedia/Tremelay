@@ -48,8 +48,13 @@ All-state scans read only metadata/receipts; only eligible current checkpoints
 can consume the existing model budget. Every create path (initial goal, ordinary
 review, checkpoint supervisor and opted-in generic remediation), plus ownership
 recovery/completion, uses one job-level `tremelay-worker-admission` group with
-`cancel-in-progress: false`. The supervisor keeps its different workflow-level
-controller group. The fixed `serialized-v1` contract replaces its old coarse
+`cancel-in-progress: false` and `queue: max`. All six admission jobs use this
+configuration: `implement`, `review-launch`, `recover-review` and `request-codex`
+in `goal.yml`, `remediate` in `codex-cursor-remediation.yml`, and `supervise` in
+`checkpoint-supervisor.yml`. The supervisor keeps its separate workflow-level
+`tremelay-checkpoint-supervisor` group unchanged, with `cancel-in-progress: false`
+and the default single pending slot to coalesce controller wakes.
+The fixed `serialized-v1` contract replaces its old coarse
 active-workflow gate: queued jobs cannot dispatch while admission is held.
 
 Initial goal creates reserve a deterministic agent ID in a source-issue comment
@@ -77,13 +82,70 @@ remain status-only. Unknown legacy
 generic forms remain blocked for explicit assessment; the deployment inventory
 contained no such records. Missing service access never means terminal.
 
-GitHub may replace an unstarted pending job in a shared group. Durable receipts
-preserve safety across that cancellation, while scheduled completion of eligible ordinary claims and the explicit
-recovery inputs retain a route to progress. Superseded unstarted goals must be
-requeued only after existing ownership is settled. Previously created branches
-may contain older workflow YAML: a main-only merge does not retroactively replace
-that definition. Retired branches remain unqueued; future goals start from
-patched main. No production launch is part of patch validation.
+GitHub's default single pending slot can replace an actionable review job before
+its first step, leaving no durable claim for receipt recovery to reconcile.
+The shared job-level `queue: max` retains up to 100 pending jobs while admitting
+one active job at a time. GitHub processes them in FIFO order by when each job
+started waiting on the concurrency group, not workflow dispatch time. This is
+pending-work retention, not durable worker ownership: receipts and all existing
+fresh head, identity, eligibility, ownership and cycle guards remain required.
+No new replay path or launch authority is introduced.
+
+Review events must be authenticated and coalesced before entering that shared
+queue. The goal and generic workflows admit only GitHub event records whose
+review/comment author is a trusted Codex login, whose snapshot identifies an
+eligible open, non-draft, same-repository PR, and whose reviewed commit matches
+the snapshot head. Goal markers remain an alternative to the goal label;
+generic work still requires its opt-in label and excludes goal/held PRs.
+Completed goal-summary events require the connector author, canonical summary
+marker and completed state; body text never supplies actor identity.
+
+Each workflow holds a separate workflow-level, single-pending concurrency group
+through preflight, shared admission, dispatch and completion. Submitted reviews
+and inline events share a PR/review/head key. Approvals have a separate completion
+namespace, and summaries use their comment ID and are reread live. A delayed
+inline event for an older review cannot replace a newer review's pending run,
+even on the same head. An undifferentiated per-PR key would lose that newer
+review under the existing event-bound current-review checks. Untrusted,
+ineligible and non-review events receive unique run-ID groups, so main pushes,
+issue launches and manual recovery cannot displace review work. The supervisor's
+existing workflow-level wake-coalescing group is unchanged.
+
+The preflight has only read permissions and the ordinary Actions token. It
+settles review bursts and polls pending review submission outside shared worker
+admission, then rereads the PR, source lineage, review and complete inline
+findings. A completed preflight grants no durable ownership or write authority.
+The admitted job repeats these live checks without sleeping before entering its
+existing mutation path; all existing create-time ownership, head, eligibility,
+review-current and cycle guards remain. Generic reconciliation remains before
+planning, and the scheduled supervisor continues recovering existing receipts
+on closed, held or otherwise retired PRs. Clean-summary completion remains
+independent, and repeated approvals cannot be displaced by inline events.
+Both review modes reject superseded reviews at preflight and locked recheck,
+including an older same-head finding followed by a newer approval. Goal reviews
+retain substantive review-body findings without inline comments, using the
+existing feedback predicate to exclude clean and boilerplate-only bodies.
+
+This coalesces duplicates of a review, not distinct legitimate reviews. Those
+still share the finite 100-pending-job limit. Inline events remain subscribed,
+and all findings are reread after settling and again after admission. Findings
+posted after worker dispatch remain subject to the existing review/head receipt
+deduplication and worker snapshot behavior; this change promises no additional
+late-after-dispatch delivery or replay.
+
+This is not an unlimited delivery guarantee. Overflow beyond 100 pending jobs
+is canceled; manual cancellation and other workflow failures remain possible.
+Durable receipts preserve safety after dispatch reservation, and scheduled
+completion of eligible ordinary claims plus explicit recovery inputs retain a
+route to progress. They cannot recover a never-started job that made no claim;
+such a job may be requeued only after existing ownership and eligibility are
+checked. A main-only merge cannot retroactively alter already queued jobs or
+feature-branch workflow YAML. Mixed or older definitions keep their original
+queue behavior until updated and revalidated. Refresh an active application
+branch only after its current worker is terminal. Retired branches remain
+unqueued; future goals start from patched main. No production launch is part
+of patch validation. Queue semantics follow GitHub's
+[workflow and job concurrency documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
 
 Supervisor association failures emit a bounded diagnostic on the existing GET
 recovery path. It contains the expected public repository, canonical numeric PR
@@ -137,3 +199,15 @@ migration, open-PR retirement recovery, all create/recovery job locks, and gener
 single-create/no-replay behavior. The read-only deployment inventory is 65
 unreconciled receipts, at most 195 Cursor GETs for successful terminal upgrades,
 not proof of live or terminal service state.
+
+Standard-library-only structure checks require the exact shared group,
+`cancel-in-progress: false`, `queue: max` and the existing `serialized-v1`
+environment at all six actual admission sites. Negative fixtures reject missing
+or single-slot queues, wrong workflow/job/step scope, duplicate, inline, quoted
+or incorrectly indented fields, altered admission environments and changes to
+the separate supervisor workflow lock. Both normal Python and `python -S`
+execute the full offline automation suite without a YAML dependency.
+Event-gate fixtures exercise actual workflow expressions and mocked read-only
+preflight calls, including untrusted/irrelevant bursts, duplicate events, newer
+reviews followed by old inline events, approvals and clean completion, findings
+arriving during settling, moved heads and lost source/PR eligibility.

@@ -1,5 +1,6 @@
 """Review findings reproduced against both the previous and corrected trees."""
 import copy
+import json
 import os
 import re
 from pathlib import Path
@@ -16,6 +17,12 @@ ENV = {'GITHUB_REPOSITORY': REPO, 'GITHUB_REF': 'refs/heads/main',
        'GITHUB_WORKFLOW_REF': REPO + '/.github/workflows/checkpoint-supervisor.yml@refs/heads/main',
        'GH_TOKEN': 'offline', 'CURSOR_API_KEY': 'offline',
        'TREMELAY_SUPERVISOR_ACTIVATION': supervisor.ACTIVATION_VALUE}
+
+WORKER_ADMISSION_JOBS = {
+    'goal.yml': ['implement', 'review-launch', 'recover-review', 'request-codex'],
+    'checkpoint-supervisor.yml': ['supervise'],
+    'codex-cursor-remediation.yml': ['remediate'],
+}
 
 
 def workflow_block(text, header, indent, *, required=True):
@@ -62,7 +69,32 @@ def workflow_job(workflow, name):
 
 def assert_worker_concurrency(test, job):
     test.assertEqual(workflow_fields(workflow_block(job, 'concurrency:', 4), 6),
-                     {'group': 'tremelay-worker-admission', 'cancel-in-progress': 'false'})
+                     {'group': 'tremelay-worker-admission', 'cancel-in-progress': 'false', 'queue': 'max'})
+
+
+def assert_workflow_admission(test, workflow, filename):
+    top_lock = workflow_fields(workflow_block(workflow, 'concurrency:', 0, required=False), 2)
+    if filename == 'checkpoint-supervisor.yml':
+        test.assertEqual(top_lock, {'group': 'tremelay-checkpoint-supervisor', 'cancel-in-progress': 'false'})
+    else:
+        test.assertEqual(set(top_lock), {'group', 'cancel-in-progress', 'queue'})
+        test.assertEqual(top_lock['cancel-in-progress'], 'false')
+        test.assertEqual(top_lock['queue'], 'single')
+        group = json.loads(top_lock['group'])
+        mode = 'goal' if filename == 'goal.yml' else 'generic'
+        test.assertTrue(group.startswith('${{ (github.repository == '))
+        test.assertIn("format('tremelay-" + mode + "-review-{0}-{1}-{2}-{3}'", group)
+        test.assertTrue(group.endswith(" || format('tremelay-" + mode + "-run-{0}', github.run_id) }}"))
+    for name in WORKER_ADMISSION_JOBS[filename]:
+        job = workflow_job(workflow, name)
+        assert_worker_concurrency(test, job)
+        job_env = workflow_fields(workflow_block(job, 'env:', 4, required=False), 6)
+        admission = job_env.get('TREMELAY_WORKER_ADMISSION')
+        if filename == 'checkpoint-supervisor.yml':
+            step = workflow_block(workflow_block(job, 'steps:', 4), '- name: Assess stopped goal PRs', 6)
+            admission = workflow_fields(workflow_block(step, 'env:', 8), 10).get('TREMELAY_WORKER_ADMISSION')
+            test.assertNotIn('TREMELAY_WORKER_ADMISSION', job_env)
+        test.assertEqual(admission, 'serialized-v1')
 
 
 class ReviewFindings(unittest.TestCase):
@@ -73,10 +105,7 @@ class ReviewFindings(unittest.TestCase):
         self.assertNotIn('curl --fail-with-body', job)
 
     def test_every_create_entry_uses_same_serialized_job_group(self):
-        targets = {'goal.yml': ['implement', 'review-launch'],
-                   'checkpoint-supervisor.yml': ['supervise'],
-                   'codex-cursor-remediation.yml': ['remediate']}
-        for path, names in targets.items():
+        for path, names in WORKER_ADMISSION_JOBS.items():
             workflow = (ROOT / '.github/workflows' / path).read_text()
             for name in names:
                 with self.subTest(workflow=path, job=name):
@@ -104,7 +133,7 @@ class ReviewFindings(unittest.TestCase):
 
 class WorkflowScopes(unittest.TestCase):
     def test_other_job_workflow_or_step_cannot_supply_a_missing_job_lock(self):
-        lock = 'concurrency:\n  group: tremelay-worker-admission\n  cancel-in-progress: false\n'
+        lock = 'concurrency:\n  group: tremelay-worker-admission\n  cancel-in-progress: false\n  queue: max\n'
         for misplaced in [lock, '  other:\n' + '\n'.join('    ' + line for line in lock.splitlines()),
                           '  target:\n    steps:\n      - name: Nested\n' + '\n'.join('        ' + line for line in lock.splitlines())]:
             if misplaced.startswith('concurrency:'):
@@ -134,12 +163,47 @@ class WorkflowScopes(unittest.TestCase):
                 workflow_block(text, 'concurrency:', 0, required=False)
         self.assertEqual(workflow_block('jobs:\n  test:\n    steps: []', 'env:', 0, required=False), '')
 
-    def test_nested_or_duplicate_fields_and_cancelled_admission_fail(self):
-        for body in ['      group: tremelay-worker-admission\n        cancel-in-progress: false',
-                     '      group: tremelay-worker-admission\n      group: other\n      cancel-in-progress: false',
-                     '      group: tremelay-worker-admission\n      cancel-in-progress: true']:
-            with self.subTest(body=body), self.assertRaises(AssertionError):
-                assert_worker_concurrency(self, '    concurrency:\n' + body)
+    def test_queue_must_be_on_the_target_job_concurrency(self):
+        lock = '    concurrency:\n      group: tremelay-worker-admission\n      cancel-in-progress: false\n'
+        target = '  target:\n' + lock
+        misplaced = [
+            'concurrency:\n  queue: max\njobs:\n' + target,
+            'jobs:\n  other:\n' + lock + '      queue: max\n' + target,
+            'jobs:\n' + target + '    steps:\n      - name: Nested\n        concurrency:\n          queue: max\n',
+            'jobs:\n' + target + '    queue: max\n',
+        ]
+        for workflow in misplaced:
+            with self.subTest(workflow=workflow), self.assertRaises(AssertionError):
+                assert_worker_concurrency(self, workflow_job(workflow, 'target'))
+
+    def test_noncanonical_fields_or_single_pending_admission_fail(self):
+        lock = ('    concurrency:\n      group: tremelay-worker-admission\n'
+                '      cancel-in-progress: false\n      queue: max\n')
+        assert_worker_concurrency(self, lock)
+        mutations = [
+            lock.replace('      queue: max\n', ''),
+            lock.replace('queue: max', 'queue: single'),
+            lock.replace('group: tremelay-worker-admission', 'group: other'),
+            lock.replace('cancel-in-progress: false', 'cancel-in-progress: true'),
+            lock.replace('    concurrency:', '    concurrency: {queue: max}'),
+            lock + lock,
+        ]
+        for key, value in [('group', 'tremelay-worker-admission'), ('cancel-in-progress', 'false'), ('queue', 'max')]:
+            field = f'      {key}: {value}\n'
+            mutations.extend([
+                lock.replace(field, field + field),
+                lock.replace(field, '  ' + field),
+                lock.replace(field, field[2:]),
+                lock.replace(field, f'      {key}: {{{value}}}\n'),
+            ])
+            for quote in ['"', "'"]:
+                mutations.extend([
+                    lock.replace(field, f'      {quote}{key}{quote}: {value}\n'),
+                    lock.replace(field, f'      {key}: {quote}{value}{quote}\n'),
+                ])
+        for job in mutations:
+            with self.subTest(job=job), self.assertRaises(AssertionError):
+                assert_worker_concurrency(self, job)
 
 
 if __name__ == '__main__':

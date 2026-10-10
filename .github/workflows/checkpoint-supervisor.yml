@@ -47,6 +47,7 @@ jobs:
     concurrency:
       group: tremelay-worker-admission
       cancel-in-progress: false
+      queue: max
     steps:
       # Every action in an OIDC-enabled job can request its identity token.
       # Keep first-party actions immutable; review a new full SHA before updates.
