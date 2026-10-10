@@ -53,9 +53,10 @@ func GitHubIssueResource(owner, repository, number string) (string, error) {
 }
 
 func (s *Session) githubIssueState(agentID string, req GitHubIssueRequest) (GitHubIssueState, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return GitHubIssueState{}, err
 	}
+	defer s.end()
 	if s.agentExists(agentID) && !s.agentActive(agentID) {
 		_, err := s.brokerDeny(s.destinationEvent(agentID, req.CredentialID, resultDeniedAgent, OpGitHubIssueState), http.MethodGet, ErrDeniedAgent)
 		return GitHubIssueState{}, err

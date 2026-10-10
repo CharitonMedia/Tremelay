@@ -28,18 +28,29 @@ type AbuseDecision struct {
 // destination checks and before the credential is copied. It cannot turn a
 // denial into an allow. Agent principals have no method that sets it.
 func (s *Session) SetAbuseGuard(fn func(AbuseDecision) error) error {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return err
 	}
+	defer s.end()
 	s.abuseGuard = fn
 	return nil
 }
 
 func (s *Session) abuseHook(d AbuseDecision) error {
-	if s == nil || s.abuseGuard == nil {
+	if s == nil {
 		return nil
 	}
-	return s.abuseGuard(d)
+	// Snapshot under the lock. SetAbuseGuard may replace or clear the hook
+	// while the callback runs.
+	guard := s.abuseGuard
+	if guard == nil {
+		return nil
+	}
+	var err error
+	s.duringCallback(func() {
+		err = guard(d)
+	})
+	return err
 }
 
 // transmissionAuthorized reports whether a broker result is written only

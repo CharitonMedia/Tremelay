@@ -367,6 +367,14 @@ func (b agentBinder) sshRelease(agentID, grantID string, hostKey, sessionID, hos
 }
 
 func (s *Session) sshConstruct(agentID, grantID string) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	return s.sshConstructUnlocked(agentID, grantID)
+}
+
+func (s *Session) sshConstructUnlocked(agentID, grantID string) error {
 	if err := s.live(); err != nil {
 		return err
 	}
@@ -455,6 +463,14 @@ func (s *Session) sshRecord(ev auditEvent) error {
 }
 
 func (s *Session) sshShowKey(agentID, grantID string, hostKey, sessionID, hostSig []byte) ([]byte, error) {
+	if err := s.begin(); err != nil {
+		return nil, err
+	}
+	defer s.end()
+	return s.sshShowKeyUnlocked(agentID, grantID, hostKey, sessionID, hostSig)
+}
+
+func (s *Session) sshShowKeyUnlocked(agentID, grantID string, hostKey, sessionID, hostSig []byte) ([]byte, error) {
 	ev, pinned, err := s.sshJudge(agentID, grantID)
 	if err != nil {
 		if errors.Is(err, ErrUnauthenticated) {
@@ -488,6 +504,14 @@ func (s *Session) sshShowKey(agentID, grantID string, hostKey, sessionID, hostSi
 }
 
 func (s *Session) sshRelease(agentID, grantID string, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
+	if err := s.begin(); err != nil {
+		return nil, err
+	}
+	defer s.end()
+	return s.sshReleaseUnlocked(agentID, grantID, hostKey, sessionID, hostSig, signBody)
+}
+
+func (s *Session) sshReleaseUnlocked(agentID, grantID string, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
 	ev, pinned, err := s.sshJudge(agentID, grantID)
 	if err != nil {
 		if errors.Is(err, ErrUnauthenticated) {
@@ -529,7 +553,13 @@ func (s *Session) sshRelease(agentID, grantID string, hostKey, sessionID, hostSi
 		return nil, err
 	}
 	if s.sshFault != nil {
-		if faultErr := s.sshFault(); faultErr != nil {
+		var faultErr error
+		s.duringCallback(func() {
+			if s.sshFault != nil {
+				faultErr = s.sshFault()
+			}
+		})
+		if faultErr != nil {
 			wipe(priv)
 			ev.Result = resultFailed
 			if rec := s.sshRecord(ev); rec != nil {
@@ -537,6 +567,20 @@ func (s *Session) sshRelease(agentID, grantID string, hostKey, sessionID, hostSi
 			}
 			return nil, ErrSignFailed
 		}
+	}
+	if err := s.sharedGrantLive(grantID); err != nil {
+		wipe(priv)
+		if errors.Is(err, ErrStale) {
+			return nil, err
+		}
+		ev.Result = resultDeniedRevoked
+		if errors.Is(err, ErrDeniedExpired) {
+			ev.Result = resultDeniedExpired
+		}
+		if rec := s.sshRecord(ev); rec != nil {
+			return nil, rec
+		}
+		return nil, err
 	}
 	preimage := sshSignData(signBody)
 	if len(preimage) == 0 {

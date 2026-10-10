@@ -123,6 +123,9 @@ type grantRecord struct {
 	KeyID           string     `json:"key_id,omitempty"`
 	SSHUsername     string     `json:"ssh_username,omitempty"`
 	SSHHostKey      []byte     `json:"ssh_host_key,omitempty"`
+	// Provenance is set only on a grant issued by shared-mode approval.
+	// Legacy grants leave it empty. A legacy grant cannot gain it later.
+	Provenance *grantProvenance `json:"provenance,omitempty"`
 }
 
 // capabilityView is the slice of the vault an agent principal can call.
@@ -186,9 +189,10 @@ type AgentPrincipal struct {
 // Agent binds id to an agent-facing principal. The human control plane chooses
 // the id. The returned principal cannot switch to another identity.
 func (s *Session) Agent(id string) (*AgentPrincipal, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return nil, err
 	}
+	defer s.end()
 	return &AgentPrincipal{view: agentBinder{s: s}, id: id}, nil
 }
 
@@ -244,9 +248,20 @@ func (a *AgentPrincipal) LocalAttest(req LocalAttestRequest) (LocalAttestation, 
 
 // CreateAgent persists a new agent principal.
 func (s *Session) CreateAgent(label string) (Agent, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return Agent{}, err
 	}
+	defer s.end()
+	if s.shared() {
+		if err := s.finish(auditEvent{Action: actionAgentCreate, Result: resultDenied}, ErrDenied); err != nil {
+			return Agent{}, err
+		}
+		return Agent{}, ErrDenied
+	}
+	return s.createAgentUnlocked(label)
+}
+
+func (s *Session) createAgentUnlocked(label string) (Agent, error) {
 	if err := validateLabel(label); err != nil {
 		return Agent{}, s.denyAction(actionAgentCreate, err)
 	}
@@ -272,9 +287,25 @@ func (s *Session) CreateAgent(label string) (Agent, error) {
 // IssueGrant persists a revocable, expiring capability for one agent.
 // It does not grant raw-secret read authority.
 func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return Grant{}, err
 	}
+	defer s.end()
+	if s.shared() {
+		return s.issueDenied(ErrDenied)
+	}
+	return s.issueGrantUnlocked(spec)
+}
+
+func (s *Session) issueDenied(cause error) (Grant, error) {
+	partial := auditEvent{Action: actionGrantCreate, Result: resultDenied}
+	if err := s.writeAudit(partial, s.creds, s.agents, s.grants); err != nil {
+		return Grant{}, err
+	}
+	return Grant{}, cause
+}
+
+func (s *Session) issueGrantUnlocked(spec GrantSpec) (Grant, error) {
 	now := time.Now().UTC()
 	agentID := ""
 	if safeID(spec.AgentID) != "" && s.agentExists(spec.AgentID) {
@@ -364,9 +395,17 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 
 // RevokeGrant marks a grant revoked. A second revocation fails closed.
 func (s *Session) RevokeGrant(id string) error {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return err
 	}
+	defer s.end()
+	if s.shared() {
+		return s.finish(auditEvent{Action: actionGrantRevoke, Result: resultDenied}, ErrDenied)
+	}
+	return s.revokeGrantUnlocked(id)
+}
+
+func (s *Session) revokeGrantUnlocked(id string) error {
 	if safeID(id) == "" {
 		return s.finish(auditEvent{Action: actionGrantRevoke, Result: resultDenied}, ErrInvalid)
 	}
@@ -410,33 +449,54 @@ func (s *Session) RevokeGrant(id string) error {
 
 // RejectAgentCreate records a metadata-free agent_create denial.
 func (s *Session) RejectAgentCreate(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionAgentCreate, cause)
 }
 
 // RejectGrantCreate records a metadata-free grant_create denial.
 func (s *Session) RejectGrantCreate(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionGrantCreate, cause)
 }
 
 // RejectGrantRevoke records a metadata-free grant_revoke denial.
 func (s *Session) RejectGrantRevoke(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionGrantRevoke, cause)
 }
 
 // RejectCapabilityList records a metadata-free capability_list denial.
 func (s *Session) RejectCapabilityList(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionCapList, cause)
 }
 
 // RejectAuthorize records a metadata-free capability_authorize denial.
 func (s *Session) RejectAuthorize(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
 	return s.denyAction(actionAuthorize, cause)
 }
 
 func (s *Session) listCapabilities(agentID string) ([]Capability, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return nil, err
 	}
+	defer s.end()
 	now, err := s.evaluationTime()
 	if err != nil {
 		return nil, s.denyAction(actionCapList, err)
@@ -450,7 +510,7 @@ func (s *Session) listCapabilities(agentID string) ([]Capability, error) {
 		}
 		return nil, ErrAgentNotFound
 	}
-	caps := capabilitiesFor(s.grants, agentID, now)
+	caps := capabilitiesFor(s.decisionGrants(), agentID, now)
 	if err := s.finish(auditEvent{Action: actionCapList, Result: resultAllowed, AgentID: agentID}, nil); err != nil {
 		return nil, err
 	}
@@ -458,9 +518,10 @@ func (s *Session) listCapabilities(agentID string) ([]Capability, error) {
 }
 
 func (s *Session) authorizeCapability(agentID, credentialID, operation, resource string) (string, error) {
-	if err := s.live(); err != nil {
+	if err := s.begin(); err != nil {
 		return "", err
 	}
+	defer s.end()
 	partial, cause := s.judge(agentID, credentialID, operation, resource)
 	if cause == nil && operation == OpLocalArtifactAttest {
 		partial, cause = s.screenAttestKey(partial)
@@ -513,7 +574,7 @@ func (s *Session) judge(agentID, credentialID, operation, resource string) (audi
 	}
 	agentOK := s.agentExists(agentID)
 	credID, credType, credOK := s.lookupCred(credentialID)
-	result, grantID := decideAccess(s.grants, agentOK, agentID, credID, credType, credOK, operation, resource, now)
+	result, grantID := decideAccess(s.decisionGrants(), agentOK, agentID, credID, credType, credOK, operation, resource, now)
 	partial := auditEvent{Result: result, Operation: operation, GrantID: grantID}
 	if agentOK {
 		partial.AgentID = agentID
@@ -521,6 +582,14 @@ func (s *Session) judge(agentID, credentialID, operation, resource string) (audi
 	if agentOK && credOK && result != resultDeniedAgent {
 		partial.CredID = credID
 		partial.CredType = credType
+	}
+	if result == resultAllowed && s.shared() {
+		g, ok := s.grantByID(grantID)
+		if !ok || !s.provenanceLive(g.Provenance) {
+			partial.Result = resultDeniedRevoked
+			partial.GrantID = grantID
+			return partial, ErrDeniedRevoked
+		}
 	}
 	if result != resultAllowed {
 		return partial, denialError(result)
@@ -864,19 +933,6 @@ func requireTime(t time.Time) (time.Time, error) {
 		return time.Time{}, ErrInvalid
 	}
 	return u, nil
-}
-
-func validateDocument(doc document) error {
-	if err := validateStored(doc.Credentials); err != nil {
-		return err
-	}
-	if err := validateAgentsAndGrants(doc); err != nil {
-		return err
-	}
-	if err := validateHealthPolicyStored(doc.HealthPolicy); err != nil {
-		return err
-	}
-	return validateDetection(doc.Detection)
 }
 
 func validateAgentsAndGrants(doc document) error {

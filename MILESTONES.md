@@ -67,6 +67,8 @@ The SSH slice is one host-bound user authentication signature. An already-bound 
 
 **Goal:** Support organizations, ownership, shared vaults, recovery, role separation, and approvals without weakening earlier invariants.
 
+M9 is not complete. M9a is the local shared-vault authorization reference in [ADR 0015](docs/adr/0015-local-shared-vault-authorization.md) and [docs/m9a-shared-vault.md](docs/m9a-shared-vault.md). A bound member requests one exact local attestation, a different bound owner approves the stored request, and the designated agent uses the grant through the existing broker. Revocation or membership removal stops later use. Real authentication, recovery, independent custody, and production shared access remain open.
+
 ## M10 — Agent SDK / MCP integration
 
 **Goal:** Give agents a first-class interface to discover and invoke capabilities, never generic secret retrieval.
