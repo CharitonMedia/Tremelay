@@ -73,6 +73,7 @@ func TestBackupRestoreSyntheticDemo(t *testing.T) {
 	var logBuf bytes.Buffer
 	logger := log.New(&logBuf, "", 0)
 	env := newSharedEnvLog(t, &logBuf)
+	env.path = canonicalExisting(t, env.path)
 	spec := env.requestSpec(time.Hour, 30*time.Minute)
 	req, err := env.bob.RequestAccess(spec)
 	if err != nil {
@@ -87,7 +88,7 @@ func TestBackupRestoreSyntheticDemo(t *testing.T) {
 		t.Fatal("source attestation")
 	}
 	srcHash := readAll(t, env.path)
-	dir := t.TempDir()
+	dir := canonicalTemp(t)
 	art, cp := mustBackup(t, env.path, dir, env.pass, logger)
 	if cp.VaultID != env.s.id || cp.OrgID == "" || cp.OrgID != env.s.org.ID || cp.AuditSeq == 0 {
 		t.Fatalf("%+v", cp)
@@ -170,7 +171,8 @@ func TestBackupRestoreSyntheticDemo(t *testing.T) {
 
 func TestBackupRestoreNegative(t *testing.T) {
 	env := newSharedEnv(t)
-	dir := t.TempDir()
+	env.path = canonicalExisting(t, env.path)
+	dir := canonicalTemp(t)
 	spec := env.requestSpec(time.Hour, 20*time.Minute)
 	req, err := env.bob.RequestAccess(spec)
 	if err != nil {
@@ -184,7 +186,7 @@ func TestBackupRestoreNegative(t *testing.T) {
 	mustReject(t, artPending, env.pass, cpApproved, ErrCheckpoint)
 	// The pending artifact still matches the checkpoint issued for it.
 	// That pair is stale against the approved source, and this reference cannot tell.
-	pendingDest := filepath.Join(t.TempDir(), "pending.db")
+	pendingDest := filepath.Join(canonicalTemp(t), "pending.db")
 	if err := Restore(artPending, pendingDest, env.pass, cpPending, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +209,7 @@ func TestBackupRestoreNegative(t *testing.T) {
 	}
 	artKey, cpKey := mustBackup(t, env.path, dir, env.pass, nil)
 	mustReject(t, artApproved, env.pass, cpKey, ErrCheckpoint)
-	keyDest := filepath.Join(t.TempDir(), "replaced.db")
+	keyDest := filepath.Join(canonicalTemp(t), "replaced.db")
 	if err := Restore(artKey, keyDest, env.pass, cpKey, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +227,7 @@ func TestBackupRestoreNegative(t *testing.T) {
 	}
 	artRevoked, cpRevoked := mustBackup(t, env.path, dir, env.pass, nil)
 	mustReject(t, artKey, env.pass, cpRevoked, ErrCheckpoint)
-	revokedDest := filepath.Join(t.TempDir(), "revoked.db")
+	revokedDest := filepath.Join(canonicalTemp(t), "revoked.db")
 	if err := Restore(artRevoked, revokedDest, env.pass, cpRevoked, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +284,7 @@ func TestBackupRestoreNegative(t *testing.T) {
 	}
 	artContain, cpContain := mustBackup(t, env.path, dir, env.pass, nil)
 	mustReject(t, artKey, env.pass, cpContain, ErrCheckpoint)
-	containDest := filepath.Join(t.TempDir(), "contained.db")
+	containDest := filepath.Join(canonicalTemp(t), "contained.db")
 	if err := Restore(artContain, containDest, env.pass, cpContain, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +324,7 @@ func TestBackupRestoreNegative(t *testing.T) {
 
 	wrong := []byte("wrong-passphrase-value")
 	artHash := readAll(t, artApproved)
-	if err := Restore(artApproved, filepath.Join(t.TempDir(), "nope.db"), wrong, cpApproved, nil); !errors.Is(err, ErrUnauthenticated) {
+	if err := Restore(artApproved, filepath.Join(canonicalTemp(t), "nope.db"), wrong, cpApproved, nil); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(readAll(t, artApproved), artHash) {
@@ -349,7 +351,7 @@ func TestBackupRestoreNegative(t *testing.T) {
 	}
 	badCP := cpApproved
 	badCP.Digest = badSum
-	dest := filepath.Join(t.TempDir(), "bad-dest.db")
+	dest := filepath.Join(canonicalTemp(t), "bad-dest.db")
 	err = Restore(bad, dest, env.pass, badCP, nil)
 	if !errors.Is(err, ErrCorrupt) && !errors.Is(err, ErrAudit) && !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("corrupt %v", err)
@@ -384,7 +386,7 @@ func TestBackupRestoreNegative(t *testing.T) {
 	} else if err := Restore(artApproved, linkDest, env.pass, cpApproved, nil); !errors.Is(err, ErrInvalid) {
 		t.Fatal(err)
 	}
-	real := t.TempDir()
+	real := canonicalTemp(t)
 	parentLink := filepath.Join(dir, "parent-link")
 	if err := os.Symlink(real, parentLink); err == nil {
 		if err := Restore(artApproved, filepath.Join(parentLink, "vault.db"), env.pass, cpApproved, nil); !errors.Is(err, ErrInvalid) {
@@ -428,7 +430,7 @@ func TestBackupRestoreNegative(t *testing.T) {
 		if _, err := Unlock(path, []byte("wrong-passphrase-value"), nil); !errors.Is(err, ErrUnauthenticated) {
 			t.Fatal(err)
 		}
-		art, cp := mustBackup(t, path, t.TempDir(), pass, nil)
+		art, cp := mustBackup(t, path, canonicalTemp(t), pass, nil)
 		events := mustAudit(t, path)
 		tip := events[len(events)-1]
 		head := events[len(events)-2]
@@ -442,7 +444,7 @@ func TestBackupRestoreNegative(t *testing.T) {
 		forged.AuditSeq = head.Seq
 		forged.AuditTip = head.Hash
 		mustReject(t, art, pass, forged, ErrCheckpoint)
-		dest := filepath.Join(t.TempDir(), "solo.db")
+		dest := filepath.Join(canonicalTemp(t), "solo.db")
 		var buf bytes.Buffer
 		if err := Restore(art, dest, pass, cp, log.New(&buf, "", 0)); err != nil {
 			t.Fatal(err)
@@ -467,8 +469,83 @@ func TestBackupRestoreNegative(t *testing.T) {
 	})
 }
 
+func TestBackupMigratesLegacyAuditSchema(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	id := session.id
+	session.Lock()
+	path = canonicalExisting(t, path)
+	// Same M1 fixture Unlock already accepts: base audit columns only.
+	// A current health row cannot be stripped this way; its hash still
+	// covers reasons and cred_gen.
+	rewriteAudit(t, path, false)
+	before := readAll(t, path)
+	if auditReady(t, path) {
+		t.Fatal("fixture still has the current audit schema")
+	}
+	sourceHash := auditSeqHash(t, path)
+	dir := canonicalTemp(t)
+	art, cp := mustBackup(t, path, dir, pass, nil)
+	if !bytes.Equal(readAll(t, path), before) || auditReady(t, path) {
+		t.Fatal("backup migrated the source")
+	}
+	if !auditReady(t, art) || auditSeqHash(t, art) != sourceHash {
+		t.Fatal("artifact schema or audit hash")
+	}
+	sum, err := fileSHA256(art)
+	if err != nil || sum != cp.Digest {
+		t.Fatal("digest")
+	}
+	assertMode(t, art)
+	dest := filepath.Join(dir, "restored.db")
+	if err := Restore(art, dest, pass, cp, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyAudit(dest, pass); err != nil {
+		t.Fatal(err)
+	}
+	opened := mustUnlock(t, dest, pass)
+	if opened.id != id {
+		t.Fatal("restored identity")
+	}
+	opened.Lock()
+	leftover := filepath.Join(dir, "leftover.db")
+	if _, err := Backup(path, leftover, []byte("wrong-passphrase-value"), nil); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Lstat(leftover); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatal("failed backup left an artifact")
+	}
+	if !bytes.Equal(readAll(t, path), before) {
+		t.Fatal("failed backup changed the source")
+	}
+}
+
+func TestBackupPathRequiresCanonicalAncestor(t *testing.T) {
+	base := canonicalTemp(t)
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "alias")
+	if err := os.Symlink(real, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Log("symlink skipped")
+			return
+		}
+		t.Fatal(err)
+	}
+	if _, err := cleanPath(filepath.Join(link, "vault.db"), true); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("alias ancestor %v", err)
+	}
+	if got, err := cleanPath(filepath.Join(real, "vault.db"), true); err != nil || got != filepath.Join(real, "vault.db") {
+		t.Fatalf("%s %v", got, err)
+	}
+}
+
 func mustBackup(t *testing.T, src, dir string, pass []byte, logger *log.Logger) (string, Checkpoint) {
 	t.Helper()
+	src = canonicalExisting(t, src)
+	dir = canonicalExisting(t, dir)
 	art := filepath.Join(dir, "art-"+randHex(t, 4)+".db")
 	cp, err := Backup(src, art, pass, logger)
 	if err != nil {
@@ -489,7 +566,7 @@ func mustUnlock(t *testing.T, path string, pass []byte) *Session {
 
 func mustReject(t *testing.T, art string, pass []byte, cp Checkpoint, want error) {
 	t.Helper()
-	dest := filepath.Join(t.TempDir(), "dest.db")
+	dest := filepath.Join(canonicalTemp(t), "dest.db")
 	before := readAll(t, art)
 	err := Restore(art, dest, pass, cp, nil)
 	if !errors.Is(err, want) {
@@ -561,6 +638,48 @@ func assertNoIncomplete(t *testing.T, dir string) {
 			t.Fatal(entry.Name())
 		}
 	}
+}
+
+// canonicalTemp is an ordinary temporary directory with symlink components
+// resolved. Backup and Restore reject an ancestor symlink, including the
+// macOS temporary root /var -> /private/var. A path that still contains a
+// symlink is a negative case and must not pass through this helper.
+func canonicalTemp(t *testing.T) string {
+	t.Helper()
+	return canonicalExisting(t, t.TempDir())
+}
+
+func canonicalExisting(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
+func auditReady(t *testing.T, path string) bool {
+	t.Helper()
+	db, err := openDBRead(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	return auditSchemaReady(db) == nil
+}
+
+func auditSeqHash(t *testing.T, path string) string {
+	t.Helper()
+	db, err := openDBRead(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var hash string
+	if err := db.QueryRow(`SELECT hash FROM audit WHERE seq=1`).Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	return hash
 }
 
 func assertNoSecret(t *testing.T, blob, pass, secret []byte) {

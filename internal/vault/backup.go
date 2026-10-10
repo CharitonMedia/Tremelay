@@ -58,6 +58,11 @@ type Checkpoint struct {
 // The host keeps the checkpoint. This call does not freeze other processes
 // or machines. The host quiesces writers when the checkpoint must describe
 // the newest source state.
+//
+// srcPath and artifactPath must not contain a symlink component. An ancestor
+// symlink is rejected and is not resolved. On macOS the usual temporary
+// directory is under /var, which is a symlink to /private/var; pass the
+// canonical path.
 func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger) (cp Checkpoint, err error) {
 	var created string
 	defer func() {
@@ -99,6 +104,12 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 	if err = os.Chmod(dst, 0o600); err != nil {
 		return Checkpoint{}, ErrIO
 	}
+	// Migrate the private artifact before hashing it. A read-only check of
+	// the source would reject an M1–M5 audit table, and writing the source
+	// would change the vault the host did not ask to upgrade.
+	if err = migrateCopiedAudit(dst); err != nil {
+		return Checkpoint{}, err
+	}
 	sum, err := fileSHA256(dst)
 	if err != nil {
 		return Checkpoint{}, err
@@ -125,9 +136,9 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 // Restore publishes artifactPath at destPath when passphrase unlocks that
 // artifact and want is the checkpoint for it.
 //
-// destPath must not exist. A symlink component, an existing file, or an
-// existing directory is rejected and left unchanged. The artifact is read,
-// not written. Validation runs before the destination name is published.
+// destPath must not exist. A symlink component, including an ancestor, an
+// existing file, or an existing directory is rejected and left unchanged.
+// The path is not resolved. The artifact is read, not written. Validation runs before the destination name is published.
 // A failure removes private staging data and does not return a session.
 // Restore does not append an audit event. A later Unlock of destPath is an
 // ordinary open, including trusted-time expiry.
@@ -337,6 +348,42 @@ func readSnapshot(path string, passphrase []byte) (snapshotView, error) {
 
 type sqliteBackuper interface {
 	NewBackup(dstURI string) (*sqlite.Backup, error)
+}
+
+// migrateCopiedAudit upgrades a private backup artifact when its audit
+// table predates the current columns. A current schema is not opened for
+// write, so those bytes stay the online-backup image. Existing row hashes
+// are not rewritten. The caller hashes the artifact after this returns.
+func migrateCopiedAudit(path string) error {
+	db, err := openDBRead(path)
+	if err != nil {
+		return err
+	}
+	ready := auditSchemaReady(db)
+	closeErr := db.Close()
+	if ready == nil {
+		if closeErr != nil {
+			return ErrIO
+		}
+		return nil
+	}
+	if closeErr != nil {
+		return ErrIO
+	}
+	db, err = openDB(path)
+	if err != nil {
+		return err
+	}
+	err = migrateAudit(db)
+	closeErr = db.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return ErrIO
+	}
+	removeSidecars(path)
+	return nil
 }
 
 func snapshotDB(srcPath, dstPath string) error {
@@ -555,6 +602,8 @@ func cleanPath(path string, create bool) (string, error) {
 	return abs, nil
 }
 
+// walkPath rejects a symlink at any component, including an ancestor.
+// The host supplies a canonical path. Resolving the link would follow an alias.
 func walkPath(abs string, create bool) error {
 	var chain []string
 	cur := abs
