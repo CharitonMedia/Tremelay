@@ -53,7 +53,7 @@ func TestGoEnvIgnoresPersistedConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	bare := exec.Command(goBin, "env", "GOEXPERIMENT", "GOCACHEPROG", "GOFIPS140")
-	bare.Env = append([]string{"PATH=" + os.Getenv("PATH"), "GOTOOLCHAIN=" + evidence.GoToolchain}, identity...)
+	bare.Env = append([]string{"PATH=" + os.Getenv("PATH"), "GOTOOLCHAIN=" + evidence.GoToolchain, "GOTELEMETRY=off"}, identity...)
 	out, err := bare.Output()
 	if err != nil {
 		t.Fatal(err)
