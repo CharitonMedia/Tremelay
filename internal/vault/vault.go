@@ -518,7 +518,11 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		return nil, deny(ErrCorrupt)
 	}
 	red := &Redactor{}
-	red.Add(passphrase)
+	// A logger cannot be attached later. A logger-free host (including stdio)
+	// must not retain an unnecessary passphrase copy for the session lifetime.
+	if logger != nil {
+		red.Add(passphrase)
+	}
 	for i := range doc.Credentials {
 		red.Add(doc.Credentials[i].Secret)
 	}

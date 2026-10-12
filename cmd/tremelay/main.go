@@ -42,6 +42,8 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 		return cmdCapability(args[1:], getenv, stdin, stdout, stderr)
 	case "audit":
 		return cmdAudit(args[1:], getenv, stdin, stdout, stderr)
+	case "mcp":
+		return cmdMCP(args[1:], stdin, stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, "unknown command")
 		return 2
@@ -69,6 +71,7 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay grant revoke --path PATH --id ID
   tremelay capability list --path PATH --agent ID
   tremelay capability authorize --path PATH --agent ID --credential ID --operation OP --resource SCOPE
+  tremelay mcp serve --path PATH --agent ID --pinentry /absolute/helper [--pinentry-tty /absolute/tty] [--unlock-timeout 2m]
   tremelay audit verify --path PATH
   tremelay audit list --path PATH [--credential ID] [--agent ID] [--action ACTION] [--class CLASS] [--since RFC3339] [--until RFC3339] [--after SEQ] [--limit N]
   tremelay audit get --path PATH --seq SEQ
@@ -77,6 +80,7 @@ Types: %s
 Grant operations: %s
 Passphrase: TREMELAY_PASSPHRASE, or a no-echo terminal prompt.
 change-passphrase requires no-echo terminal entry of old, new, and confirmation; it ignores the environment.
+mcp serve uses a trusted pinentry helper over private pipes; it ignores the passphrase environment and keeps stdout MCP-only.
 The passphrase is not accepted as an argument. credential get writes the raw secret to stdout.
 Health is advisory. Refresh runs only while the vault is unlocked; a locked or stopped process does not evaluate credentials.
 `, strings.Join(vault.CredentialTypes(), ", "), strings.Join(vault.GrantOperations(), ", "))

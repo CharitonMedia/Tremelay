@@ -1271,3 +1271,31 @@ func mutateDB(t *testing.T, path string, fn func(*sql.DB)) {
 	defer db.Close()
 	fn(db)
 }
+
+func TestUnlockPassphraseRedactionCustody(t *testing.T) {
+	path, pass, session := mustCreate(t, nil)
+	session.Lock()
+	for _, withLogger := range []bool{false, true} {
+		var output bytes.Buffer
+		var logger *log.Logger
+		if withLogger {
+			logger = log.New(&output, "", 0)
+		}
+		opened, err := Unlock(path, pass, logger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		retained := opened.redactor.Contains(pass)
+		opened.logf("test passphrase=%s", pass)
+		opened.Lock()
+		if retained != withLogger {
+			t.Fatalf("passphrase retention with logger=%v: %v", withLogger, retained)
+		}
+		if bytes.Contains(output.Bytes(), pass) {
+			t.Fatal("logger lost passphrase redaction")
+		}
+		if !withLogger && output.Len() != 0 {
+			t.Fatal("logger-free unlock emitted output")
+		}
+	}
+}
