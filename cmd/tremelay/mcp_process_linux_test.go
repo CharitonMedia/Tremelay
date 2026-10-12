@@ -10,8 +10,10 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +25,8 @@ import (
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
 	"golang.org/x/sys/unix"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 func TestMCPProcessHelper(t *testing.T) {
@@ -361,29 +365,191 @@ func TestMCPProcessBlockedOutputCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", p.path)
+	observer, err := openMCPAuditObserver(p.path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	deadline := time.Now().Add(8 * time.Second)
-	for {
-		var denied int
-		if err := db.QueryRow(`SELECT count(*) FROM audit WHERE action='local_attest' AND result='denied'`).Scan(&denied); err != nil {
-			t.Fatal(err)
-		}
-		if denied == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("blocked-output denial was not audited")
-		}
-		time.Sleep(5 * time.Millisecond)
+	err = waitMCPDeniedAudit(context.Background(), observer)
+	closeErr := observer.Close() // Release every observer connection before SIGTERM.
+	if err != nil || closeErr != nil {
+		t.Fatalf("observe committed blocked-output denial: %v; close: %v", err, closeErr)
 	}
 	if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
 	p.finish(t, 1, "mcp session cancelled")
+	// The live observer never retries an operation. One submitted malformed
+	// invocation must still leave exactly one denial after process cleanup.
+	observer, err = openMCPAuditObserver(p.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	var denied int
+	if err := observer.QueryRowContext(ctx, mcpDeniedAuditQuery).Scan(&denied); err != nil || denied != 1 {
+		t.Fatalf("post-exit denial count %d, error %v", denied, err)
+	}
+}
+
+const mcpDeniedAuditQuery = `SELECT count(*) FROM audit WHERE action='local_attest' AND result='denied'`
+
+// This test observer must not create a vault, mutate it, or hold an unbounded
+// read while the child commits an audit row in SQLite's DELETE journal mode.
+func openMCPAuditObserver(path string) (*sql.DB, error) {
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
+	q := url.Values{"mode": {"ro"}, "_pragma": {"busy_timeout(50)", "query_only(ON)"}}
+	u.RawQuery = q.Encode()
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	return db, nil
+}
+
+func waitMCPDeniedAudit(parent context.Context, db *sql.DB) error {
+	ctx, cancel := context.WithTimeout(parent, 8*time.Second)
+	defer cancel()
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		var denied int
+		err := db.QueryRowContext(ctx, mcpDeniedAuditQuery).Scan(&denied)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err == nil {
+			if denied == 1 {
+				return nil
+			}
+			if denied != 0 {
+				return errors.New("denial audit count is not exactly one")
+			}
+		} else {
+			var driverErr *sqlite.Error
+			// Only primary SQLITE_BUSY (including its extended codes) is a
+			// transient reader/writer conflict. Do not hide LOCKED or other errors.
+			if !errors.As(err, &driverErr) || driverErr.Code()&0xff != sqlite3.SQLITE_BUSY {
+				return err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+}
+
+func TestMCPAuditObserverLockBounds(t *testing.T) {
+	for _, release := range []bool{true, false} {
+		t.Run(fmt.Sprintf("release=%t", release), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "observer.db")
+			writer, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Close()
+			writer.SetMaxOpenConns(1)
+			if _, err := writer.Exec(`CREATE TABLE audit(action TEXT, result TEXT); INSERT INTO audit VALUES('local_attest','denied')`); err != nil {
+				t.Fatal(err)
+			}
+			observer, err := openMCPAuditObserver(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer observer.Close()
+			var queryOnly, busyTimeout int
+			if err := observer.QueryRow(`PRAGMA query_only`).Scan(&queryOnly); err != nil || queryOnly != 1 {
+				t.Fatalf("query-only observer: %d, %v", queryOnly, err)
+			}
+			if err := observer.QueryRow(`PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil || busyTimeout != 50 || observer.Stats().MaxOpenConnections != 1 {
+				t.Fatalf("bounded single observer: timeout %d, %v", busyTimeout, err)
+			}
+			if _, err := writer.Exec(`BEGIN EXCLUSIVE`); err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Exec(`ROLLBACK`)
+			// Establish an actual BUSY read against the held exclusive lock,
+			// rather than relying only on timing to guess a lock was observed.
+			var count int
+			err = observer.QueryRow(mcpDeniedAuditQuery).Scan(&count)
+			var driverErr *sqlite.Error
+			if !errors.As(err, &driverErr) || driverErr.Code()&0xff != sqlite3.SQLITE_BUSY {
+				t.Fatalf("fixture did not produce SQLITE_BUSY: %v", err)
+			}
+			timeout := 200 * time.Millisecond
+			if release {
+				timeout = 2 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- waitMCPDeniedAudit(ctx, observer) }()
+			if release {
+				select {
+				case err := <-done:
+					t.Fatalf("observer finished while writer lock was held: %v", err)
+				case <-time.After(100 * time.Millisecond):
+				}
+				if _, err := writer.Exec(`ROLLBACK`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case err := <-done:
+				if (release && err != nil) || (!release && !errors.Is(err, context.DeadlineExceeded)) {
+					t.Fatalf("unexpected bounded observer result: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("observer outlived its context deadline")
+			}
+		})
+	}
+}
+
+func TestMCPAuditObserverRejectsUnexpectedStates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "observer.db")
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Exec(`CREATE TABLE audit(action TEXT, result TEXT); INSERT INTO audit VALUES('local_attest','denied'),('local_attest','denied')`); err != nil {
+		t.Fatal(err)
+	}
+	observer, err := openMCPAuditObserver(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := waitMCPDeniedAudit(ctx, observer); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("multiple denials did not fail immediately: %v", err)
+	}
+	_, err = observer.ExecContext(ctx, `DELETE FROM audit`)
+	var driverErr *sqlite.Error
+	if !errors.As(err, &driverErr) || driverErr.Code()&0xff != sqlite3.SQLITE_READONLY {
+		t.Fatalf("observer write did not fail read-only: %v", err)
+	}
+	var count, queryOnly int
+	if err := observer.QueryRowContext(ctx, mcpDeniedAuditQuery).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("observer write changed audit rows: count %d, %v", count, err)
+	}
+	if err := observer.QueryRowContext(ctx, `PRAGMA query_only`).Scan(&queryOnly); err != nil || queryOnly != 1 {
+		t.Fatalf("observer lost query-only restriction: %d, %v", queryOnly, err)
+	}
+	if _, err := writer.ExecContext(ctx, `DROP TABLE audit`); err != nil {
+		t.Fatal(err)
+	}
+	err = waitMCPDeniedAudit(ctx, observer)
+	if !errors.As(err, &driverErr) || driverErr.Code()&0xff != sqlite3.SQLITE_ERROR {
+		t.Fatalf("non-BUSY SQL error was not propagated: %v", err)
+	}
 }
 
 func TestMCPProcessAdmittedBlockedOutputEOF(t *testing.T) {
