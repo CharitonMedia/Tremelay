@@ -222,8 +222,8 @@ func TestMCPWireAdmission(t *testing.T) {
 	if !bytes.Contains(got, []byte("unsupported protocol version")) || !bytes.Contains(got, []byte(`"supported":["2026-07-28"]`)) || !bytes.Contains(got, []byte(`"requested":"2025-11-25"`)) || bytes.Contains(got, []byte(`"2025-11-25","2026-07-28"`)) || bytes.Contains(got, []byte(`"2026-07-28","2025-11-25"`)) {
 		t.Fatalf("mismatched revision %s", got)
 	}
-	if mcpAuditSnapshot(env.s)[len(mcpAuditSnapshot(env.s))-1].Action != actionLocalAttest || len(mcpAuditSnapshot(env.s)) != before+1 {
-		t.Fatal("mismatched invoke was not a sparse local_attest denial")
+	if mcpAuditSnapshot(env.s)[len(mcpAuditSnapshot(env.s))-1].Action != actionAgentCap || len(mcpAuditSnapshot(env.s)) != before+1 {
+		t.Fatal("mismatched invoke was not a sparse agent_capability denial")
 	}
 
 	sentinel := "dup-sentinel-" + strings.Repeat("Q", 24)
@@ -242,7 +242,7 @@ func TestMCPWireAdmission(t *testing.T) {
 		t.Fatalf("unknown field %s", got)
 	}
 	ev := mcpAuditSnapshot(env.s)[len(mcpAuditSnapshot(env.s))-1]
-	if ev.Action != actionLocalAttest || ev.Result != resultDenied || ev.GrantID != "" || len(mcpAuditSnapshot(env.s)) != before+1 {
+	if ev.Action != actionAgentCap || ev.Result != resultDenied || ev.GrantID != "" || len(mcpAuditSnapshot(env.s)) != before+1 {
 		t.Fatalf("unknown-field audit %+v", ev)
 	}
 	badB64 := rpcFrame(t, 8, "tools/call", map[string]any{
@@ -813,7 +813,7 @@ func TestMCPReviewFixes(t *testing.T) {
 			t.Fatal(err)
 		}
 		waitRaw(t, raw)
-		assertSparse(t, env.s, before, actionLocalAttest)
+		assertSparse(t, env.s, before, actionAgentCap)
 	})
 	t.Run("partial-unparsed", func(t *testing.T) {
 		env := approvedShared(t)
@@ -845,7 +845,7 @@ func TestMCPReviewFixes(t *testing.T) {
 			t.Fatal(err)
 		}
 		waitRaw(t, raw)
-		assertSparse(t, env.s, before, actionLocalAttest)
+		assertSparse(t, env.s, before, actionAgentCap)
 	})
 	t.Run("recognized-invoke", func(t *testing.T) {
 		env := approvedShared(t)
@@ -857,14 +857,14 @@ func TestMCPReviewFixes(t *testing.T) {
 		if !bytes.Contains(got, []byte("invalid params")) {
 			t.Fatalf("outer field %s", got)
 		}
-		assertSparse(t, env.s, before, actionLocalAttest)
+		assertSparse(t, env.s, before, actionAgentCap)
 		badID := []byte(`{"jsonrpc":"2.0","id":{"n":1},"method":"tools/call","params":{"name":"invoke_capability"}}`)
 		before = len(mcpAuditSnapshot(env.s))
 		got = raw.round(t, badID)
 		if !bytes.Contains(got, []byte("invalid request")) || bytes.Contains(got, []byte("invoke_capability")) {
 			t.Fatalf("bad id %s", got)
 		}
-		assertSparse(t, env.s, before, actionLocalAttest)
+		assertSparse(t, env.s, before, actionAgentCap)
 	})
 	t.Run("numeric-id", func(t *testing.T) {
 		env := approvedShared(t)
@@ -966,7 +966,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		if err := c.Write(context.Background(), msg); err != nil {
 			t.Fatal(err)
 		}
-		assertSparse(t, env.s, before, actionLocalAttest)
+		assertSparse(t, env.s, before, actionAgentCap)
 		if err := c.Write(context.Background(), msg); err != nil {
 			t.Fatal(err)
 		}
@@ -1113,7 +1113,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("Serve did not finish after the peer closed")
 		}
-		assertSparse(t, env.s, before, actionLocalAttest)
+		assertSparse(t, env.s, before, actionAgentCap)
 	})
 	t.Run("audit-fault", func(t *testing.T) {
 		env := approvedShared(t)
@@ -1161,10 +1161,10 @@ func TestMCPReviewFixes(t *testing.T) {
 			action    string
 			failAudit bool
 		}{
-			{"invoke", lifecycleInvoke(t, 2), actionLocalAttest, false},
+			{"invoke", lifecycleInvoke(t, 2), actionAgentCap, false},
 			{"notification", cancellationFrame(t, 2), actionAgentCap, false},
 			{"malformed", []byte(`{"jsonrpc":`), actionAgentCap, false},
-			{"audit-failure", lifecycleInvoke(t, 2), actionLocalAttest, true},
+			{"audit-failure", lifecycleInvoke(t, 2), actionAgentCap, true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				env := approvedShared(t)

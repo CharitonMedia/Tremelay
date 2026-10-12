@@ -109,9 +109,6 @@ func TestMCPOutputLifecycle(t *testing.T) {
 		}
 		for i, row := range rows {
 			want := actionAgentCap
-			if i == 3 {
-				want = actionLocalAttest
-			}
 			if row.Action != want || row.Result != resultDenied || row.GrantID != "" || row.CredID != "" {
 				t.Fatalf("denial %d: %+v", i, row)
 			}
@@ -331,7 +328,7 @@ func TestMCPNotificationEnvelopes(t *testing.T) {
 		t.Fatalf("genuine notification produced a response %s", got)
 	}
 	rows := mcpAuditSnapshot(env.s)[before:]
-	if len(rows) != 4 || rows[3].Action != actionLocalAttest {
+	if len(rows) != 4 || rows[3].Action != actionAgentCap {
 		t.Fatalf("notification denials %+v", rows)
 	}
 }
@@ -411,7 +408,7 @@ func TestMCPCancellationDecoderFailure(t *testing.T) {
 				}
 				return
 			}
-			if len(rows) != 2 || rows[0].Action != actionAgentCap || rows[1].Action != actionLocalAttest {
+			if len(rows) != 2 || rows[0].Action != actionAgentCap || rows[1].Action != actionAgentCap {
 				t.Fatalf("cancellation/invocation settlement %+v", rows)
 			}
 			for _, row := range rows {

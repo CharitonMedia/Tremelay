@@ -2,6 +2,7 @@ package vault
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/hex"
@@ -21,7 +22,7 @@ const (
 	// and is not truncated.
 	MaxAgentCapMessage = MaxAttestPayload + 512
 
-	// ponytail: one response lists at most 64 attestation grants. A larger
+	// ponytail: one response lists at most 64 exact grants. A larger
 	// catalog is denied in full. Upgrade path: a paged list.
 	maxAgentCapEntries = 64
 
@@ -31,20 +32,25 @@ const (
 	capMethodInvoke   = 3
 	capMethodRequest  = 4
 
-	capFieldHandle    = 1
-	capFieldPayload   = 2
-	capFieldOperation = 3
-	capFieldResource  = 4
-	capFieldKeyID     = 5
-	capFieldStatus    = 6
-	capFieldExpiry    = 7
-	capFieldCatalog   = 8
-	capFieldSignature = 9
-	capFieldPublicKey = 10
-	capFieldDomain    = 11
-	capFieldPurpose   = 12
-	capFieldCode      = 13
-	capFieldMessage   = 14
+	capFieldHandle        = 1
+	capFieldPayload       = 2
+	capFieldOperation     = 3
+	capFieldResource      = 4
+	capFieldKeyID         = 5
+	capFieldStatus        = 6
+	capFieldExpiry        = 7
+	capFieldCatalog       = 8
+	capFieldSignature     = 9
+	capFieldPublicKey     = 10
+	capFieldDomain        = 11
+	capFieldPurpose       = 12
+	capFieldCode          = 13
+	capFieldMessage       = 14
+	capFieldHTTPStatus    = 15
+	capFieldIssueNumber   = 16
+	capFieldIssueState    = 17
+	capFieldIssueLocked   = 18
+	capFieldIssueComments = 19
 
 	capTypeBytes  = 1
 	capTypeString = 2
@@ -71,10 +77,12 @@ var errCapStale = errors.New("capability handle is not current")
 // agentCapGrant is the exact authority a handle locates. It stays inside the
 // adapter. The caller message cannot supply these fields.
 type agentCapGrant struct {
-	grantID  string
-	credID   string
-	keyID    string
-	resource string
+	grantID   string
+	credID    string
+	keyID     string
+	resource  string
+	operation string
+	credGen   uint64
 }
 
 type agentCapSnapshot struct {
@@ -94,6 +102,7 @@ type agentCapBroker interface {
 	agentCapList(agentID string) ([]agentCapSnapshot, error)
 	agentCapDescribe(agentID string, bound agentCapGrant) (agentCapView, error)
 	agentCapInvoke(agentID, grantID string, payload []byte) (LocalAttestation, error)
+	agentCapNetwork(context.Context, string, agentCapGrant) (capNetworkResult, error)
 	agentCapDeny(agentID string, invoke bool) error
 }
 
@@ -137,6 +146,10 @@ func BindAgentCapability(p *AgentPrincipal) (*AgentCapability, error) {
 // required audit returns an error and no response bytes, and does not mean
 // an event was recorded.
 func (a *AgentCapability) Exchange(message []byte) ([]byte, error) {
+	return a.exchange(context.Background(), message)
+}
+
+func (a *AgentCapability) exchange(ctx context.Context, message []byte) ([]byte, error) {
 	if a == nil || a.broker == nil || safeID(a.agentID) == "" {
 		return nil, ErrUnauthenticated
 	}
@@ -151,7 +164,7 @@ func (a *AgentCapability) Exchange(message []byte) ([]byte, error) {
 	case capMethodDescribe:
 		return a.describe(req.handle)
 	case capMethodInvoke:
-		return a.invoke(req.handle, req.payload)
+		return a.invokeContext(ctx, req.handle, req.payload)
 	default:
 		return a.protocolDeny(false, capUnknownMethod)
 	}
@@ -165,7 +178,7 @@ func (a *AgentCapability) protocolDeny(invoke bool, code string) ([]byte, error)
 }
 
 // denyBound records one sparse denial for this adapter's agent.
-// invoke selects local_attest; any other attempt stays agent_capability.
+// The operation is unresolved, so the action is always agent_capability.
 // The row has no grant, credential, handle, or caller text.
 // A non-nil error means the row was not persisted.
 func (a *AgentCapability) denyBound(invoke bool) error {
@@ -213,20 +226,37 @@ func (a *AgentCapability) describe(handle [32]byte) ([]byte, error) {
 	if err != nil {
 		return nil, ErrInvalid
 	}
-	return encodeCap(capMethodDescribe, []capWire{
-		{id: capFieldHandle, typ: capTypeBytes, val: handle[:]},
-		{id: capFieldOperation, typ: capTypeString, val: []byte(OpLocalArtifactAttest)},
-		{id: capFieldResource, typ: capTypeString, val: []byte(bound.resource)},
-		{id: capFieldKeyID, typ: capTypeString, val: []byte(bound.keyID)},
-		{id: capFieldStatus, typ: capTypeString, val: []byte(view.status)},
-		{id: capFieldExpiry, typ: capTypeString, val: []byte(exp.Format(time.RFC3339Nano))},
-	})
+	entry, err := encodeEntry(capEntry{handle: handle, operation: bound.operation, resource: bound.resource, keyID: bound.keyID, status: view.status, expires: exp})
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte{AgentCapVersion, capMethodDescribe}, entry...), nil
 }
 
 func (a *AgentCapability) invoke(handle [32]byte, payload []byte) ([]byte, error) {
+	return a.invokeContext(context.Background(), handle, payload)
+}
+
+func (a *AgentCapability) invokeContext(ctx context.Context, handle [32]byte, payload []byte) ([]byte, error) {
 	bound, ok := a.lookup(handle)
 	if !ok {
 		return a.protocolDeny(true, capUnknownHandle)
+	}
+	if networkOperation(bound.operation) {
+		if payload != nil {
+			return a.protocolDeny(false, capMalformed)
+		}
+		out, err := a.broker.agentCapNetwork(ctx, a.agentID, bound)
+		if err != nil {
+			if capHost(err) {
+				return nil, err
+			}
+			return encodeCapError(capFromErr(err))
+		}
+		return encodeNetworkResult(out)
+	}
+	if len(payload) == 0 {
+		return a.protocolDeny(false, capMalformed)
 	}
 	att, err := a.broker.agentCapInvoke(a.agentID, bound.grantID, payload)
 	if err != nil {
@@ -275,13 +305,16 @@ func (a *AgentCapability) bindAll(snaps []agentCapSnapshot) ([]capEntry, error) 
 		// An existing handle keeps its original grant, credential, key, and
 		// resource. A later list does not point it at another grant.
 		stored := a.byHandle[handle]
+		if networkOperation(stored.operation) && stored != sn.agentCapGrant {
+			sn.status = GrantRevoked
+		}
 		exp, err := requireTime(sn.expires)
 		if err != nil {
 			return nil, ErrInvalid
 		}
 		out = append(out, capEntry{
 			handle:    handle,
-			operation: OpLocalArtifactAttest,
+			operation: stored.operation,
 			resource:  stored.resource,
 			keyID:     stored.keyID,
 			status:    sn.status,
@@ -342,12 +375,13 @@ func (s *Session) agentCapList(agentID string) ([]agentCapSnapshot, error) {
 	}
 	var snaps []agentCapSnapshot
 	for _, g := range s.grants {
-		if g.AgentID != agentID || !soleLocalAttest(g.Operations) || g.CredentialClass != "" || safeID(g.CredentialID) == "" || !canonicalKeyID(g.KeyID) {
+		if g.AgentID != agentID || !s.capGrantSupported(g) {
 			continue
 		}
+		c, _ := s.credByID(g.CredentialID)
 		snaps = append(snaps, agentCapSnapshot{
 			agentCapGrant: agentCapGrant{
-				grantID: g.ID, credID: g.CredentialID, keyID: g.KeyID, resource: g.Resource,
+				grantID: g.ID, credID: g.CredentialID, keyID: g.KeyID, resource: g.Resource, operation: g.Operations[0], credGen: c.Gen,
 			},
 			status:  s.attestCapStatus(g, now),
 			expires: g.ExpiresAt.UTC(),
@@ -389,7 +423,7 @@ func (s *Session) agentCapDescribe(agentID string, bound agentCapGrant) (agentCa
 	deny := s.boundAgentDenial(agentID)
 	deny.Action = actionAgentCap
 	g, ok := s.grantByID(bound.grantID)
-	if !ok || g.AgentID != agentID || g.CredentialID != bound.credID || g.Resource != bound.resource || g.KeyID != bound.keyID || !soleLocalAttest(g.Operations) {
+	if !ok || g.AgentID != agentID || g.CredentialID != bound.credID || g.Resource != bound.resource || g.KeyID != bound.keyID || !s.capGrantSupported(g) || g.Operations[0] != bound.operation {
 		if err := s.finish(deny, nil); err != nil {
 			return agentCapView{}, err
 		}
@@ -404,7 +438,7 @@ func (s *Session) agentCapDescribe(agentID string, bound agentCapGrant) (agentCa
 	}
 	ev := auditEvent{
 		Action: actionAgentCap, Result: resultAllowed, AgentID: agentID, GrantID: g.ID,
-		CredID: g.CredentialID, CredType: CredTypeEd25519, Operation: OpLocalArtifactAttest,
+		CredID: g.CredentialID, CredType: s.auditCredType(g), Operation: bound.operation,
 	}
 	if err := s.finish(ev, nil); err != nil {
 		return agentCapView{}, err
@@ -413,7 +447,14 @@ func (s *Session) agentCapDescribe(agentID string, bound agentCapGrant) (agentCa
 	if err != nil {
 		return agentCapView{}, ErrInvalid
 	}
-	return agentCapView{status: s.attestCapStatus(g, now), expires: exp}, nil
+	status := s.attestCapStatus(g, now)
+	if networkOperation(bound.operation) {
+		c, ok := s.credByID(bound.credID)
+		if !ok || c.Gen != bound.credGen || c.Lifecycle.State != StateActive {
+			status = GrantRevoked
+		}
+	}
+	return agentCapView{status: status, expires: exp}, nil
 }
 
 func (s *Session) agentCapDeny(agentID string, invoke bool) error {
@@ -426,9 +467,8 @@ func (s *Session) agentCapDeny(agentID string, invoke bool) error {
 	}
 	ev := s.boundAgentDenial(agentID)
 	ev.Action = actionAgentCap
-	if invoke {
-		ev.Action = actionLocalAttest
-	}
+	// Before resolving a handle, its operation is unknown. Never guess it.
+	_ = invoke
 	return s.finish(ev, nil)
 }
 
@@ -614,6 +654,7 @@ type capResponse struct {
 	entries []capEntry
 	entry   capEntry
 	att     LocalAttestation
+	network capNetworkResult
 }
 
 func parseCapRequest(msg []byte) (capRequest, string) {
@@ -621,7 +662,7 @@ func parseCapRequest(msg []byte) (capRequest, string) {
 		return capRequest{}, capMalformed
 	}
 	// Keep a version-1 method byte when the body is not parsed. A malformed
-	// invoke is audited as local_attest; other methods stay agent_capability.
+	// request shape is retained, but all pre-handle denials are agent_capability.
 	if len(msg) > MaxAgentCapMessage {
 		if msg[0] == AgentCapVersion && len(msg) >= 2 {
 			return capRequest{method: msg[1]}, capMalformed
@@ -665,7 +706,7 @@ func parseCapRequest(msg []byte) (capRequest, string) {
 	case capMethodInvoke:
 		handle, hok := capExactBytes(fields, capFieldHandle, 32)
 		payload, pok := fields[capFieldPayload]
-		if !hok || !pok || payload.typ != capTypeBytes || len(fields) != 2 || len(payload.val) == 0 || len(payload.val) > MaxAttestPayload {
+		if !hok || (pok && (payload.typ != capTypeBytes || len(fields) != 2 || len(payload.val) == 0 || len(payload.val) > MaxAttestPayload)) || (!pok && len(fields) != 1) {
 			return capRequest{method: method}, capMalformed
 		}
 		var req capRequest
@@ -779,7 +820,7 @@ func encodeCatalog(entries []capEntry) ([]byte, error) {
 }
 
 func encodeEntry(e capEntry) ([]byte, error) {
-	if e.operation != OpLocalArtifactAttest || !capStatusOK(e.status) || !canonicalKeyID(e.keyID) || validateResource(e.resource) != nil {
+	if !capEntryScopeOK(e.operation, e.resource, e.keyID) || !capStatusOK(e.status) {
 		return nil, ErrInvalid
 	}
 	exp, err := requireTime(e.expires)
@@ -790,9 +831,11 @@ func encodeEntry(e capEntry) ([]byte, error) {
 		{id: capFieldHandle, typ: capTypeBytes, val: e.handle[:]},
 		{id: capFieldOperation, typ: capTypeString, val: []byte(e.operation)},
 		{id: capFieldResource, typ: capTypeString, val: []byte(e.resource)},
-		{id: capFieldKeyID, typ: capTypeString, val: []byte(e.keyID)},
 		{id: capFieldStatus, typ: capTypeString, val: []byte(e.status)},
 		{id: capFieldExpiry, typ: capTypeString, val: []byte(exp.Format(time.RFC3339Nano))},
+	}
+	if e.operation == OpLocalArtifactAttest {
+		fields = append(fields, capWire{id: capFieldKeyID, typ: capTypeString, val: []byte(e.keyID)})
 	}
 	slices.SortFunc(fields, func(a, b capWire) int { return int(a.id) - int(b.id) })
 	body := make([]byte, 2)
@@ -884,10 +927,10 @@ func decodeCapEntryFields(fields map[byte]capWire) (capEntry, error) {
 	keyID, kok := capString(fields, capFieldKeyID)
 	status, sok := capString(fields, capFieldStatus)
 	expiry, eok := capString(fields, capFieldExpiry)
-	if !hok || !ook || !rok || !kok || !sok || !eok || len(fields) != 6 {
+	if !hok || !ook || !rok || !sok || !eok || (op == OpLocalArtifactAttest && (!kok || len(fields) != 6)) || (networkOperation(op) && (kok || len(fields) != 5)) {
 		return capEntry{}, ErrInvalid
 	}
-	if op != OpLocalArtifactAttest || !capStatusOK(status) || !canonicalKeyID(keyID) || validateResource(resource) != nil {
+	if !capEntryScopeOK(op, resource, keyID) || !capStatusOK(status) {
 		return capEntry{}, ErrInvalid
 	}
 	exp, ok := canonicalAuditTime(expiry)
@@ -905,6 +948,12 @@ func decodeCapEntryFields(fields map[byte]capWire) (capEntry, error) {
 }
 
 func decodeCapInvoke(fields map[byte]capWire) (capResponse, error) {
+	if _, ok := fields[capFieldHTTPStatus]; ok {
+		return decodeNetworkResult(fields)
+	}
+	if _, ok := fields[capFieldIssueNumber]; ok {
+		return decodeNetworkResult(fields)
+	}
 	sig, sok := capExactBytes(fields, capFieldSignature, ed25519.SignatureSize)
 	pub, pok := capExactBytes(fields, capFieldPublicKey, ed25519.PublicKeySize)
 	domain, dok := capString(fields, capFieldDomain)
@@ -943,10 +992,11 @@ func encodeCapDescribe(handle [32]byte) ([]byte, error) {
 }
 
 func encodeCapInvoke(handle [32]byte, payload []byte) ([]byte, error) {
-	return encodeCap(capMethodInvoke, []capWire{
-		{id: capFieldHandle, typ: capTypeBytes, val: handle[:]},
-		{id: capFieldPayload, typ: capTypeBytes, val: payload},
-	})
+	fields := []capWire{{id: capFieldHandle, typ: capTypeBytes, val: handle[:]}}
+	if payload != nil {
+		fields = append(fields, capWire{id: capFieldPayload, typ: capTypeBytes, val: payload})
+	}
+	return encodeCap(capMethodInvoke, fields)
 }
 
 func encodeCapRequest() ([]byte, error) {

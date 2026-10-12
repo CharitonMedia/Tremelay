@@ -496,7 +496,7 @@ func TestMCPProcessBlockedOutputCancellation(t *testing.T) {
 	}
 }
 
-const mcpDeniedAuditQuery = `SELECT count(*) FROM audit WHERE action='local_attest' AND result='denied'`
+const mcpDeniedAuditQuery = `SELECT count(*) FROM audit WHERE action='agent_capability' AND result='denied'`
 
 // This test observer must not create a vault, mutate it, or hold an unbounded
 // read while the child commits an audit row in SQLite's DELETE journal mode.
@@ -557,7 +557,7 @@ func TestMCPAuditObserverLockBounds(t *testing.T) {
 			}
 			defer writer.Close()
 			writer.SetMaxOpenConns(1)
-			if _, err := writer.Exec(`CREATE TABLE audit(action TEXT, result TEXT); INSERT INTO audit VALUES('local_attest','denied')`); err != nil {
+			if _, err := writer.Exec(`CREATE TABLE audit(action TEXT, result TEXT); INSERT INTO audit VALUES('agent_capability','denied')`); err != nil {
 				t.Fatal(err)
 			}
 			observer, err := openMCPAuditObserver(path)
@@ -621,7 +621,7 @@ func TestMCPAuditObserverRejectsUnexpectedStates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer writer.Close()
-	if _, err := writer.Exec(`CREATE TABLE audit(action TEXT, result TEXT); INSERT INTO audit VALUES('local_attest','denied'),('local_attest','denied')`); err != nil {
+	if _, err := writer.Exec(`CREATE TABLE audit(action TEXT, result TEXT); INSERT INTO audit VALUES('agent_capability','denied'),('agent_capability','denied')`); err != nil {
 		t.Fatal(err)
 	}
 	observer, err := openMCPAuditObserver(path)
@@ -731,7 +731,7 @@ func TestMCPProcessAdmittedBlockedOutputEOF(t *testing.T) {
 			if err := db.QueryRow(`SELECT count(*) FROM audit WHERE action='capability_list' AND result='allowed'`).Scan(&listed); err != nil || listed != 1 {
 				t.Fatalf("admitted catalogue was not audited exactly once: count %d, error %v", listed, err)
 			}
-			if err := db.QueryRow(`SELECT count(*) FROM audit WHERE action='local_attest' AND result='denied'`).Scan(&denied); err != nil || denied != map[bool]int{false: 0, true: 1}[partial] {
+			if err := db.QueryRow(`SELECT count(*) FROM audit WHERE action='agent_capability' AND result='denied'`).Scan(&denied); err != nil || denied != map[bool]int{false: 0, true: 1}[partial] {
 				t.Fatalf("partial-frame denial count %d, error %v", denied, err)
 			}
 		})

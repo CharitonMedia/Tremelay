@@ -65,3 +65,14 @@ sequential clients without releasing admission early. Linux/macOS use owned,
 close-interruptible pipes; cleanup joins dispatch/output before locking the
 session. No listener, callback, remote identity proof or new grant is added.
 See [the client guide](docs/local-stdio-mcp.md) for measured runtime support.
+
+
+## Exact network capabilities
+
+[ADR 0021](docs/adr/0021-mcp-credential-brokers.md) extends the same capability
+adapter and both MCP profiles to existing HTTP and GitHub issue brokers. Network
+handles bind one agent, grant, operation, credential generation and canonical
+resource. Invocation carries only the handle; the host-derived grant supplies
+the request. Existing destination policy, fixed projections, audit and M5
+response controls remain in force. Shared vaults remain attestation-only. SSH's
+stateful host-proof contract is not represented by these one-shot invocations.

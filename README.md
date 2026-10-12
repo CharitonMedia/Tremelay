@@ -42,7 +42,10 @@ Passphrase change requires old/new/confirmation through no-echo terminal prompts
 `tremelay mcp serve` is a human-unlocked local stdio subprocess for one
 host-selected agent. It uses an explicitly trusted pinentry helper, with
 passphrase input separate from MCP, and exposes only the same three exact-grant
-local-attestation tools. The initialize-based profile supports `2025-06-18` and
+credential-use tools for exact `local_artifact_attest`, `http_request` and
+`github_issue_state` grants. Network calls accept only a discovered handle and
+return status-only HTTP or the four-field GitHub summary; credentials stay in
+the broker. Shared vaults remain attestation-only. The initialize-based profile supports `2025-06-18` and
 `2025-11-25`; the modern in-memory reference remains separate. See the
 [stdio setup, client examples, tested versions and limitations](docs/local-stdio-mcp.md).
 This command ignores the environment-passphrase shortcut described above.
