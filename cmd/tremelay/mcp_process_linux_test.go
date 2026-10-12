@@ -35,7 +35,23 @@ func TestMCPProcessHelper(t *testing.T) {
 	}
 	for i, arg := range os.Args {
 		if arg == "--" {
-			os.Exit(run(os.Args[i+1:], func(string) string { panic("MCP consulted getenv") }, os.Stdin, os.Stdout, os.Stderr))
+			args := os.Args[i+1:]
+			// Only this test binary selects the optional record, and only for
+			// the exact command/flag layout used by the cancellation fixture.
+			if os.Getenv("TREMELAY_TEST_MCP_OBSERVE") == "1" && len(args) == 12 &&
+				args[0] == "mcp" && args[1] == "serve" && args[2] == "--path" &&
+				args[4] == "--agent" && args[6] == "--pinentry" && args[7] == "/usr/bin/pinentry-curses" &&
+				args[8] == "--pinentry-tty" && args[10] == "--unlock-timeout" {
+				var observation pinentryObservation
+				code := cmdMCPObserved(args[1:], os.Stdin, os.Stdout, os.Stderr, &observation)
+				// cmdMCP cleanup has finished. Numeric enum metadata cannot
+				// contain or satisfy any expected public error diagnostic.
+				fmt.Fprintf(os.Stderr, "MCP_OBSERVATION phase=%d outcome=%d classification=%d after_watch=%d reap=%d kill_attempted=%t restore=%d\n",
+					observation.phase, observation.outcome, observation.classification, observation.afterWatch,
+					observation.reap, observation.killAttempted, observation.restore)
+				os.Exit(code)
+			}
+			os.Exit(run(args, func(string) string { panic("MCP consulted getenv") }, os.Stdin, os.Stdout, os.Stderr))
 		}
 	}
 	os.Exit(99)
@@ -57,6 +73,10 @@ func startMCPProcess(t *testing.T, timeout string, blockedOutput bool) *mcpProce
 }
 
 func startMCPProcessWithGrants(t *testing.T, timeout string, blockedOutput bool, grants int) *mcpProcess {
+	return startMCPProcessWithObservation(t, timeout, blockedOutput, grants, false)
+}
+
+func startMCPProcessWithObservation(t *testing.T, timeout string, blockedOutput bool, grants int, observe bool) *mcpProcess {
 	t.Helper()
 	const pinentry = "/usr/bin/pinentry-curses"
 	if _, err := os.Stat(pinentry); err != nil {
@@ -172,11 +192,15 @@ func startMCPProcessWithGrants(t *testing.T, timeout string, blockedOutput bool,
 	args := []string{"-test.run=^TestMCPProcessHelper$", "--", "mcp", "serve", "--path", path, "--agent", agent.ID, "--pinentry", pinentry, "--pinentry-tty", tty, "--unlock-timeout", timeout}
 	cmd := exec.CommandContext(ctx, os.Args[0], args...)
 	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, "TREMELAY_PASSPHRASE=") && !strings.HasPrefix(entry, "TREMELAY_TEST_MCP_PROCESS=") && !strings.HasPrefix(entry, "TERM=") {
+		if !strings.HasPrefix(entry, "TREMELAY_PASSPHRASE=") && !strings.HasPrefix(entry, "TREMELAY_TEST_MCP_PROCESS=") &&
+			!strings.HasPrefix(entry, "TREMELAY_TEST_MCP_OBSERVE=") && !strings.HasPrefix(entry, "TERM=") {
 			cmd.Env = append(cmd.Env, entry)
 		}
 	}
 	cmd.Env = append(cmd.Env, "TREMELAY_TEST_MCP_PROCESS=1", "TERM=xterm")
+	if observe {
+		cmd.Env = append(cmd.Env, "TREMELAY_TEST_MCP_OBSERVE=1")
+	}
 	diag, ui := &lifecycleOutput{}, &lifecycleOutput{}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = serverInput, serverOutput, diag
 	// A real foreground terminal delivers Ctrl-C to the process group. Keep
@@ -256,13 +280,15 @@ func (p *mcpProcess) finish(t *testing.T, want int, message string) {
 }
 
 func TestMCPProcessPromptCancellation(t *testing.T) {
+	version, versionState := mcpPinentryVersionObservation()
+	t.Logf("MCP_OBSERVATION version_state=%d version=%s", versionState, version)
 	for _, reason := range []string{"SIGINT", "SIGTERM", "ctrl-c", "EOF", "output-closed", "timeout"} {
 		t.Run(reason, func(t *testing.T) {
 			timeout := "10s"
 			if reason == "timeout" {
 				timeout = "1s"
 			}
-			p := startMCPProcess(t, timeout, false)
+			p := startMCPProcessWithObservation(t, timeout, false, 0, true)
 			p.prompt(t)
 			before, err := os.ReadFile(p.path)
 			if err != nil {
@@ -275,6 +301,22 @@ func TestMCPProcessPromptCancellation(t *testing.T) {
 			case "SIGTERM":
 				err = p.cmd.Process.Signal(syscall.SIGTERM)
 			case "ctrl-c":
+				state, stateErr := unix.IoctlGetTermios(int(p.slave.Fd()), unix.TCGETS)
+				// The parent does not own the slave as its controlling tty.
+				// Query through the PTY master, preserving its pollable mode.
+				var foreground int
+				var foregroundErr error
+				raw, rawErr := p.master.SyscallConn()
+				if rawErr == nil {
+					rawErr = raw.Control(func(fd uintptr) {
+						foreground, foregroundErr = unix.IoctlGetInt(int(fd), unix.TIOCGPGRP)
+					})
+				}
+				foregroundRead := rawErr == nil && foregroundErr == nil
+				group, groupErr := unix.Getpgid(p.cmd.Process.Pid)
+				t.Logf("MCP_OBSERVATION termios_read=%t isig=%t vintr_three=%t foreground_read=%t process_group_read=%t foreground_matches=%t",
+					stateErr == nil, stateErr == nil && state.Lflag&unix.ISIG != 0, stateErr == nil && state.Cc[unix.VINTR] == 3,
+					foregroundRead, groupErr == nil, foregroundRead && groupErr == nil && foreground == group)
 				_, err = p.master.Write([]byte{3})
 			case "EOF":
 				err = p.input.Close()
@@ -286,13 +328,79 @@ func TestMCPProcessPromptCancellation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			p.finish(t, 1, message)
+			p.finish(t, 1, "")
 			after, err := os.ReadFile(p.path)
 			if err != nil || !bytes.Equal(before, after) {
 				t.Fatal("prompt cancellation changed vault")
 			}
+			// Assert only the public diagnostic line, independently of the
+			// numeric observation appended by the test subprocess after cleanup.
+			publicDiagnostic, _, _ := strings.Cut(p.diag.String(), "\n")
+			if publicDiagnostic != message {
+				t.Fatalf("unexpected prompt diagnostic: %s", p.diag.String())
+			}
 		})
 	}
+}
+
+// Read only the fixed official helper's version. Raw output is bounded, wiped,
+// and never logged; the caller sees a numeric version or a fixed state enum.
+// States: 1 valid, 2 timeout, 3 process failure, 4 output limit, 5 invalid format.
+func mcpPinentryVersionObservation() (string, uint8) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var output mcpVersionOutput
+	defer vault.Wipe(output.data[:])
+	cmd := exec.CommandContext(ctx, "/usr/bin/pinentry-curses", "--version")
+	cmd.Env = []string{"LC_ALL=C"}
+	cmd.Stdout, cmd.Stderr = &output, io.Discard
+	cmd.WaitDelay = 100 * time.Millisecond
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return "", 2
+	}
+	if output.overflow {
+		return "", 4
+	}
+	if err != nil {
+		return "", 3
+	}
+	line, _, _ := bytes.Cut(output.data[:output.used], []byte{'\n'})
+	version, ok := bytes.CutPrefix(line, []byte("pinentry-curses (pinentry) "))
+	if !ok || len(version) == 0 || len(version) > 32 {
+		return "", 5
+	}
+	dots, digits := 0, 0
+	for _, ch := range version {
+		if ch == '.' && digits > 0 {
+			dots++
+			digits = 0
+		} else if ch >= '0' && ch <= '9' {
+			digits++
+		} else {
+			return "", 5
+		}
+	}
+	if dots != 2 || digits == 0 {
+		return "", 5
+	}
+	return string(version), 1
+}
+
+type mcpVersionOutput struct {
+	data     [1024]byte
+	used     int
+	overflow bool
+}
+
+func (w *mcpVersionOutput) Write(p []byte) (int, error) {
+	n := copy(w.data[w.used:], p)
+	w.used += n
+	if n != len(p) {
+		w.overflow = true
+		return n, io.ErrShortBuffer
+	}
+	return n, nil
 }
 
 func TestMCPProcessEOFAndBrokenOutput(t *testing.T) {

@@ -28,7 +28,10 @@ var (
 	errPinentryTerminal    = errors.New("pinentry terminal restoration failed")
 )
 
-type pinentryOptions struct{ path, tty string }
+type pinentryOptions struct {
+	path, tty   string
+	observation *pinentryObservation
+}
 
 func validPinentryTTY(path string) bool {
 	if !filepath.IsAbs(path) || len(path) > 1024 {
@@ -54,7 +57,14 @@ func pinentryContextError(ctx context.Context) error {
 // Terminal restoration and an established timeout keep their more specific
 // diagnostics even when cancellation is observed at the same time.
 func pinentryDiagnostic(ctx context.Context, protocolErr, waitErr error) error {
+	return pinentryDiagnosticObserved(ctx, protocolErr, waitErr, nil)
+}
+
+func pinentryDiagnosticObserved(ctx context.Context, protocolErr, waitErr error, observedContext *pinentryContextState) error {
 	contextErr := ctx.Err()
+	if observedContext != nil {
+		*observedContext = observePinentryContext(contextErr)
+	}
 	if errors.Is(protocolErr, errPinentryTerminal) {
 		return errPinentryTerminal
 	}
@@ -88,6 +98,8 @@ func pinentryDiagnostic(ctx context.Context, protocolErr, waitErr error) error {
 // are trusted host custody. Every pipe, helper process and terminal lease is
 // closed before return, including cancellation and malformed helper output.
 func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, err error) {
+	observation := options.observation
+	observation.begin(pinentryPhaseSetup)
 	if ctx.Err() != nil {
 		return nil, pinentryContextError(ctx)
 	}
@@ -105,6 +117,11 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 	defer func() {
 		if e := restore(); e != nil {
 			err = errPinentryTerminal
+			if observation != nil {
+				observation.restore = pinentryRestoreFailed
+			}
+		} else if observation != nil {
+			observation.restore = pinentryRestoreOK
 		}
 		if err != nil {
 			vault.Wipe(pass)
@@ -157,6 +174,10 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 	defer func() {
 		if !stop() {
 			<-afterDone
+			// AfterFunc always attempts Kill. Observe it only after its join.
+			if observation != nil {
+				observation.killAttempted = true
+			}
 		}
 		input.Close()
 		output.Close()
@@ -167,14 +188,23 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 			select {
 			case waitErr = <-waited:
 			default:
+				if observation != nil {
+					observation.killAttempted = true
+				}
 				_ = cmd.Process.Kill()
 				waitErr = <-waited
 			}
 			finished = true
 		}
-		err = pinentryDiagnostic(ctx, err, waitErr)
+		var observedContext *pinentryContextState
+		if observation != nil {
+			observation.reap = observePinentryReap(waitErr)
+			observedContext = &observation.classification
+		}
+		err = pinentryDiagnosticObserved(ctx, err, waitErr, observedContext)
 	}()
-	protocol := pinentryProtocol{reader: output, writer: input}
+	protocol := pinentryProtocol{reader: output, writer: input, observation: observation}
+	observation.begin(pinentryPhaseGreeting)
 	if _, e := protocol.reply(false); e != nil {
 		return nil, e
 	}
@@ -183,6 +213,7 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 		commands = append([]string{"OPTION ttyname=" + tty}, commands...)
 	}
 	for _, command := range commands {
+		observation.begin(pinentryPhaseConfigure)
 		if e := protocol.command(command); e != nil {
 			return nil, e
 		}
@@ -190,6 +221,7 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 			return nil, e
 		}
 	}
+	observation.begin(pinentryPhaseGetPIN)
 	if e := protocol.command("GETPIN"); e != nil {
 		return nil, e
 	}
@@ -197,6 +229,7 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 	if err != nil {
 		return pass, err
 	}
+	observation.begin(pinentryPhaseBye)
 	if e := protocol.command("BYE"); e != nil {
 		return pass, e
 	}
@@ -205,6 +238,7 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 	// must not retain the passphrase or delay cleanup for the whole UI timeout.
 	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
+	observation.begin(pinentryPhaseReap)
 	select {
 	case waitErr = <-waited:
 		finished = true
@@ -220,12 +254,14 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 }
 
 type pinentryProtocol struct {
-	reader io.Reader
-	writer io.Writer
+	reader      io.Reader
+	writer      io.Writer
+	observation *pinentryObservation
 }
 
 func (p *pinentryProtocol) command(command string) error {
 	if n, err := io.WriteString(p.writer, command+"\n"); err != nil || n != len(command)+1 {
+		p.observation.result(pinentryOutcomeWriteError)
 		return errPinentryFailed
 	}
 	return nil
@@ -251,9 +287,15 @@ func (p *pinentryProtocol) reply(data bool) (pass []byte, err error) {
 		n := 0
 		for {
 			if n == len(line) || total == maxPinentryReply {
+				p.observation.result(pinentryOutcomeLimit)
 				return pass, errPinentryFailed
 			}
 			if _, e := io.ReadFull(p.reader, line[n:n+1]); e != nil {
+				if errors.Is(e, io.EOF) || errors.Is(e, io.ErrUnexpectedEOF) {
+					p.observation.result(pinentryOutcomeEOF)
+				} else {
+					p.observation.result(pinentryOutcomeReadError)
+				}
 				return pass, errPinentryFailed
 			}
 			total++
@@ -268,9 +310,10 @@ func (p *pinentryProtocol) reply(data bool) (pass []byte, err error) {
 		}
 		switch {
 		case bytes.Equal(value, []byte("OK")) || bytes.HasPrefix(value, []byte("OK ")):
+			p.observation.result(pinentryOutcomeOK)
 			return pass, nil
 		case bytes.HasPrefix(value, []byte("ERR ")):
-			return pass, pinentryReplyError(value[4:])
+			return pass, pinentryReplyErrorObserved(value[4:], p.observation)
 		case bytes.HasPrefix(value, []byte("S ")) || bytes.HasPrefix(value, []byte("#")):
 			// Status/comment lines are bounded and discarded, not reflected.
 		case data && bytes.HasPrefix(value, []byte("D ")):
@@ -278,24 +321,29 @@ func (p *pinentryProtocol) reply(data bool) (pass []byte, err error) {
 				ch := value[i]
 				if ch == '%' {
 					if i+2 >= len(value) {
+						p.observation.result(pinentryOutcomeMalformed)
 						return pass, errPinentryFailed
 					}
 					hi, lo := pinentryHex(value[i+1]), pinentryHex(value[i+2])
 					if hi < 0 || lo < 0 {
+						p.observation.result(pinentryOutcomeMalformed)
 						return pass, errPinentryFailed
 					}
 					ch, i = byte(hi<<4|lo), i+2
 				}
 				if len(pass) == maxPinentryPassphrase {
+					p.observation.result(pinentryOutcomeLimit)
 					return pass, errPinentryFailed
 				}
 				pass = append(pass, ch)
 			}
 		default:
+			p.observation.result(pinentryOutcomeMalformed)
 			return pass, errPinentryFailed
 		}
 		vault.Wipe(line[:])
 	}
+	p.observation.result(pinentryOutcomeLimit)
 	return pass, errPinentryFailed
 }
 
@@ -312,22 +360,37 @@ func pinentryHex(ch byte) int {
 }
 
 func pinentryReplyError(value []byte) error {
+	return pinentryReplyErrorObserved(value, nil)
+}
+
+func pinentryReplyErrorObserved(value []byte, observation *pinentryObservation) error {
 	i := bytes.IndexByte(value, ' ')
 	if i < 0 {
 		i = len(value)
 	}
 	if i > 10 || i == 0 || strings.IndexFunc(string(value[:i]), func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+		observation.result(pinentryOutcomeMalformed)
 		return errPinentryFailed
 	}
 	code, err := strconv.ParseUint(string(value[:i]), 10, 32)
 	if err != nil {
+		observation.result(pinentryOutcomeMalformed)
 		return errPinentryFailed
 	}
 	switch code & 0xffff { // libgpg-error source bits do not change the code.
-	case 99, 198:
+	case 99:
+		observation.result(pinentryOutcomeERR99)
+		return errPinentryCancelled
+	case 198:
+		observation.result(pinentryOutcomeERR198)
 		return errPinentryCancelled
 	case 62:
+		observation.result(pinentryOutcomeERR62)
 		return errPinentryTimeout
+	case 277:
+		observation.result(pinentryOutcomeERR277)
+	default:
+		observation.result(pinentryOutcomeERROther)
 	}
 	return errPinentryFailed
 }

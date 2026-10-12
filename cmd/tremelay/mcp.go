@@ -20,6 +20,10 @@ const mcpServeUsage = "usage: tremelay mcp serve --path PATH --agent ID --pinent
 var errMCPStdio = errors.New("mcp serve requires supported, close-interruptible stdin and stdout pipes")
 
 func cmdMCP(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return cmdMCPObserved(args, stdin, stdout, stderr, nil)
+}
+
+func cmdMCPObserved(args []string, stdin io.Reader, stdout, stderr io.Writer, observation *pinentryObservation) int {
 	if len(args) == 0 || args[0] != "serve" {
 		fmt.Fprintln(stderr, mcpServeUsage)
 		return 2
@@ -40,7 +44,7 @@ func cmdMCP(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	defer stopPipe()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serveMCP(ctx, *path, *agentID, pinentryOptions{path: *helper, tty: *tty}, *timeout, stdin, stdout, stderr)
+	return serveMCP(ctx, *path, *agentID, pinentryOptions{path: *helper, tty: *tty, observation: observation}, *timeout, stdin, stdout, stderr)
 }
 
 func serveMCP(ctx context.Context, path, agentID string, options pinentryOptions, timeout time.Duration, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -63,7 +67,11 @@ func serveMCP(ctx context.Context, path, agentID string, options pinentryOptions
 	// Joining the watcher can expose cancellation just after the helper
 	// returned. Do not unlock with a late successful answer, and do not
 	// replace a terminal-restoration failure or timeout with cancellation.
-	err = pinentryDiagnostic(unlockCtx, err, nil)
+	var observedContext *pinentryContextState
+	if options.observation != nil {
+		observedContext = &options.observation.afterWatch
+	}
+	err = pinentryDiagnosticObserved(unlockCtx, err, nil, observedContext)
 	if err != nil {
 		vault.Wipe(pass)
 		return fail(err.Error()) // readPinentry returns only fixed local errors.
