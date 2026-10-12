@@ -51,7 +51,13 @@ Unlock defaults to two minutes and is configurable only from one second through
 five minutes. Cancellation, helper error, unavailable UI, or timeout fails
 closed. The helper is terminated and reaped. A separately captured terminal
 state is restored after helper exit, including when cancellation killed curses.
-Startup watches pipe disconnect without consuming MCP bytes. A synchronous KDF
+Startup watches pipe disconnect without consuming MCP bytes. Nonblocking poll
+snapshots request input/output readiness filters but inspect only hangup/error
+bits. Each nonterminal iteration, including EINTR, waits on a stoppable 50ms
+timer so ordinary readiness cannot cause a busy loop. Joining the watcher
+precedes descriptor closure. Explicit readiness registration is required by
+[Darwin's poll implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/sys_generic.c#L1656-L1670);
+an empty event mask does not install its EOF-reporting filters. A synchronous KDF
 already started is allowed to finish; cancellation then prevents service and
 locks the session. No protocol requests are dispatched before human unlock and
 agent binding.

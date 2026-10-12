@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,37 +85,72 @@ func TestMCPStdioCloseInterruptsPipes(t *testing.T) {
 }
 
 func TestMCPStdioDisconnectWatch(t *testing.T) {
-	for _, closeInput := range []bool{true, false} {
-		in, clientWrite, err := os.Pipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer in.Close()
-		defer clientWrite.Close()
-		clientRead, out, err := os.Pipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer clientRead.Close()
-		defer out.Close()
-		s, err := openMCPStdio(in, out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		stop := s.watchDisconnect(cancel)
-		if closeInput {
-			clientWrite.Close()
-		} else {
-			clientRead.Close()
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(time.Second):
-			t.Fatal("pipe disconnect was not observed")
-		}
-		stop()
-		s.close()
-		cancel()
+	for _, tc := range []struct {
+		name       string
+		closeInput bool
+		buffered   bool
+	}{
+		{"stdin-closed", true, false},
+		{"stdout-closed", false, false},
+		{"buffered-stdin-closed", true, true},
+		{"buffered-stdout-closed", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in, clientWrite, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { in.Close(); clientWrite.Close() })
+			clientRead, out, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { clientRead.Close(); out.Close() })
+			s, err := openMCPStdio(in, out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(s.close)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			stop := s.watchDisconnect(cancel)
+			t.Cleanup(stop) // Join before cleanup can close or reuse a watched fd.
+			const pending = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n"
+			if tc.buffered {
+				if _, err := io.WriteString(clientWrite, pending); err != nil {
+					t.Fatal(err)
+				}
+				// Buffered input and writable output must remain open across
+				// multiple snapshots; neither readiness event means disconnect.
+				select {
+				case <-ctx.Done():
+					t.Fatal("ready but open pipes were classified as disconnected")
+				case <-time.After(150 * time.Millisecond):
+				}
+			}
+			if tc.closeInput {
+				err = clientWrite.Close()
+			} else {
+				err = clientRead.Close()
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+				t.Fatal("pipe disconnect was not observed")
+			}
+			stop()
+			if tc.buffered {
+				if err := s.in.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				got := make([]byte, len(pending))
+				if _, err := io.ReadFull(s.in, got); err != nil || string(got) != pending {
+					t.Fatalf("watcher consumed or changed buffered protocol input: %v", err)
+				}
+			}
+		})
 	}
 }

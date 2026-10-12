@@ -74,23 +74,45 @@ func (s *mcpStdio) watchDisconnect(cancel func()) func() {
 	stop, done := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(done)
-		fds := []unix.PollFd{{Fd: int32(s.inFD)}, {Fd: int32(s.outFD)}}
+		// Darwin needs an interested read/write filter to report pipe EOF.
+		// Readiness itself is not a disconnect and must not consume MCP bytes.
+		fds := []unix.PollFd{
+			{Fd: int32(s.inFD), Events: unix.POLLIN},
+			{Fd: int32(s.outFD), Events: unix.POLLOUT},
+		}
+		pause := time.NewTimer(50 * time.Millisecond)
+		pause.Stop()
+		defer pause.Stop()
 		for {
 			select {
 			case <-stop:
 				return
 			default:
 			}
-			_, err := unix.Poll(fds, 50)
-			if err != nil && err != unix.EINTR {
-				cancel()
-				return
-			}
-			for _, fd := range fds {
-				if fd.Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+			_, err := unix.Poll(fds, 0)
+			if err != nil {
+				if err != unix.EINTR {
 					cancel()
 					return
 				}
+			} else {
+				// An interrupted poll need not refresh revents; inspect them
+				// only after a successful snapshot.
+				for _, fd := range fds {
+					if fd.Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+						cancel()
+						return
+					}
+				}
+			}
+			// Writable stdout and buffered stdin are commonly always ready.
+			// Pace every nonterminal snapshot, including EINTR, with a full
+			// interruptible interval rather than spinning on that readiness.
+			pause.Reset(50 * time.Millisecond)
+			select {
+			case <-stop:
+				return
+			case <-pause.C:
 			}
 		}
 	}()
