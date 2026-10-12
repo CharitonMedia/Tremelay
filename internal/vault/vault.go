@@ -900,6 +900,12 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 // withResp lets one ordinary security event pick up its M5 response.
 // policy, when non-nil, becomes the durable health policy only after commit.
 func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, shared *sharedSnap) error {
+	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, shared, nil)
+}
+
+// commitBatchWrap optionally replaces the passphrase wrap in the same transaction.
+// Neither the session header nor its audit cache changes before commit succeeds.
+func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, shared *sharedSnap, wrap *passphraseWrap) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
@@ -986,6 +992,9 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 		return err
 	}
 	h := s.header
+	if wrap != nil {
+		h.KDF, h.WrapNonce, h.WrappedDEK = wrap.kdf, wrap.nonce, wrap.ciphertext
+	}
 	h.Version = formatVersion
 	h.ID = s.id
 	h.Root = rootPassphrase

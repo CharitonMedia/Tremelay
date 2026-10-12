@@ -53,6 +53,9 @@ func usage(w io.Writer) {
 Agent and grant commands manage capability authority. They do not retrieve raw secrets.
 
   tremelay vault create --path PATH
+  tremelay vault change-passphrase --path PATH
+  tremelay vault backup --path PATH --output ARTIFACT
+  tremelay vault restore --input ARTIFACT --path NEW_PATH --checkpoint-file CHECKPOINT
   tremelay credential put --path PATH --label LABEL --type TYPE --secret-file PATH
   tremelay credential get --path PATH --id ID
   tremelay credential list --path PATH
@@ -73,13 +76,26 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
 Types: %s
 Grant operations: %s
 Passphrase: TREMELAY_PASSPHRASE, or a no-echo terminal prompt.
+change-passphrase requires no-echo terminal entry of old, new, and confirmation; it ignores the environment.
 The passphrase is not accepted as an argument. credential get writes the raw secret to stdout.
 Health is advisory. Refresh runs only while the vault is unlocked; a locked or stopped process does not evaluate credentials.
 `, strings.Join(vault.CredentialTypes(), ", "), strings.Join(vault.GrantOperations(), ", "))
 }
 
 func cmdVault(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] != "create" {
+	if len(args) == 0 {
+		usage(stderr)
+		return 2
+	}
+	switch args[0] {
+	case "change-passphrase":
+		return cmdChangePassphrase(args[1:], stdin, stdout, stderr)
+	case "backup":
+		return cmdBackup(args[1:], getenv, stdin, stdout, stderr)
+	case "restore":
+		return cmdRestore(args[1:], getenv, stdin, stdout, stderr)
+	case "create":
+	default:
 		usage(stderr)
 		return 2
 	}

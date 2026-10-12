@@ -567,7 +567,8 @@ func insertVault(tx *sql.Tx, h fileHeader) error {
 }
 
 func updateVault(tx *sql.Tx, h fileHeader, prevSeq uint64) error {
-	res, err := tx.Exec(`UPDATE vault SET data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=? WHERE id=? AND audit_seq=?`,
+	res, err := tx.Exec(`UPDATE vault SET kdf_algorithm=?, kdf_salt=?, kdf_time=?, kdf_memory=?, kdf_threads=?, kdf_key_len=?, wrap_nonce=?, wrapped_dek=?, data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=? WHERE id=? AND audit_seq=?`,
+		h.KDF.Algorithm, h.KDF.Salt, h.KDF.Time, h.KDF.Memory, h.KDF.Threads, h.KDF.KeyLen, h.WrapNonce, h.WrappedDEK,
 		h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), h.ID, int64(prevSeq))
 	if err != nil {
 		return ErrIO

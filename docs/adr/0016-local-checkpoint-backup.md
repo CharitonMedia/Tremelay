@@ -74,7 +74,7 @@ Lost-passphrase recovery, owner recovery, enrollment, SSO, independent custody, 
 ## Consequences
 
 - M9 remains open for real recovery, enrollment, independent custody, and production shared access.
-- Operators do not get a backup CLI in this slice. The demonstration is in-process.
+- The original M9b slice was in-process. [ADR 0019](0019-human-vault-lifecycle.md) adds a human CLI without changing these custody and publication semantics.
 - The host must keep checkpoints outside the artifact. Losing the checkpoint loses the ability to restore that artifact against a later checkpoint, which is the intended refusal.
 
 ## Tests
