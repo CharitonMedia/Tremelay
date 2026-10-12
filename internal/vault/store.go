@@ -221,14 +221,18 @@ func assertDurable(db *sql.DB) error {
 }
 
 func loadVault(path string) (*sql.DB, fileHeader, []auditEvent, error) {
-	return loadVaultMode(path, false)
+	return loadVaultMode(path, false, false)
 }
 
 func loadVaultRead(path string) (*sql.DB, fileHeader, []auditEvent, error) {
-	return loadVaultMode(path, true)
+	return loadVaultMode(path, true, false)
 }
 
-func loadVaultMode(path string, readonly bool) (*sql.DB, fileHeader, []auditEvent, error) {
+func loadVaultForVerify(path string) (*sql.DB, fileHeader, []auditEvent, error) {
+	return loadVaultMode(path, true, true)
+}
+
+func loadVaultMode(path string, readonly, legacyAudit bool) (*sql.DB, fileHeader, []auditEvent, error) {
 	var db *sql.DB
 	var err error
 	if readonly {
@@ -248,10 +252,12 @@ func loadVaultMode(path string, readonly bool) (*sql.DB, fileHeader, []auditEven
 		db.Close()
 		return nil, fileHeader{}, nil, err
 	}
-	// A read-only open must not migrate. M1–M5 files still unlock through
-	// loadVault, which adds missing columns without rewriting hashes.
+	// Verification projects legacy columns without migrating. Backup artifact
+	// reads remain strict; ordinary unlock still performs its existing migration.
 	if readonly {
-		err = auditSchemaReady(db)
+		if !legacyAudit {
+			err = auditSchemaReady(db)
+		}
 	} else {
 		err = migrateAudit(db)
 	}
@@ -259,7 +265,7 @@ func loadVaultMode(path string, readonly bool) (*sql.DB, fileHeader, []auditEven
 		db.Close()
 		return nil, fileHeader{}, nil, err
 	}
-	events, err := readAuditRows(db)
+	events, err := readAuditRowsMode(db, legacyAudit)
 	if err != nil {
 		db.Close()
 		return nil, fileHeader{}, nil, err
@@ -443,7 +449,33 @@ func backfillAuditVersion(tx *sql.Tx) error {
 }
 
 func readAuditRows(db *sql.DB) ([]auditEvent, error) {
-	rows, err := db.Query(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq, reasons, cred_gen, actor_id, org_id, target_id, request_id, decision FROM audit ORDER BY seq`)
+	return readAuditRowsMode(db, false)
+}
+
+func readAuditRowsMode(db *sql.DB, legacy bool) ([]auditEvent, error) {
+	columns := strings.Split("seq,time,action,vault_id,credential_id,credential_type,result,prev_hash,hash,agent_id,grant_id,operation,v,class,ref_seq,reasons,cred_gen,actor_id,org_id,target_id,request_id,decision", ",")
+	inferVersion := false
+	if legacy {
+		present, err := auditColumnSet(db)
+		if err != nil {
+			return nil, err
+		}
+		// Only post-M1 columns have defaults. Required original columns must
+		// exist. Identifiers and replacement literals are all fixed here.
+		for i := 9; i < len(columns); i++ {
+			name := columns[i]
+			if present[name] {
+				continue
+			}
+			columns[i] = "''"
+			switch name {
+			case "v", "ref_seq", "cred_gen":
+				columns[i] = "0"
+			}
+		}
+		inferVersion = !present["v"]
+	}
+	rows, err := db.Query(`SELECT ` + strings.Join(columns, ",") + ` FROM audit ORDER BY seq`)
 	if err != nil {
 		return nil, ErrCorrupt
 	}
@@ -455,6 +487,9 @@ func readAuditRows(db *sql.DB) ([]auditEvent, error) {
 		var seq, ref, gen int64
 		if err := rows.Scan(&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref, &ev.Reasons, &gen, &ev.ActorID, &ev.OrgID, &ev.TargetID, &ev.RequestID, &ev.Decision); err != nil {
 			return nil, ErrCorrupt
+		}
+		if inferVersion {
+			ev.V = auditVersionFor(ev.Action)
 		}
 		if seq <= 0 || ref < 0 || gen < 0 || !knownAuditVersion(ev.V) {
 			return nil, ErrAudit

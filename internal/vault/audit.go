@@ -123,9 +123,9 @@ type auditEvent struct {
 // retained. Rows after the head are accepted only when they are canonical
 // locked-state unlock denials with a chronological timestamp. The returned
 // hash is the chain tip, for a later external checkpoint. This read does not
-// append an audit event.
+// append an audit event or migrate the file, including before authentication.
 func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
-	db, header, events, err := loadVault(vaultPath)
+	db, header, events, err := loadVaultForVerify(vaultPath)
 	if err != nil {
 		return "", err
 	}
