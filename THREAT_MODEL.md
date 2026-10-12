@@ -108,3 +108,26 @@ The first vertical slice does not promise protection against an attacker with ar
 - error-path secret leakage
 - audit logging for success and denial
 - log redaction
+
+
+## Human-unlocked local stdio process limits
+
+The stdio process in [ADR 0020](docs/adr/0020-local-stdio-mcp.md) selects a separate
+initialize-based compatibility profile before reading MCP input. It supports
+only `2025-06-18` and `2025-11-25`. Host launch settings bind one agent and vault;
+client identity and bounded advisory metadata never authenticate or retarget
+that binding. No callbacks are enabled. The pinentry executable and its local
+terminal/display stack join the trusted custody boundary. There is no cached or
+unattended unlock. Passphrases flow only through private helper pipes and are
+wiped after unlock, not through MCP, command arguments, config or logs.
+
+One admitted call remains outstanding until response Write returns. The stdio
+profile can wait on that exact response's completion with a 10ms deadline before
+checking admission; it does not queue another operation or weaken the two-frame
+output bound. Deadline expiry is busy, and transport ambiguity never authorizes
+replay. Signals, EOF and broken output close owned interruptible pipes; helper
+cleanup restores captured terminal state. The process joins work before locking
+the session. It does not enforce exclusive ownership against another process or
+protect secrets from a compromised host/helper. Linux runtime evidence does not
+prove macOS display behavior; unsupported platforms fail closed. M9/M10 remain
+open, and real production credentials are outside the demonstrated evidence.

@@ -12,6 +12,14 @@ Each NDJSON value is at most 128 KiB. The attestation payload remains 1 through 
 
 Cancellation and close do not recall a signature that was already released. A caller that does not see a response must not treat that as a reason to replay the call automatically. `Serve` waits for SDK callbacks and output to terminate before returning or admitting a sequential session. Stored audit failure takes precedence over cancellation and is reset only for that later session. The host must provide pipe ends whose concurrent close unblocks I/O, and must not use the session on another goroutine during `Serve`, except from a callback the session itself invokes. This process does not enforce that rule for other processes.
 
+## Separate process profile
+
+The later [human-unlocked stdio command](local-stdio-mcp.md) deliberately selects
+an initialize-based compatibility profile and a bounded 10ms write-return
+handoff. It does not change this modern reference's wire or immediate-busy
+contract. Its trust boundary and runtime evidence are in
+[ADR 0020](adr/0020-local-stdio-mcp.md).
+
 ## Local demonstration
 
 The demonstration uses a temporary database, a disposable Ed25519 key, synthetic identities, an in-memory pipe, and the official SDK client. It does not open a socket.

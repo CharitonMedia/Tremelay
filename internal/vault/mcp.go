@@ -98,6 +98,7 @@ type MCPEndpoint struct {
 	cap    *AgentCapability
 	server *mcp.Server
 	logs   *mcpLog
+	stdio  bool // trusted host-selected legacy profile, never selected by a frame
 
 	mu          sync.Mutex
 	serving     bool
@@ -124,16 +125,24 @@ func (k callKey) matches(o callKey) bool {
 // BindMCPEndpoint builds one peer around an adapter the host already bound.
 // A nil adapter is refused. The peer does not open a socket or a listener.
 func BindMCPEndpoint(cap *AgentCapability) (*MCPEndpoint, error) {
+	return bindMCPEndpoint(cap, false)
+}
+
+func bindMCPEndpoint(cap *AgentCapability, stdio bool) (*MCPEndpoint, error) {
 	if cap == nil || cap.broker == nil || safeID(cap.agentID) == "" {
 		return nil, ErrUnauthenticated
 	}
-	logs := &mcpLog{}
-	ep := &MCPEndpoint{cap: cap, logs: logs}
+	logs := &mcpLog{discard: stdio}
+	ep := &MCPEndpoint{cap: cap, logs: logs, stdio: stdio}
+	versions := []string{mcpProtocolRevision}
+	if stdio {
+		versions = []string{mcpStdio20251125, mcpStdio20250618}
+	}
 	ep.server = mcp.NewServer(&mcp.Implementation{Name: "tremelay-local-mcp", Version: "m10b"}, &mcp.ServerOptions{
 		Capabilities: &mcp.ServerCapabilities{
 			Tools: &mcp.ToolCapabilities{},
 		},
-		SupportedProtocolVersions: []string{mcpProtocolRevision},
+		SupportedProtocolVersions: versions,
 		Logger:                    slog.New(logs),
 	})
 	ep.server.AddTool(&mcp.Tool{
@@ -603,6 +612,9 @@ func (t *admitTransport) Connect(context.Context) (mcp.Connection, error) {
 }
 
 func (t *admitTransport) SupportsProtocolVersion(v string) bool {
+	if t != nil && t.conn != nil && t.conn.ep != nil && t.conn.ep.stdio {
+		return v == mcpStdio20250618 || v == mcpStdio20251125
+	}
 	return v == mcpProtocolRevision
 }
 
@@ -623,14 +635,20 @@ type admitConn struct {
 	wake       chan struct{}
 	writerDone chan struct{}
 	once       sync.Once
+	// Legacy lifecycle belongs to this Serve connection and is protected by ep.mu.
+	legacyPhase      int
+	initializeID     callKey
+	initializeNotice bool
 }
 
 type mcpOutput struct {
 	frame      []byte
 	key        callKey
 	response   bool
+	initialize bool
 	closeAfter bool
 	done       chan error
+	complete   chan struct{} // closed after delivery state is settled, never consumed
 }
 
 func (c *admitConn) SessionID() string { return "" }
@@ -648,6 +666,7 @@ func (c *admitConn) Close() error {
 		c.closed = true
 		if c.ep.pending != nil {
 			c.ep.pending.done <- io.ErrClosedPipe
+			close(c.ep.pending.complete)
 			c.ep.pending = nil
 		}
 		c.ep.mu.Unlock()
@@ -670,7 +689,12 @@ func (c *admitConn) admit(d frameDecision) bool {
 	defer c.ep.mu.Unlock()
 	// Even an error write must finish before new credential work starts:
 	// otherwise a broken output stream could execute an unrelated invocation.
-	return !c.closed && !c.terminal && c.ep.active == nil && c.ep.pending == nil && c.ep.beginCallLocked(d.key, d.invoke)
+	ok := !c.closed && !c.terminal && c.ep.active == nil && c.ep.pending == nil && c.ep.beginCallLocked(d.key, d.invoke)
+	if ok && c.ep.stdio && d.method == "initialize" {
+		c.legacyPhase = stdioInitializing
+		c.initializeID = d.key
+	}
+	return ok
 }
 
 func (c *admitConn) writeLoop() {
@@ -695,12 +719,24 @@ func (c *admitConn) writeLoop() {
 			}
 		}
 		c.ep.mu.Lock()
-		if c.closed && err == nil {
+		// A full successful stdio Write remains complete if Close won the
+		// accounting mutex while the writer returned. Reclassifying those
+		// bytes as failed makes ordinary client EOF spuriously fail shutdown.
+		// Close still denies admission and fails pending/skipped output; short
+		// or failed raw writes retain their errors. The modern profile keeps
+		// its existing conservative post-close classification.
+		if c.closed && err == nil && !c.ep.stdio {
 			err = io.ErrClosedPipe
 		}
 		if err != nil || out.closeAfter {
 			// Refuse admission before unlocking, even if Close has not run yet.
 			c.terminal = true
+		}
+		if out.initialize && err == nil && !c.closed {
+			c.legacyPhase = stdioAwaitInitialized
+			if c.initializeNotice {
+				c.legacyPhase = stdioReady
+			}
 		}
 		if out.response {
 			c.ep.finishCallLocked(out.key)
@@ -709,6 +745,7 @@ func (c *admitConn) writeLoop() {
 		// can never install a frame between an empty check and going idle.
 		c.ep.active, c.ep.pending = c.ep.pending, nil
 		out.done <- err
+		close(out.complete)
 		c.ep.mu.Unlock()
 		if err != nil || out.closeAfter {
 			_ = c.Close()
@@ -720,6 +757,7 @@ func (c *admitConn) writeLoop() {
 // the active frame's bytes were consumed but its Write has not returned.
 func (c *admitConn) submit(out *mcpOutput) error {
 	out.done = make(chan error, 1)
+	out.complete = make(chan struct{})
 	c.ep.mu.Lock()
 	if c.closed || c.terminal {
 		c.ep.mu.Unlock()
@@ -751,9 +789,15 @@ func (c *admitConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 		}
 		frame, err := c.nextFrame()
 		if err != nil {
-			return nil, c.failFrame(frame, err)
+			// Terminal input loss must interrupt output independently of SDK
+			// Wait: an admitted response may still be blocked in Write. Audit
+			// any consumed partial frame first; a failed denial remains the
+			// controlling error, then Close lets writer/dispatch settle.
+			readErr := c.failFrame(frame, err)
+			_ = c.Close()
+			return nil, readErr
 		}
-		d := classifyFrame(frame)
+		d := c.classifyFrame(frame)
 		c.ep.mu.Lock()
 		terminal := c.closed || c.terminal
 		c.ep.mu.Unlock()
@@ -769,9 +813,25 @@ func (c *admitConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 		}
 		switch d.op {
 		case opForward:
-			// The slot check never waits for rawW. A call arriving during
-			// a blocked write is rejected immediately, even if that write
-			// will complete before its rejection can be delivered.
+			c.waitStdioHandoff(ctx)
+			if ctx != nil && ctx.Err() != nil {
+				// This frame was consumed while waiting; account for it without
+				// admitting work after cancellation.
+				if err := c.drop(d); err != nil {
+					return nil, err
+				}
+				_ = c.Close()
+				return nil, ctx.Err()
+			}
+			if !c.stdioLifecycleAllowed(d) {
+				if err := c.reject(d, jsonrpc.CodeInvalidRequest); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			// Admission never releases the prior call early. The stdio-only
+			// bounded handoff above may observe its completed write; otherwise
+			// this remains the same fail-closed busy decision.
 			if !c.admit(d) {
 				if err := c.reject(d, mcpCodeBusy); err != nil {
 					return nil, err
@@ -784,6 +844,22 @@ func (c *admitConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 					return nil, err
 				}
 				continue
+			}
+			return msg, nil
+		case opInitialized:
+			if !c.acceptInitialized() {
+				if err := c.drop(d); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			msg, err := decodeAdmitted(ctx, frame)
+			if err != nil {
+				if aerr := c.drop(d); aerr != nil {
+					return nil, aerr
+				}
+				_ = c.Close()
+				return nil, err
 			}
 			return msg, nil
 		case opCancel:
@@ -844,7 +920,7 @@ func (c *admitConn) failFrame(frame []byte, err error) error {
 	if len(frame) == 0 {
 		return err
 	}
-	d := classifyFrame(frame)
+	d := c.classifyFrame(frame)
 	if aerr := c.ep.cap.denyBound(d.invoke); aerr != nil {
 		c.ep.noteAudit(aerr)
 		_ = c.Close()
@@ -873,7 +949,7 @@ func (c *admitConn) failAdmitted(d frameDecision, err error) error {
 func (c *admitConn) finishAuditFailure(d frameDecision, auditErr error) error {
 	c.ep.noteAudit(auditErr)
 	if d.idOK && d.op != opDrop {
-		out := &mcpOutput{frame: encodeRPCError(d.idRaw, jsonrpc.CodeInternalError, ""), closeAfter: true}
+		out := &mcpOutput{frame: c.errorFrame(d.idRaw, jsonrpc.CodeInternalError, ""), closeAfter: true}
 		if err := c.submit(out); err == nil {
 			return nil
 		}
@@ -899,6 +975,13 @@ func (c *admitConn) Write(ctx context.Context, msg jsonrpc.Message) error {
 	out := &mcpOutput{frame: frame, closeAfter: auditErr != nil}
 	if resp, ok := msg.(*jsonrpc.Response); ok {
 		out.key, out.response = keyFromRPC(resp.ID)
+		c.ep.mu.Lock()
+		if c.ep.stdio && c.legacyPhase == stdioInitializing && c.ep.inCall && out.key.matches(c.initializeID) && out.key.matches(c.ep.callID) {
+			out.initialize = resp.Error == nil
+			// An SDK-rejected handshake cannot be revived by reusing its id.
+			out.closeAfter = out.closeAfter || resp.Error != nil
+		}
+		c.ep.mu.Unlock()
 	}
 	err := c.submit(out)
 	if err == nil {
@@ -929,7 +1012,7 @@ func (c *admitConn) settleWrite(msg jsonrpc.Message) error {
 }
 
 func (c *admitConn) writeCode(id json.RawMessage, code int64, requested string) error {
-	return c.submit(&mcpOutput{frame: encodeRPCError(id, code, requested)})
+	return c.submit(&mcpOutput{frame: c.errorFrame(id, code, requested)})
 }
 
 func (c *admitConn) nextFrame() ([]byte, error) {
@@ -966,6 +1049,7 @@ const (
 	opForward
 	opCancel
 	opDrop
+	opInitialized
 )
 
 type frameDecision struct {
@@ -976,6 +1060,7 @@ type frameDecision struct {
 	idRaw     json.RawMessage
 	idOK      bool
 	requested string
+	method    string // fixed supported method, used only by legacy lifecycle
 }
 
 func classifyFrame(frame []byte) frameDecision {
@@ -1629,12 +1714,16 @@ func responseID(msg jsonrpc.Message) json.RawMessage {
 // mcpLog records that the SDK logged and drops the message and every attribute.
 // Credentials, payloads, frames, handles, and caller text are not written.
 type mcpLog struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	discard bool // stdio is long-lived; retain no per-request diagnostic history
 }
 
 func (h *mcpLog) Enabled(context.Context, slog.Level) bool { return true }
 func (h *mcpLog) Handle(context.Context, slog.Record) error {
+	if h.discard {
+		return nil
+	}
 	h.mu.Lock()
 	h.buf.WriteString("mcp\n")
 	h.mu.Unlock()

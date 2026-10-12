@@ -37,6 +37,16 @@ The path is one local SQLite database. Credential bytes are encrypted; the file 
 
 Passphrase change requires old/new/confirmation through no-echo terminal prompts and ignores the environment. Backup emits a checkpoint to stdout for independent retention; restore requires that explicit checkpoint and a new target. Existing snapshots retain their original passphrase. See [the lifecycle guide](docs/vault-lifecycle.md) before using these commands.
 
+## Local MCP clients
+
+`tremelay mcp serve` is a human-unlocked local stdio subprocess for one
+host-selected agent. It uses an explicitly trusted pinentry helper, with
+passphrase input separate from MCP, and exposes only the same three exact-grant
+local-attestation tools. The initialize-based profile supports `2025-06-18` and
+`2025-11-25`; the modern in-memory reference remains separate. See the
+[stdio setup, client examples, tested versions and limitations](docs/local-stdio-mcp.md).
+This command ignores the environment-passphrase shortcut described above.
+
 ## Core goals
 
 - Self-hosted and open source from day one.

@@ -50,3 +50,18 @@ M1 uses one local SQLite database as the transactional store for encrypted crede
 ## Cryptography
 
 Use envelope encryption with authenticated encryption and mature libraries. Exact primitives and key-derivation choices require an ADR before implementation. The design must allow future external root protection through TPM, HSM, KMS, or OpenBao Transit-style services. Local artifact attestation and SSH userauth both use `crypto/ed25519` and the canonical PKCS#8 encoding from `crypto/x509`. Attestation bytes are specified in [ADR 0012](docs/adr/0012-local-ed25519-attestation.md). The SSH signature is the host-bound userauth preimage from [ADR 0013](docs/adr/0013-ssh-userauth.md), not the attestation domain.
+
+
+## Local stdio process boundary
+
+[ADR 0020](docs/adr/0020-local-stdio-mcp.md) adds a human-unlocked MCP subprocess
+around the same bound capability adapter. A trusted host selects the vault,
+agent and absolute pinentry executable; a private helper pipe obtains unlock
+material without touching protocol stdin/stdout. The explicit initialize-based
+profile supports `2025-06-18` and `2025-11-25`, while the modern reference remains
+separate. Admission, exact-grant rechecks and fail-closed audit are shared.
+A stdio-only 10ms response-write handoff deadline avoids spurious busy for normal
+sequential clients without releasing admission early. Linux/macOS use owned,
+close-interruptible pipes; cleanup joins dispatch/output before locking the
+session. No listener, callback, remote identity proof or new grant is added.
+See [the client guide](docs/local-stdio-mcp.md) for measured runtime support.
