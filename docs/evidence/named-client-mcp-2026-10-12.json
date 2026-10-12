@@ -1,0 +1,420 @@
+{
+  "broker_driver_sha256": "67f568044a62d71e8d2f93efac641a33c289f941cf2e888aa16e0ca5d327369e",
+  "broker_fixture_sha256": "3b072b1aab11734d939cfc5cd5eb4711170dae998e9c2580c860b99d33d2de43",
+  "claude_binary_sha256": "24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de",
+  "codex_binary_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
+  "core_tree": "a1383c42054fe98c56a287f1b529c7b8e83536fd",
+  "custody_driver_sha256": "652c6ee7ef539af3e3d98cb677aa41f1cab8c0b7165c26236b8465863990733c",
+  "date_utc": "2026-10-12",
+  "limits": [
+    "No stock CLI public-network credential operation claimed.",
+    "Native MCP control paths only; no model turn or provider account.",
+    "Native Windows/macOS client execution and GUI behavior untested by this Linux harness.",
+    "Grok Bot untested: authenticated eligible Bot session and computer not supplied.",
+    "Fixture/server exit status is not observed directly; native client exit and child process termination are separate observations.",
+    "Broker observation scan excludes late client output and native-home bundled code/cache/SQLite; custody outer scan occurs after client EOF."
+  ],
+  "platform": "Linux x86_64 (Debian 13)",
+  "runs": [
+    {
+      "client": "codex",
+      "result": {
+        "all_tool_responses_captured_before_close": true,
+        "cleanup": {
+          "exit_code": 0,
+          "shutdown_escalated": false
+        },
+        "client": "Codex app-server",
+        "credential_invocations": 3,
+        "driver_retries": 0,
+        "evidence_scope": "real named client and broker runtime; synthetic upstream; not stock CLI network proof",
+        "exclusive_fixture_launch_marker": true,
+        "fixture": {
+          "allowed_before_request": true,
+          "audit_head": "c6b192d6d3c9ac358c34a57d63a1f0afebe04573a907cd33cb6c78d9d35f5177",
+          "audit_rows": 18,
+          "audit_verified": true,
+          "authenticated_requests": 2,
+          "broker_results": {
+            "github_issue_state": {
+              "allowed": 1,
+              "completed": 1
+            },
+            "http_request": {
+              "allowed": 1,
+              "completed": 1,
+              "denied_revoked": 1
+            }
+          },
+          "fixture": "synthetic-tls-protected-service",
+          "observation_files": 9,
+          "observations_complete": true,
+          "observed_secret_absent": true,
+          "own_output_secret_absent": true,
+          "protocol_denials": 0,
+          "serve_clean": false,
+          "shutdown_accepted": true,
+          "shutdown_reason": "signal",
+          "shutdown_signal": "terminated",
+          "unauthenticated_self_checks": 2,
+          "unexpected_requests": 0,
+          "vault_secret_absent": true,
+          "version": 1
+        },
+        "fixture_exit_status_observed": false,
+        "fixture_process_exited": true,
+        "model_turns": 0,
+        "observation_manifest": "observations/observation-manifest.json",
+        "protocol": null,
+        "protocol_observed": false,
+        "raw_client_output_capture_complete": true,
+        "results": [
+          {
+            "operation": "github_issue_state",
+            "result": "completed"
+          },
+          {
+            "operation": "http_request",
+            "result": "denied"
+          },
+          {
+            "operation": "http_request",
+            "result": "completed"
+          }
+        ],
+        "secret_scan_scope": "fixture output/audit/vault and manifest-listed captures/configuration present at fixture finalization; excludes native-home bundled code, caches, SQLite and late client output",
+        "thread_closed_before_app_server_eof": true,
+        "tool_calls": 7,
+        "tools": [
+          "describe_capability",
+          "invoke_capability",
+          "list_capabilities"
+        ],
+        "version": "tremelay_broker_smoke/0.159.2 (Debian 13.0.0; x86_64) unknown (tremelay_broker_smoke; 1)"
+      },
+      "scenario": "protected_brokers"
+    },
+    {
+      "client": "codex",
+      "result": {
+        "audit": {
+          "attestation_allowed": 1,
+          "attestation_completed": 1,
+          "chain_verified": true,
+          "payload_and_private_key_absent": true
+        },
+        "cleanup": {
+          "exit_code": 0,
+          "shutdown_escalated": false
+        },
+        "client": "Codex app-server",
+        "credential_invocations": 1,
+        "driver_retries": 0,
+        "evidence_scope": "shipping CLI launch/unlock/attestation/custody; no network credential operation",
+        "model_turns": 0,
+        "observation_manifest": "observations/observation-manifest.json",
+        "pinentry": {
+          "dedicated_pty": true,
+          "echo_disabled": true,
+          "helper_exited": true,
+          "official_helper": true,
+          "passphrase_not_echoed": true,
+          "terminal_restored": true,
+          "version": "pinentry-curses (pinentry) 1.3.1"
+        },
+        "protocol": null,
+        "protocol_observed": false,
+        "public_signature_verified": true,
+        "raw_client_output_capture_complete": true,
+        "secret_scan": {
+          "files": 10,
+          "scope": "manifest-listed full client captures and generated public configuration after client EOF",
+          "secret_absent": true
+        },
+        "server_exit_status_observed": false,
+        "server_process_count": 1,
+        "server_process_count_scope": "connected-session PID snapshot; not exclusive launch history",
+        "server_process_exited": true,
+        "setup_key_removed": true,
+        "shipping_server_exited_before_app_server_eof": true,
+        "synthetic_vault_removed": true,
+        "thread_closed_before_app_server_eof": true,
+        "tool_calls": 3,
+        "tools": [
+          "describe_capability",
+          "invoke_capability",
+          "list_capabilities"
+        ],
+        "version": "tremelay_broker_smoke/0.159.2 (Debian 13.0.0; x86_64) xterm (tremelay_broker_smoke; 1)"
+      },
+      "scenario": "shipping_attestation_custody"
+    },
+    {
+      "client": "claude",
+      "result": {
+        "all_tool_responses_captured_before_close": true,
+        "cleanup": {
+          "exit_code": 0,
+          "shutdown_escalated": false
+        },
+        "client": "Claude Code stream-json control",
+        "credential_invocations": 3,
+        "driver_retries": 0,
+        "evidence_scope": "real named client and broker runtime; synthetic upstream; not stock CLI network proof",
+        "exclusive_fixture_launch_marker": true,
+        "fixture": {
+          "allowed_before_request": true,
+          "audit_head": "0e7e49dd5cab52b6c46b807f1d3a4ef436a4bfd94d5fc6cc680d1dfdd6b4be9b",
+          "audit_rows": 19,
+          "audit_verified": true,
+          "authenticated_requests": 2,
+          "broker_results": {
+            "github_issue_state": {
+              "allowed": 1,
+              "completed": 1
+            },
+            "http_request": {
+              "allowed": 1,
+              "completed": 1,
+              "denied_revoked": 1
+            }
+          },
+          "fixture": "synthetic-tls-protected-service",
+          "observation_files": 10,
+          "observations_complete": true,
+          "observed_secret_absent": true,
+          "own_output_secret_absent": true,
+          "protocol_denials": 1,
+          "serve_clean": false,
+          "shutdown_accepted": true,
+          "shutdown_reason": "signal",
+          "shutdown_signal": "interrupt",
+          "unauthenticated_self_checks": 2,
+          "unexpected_requests": 0,
+          "vault_secret_absent": true,
+          "version": 1
+        },
+        "fixture_exit_status_observed": false,
+        "fixture_process_exited": true,
+        "model_turns": 0,
+        "observation_manifest": "observations/observation-manifest.json",
+        "protocol": null,
+        "protocol_observed": false,
+        "raw_client_output_capture_complete": true,
+        "results": [
+          {
+            "operation": "github_issue_state",
+            "result": "completed"
+          },
+          {
+            "operation": "http_request",
+            "result": "denied"
+          },
+          {
+            "operation": "http_request",
+            "result": "completed"
+          }
+        ],
+        "secret_scan_scope": "fixture output/audit/vault and manifest-listed captures/configuration present at fixture finalization; excludes native-home bundled code, caches, SQLite and late client output",
+        "tool_calls": 7,
+        "tools": [
+          "describe_capability",
+          "invoke_capability",
+          "list_capabilities"
+        ],
+        "version": "2.1.296 (Claude Code)"
+      },
+      "scenario": "protected_brokers"
+    },
+    {
+      "client": "claude",
+      "result": {
+        "audit": {
+          "attestation_allowed": 1,
+          "attestation_completed": 1,
+          "chain_verified": true,
+          "payload_and_private_key_absent": true
+        },
+        "cleanup": {
+          "exit_code": 0,
+          "shutdown_escalated": false
+        },
+        "client": "Claude Code stream-json control",
+        "credential_invocations": 1,
+        "driver_retries": 0,
+        "evidence_scope": "shipping CLI launch/unlock/attestation/custody; no network credential operation",
+        "model_turns": 0,
+        "observation_manifest": "observations/observation-manifest.json",
+        "pinentry": {
+          "dedicated_pty": true,
+          "echo_disabled": true,
+          "helper_exited": true,
+          "official_helper": true,
+          "passphrase_not_echoed": true,
+          "terminal_restored": true,
+          "version": "pinentry-curses (pinentry) 1.3.1"
+        },
+        "protocol": null,
+        "protocol_observed": false,
+        "public_signature_verified": true,
+        "raw_client_output_capture_complete": true,
+        "secret_scan": {
+          "files": 11,
+          "scope": "manifest-listed full client captures and generated public configuration after client EOF",
+          "secret_absent": true
+        },
+        "server_exit_status_observed": false,
+        "server_process_count": 1,
+        "server_process_count_scope": "connected-session PID snapshot; not exclusive launch history",
+        "server_process_exited": true,
+        "setup_key_removed": true,
+        "synthetic_vault_removed": true,
+        "tool_calls": 3,
+        "tools": [
+          "describe_capability",
+          "invoke_capability",
+          "list_capabilities"
+        ],
+        "version": "2.1.296 (Claude Code)"
+      },
+      "scenario": "shipping_attestation_custody"
+    },
+    {
+      "client": "hermes",
+      "result": {
+        "all_tool_responses_captured_before_close": true,
+        "cleanup": {
+          "exit_code": 0,
+          "shutdown_escalated": false
+        },
+        "client": "Hermes native MCP runtime",
+        "commit": "71d34bad1045610252eda02ee79549436896e784",
+        "credential_invocations": 3,
+        "driver_retries": 0,
+        "evidence_scope": "real named client and broker runtime; synthetic upstream; not stock CLI network proof",
+        "exclusive_fixture_launch_marker": true,
+        "fixture": {
+          "allowed_before_request": true,
+          "audit_head": "73fab19b73b3c2233f49dc221f73b836d8e6fb79fe27fe270882c0a8d5154132",
+          "audit_rows": 18,
+          "audit_verified": true,
+          "authenticated_requests": 2,
+          "broker_results": {
+            "github_issue_state": {
+              "allowed": 1,
+              "completed": 1
+            },
+            "http_request": {
+              "allowed": 1,
+              "completed": 1,
+              "denied_revoked": 1
+            }
+          },
+          "fixture": "synthetic-tls-protected-service",
+          "observation_files": 12,
+          "observations_complete": true,
+          "observed_secret_absent": true,
+          "own_output_secret_absent": true,
+          "protocol_denials": 0,
+          "serve_clean": true,
+          "shutdown_accepted": true,
+          "shutdown_reason": "eof",
+          "unauthenticated_self_checks": 2,
+          "unexpected_requests": 0,
+          "vault_secret_absent": true,
+          "version": 1
+        },
+        "fixture_exit_status_observed": false,
+        "fixture_process_exited": true,
+        "mcp": "2.0.0",
+        "model_turns": 0,
+        "observation_manifest": "observations/observation-manifest.json",
+        "protocol": "2025-11-25",
+        "protocol_observed": true,
+        "python": "3.12.14",
+        "raw_client_output_capture_complete": true,
+        "results": [
+          {
+            "operation": "github_issue_state",
+            "result": "completed"
+          },
+          {
+            "operation": "http_request",
+            "result": "denied"
+          },
+          {
+            "operation": "http_request",
+            "result": "completed"
+          }
+        ],
+        "secret_scan_scope": "fixture output/audit/vault and manifest-listed captures/configuration present at fixture finalization; excludes native-home bundled code, caches, SQLite and late client output",
+        "tool_calls": 7,
+        "tools": [
+          "mcp__tremelay_smoke__describe_capability",
+          "mcp__tremelay_smoke__invoke_capability",
+          "mcp__tremelay_smoke__list_capabilities"
+        ],
+        "version": "v0.21.7"
+      },
+      "scenario": "protected_brokers"
+    },
+    {
+      "client": "hermes",
+      "result": {
+        "audit": {
+          "attestation_allowed": 1,
+          "attestation_completed": 1,
+          "chain_verified": true,
+          "payload_and_private_key_absent": true
+        },
+        "cleanup": {
+          "exit_code": 0,
+          "shutdown_escalated": false
+        },
+        "client": "Hermes native MCP runtime",
+        "commit": "71d34bad1045610252eda02ee79549436896e784",
+        "credential_invocations": 1,
+        "driver_retries": 0,
+        "evidence_scope": "shipping CLI launch/unlock/attestation/custody; no network credential operation",
+        "mcp": "2.0.0",
+        "model_turns": 0,
+        "observation_manifest": "observations/observation-manifest.json",
+        "pinentry": {
+          "dedicated_pty": true,
+          "echo_disabled": true,
+          "helper_exited": true,
+          "official_helper": true,
+          "passphrase_not_echoed": true,
+          "terminal_restored": true,
+          "version": "pinentry-curses (pinentry) 1.3.1"
+        },
+        "protocol": "2025-11-25",
+        "protocol_observed": true,
+        "public_signature_verified": true,
+        "python": "3.12.14",
+        "raw_client_output_capture_complete": true,
+        "secret_scan": {
+          "files": 13,
+          "scope": "manifest-listed full client captures and generated public configuration after client EOF",
+          "secret_absent": true
+        },
+        "server_exit_status_observed": false,
+        "server_process_count": 1,
+        "server_process_count_scope": "connected-session PID snapshot; not exclusive launch history",
+        "server_process_exited": true,
+        "setup_key_removed": true,
+        "synthetic_vault_removed": true,
+        "tool_calls": 3,
+        "tools": [
+          "mcp__tremelay_smoke__describe_capability",
+          "mcp__tremelay_smoke__invoke_capability",
+          "mcp__tremelay_smoke__list_capabilities"
+        ],
+        "version": "v0.21.7"
+      },
+      "scenario": "shipping_attestation_custody"
+    }
+  ],
+  "shipping_binary_sha256": "f1d8fd50f8a1f3aec0eebaa246e2ae83d18ac2b6847d9b4fd81780850ef93de2",
+  "version": 1
+}

@@ -14,8 +14,9 @@ See [ADR 0020](adr/0020-local-stdio-mcp.md) for process custody and
 
 ## Prerequisites and unlock
 
-- Build the CLI with the repository-pinned Go toolchain. Linux and macOS process
-  pipes are implemented; Windows `mcp serve` fails closed. Linux is runtime-tested;
+- Build the CLI with the repository-pinned Go toolchain. Linux and macOS inherited
+  pipes and connected unnamed Unix stream pairs are implemented; Windows
+  `mcp serve` fails closed. Linux is runtime-tested;
   macOS compilation alone is not terminal/display validation.
 - Create the agent and its narrowly scoped operation grant using the human CLI.
   The chosen agent ID is host authority, not an identity proven by MCP.
@@ -23,7 +24,9 @@ See [ADR 0020](adr/0020-local-stdio-mcp.md) for process custody and
   A GUI helper needs a working local display. A curses helper needs a separate
   interactive terminal. The helper and display/terminal stack are trusted with
   the passphrase. Tremelay does not install or configure them.
-- Launch from a client that owns stdin/stdout pipes. Do not run this command with
+- Launch from a client that owns stdin/stdout pipes or connected unnamed Unix
+  stream pairs. Named/abstract sockets and network sockets are not accepted.
+  Do not run this command with
   terminal stdin, redirect the protocol into a file, or send a passphrase on stdin.
 
 The client launches this command, substituting real absolute paths and an

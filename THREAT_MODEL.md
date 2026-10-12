@@ -127,7 +127,11 @@ One admitted call remains outstanding until response Write returns. The stdio
 profile can wait on that exact response's completion with a 10ms deadline before
 checking admission; it does not queue another operation or weaken the two-frame
 output bound. Deadline expiry is busy, and transport ambiguity never authorizes
-replay. Signals, EOF and broken output close owned interruptible pipes; helper
+replay. Signals, EOF and broken output close owned interruptible inherited pipes
+or connected unnamed Unix stream pairs. Sockets must be non-listening Unix
+streams with both endpoints unnamed; this adds no listener or remote identity.
+The classifier uses kernel address lengths on Linux, not lossy display names.
+Read-half-close is detected without consuming protocol bytes. Helper
 cleanup restores captured terminal state. The process joins work before locking
 the session. It does not enforce exclusive ownership against another process or
 protect secrets from a compromised host/helper. Linux runtime evidence does not

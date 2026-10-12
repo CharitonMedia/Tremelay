@@ -47,7 +47,8 @@ credential-use tools for exact `local_artifact_attest`, `http_request` and
 return status-only HTTP or the four-field GitHub summary; credentials stay in
 the broker. Shared vaults remain attestation-only. The initialize-based profile supports `2025-06-18` and
 `2025-11-25`; the modern in-memory reference remains separate. See the
-[stdio setup, client examples, tested versions and limitations](docs/local-stdio-mcp.md).
+[stdio setup, client examples, tested versions and limitations](docs/local-stdio-mcp.md)
+and [measured Codex, Claude Code and Hermes integration](docs/named-client-mcp-tests.md).
 This command ignores the environment-passphrase shortcut described above.
 
 ## Core goals

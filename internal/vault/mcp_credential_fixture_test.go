@@ -28,6 +28,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/CharitonMedia/Tremelay/internal/mcpstdio"
 )
 
 // TestMCPSyntheticCredentialFixture is an explicitly selected test-binary host,
@@ -385,10 +387,6 @@ func runMCPCredentialFixture() error {
 // files satisfy Serve's close-interruptible read/write precondition.
 func fixtureStdio() (*os.File, *os.File, error) {
 	duplicate := func(source *os.File) (*os.File, error) {
-		info, err := source.Stat()
-		if err != nil || info.Mode()&os.ModeNamedPipe == 0 {
-			return nil, ErrInvalid
-		}
 		raw, err := source.SyscallConn()
 		if err != nil {
 			return nil, ErrInvalid
@@ -397,6 +395,10 @@ func fixtureStdio() (*os.File, *os.File, error) {
 		var dupErr error
 		err = raw.Control(func(sourceFD uintptr) { fd, dupErr = unix.FcntlInt(sourceFD, unix.F_DUPFD_CLOEXEC, 3) })
 		if err != nil || dupErr != nil || fd < 0 {
+			return nil, ErrInvalid
+		}
+		if !mcpstdio.ValidInheritedStream(fd) {
+			_ = unix.Close(fd)
 			return nil, ErrInvalid
 		}
 		if err := unix.SetNonblock(fd, true); err != nil {
