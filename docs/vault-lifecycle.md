@@ -13,7 +13,11 @@ tremelay vault change-passphrase --path /canonical/path/vault.db
 Use a terminal. Enter the old passphrase, then the new value twice; none is echoed.
 This command ignores `TREMELAY_PASSPHRASE` and refuses piped input. The replacement
 must differ and must contain 8–1024 bytes. This length check is not a guarantee of
-strength or a compromised-password check. No passphrase belongs on the command line.
+strength or a compromised-password check. No passphrase belongs on the command line. Ctrl-C or a caught SIGINT/SIGTERM
+during a prompt restores the terminal; after authentication it records a fixed
+change denial. Uncatchable termination, power loss, and OS restore failures cannot
+guarantee terminal cleanup. The process/PTY regression tests exercise Linux;
+Windows/macOS terminal and signal behavior has not been directly tested.
 
 The same data-encryption key is rewrapped with a fresh salt and nonce. The wrap and
 audit change commit together. Wrong old input, rejected replacement, mismatched

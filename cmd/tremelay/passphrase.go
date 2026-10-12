@@ -2,33 +2,82 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
 	"golang.org/x/term"
 )
 
 func cmdChangePassphrase(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	terminal := term.NewTerminal(struct {
+		io.Reader
+		io.Writer
+	}{stdin, io.Discard}, "")
 	return changePassphrase(args, stdout, stderr, func(prompt string) ([]byte, error) {
-		f, ok := stdin.(*os.File)
-		if !ok || !term.IsTerminal(int(f.Fd())) {
-			return nil, vault.ErrPassphrase
-		}
-		if _, err := fmt.Fprint(stderr, prompt); err != nil {
-			return nil, vault.ErrIO
-		}
-		pass, err := term.ReadPassword(int(f.Fd()))
-		_, outputErr := fmt.Fprintln(stderr)
-		if err != nil || outputErr != nil {
-			vault.Wipe(pass)
-			return nil, vault.ErrPassphrase
-		}
-		return pass, nil
+		return readChangePassphrase(ctx, stdin, stderr, terminal, prompt)
 	})
+}
+
+// Only this goroutine owns terminal state. MakeRaw runs before the reader
+// starts, so cancellation cannot race a late echo-disabling ioctl. Terminal's
+// line reader changes no OS flags and treats Ctrl-C as an input cancellation.
+// A signal can leave a blocked reader until main exits; it has no state-writing
+// authority and wipes any late returned buffer. Cancellation never waits for it.
+func readChangePassphrase(ctx context.Context, stdin io.Reader, stderr io.Writer, terminal *term.Terminal, prompt string) (pass []byte, err error) {
+	f, ok := stdin.(*os.File)
+	if !ok || !term.IsTerminal(int(f.Fd())) || ctx.Err() != nil {
+		return nil, vault.ErrPassphrase
+	}
+	state, err := term.MakeRaw(int(f.Fd()))
+	if err != nil {
+		return nil, vault.ErrPassphrase
+	}
+	defer func() {
+		if restoreErr := term.Restore(int(f.Fd()), state); restoreErr != nil {
+			vault.Wipe(pass)
+			pass, err = nil, vault.ErrIO
+		}
+	}()
+	if _, err := fmt.Fprint(stderr, prompt); err != nil {
+		return nil, vault.ErrIO
+	}
+	type answer struct {
+		pass []byte
+		err  error
+	}
+	result := make(chan answer)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		line, err := terminal.ReadPassword("")
+		p := []byte(line)
+		select {
+		case result <- answer{p, err}:
+		case <-done:
+			vault.Wipe(p)
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		err = vault.ErrPassphrase
+	case got := <-result:
+		pass, err = got.pass, got.err
+	}
+	_, outputErr := fmt.Fprintln(stderr)
+	if err != nil || outputErr != nil || ctx.Err() != nil {
+		vault.Wipe(pass)
+		return nil, vault.ErrPassphrase
+	}
+	return pass, nil
 }
 
 // The prompt function is injected only for tests. The command's sole input

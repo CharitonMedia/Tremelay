@@ -87,6 +87,12 @@ func cmdVault(args []string, getenv func(string) string, stdin io.Reader, stdout
 		usage(stderr)
 		return 2
 	}
+	// Let closed stdout pipes reach each lifecycle command's committed-outcome
+	// handler instead of terminating the process through Go's default SIGPIPE.
+	if args[0] == "change-passphrase" || args[0] == "backup" || args[0] == "restore" {
+		stop := lifecyclePipeErrors()
+		defer stop()
+	}
 	switch args[0] {
 	case "change-passphrase":
 		return cmdChangePassphrase(args[1:], stdin, stdout, stderr)

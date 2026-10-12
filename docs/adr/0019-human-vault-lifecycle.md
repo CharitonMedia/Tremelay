@@ -21,6 +21,13 @@ old passphrase is authenticated through ordinary `Unlock` before a new value is
 requested. An incorrect old value records the existing locked-unlock denial.
 Missing terminal input before authentication makes no vault change. A cancelled
 or mismatched replacement after authentication records a fixed change denial.
+The command catches SIGINT/SIGTERM while prompting. It enters raw mode
+synchronously, uses the existing x/term no-echo line reader (which recognizes
+Ctrl-C), and restores the captured terminal state before returning a cancelled
+read. A cancelled blocked reader cannot change terminal flags or vault state;
+any late returned byte buffer is wiped, and main exits without waiting for input.
+SIGKILL, power loss, and a failed OS terminal-restore operation cannot be made
+clean cancellations; a restore error fails closed.
 
 The host-only `Session.ChangePassphrase(old, new)` verifies both lengths (the
 existing 8–1024 byte bound), rejects an unchanged value, and reauthenticates the
@@ -71,7 +78,9 @@ sidecar-collision rules are unchanged. Restore returns exit 3 for `ErrPublished`
 visibility is not known crash-durable). Messages require inspection and prohibit
 blind retry. Success followed by failed stdout confirmation also returns exit 3,
 explicitly saying the restored destination remains. No restore outcome triggers
-an automatic retry, cutover, or additional unlock. See ADR 0016 for the publication
+an automatic retry, cutover, or additional unlock. These lifecycle commands
+subscribe to SIGPIPE so a closed output pipe returns EPIPE to the fixed outcome
+handler instead of killing the process before it can report retained state. See ADR 0016 for the publication
 and Windows durability limits. Ordinary operational errors return 1; usage returns 2.
 
 An old snapshot and its original checkpoint still match. The CLI cannot tell that
@@ -100,3 +109,12 @@ cancellation, buffer wiping, terminal-only entry and fixed argument errors.
 Existing backup fault tests continue covering publication/rollback failures.
 The existing `TestCLIAuditVerifyReadOnly` and `TestVerifyAuditReadOnlyCompatibility`
 remain required: this work does not restore a pre-authentication write to verify.
+
+`TestLifecycleProcessCancellation` runs actual Linux PTY child processes for
+Ctrl-C, SIGINT, and SIGTERM at all three prompts, checks full terminal-state
+restoration, retained old authority and authenticated denial rows.
+`TestLifecycleProcessBrokenStdout` closes an actual stdout pipe for all three
+lifecycle commands and checks the committed-outcome warning and exit status.
+These process/PTY tests are Linux-only; Windows/macOS terminal and signal
+behavior has not been directly exercised. Shared state retention is source-
+reviewed; the new rewrap fixtures are single-user.
