@@ -1,9 +1,9 @@
 {
   "broker_driver_sha256": "67f568044a62d71e8d2f93efac641a33c289f941cf2e888aa16e0ca5d327369e",
-  "broker_fixture_sha256": "3b072b1aab11734d939cfc5cd5eb4711170dae998e9c2580c860b99d33d2de43",
+  "broker_fixture_sha256": "db117c63f513a729d9b87e5a105900413e85841c9ee88a38190776c9455c8753",
   "claude_binary_sha256": "24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de",
   "codex_binary_sha256": "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e",
-  "core_tree": "a1383c42054fe98c56a287f1b529c7b8e83536fd",
+  "core_tree": "12aa634b0ced9b4ae88f8fdc6f37ae6ffaae8a20",
   "custody_driver_sha256": "652c6ee7ef539af3e3d98cb677aa41f1cab8c0b7165c26236b8465863990733c",
   "date_utc": "2026-10-12",
   "limits": [
@@ -31,7 +31,7 @@
         "exclusive_fixture_launch_marker": true,
         "fixture": {
           "allowed_before_request": true,
-          "audit_head": "c6b192d6d3c9ac358c34a57d63a1f0afebe04573a907cd33cb6c78d9d35f5177",
+          "audit_head": "9fb66d80f30507ff319994e65f24c9a0077b4f1dceed3748bf0832e3a8db4638",
           "audit_rows": 18,
           "audit_verified": true,
           "authenticated_requests": 2,
@@ -164,7 +164,7 @@
         "exclusive_fixture_launch_marker": true,
         "fixture": {
           "allowed_before_request": true,
-          "audit_head": "0e7e49dd5cab52b6c46b807f1d3a4ef436a4bfd94d5fc6cc680d1dfdd6b4be9b",
+          "audit_head": "ffdc1b6ae1e6e862aa094cd3186ca013b98ce34a1f58130facd062a5a8789d4f",
           "audit_rows": 19,
           "audit_verified": true,
           "authenticated_requests": 2,
@@ -295,7 +295,7 @@
         "exclusive_fixture_launch_marker": true,
         "fixture": {
           "allowed_before_request": true,
-          "audit_head": "73fab19b73b3c2233f49dc221f73b836d8e6fb79fe27fe270882c0a8d5154132",
+          "audit_head": "5628303bd46cb1b1080cfa9729c95c4f1244739c9113de6a157ebbf00c972209",
           "audit_rows": 18,
           "audit_verified": true,
           "authenticated_requests": 2,
@@ -415,6 +415,6 @@
       "scenario": "shipping_attestation_custody"
     }
   ],
-  "shipping_binary_sha256": "f1d8fd50f8a1f3aec0eebaa246e2ae83d18ac2b6847d9b4fd81780850ef93de2",
+  "shipping_binary_sha256": "27be925682e3a0b43dd821f15205d9dd8b147253f64b7d4e24fc0eaf65b42ee8",
   "version": 1
 }

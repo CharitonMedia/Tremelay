@@ -199,7 +199,7 @@ launch marker or a count of every historical launch attempt.
 ## Measured Linux acceptance: 2026-10-12
 
 All six normal workflows passed on core tree
-`a1383c42054fe98c56a287f1b529c7b8e83536fd`. The
+`12aa634b0ced9b4ae88f8fdc6f37ae6ffaae8a20`. The
 [machine-readable evidence](evidence/named-client-mcp-2026-10-12.json) records
 binary/driver hashes, audit heads, exact counts, shutdown classification, and
 scan coverage without retaining protected material.
