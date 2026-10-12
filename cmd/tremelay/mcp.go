@@ -60,7 +60,12 @@ func serveMCP(ctx context.Context, path, agentID string, options pinentryOptions
 	stopWatch := stream.watchDisconnect(cancelUnlock)
 	pass, err := readPinentry(unlockCtx, options)
 	stopWatch()
+	// Joining the watcher can expose cancellation just after the helper
+	// returned. Do not unlock with a late successful answer, and do not
+	// replace a terminal-restoration failure or timeout with cancellation.
+	err = pinentryDiagnostic(unlockCtx, err, nil)
 	if err != nil {
+		vault.Wipe(pass)
 		return fail(err.Error()) // readPinentry returns only fixed local errors.
 	}
 	// Unlock has no context API. Finish its bounded KDF, wipe immediately, and

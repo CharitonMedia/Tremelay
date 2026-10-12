@@ -464,3 +464,81 @@ func TestStdioMCPEOFInterruptsAdmittedOutput(t *testing.T) {
 		}
 	}
 }
+
+// The raw write has a result, but Close wins before its accounting settles.
+// No protocol call or credential operation is involved in this transport test.
+type closeSettledMCPWriter struct {
+	entered, release chan struct{}
+	n                int
+	err              error
+}
+
+func (w *closeSettledMCPWriter) Write([]byte) (int, error) {
+	close(w.entered)
+	<-w.release
+	return w.n, w.err
+}
+
+func (w *closeSettledMCPWriter) Close() error { close(w.release); return nil }
+
+func TestStdioMCPWriteCompletionAfterClose(t *testing.T) {
+	for _, stdio := range []bool{false, true} {
+		profile := "modern"
+		if stdio {
+			profile = "stdio"
+		}
+		for _, tc := range []struct {
+			name string
+			n    int
+			err  error
+			want error
+		}{
+			{"full", 2, nil, nil},
+			{"short", 1, nil, io.ErrShortWrite},
+			{"full-with-error", 2, io.ErrClosedPipe, io.ErrClosedPipe},
+			{"failed", 0, io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+		} {
+			t.Run(profile+"-"+tc.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ep := &MCPEndpoint{stdio: stdio}
+					writer := &closeSettledMCPWriter{entered: make(chan struct{}), release: make(chan struct{}), n: tc.n, err: tc.err}
+					c := &admitConn{ep: ep, raw: io.NopCloser(bytes.NewReader(nil)), rawW: writer}
+					c.startWriter()
+					defer func() { _ = c.Close(); <-c.writerDone }()
+					out := &mcpOutput{frame: []byte("{}")}
+					if err := c.submit(out); err != nil {
+						t.Fatal(err)
+					}
+					<-writer.entered
+					pending := &mcpOutput{frame: []byte("{}")}
+					if err := c.submit(pending); err != nil {
+						t.Fatal(err)
+					}
+					if err := c.Close(); err != nil {
+						t.Fatal(err)
+					}
+					want := tc.want
+					if !stdio && want == nil {
+						want = io.ErrClosedPipe
+					}
+					if got := <-out.done; !errors.Is(got, want) {
+						t.Fatalf("settled write = %v, want %v", got, want)
+					}
+					if got := <-pending.done; !errors.Is(got, io.ErrClosedPipe) {
+						t.Fatalf("pending write = %v", got)
+					}
+					if c.admit(frameDecision{}) {
+						t.Fatal("closed connection admitted new work")
+					}
+					if err := c.submit(&mcpOutput{}); !errors.Is(err, io.ErrClosedPipe) {
+						t.Fatalf("post-close output = %v", err)
+					}
+					<-c.writerDone
+					if ep.active != nil || ep.pending != nil || ep.inCall {
+						t.Fatal("closed output did not settle")
+					}
+				})
+			})
+		}
+	}
+}

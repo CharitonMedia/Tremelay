@@ -128,6 +128,14 @@ Cancellation does not recall an already released signature. Review the vault
 audit through the human CLI. Audit persistence failure stops service and takes
 precedence over routine cancellation.
 
+An abrupt input close interrupts outstanding output. Cleanup still joins
+transport work and locks the session, but skipped, short or failed response
+writes can produce exit 1 with the fixed `mcp session failed; inspect the vault
+audit before retrying an operation` diagnostic. A full successful raw stdio
+write keeps that result if close wins the accounting mutex just afterward;
+the closed connection still cannot admit new work. This does not authorize
+replaying an operation with a missing response.
+
 The host owns the unlocked session for this process. This command does not add
 cross-process locking, remote identity proof, host-compromise protection, a
 network listener, a raw-secret API, or signed-release assurance.
@@ -151,6 +159,13 @@ allowed/completed attestation pair, no retries, helper no-echo/terminal
 restoration, and server/helper exit after client close. Fixture setup uses the
 existing human CLI's environment shortcut with generated test-only material;
 the tested MCP subprocess itself receives none of it.
+
+Normal Python client closure must leave server stderr empty. The Codex check
+explicitly enables its MCP child-stderr INFO forwarding and rejects the fixed
+session-failed diagnostic; its app-server must exit 0 without forced shutdown.
+Both checks observe that the Tremelay process has exited. Neither public client
+API exposes the child's exit status here, so an app-server exit 0 is not claimed
+as a directly observed Tremelay exit 0.
 
 Runtime evidence on Linux used Codex 0.159.2, official Python MCP 1.29.0,
 cryptography 50.0.0, pinentry-curses 1.3.1, and Go 1.26.9. Ten fresh sessions per

@@ -39,6 +39,8 @@ DOMAIN = "tremelay/local-artifact-attestation/v1"
 PURPOSE = "local-artifact-attestation"
 RESOURCE = "stdio-smoke-artifact"
 TIMEOUT = 40
+MAX_STDERR = 1 << 20
+SESSION_FAILED = b"mcp session failed; inspect the vault audit before retrying an operation"
 
 
 def require(condition: bool, message: str) -> None:
@@ -249,7 +251,7 @@ def catalogue(value: dict, fixture: Fixture) -> dict:
 async def python_smoke(fixture: Fixture, read_rounds: int = 1) -> dict:
     pids = set()
 
-    with PinentryTerminal(fixture.passphrase, fixture.pinentry) as terminal, tempfile.TemporaryFile(mode="w+") as stderr:
+    with PinentryTerminal(fixture.passphrase, fixture.pinentry) as terminal, tempfile.TemporaryFile() as stderr:
         params = StdioServerParameters(command=str(fixture.binary), args=fixture.args(terminal.path),
                                        env=fixture.env, cwd=str(fixture.root / "work"))
         async with asyncio.timeout(90):
@@ -272,13 +274,21 @@ async def python_smoke(fixture: Fixture, read_rounds: int = 1) -> dict:
                     fixture.verify(success_content(invoked.model_dump(by_alias=True)))
         require_exited(pids)
         stderr.seek(0)
-        fixture.no_secret(stderr.read().encode())
+        errors = stderr.read(MAX_STDERR + 1)
+        require(len(errors) <= MAX_STDERR, "Python server stderr exceeded capture bound")
+        fixture.no_secret(errors)
+        require(SESSION_FAILED not in errors, "Python server reported session failure on normal closure")
+        require(not errors, "Python server emitted unexpected stderr on normal closure")
         pinentry = terminal.verify()
     return {"client": "official Python mcp", "version": importlib.metadata.version("mcp"),
             "protocol": initialized.protocolVersion, "initialize": True, "three_tools": True,
             "sequential_read_rounds": read_rounds,
             "list_describe_invoke": True, "public_signature_verified": True,
-            "server_exited_after_client_close": True, "pinentry": pinentry, "audit": fixture.audit(), "call_retries": 0}
+            "server_exited_after_client_close": True, "server_stderr_empty": True,
+            "shutdown_session_failed_diagnostic_absent": True,
+            # The official transport owns wait(); its public context exposes no child status.
+            "server_exit_status_observed": False,
+            "pinentry": pinentry, "audit": fixture.audit(), "call_retries": 0}
 
 
 class AppServer:
@@ -286,11 +296,15 @@ class AppServer:
 
     def __init__(self, command: Path, fixture: Fixture):
         self.stderr = tempfile.TemporaryFile()
-        self.process = subprocess.Popen([str(command), "app-server", "--stdio"], env=fixture.env,
+        # Codex forwards MCP child stderr at INFO. Enable that exact target so
+        # absent failure diagnostics cannot be an artifact of the default filter.
+        env = dict(fixture.env, RUST_LOG="error,codex_rmcp_client::stdio_server_launcher=info")
+        self.process = subprocess.Popen([str(command), "app-server", "--stdio"], env=env,
                                         cwd=fixture.root / "work", stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=self.stderr)
         self.buffer = b""
         self.next_id = 0
+        self.close_escalated = False
 
     def send(self, value: dict) -> None:
         self.process.stdin.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
@@ -321,6 +335,7 @@ class AppServer:
         try:
             self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            self.close_escalated = True
             self.process.terminate()
             try:
                 self.process.wait(timeout=5)
@@ -329,8 +344,9 @@ class AppServer:
                 self.process.wait(timeout=5)
         self.process.stdout.close()
         self.stderr.seek(0)
-        output = self.stderr.read(1 << 20)
+        output = self.stderr.read(MAX_STDERR + 1)
         self.stderr.close()
+        require(len(output) <= MAX_STDERR, "Codex stderr exceeded capture bound")
         return self.process.returncode, output
 
 
@@ -378,6 +394,8 @@ def codex_smoke(fixture: Fixture, codex: Path, read_rounds: int = 1) -> dict:
             exit_code, errors = app.close()
             fixture.no_secret(errors)
         require(exit_code == 0, "Codex did not close normally")
+        require(not app.close_escalated, "Codex required forced shutdown")
+        require(SESSION_FAILED not in errors, "Codex server reported session failure on normal closure")
         require_exited(pids)
         pinentry = terminal.verify()
     return {"client": "installed Codex app-server", "version": initialized["userAgent"],
@@ -385,7 +403,13 @@ def codex_smoke(fixture: Fixture, codex: Path, read_rounds: int = 1) -> dict:
             "sequential_read_rounds": read_rounds,
             "three_tools": True, "list_describe_invoke": True, "public_signature_verified": True,
             "same_thread_connection": True, "server_exited_after_client_close": True,
-            "app_server_exit": exit_code, "pinentry": pinentry, "audit": fixture.audit(), "call_retries": 0}
+            "app_server_exit": exit_code, "app_server_shutdown_escalated": False,
+            "server_stderr_forwarding": "Codex INFO diagnostics enabled",
+            "shutdown_session_failed_diagnostic_absent": True,
+            "shutdown_cancellation_diagnostic_observed": b"mcp session cancelled" in errors,
+            # App-server success is not a directly observed Tremelay exit status.
+            "server_exit_status_observed": False,
+            "pinentry": pinentry, "audit": fixture.audit(), "call_retries": 0}
 
 
 def main() -> None:

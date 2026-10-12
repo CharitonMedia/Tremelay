@@ -329,7 +329,22 @@ func TestMCPProcessEOFAndBrokenOutput(t *testing.T) {
 				p.finish(t, 1, "mcp session failed")
 			} else {
 				p.input.Close()
-				p.finish(t, 0, "")
+				select {
+				case <-p.done:
+				case <-time.After(10 * time.Second):
+					t.Fatal("abrupt EOF did not settle the MCP child")
+				}
+				code := p.cmd.ProcessState.ExitCode()
+				wantDiagnostic := ""
+				if code == 1 {
+					wantDiagnostic = "mcp session failed; inspect the vault audit before retrying an operation\n"
+				} else if code != 0 {
+					t.Fatalf("abrupt EOF did not exit normally: %d", code)
+				}
+				if p.diag.String() != wantDiagnostic {
+					t.Fatal("abrupt EOF returned an unexpected diagnostic")
+				}
+				p.finish(t, code, "")
 			}
 		})
 	}

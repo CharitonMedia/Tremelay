@@ -26,6 +26,8 @@ func TestPinentryPrivateHelper(t *testing.T) {
 	}{
 		{"success", nil}, {"cancel", errPinentryCancelled},
 		{"malformed", errPinentryFailed}, {"hang", errPinentryTimeout},
+		{"sigint", errPinentryCancelled}, {"sigterm", errPinentryCancelled},
+		{"sigkill", errPinentryFailed}, {"exit1", errPinentryFailed}, {"eof", errPinentryFailed},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "tremelay-pinentry-test-"+tc.mode)

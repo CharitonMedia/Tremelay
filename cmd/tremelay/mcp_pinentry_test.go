@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestPinentryReply(t *testing.T) {
@@ -86,6 +88,38 @@ func TestPinentryAlreadyCancelled(t *testing.T) {
 	}
 }
 
+func TestPinentryDiagnosticPrecedence(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	timedOut, stop := context.WithDeadline(context.Background(), time.Time{})
+	defer stop()
+	for _, tc := range []struct {
+		name        string
+		ctx         context.Context
+		protocolErr error
+		waitErr     error
+		want        error
+	}{
+		{"success", context.Background(), nil, nil, nil},
+		{"late-parent-cancellation", cancelled, nil, nil, errPinentryCancelled},
+		{"read-failure-with-cancellation", cancelled, errPinentryFailed, nil, errPinentryCancelled},
+		{"restore-before-cancellation", cancelled, errPinentryTerminal, nil, errPinentryTerminal},
+		{"restore-before-timeout", timedOut, errPinentryTerminal, nil, errPinentryTerminal},
+		{"timeout-before-cancellation", cancelled, errPinentryTimeout, nil, errPinentryTimeout},
+		{"observed-timeout", timedOut, errPinentryFailed, nil, errPinentryTimeout},
+		{"unknown-eof", context.Background(), io.EOF, nil, errPinentryFailed},
+		{"unknown-reap-error", context.Background(), nil, errors.New("synthetic private reap detail"), errPinentryFailed},
+		{"unavailable", context.Background(), errPinentryUnavailable, nil, errPinentryUnavailable},
+		{"assuan-cancellation", context.Background(), errPinentryCancelled, nil, errPinentryCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pinentryDiagnostic(tc.ctx, tc.protocolErr, tc.waitErr); got != tc.want {
+				t.Fatalf("unexpected fixed diagnostic: %v", got)
+			}
+		})
+	}
+}
+
 // A test-only executable identity selects a synthetic Assuan peer without
 // arguments or environment credentials. Its passphrase is generated only
 // inside the helper and transported solely through the private data pipe.
@@ -139,6 +173,26 @@ func testPinentryHelper(mode string) int {
 				return 0
 			case "malformed":
 				_, _ = io.WriteString(os.Stdout, "D do-not-reflect%xx\nOK\n")
+			case "sigint", "sigterm", "sigkill":
+				var sig os.Signal = syscall.SIGINT
+				if mode == "sigterm" {
+					sig = syscall.SIGTERM
+				} else if mode == "sigkill" {
+					sig = os.Kill
+				}
+				process, err := os.FindProcess(os.Getpid())
+				if err != nil || process.Signal(sig) != nil {
+					return 1
+				}
+				// Let normal OS signal handling determine the typed wait status.
+				time.Sleep(time.Second)
+				return 1
+			case "exit1":
+				return 1
+			case "eof":
+				os.Stdout.Close()
+				time.Sleep(time.Hour) // The parent's cleanup kill must stay a failure.
+				return 0
 			default:
 				return 2
 			}

@@ -132,7 +132,11 @@ failure, and EOF closes the session. Terminal read failure closes owned pipes
 independently of SDK Wait, so an admitted response blocked on full output cannot
 retain the unlocked session after input disappears. A consumed partial frame is
 audited first, and that audit failure outranks shutdown errors. `Serve` joins dispatch and its writer
-before session lock. Other platforms fail closed for this command pending
+before session lock. A full successful raw stdio write is not reclassified as
+failed solely because close acquires the accounting mutex first. Closed state
+still forbids admission; skipped, short, failed and pending writes retain their
+errors, as do required audit failures. The modern profile retains its existing
+post-close write classification. Other platforms fail closed for this command pending
 runtime implementation; the other CLI commands remain buildable.
 
 ### Evidence and remaining limits

@@ -719,7 +719,13 @@ func (c *admitConn) writeLoop() {
 			}
 		}
 		c.ep.mu.Lock()
-		if c.closed && err == nil {
+		// A full successful stdio Write remains complete if Close won the
+		// accounting mutex while the writer returned. Reclassifying those
+		// bytes as failed makes ordinary client EOF spuriously fail shutdown.
+		// Close still denies admission and fails pending/skipped output; short
+		// or failed raw writes retain their errors. The modern profile keeps
+		// its existing conservative post-close classification.
+		if c.closed && err == nil && !c.ep.stdio {
 			err = io.ErrClosedPipe
 		}
 		if err != nil || out.closeAfter {

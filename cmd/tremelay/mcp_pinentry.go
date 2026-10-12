@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
@@ -46,6 +47,40 @@ func pinentryContextError(ctx context.Context) error {
 		return errPinentryTimeout
 	}
 	return errPinentryCancelled
+}
+
+// Only observed cancellation establishes this diagnostic. A cleanup SIGKILL,
+// an unclassified EOF, or an ordinary nonzero exit is still a helper failure.
+// Terminal restoration and an established timeout keep their more specific
+// diagnostics even when cancellation is observed at the same time.
+func pinentryDiagnostic(ctx context.Context, protocolErr, waitErr error) error {
+	contextErr := ctx.Err()
+	if errors.Is(protocolErr, errPinentryTerminal) {
+		return errPinentryTerminal
+	}
+	if errors.Is(protocolErr, errPinentryTimeout) || errors.Is(contextErr, context.DeadlineExceeded) {
+		return errPinentryTimeout
+	}
+	if contextErr != nil {
+		return errPinentryCancelled
+	}
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) && exitErr.ProcessState != nil {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() &&
+			(status.Signal() == syscall.SIGINT || status.Signal() == syscall.SIGTERM) {
+			return errPinentryCancelled
+		}
+	}
+	if errors.Is(protocolErr, errPinentryCancelled) {
+		return errPinentryCancelled
+	}
+	if errors.Is(protocolErr, errPinentryUnavailable) {
+		return errPinentryUnavailable
+	}
+	if protocolErr != nil || waitErr != nil {
+		return errPinentryFailed
+	}
+	return nil
 }
 
 // readPinentry never uses the MCP streams, an environment passphrase, a shell,
@@ -111,6 +146,7 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 	finished := false
+	var waitErr error
 	afterDone := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		defer close(afterDone)
@@ -125,12 +161,18 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 		input.Close()
 		output.Close()
 		if !finished {
-			_ = cmd.Process.Kill()
-			<-waited
+			// Keep the typed reap result even when a protocol read failed
+			// first. It distinguishes a real SIGINT/SIGTERM from an unknown
+			// EOF or our own cleanup kill; none of its text is surfaced.
+			select {
+			case waitErr = <-waited:
+			default:
+				_ = cmd.Process.Kill()
+				waitErr = <-waited
+			}
+			finished = true
 		}
-		if ctx.Err() != nil {
-			err = pinentryContextError(ctx)
-		}
+		err = pinentryDiagnostic(ctx, err, waitErr)
 	}()
 	protocol := pinentryProtocol{reader: output, writer: input}
 	if _, e := protocol.reply(false); e != nil {
@@ -164,9 +206,9 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
 	select {
-	case e := <-waited:
+	case waitErr = <-waited:
 		finished = true
-		if e != nil {
+		if waitErr != nil {
 			return pass, errPinentryFailed
 		}
 	case <-ctx.Done():
