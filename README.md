@@ -12,6 +12,9 @@ M1 is a local single-user vault. A human can create a vault, unlock it with a pa
 
 ```
 tremelay vault create --path vault.db
+tremelay vault change-passphrase --path vault.db
+tremelay vault backup --path vault.db --output snapshot.db
+tremelay vault restore --input snapshot.db --path restored.db --checkpoint-file /independent/checkpoint.txt
 tremelay credential put --path vault.db --label ci --type api_key --secret-file ./secret
 tremelay credential get --path vault.db --id CREDENTIAL_ID
 tremelay credential list --path vault.db
@@ -31,6 +34,8 @@ tremelay audit get --path vault.db --seq 1
 ```
 
 The path is one local SQLite database. Credential bytes are encrypted; the file does not store plaintext secrets. The passphrase comes from `TREMELAY_PASSPHRASE` or a no-echo terminal prompt. It is not a command-line argument. `audit verify` uses that passphrase to authenticate the sealed audit head. `audit list` and `audit get` are the same human view of the chain and do not return credential plaintext. `credential get` writes the raw secret to stdout. `credential list` includes `rotation_every` and `review_every` as Go durations; `0s` means that interval is disabled. `credential health` returns findings without secrets. `credential refresh` runs only while the vault is unlocked; a locked or stopped process does not evaluate credentials.
+
+Passphrase change requires old/new/confirmation through no-echo terminal prompts and ignores the environment. Backup emits a checkpoint to stdout for independent retention; restore requires that explicit checkpoint and a new target. Existing snapshots retain their original passphrase. See [the lifecycle guide](docs/vault-lifecycle.md) before using these commands.
 
 ## Core goals
 

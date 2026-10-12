@@ -10,6 +10,10 @@ The host path must not contain a symlink. These calls do not resolve aliases. A 
 
 Backup and restore refuse a path whose SQLite `-journal`, `-wal`, or `-shm` file already exists, and they do not delete or rewrite that file. Backup syncs the artifact and its directory before it returns a checkpoint. A sync failure removes the artifact. Restore checks that namespace again immediately before it links the destination. The link commits the destination. If a later directory sync fails and removing the new destination plus strictly syncing that removal both succeed, the call returns ordinary `ErrIO`. If the new destination remains, the result is `ErrPublished`. If removal succeeds but its directory sync fails, the result is `ErrPublicationUncertain`: the name is absent now but may reappear after a crash. Neither exceptional outcome is safe to retry blindly; the trusted host must reconcile the destination and single-active-instance state before retry or cutover. A fault before the link leaves no newly restored destination; pre-existing collisions remain untouched. Fixed logs identify published and uncertain outcomes separately from ordinary failure. On Windows, unsupported directory sync leaves directory-entry crash durability to the OS/filesystem; file contents are synced, but this reference cannot promise stronger directory persistence than the platform supplies. Rollback never uses that best-effort fallback: an unsupported directory flush reports `ErrPublicationUncertain`.
 
+## Human CLI
+
+The [lifecycle guide](vault-lifecycle.md) describes `vault backup` and `vault restore`, checkpoint retention, new-target requirements, and exceptional publication exit codes. The engine semantics above are unchanged.
+
 ## Local demonstration
 
 The demonstration uses a temporary database, a disposable Ed25519 key, synthetic identities, and the session clock. It does not call a network or read a live credential.

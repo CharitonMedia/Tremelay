@@ -71,6 +71,10 @@ M9b copies one local SQLite vault with the driver's online backup API and restor
 
 The host is trusted to supply the current checkpoint, quiesce the source, and run one active instance. This reference does not enforce those duties across other processes or machines. An old authentic snapshot and the checkpoint issued for it still match. That pair is not detected as stale. A checkpoint the host treats as newer rejects every older artifact. Restore does not merge stale state, reset membership, reissue authority, or fail over. It does not recover a lost passphrase, a lost owner, or a compromised host. Backup and restore are not agent or member operations and do not append an audit row. A later unlock of a restored file remains an ordinary open.
 
+## Passphrase-change limits
+
+The human host can rewrap the existing DEK after reauthenticating the old passphrase ([ADR 0019](docs/adr/0019-human-vault-lifecycle.md)). The new wrap and audit event commit together. Cached sessions cannot overwrite a newer wrap, but a process already holding the DEK still knows it. This is not key revocation against a compromised host. Existing snapshots and copies retain their original passphrase. Agents and bound shared members do not receive this operation.
+
 ## Agent capability interface limits
 
 M10a is one in-process message boundary for `local_artifact_attest`. The trusted host constructs it from an already-bound agent principal. Messages cannot choose or replace that principal, a human identity, the session, the vault path, unlock material, the clock, or a host callback. A handle locates one exact grant inside that adapter. It is not a new authentication credential and it is not accepted by a different adapter. Discovery metadata is advisory. Invocation rechecks the selected grant and does not move the handle onto another grant or key.

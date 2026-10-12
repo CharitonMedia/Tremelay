@@ -17,6 +17,7 @@ const (
 
 	actionCreate        = "vault_create"
 	actionUnlock        = "vault_unlock"
+	actionPassphrase    = "vault_passphrase_change"
 	actionPut           = "credential_put"
 	actionGet           = "credential_get"
 	actionList          = "credential_list"
@@ -388,7 +389,7 @@ func verifyLinked(events []auditEvent) error {
 
 func knownAction(action string) bool {
 	switch action {
-	case actionCreate, actionUnlock, actionPut, actionGet, actionList,
+	case actionCreate, actionUnlock, actionPassphrase, actionPut, actionGet, actionList,
 		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
 		actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,

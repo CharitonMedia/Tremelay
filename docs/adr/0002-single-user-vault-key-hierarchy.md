@@ -48,7 +48,7 @@ Go's garbage collector can retain copies of key and secret bytes. `Lock` zeroes 
 ## Consequences
 
 - Vault creation is intentionally slow (Argon2id, 64 MiB). Tests use the production parameters rather than a weaker test KDF.
-- Passphrase change is rewrap-of-DEK work and is not implemented.
+- Passphrase change rewraps the existing DEK atomically with its audit event; see [ADR 0019](0019-human-vault-lifecycle.md).
 - The vault format version is 1. Readers reject any other version.
 - Single-writer. SQLite serializes transactions. Concurrent processes are not an M1 workflow.
 - Credential-state changes and their audit events commit in one SQLite transaction. A locked unlock denial is appended without the DEK and incorporated on the next valid unlock (ADR 0003).
