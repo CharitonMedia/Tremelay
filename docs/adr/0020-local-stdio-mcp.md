@@ -178,6 +178,17 @@ empty Unix name; Darwin has no Linux-style abstract namespace. The small shared
 helper never interprets or exposes address bytes. Both the CLI and synthetic
 credential fixture use this exact classifier.
 
+Non-listening proof is platform-specific. Linux requires a successful
+`SO_ACCEPTCONN` query returning zero. XNU exposes the constant but does not
+implement that option query: its getter returns `ENOPROTOOPT`. Darwin instead
+requires successful `Getpeername`, which the kernel restricts to connected
+sockets, together with both unnamed Unix endpoint checks. XNU forbids listening
+on connected sockets and requires a bound pathname for Unix listeners. No
+option-query error is ignored or reinterpreted as permission. See Apple's
+[socket option/listen implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket.c),
+[peer lookup](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_syscalls.c)
+and [Unix listener checks](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_usrreq.c).
+
 Linux requests `POLLRDHUP` only on protocol input and treats it as terminal,
 including when buffered bytes precede read-half-close. Darwin's interested read
 filter reports EOF through the existing `POLLHUP`. Neither watcher consumes MCP

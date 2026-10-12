@@ -21,8 +21,7 @@ func ValidInheritedStream(fd int) bool {
 		if err != nil || kind != unix.SOCK_STREAM {
 			return false
 		}
-		listening, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ACCEPTCONN)
-		return err == nil && listening == 0 && unnamedUnixPair(fd)
+		return unnamedUnixPair(fd)
 	default:
 		return false
 	}

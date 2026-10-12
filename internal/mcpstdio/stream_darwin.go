@@ -11,6 +11,10 @@ func unnamedUnixPair(fd int) bool {
 	if err != nil {
 		return false
 	}
+	// XNU does not implement the SO_ACCEPTCONN query. Successful Getpeername
+	// instead requires a connected socket; XNU forbids listen on connected
+	// sockets and requires a bound pathname for Unix listeners. Neither an
+	// option error nor a missing peer is accepted as proof of this state.
 	peer, err := unix.Getpeername(fd)
 	if err != nil {
 		return false

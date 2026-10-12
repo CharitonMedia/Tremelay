@@ -12,6 +12,10 @@ import (
 const ReadHalfClosed = unix.POLLRDHUP
 
 func unnamedUnixPair(fd int) bool {
+	listening, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ACCEPTCONN)
+	if err != nil || listening != 0 {
+		return false
+	}
 	return unnamedUnixAddress(fd, unix.SYS_GETSOCKNAME) && unnamedUnixAddress(fd, unix.SYS_GETPEERNAME)
 }
 
