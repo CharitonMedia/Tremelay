@@ -138,3 +138,9 @@ These mechanisms should be deleted rather than preserved as dormant compatibilit
 - a unique sentinel secret and passphrase are absent from audit rows and ordinary error/log output; equality with a fixed literal is not disclosure;
 - database corruption produces a safe failure;
 - Windows and Linux CI remain green.
+
+## Read-only verification correction — 2026-10-12
+
+`audit verify` opens SQLite with `mode=ro` and `query_only(ON)`, without a journal-mode setter, migration, or audit append, even when authentication or verification fails. For legacy audit tables it projects only the columns that the existing migration would add: empty strings and zero numeric defaults, and the existing action-derived version when `v` is absent. Present values and all chain, suffix, encrypted-document, detection, health, and shared-history checks are unchanged. Original M1 columns remain required. This preserves synthetic M1, M2–M4, and M5 schema compatibility without modifying the input.
+
+The strict read-only backup-artifact reader remains strict. Ordinary `Unlock` keeps its migration and failed-authentication denial behavior; changing that ordering is outside this correction. `TestCLIAuditVerifyReadOnly` verifies unchanged file bytes and no new sidecars for success, wrong/invalid passphrases, and tampered rows. `TestVerifyAuditReadOnlyCompatibility` checks the write-disabled connection, legacy version projection, strict artifact reader, and ordinary unlock denial. These are synthetic compatibility fixtures, not historical-binary interoperability claims.
