@@ -50,6 +50,11 @@ func TestVerifyAuditReadOnlyCompatibility(t *testing.T) {
 	if bytes.Equal(before, readAll(t, path)) {
 		t.Fatal("ordinary failed unlock did not record its denial")
 	}
+	after := mustAudit(t, path)
+	denial := after[len(after)-1]
+	if len(after) != len(events)+1 || denial.Action != actionUnlock || denial.Result != resultDenied {
+		t.Fatal("ordinary failed unlock did not append exactly one unlock denial")
+	}
 	if _, err := VerifyAudit(path, pass); err != nil {
 		t.Fatalf("verify locked-denial suffix: %v", err)
 	}
