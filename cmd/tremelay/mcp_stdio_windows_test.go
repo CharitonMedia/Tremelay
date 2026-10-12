@@ -193,6 +193,9 @@ func TestWindowsMCPPromptDisconnect(t *testing.T) {
 				defer stop()
 				select {
 				case <-ctx.Done():
+					stop()
+					logWindowsPipeSnapshot(t, "input", s.in)
+					logWindowsPipeSnapshot(t, "output", s.out)
 					t.Fatal("open native pipes were rejected or misclassified")
 				case <-time.After(150 * time.Millisecond):
 				}
@@ -216,6 +219,28 @@ func TestWindowsMCPPromptDisconnect(t *testing.T) {
 			})
 		}
 	}
+}
+
+// Failure-only diagnostics for the synthetic prompt fixture. Do not log
+// native error strings, handles, paths, quotas, or protocol/passphrase bytes.
+func logWindowsPipeSnapshot(t *testing.T, direction string, p *windowsPipe) {
+	t.Helper()
+	if p.begin() != nil {
+		t.Logf("pipe %s diagnostic reservation unavailable", direction)
+		return
+	}
+	defer p.end()
+	var info windowsPipeLocalInformation
+	iosb := windows.IO_STATUS_BLOCK{Status: windows.STATUS_PENDING}
+	err := windows.NtQueryInformationFile(p.handle, &iosb, (*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), 24)
+	var status windows.NTStatus
+	known := true
+	if err != nil {
+		status, known = err.(windows.NTStatus)
+	}
+	t.Logf("pipe %s nt=%08x known=%t iosb=%08x length=%d alignment_mod8=%d type=%d configuration=%d state=%d end=%d",
+		direction, uint32(status), known, uint32(iosb.Status), iosb.Information,
+		uintptr(unsafe.Pointer(&info))%8, info.pipeType, info.configuration, info.state, info.end)
 }
 
 func TestWindowsPinentryPrivateHelper(t *testing.T) {

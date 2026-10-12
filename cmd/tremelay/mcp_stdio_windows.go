@@ -3,12 +3,12 @@
 package main
 
 import (
-	"encoding/binary"
 	"errors"
 	"io"
 	"os"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -172,6 +172,34 @@ func openMCPStdio(input io.Reader, output io.Writer) (*mcpStdio, error) {
 
 func (s *mcpStdio) close() { s.in.Close(); s.out.Close() }
 
+// Native metadata buffers must honor their ULONG field alignment. A byte
+// array has alignment 1 and can be placed at an unaligned stack address.
+// Keep the zero-size alignment marker first so it adds no trailing padding.
+type windowsPipeLocalInformation struct {
+	_                   [0]uintptr
+	pipeType            uint32
+	configuration       uint32
+	maximumInstances    uint32
+	currentInstances    uint32
+	inboundQuota        uint32
+	readDataAvailable   uint32
+	outboundQuota       uint32
+	writeQuotaAvailable uint32
+	state               uint32
+	end                 uint32
+}
+
+// Both directions of each subtraction make a changed ABI a compile error.
+var (
+	_ [40 - unsafe.Sizeof(windowsPipeLocalInformation{})]byte
+	_ [unsafe.Sizeof(windowsPipeLocalInformation{}) - 40]byte
+	_ [32 - unsafe.Offsetof(windowsPipeLocalInformation{}.state)]byte
+	_ [unsafe.Offsetof(windowsPipeLocalInformation{}.state) - 32]byte
+	_ [36 - unsafe.Offsetof(windowsPipeLocalInformation{}.end)]byte
+	_ [unsafe.Offsetof(windowsPipeLocalInformation{}.end) - 36]byte
+	_ [unsafe.Alignof(windowsPipeLocalInformation{}) - unsafe.Alignof(uintptr(0))]byte
+)
+
 // FilePipeLocalInformation (24) is ten ULONGs on all Windows architectures.
 // Unlike GetNamedPipeHandleState's read/wait modes this reports connection
 // state, including a closed peer with unread bytes. A query consumes no data.
@@ -185,19 +213,19 @@ func (p *windowsPipe) connected() (bool, error) {
 		return false, err
 	}
 	defer p.end()
-	var info [40]byte
+	var info windowsPipeLocalInformation
 	iosb := windows.IO_STATUS_BLOCK{Status: windows.STATUS_PENDING}
-	err := windows.NtQueryInformationFile(p.handle, &iosb, &info[0], uint32(len(info)), 24)
+	err := windows.NtQueryInformationFile(p.handle, &iosb, (*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), 24)
 	if err != nil {
 		return false, err
 	}
-	if iosb.Status != 0 || iosb.Information != uintptr(len(info)) ||
-		binary.LittleEndian.Uint32(info[0:4]) != windows.FILE_PIPE_BYTE_STREAM_TYPE ||
-		binary.LittleEndian.Uint32(info[4:8]) > windows.FILE_PIPE_FULL_DUPLEX ||
-		binary.LittleEndian.Uint32(info[36:40]) > windows.FILE_PIPE_SERVER_END {
+	if iosb.Status != 0 || iosb.Information != unsafe.Sizeof(info) ||
+		info.pipeType != windows.FILE_PIPE_BYTE_STREAM_TYPE ||
+		info.configuration > windows.FILE_PIPE_FULL_DUPLEX ||
+		info.end > windows.FILE_PIPE_SERVER_END {
 		return false, errMCPStdio
 	}
-	switch binary.LittleEndian.Uint32(info[32:36]) {
+	switch info.state {
 	case windows.FILE_PIPE_CONNECTED_STATE:
 		return true, nil
 	case windows.FILE_PIPE_DISCONNECTED_STATE, windows.FILE_PIPE_LISTENING_STATE, windows.FILE_PIPE_CLOSING_STATE:
