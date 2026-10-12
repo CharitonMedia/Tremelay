@@ -51,6 +51,15 @@ captured terminal settings are restored, including after signals. A client that
 closes its pipes during the prompt cancels it. After unlock, EOF, SIGINT/SIGTERM,
 and broken output stop service and lock the session after its work is joined.
 
+Physical Ctrl-C with official pinentry-curses 1.2.1 can produce the fixed
+`pinentry failed; check the selected terminal or display` diagnostic instead of
+`pinentry cancelled`: its curses stack can exit with status 1 and close the
+helper pipe without a structured cancellation reply. Unlock still fails closed,
+the helper is reaped, and captured terminal settings are restored. An unknown
+EOF or ordinary exit 1 is not relabeled as cancellation. Upstream added graceful
+SIGINT handling in [Pinentry 1.3.x](https://dev.gnupg.org/T7046.html), following
+[the curses/tty signal issue](https://dev.gnupg.org/T6641.html).
+
 ## Client configuration examples
 
 These examples contain no passphrase. Keep the executable, helper and vault

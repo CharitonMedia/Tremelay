@@ -35,6 +35,8 @@ func TestPinentryReply(t *testing.T) {
 		{"unexpected-data", "D hidden\nOK\n", "", false, errPinentryFailed},
 		{"inquire", "INQUIRE QUALITY hidden\n", "", true, errPinentryFailed},
 		{"cancel", "D partial\nERR 83886179 ignored\n", "", true, errPinentryCancelled},
+		{"fully-cancelled", "D partial\nERR 83886278 ignored\n", "", true, errPinentryCancelled},
+		{"code-277-is-failure", "ERR 83886357 ignored\n", "", true, errPinentryFailed},
 		{"timeout", "ERR 83886142 ignored\n", "", true, errPinentryTimeout},
 		{"error-text", "ERR 1 synthetic-private-diagnostic\n", "", true, errPinentryFailed},
 		{"no-newline", "D incomplete", "", true, errPinentryFailed},

@@ -62,6 +62,16 @@ already started is allowed to finish; cancellation then prevents service and
 locks the session. No protocol requests are dispatched before human unlock and
 agent binding.
 
+Official pinentry-curses 1.2.1 can handle physical Ctrl-C through ncurses' normal
+exit-failure path, yielding EOF without an Assuan cancellation code. Tremelay
+preserves its fixed helper-failure diagnostic unless cancellation is actually
+observed; cleanup and terminal restoration are unchanged. The Linux process
+test permits either exact fixed diagnostic only for verified version 1.2.1 and
+physical Ctrl-C with checked terminal signal/foreground-group prerequisites.
+Direct parent signals and unknown helper versions retain strict cancellation
+expectations. See [upstream's SIGINT fix](https://dev.gnupg.org/T6641.html) and
+[ncurses' signal-handler exit path](https://raw.githubusercontent.com/mirror/ncurses/master/ncurses/tty/lib_tstp.c).
+
 ### Explicit compatibility profile
 
 `BindStdioMCPEndpoint` selects the initialize-based profile supporting exactly
