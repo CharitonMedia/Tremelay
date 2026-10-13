@@ -315,7 +315,6 @@ func TestWindowsNamedClientCredentialOperation(t *testing.T) {
 	// Claude and Hermes still require a successful server exit.
 	serverExitMode, operationExitPermitted, serverShutdownVerified :=
 		namedGUIOperationExitPolicy(client, codexShutdownObserved, serverExit)
-	codexUnattributedExit := serverExitMode == "unattributed-nonzero-client-runtime"
 	if exitErr != nil || !operationExitPermitted {
 		// Tell the client driver the observed CLI exit was NOT acceptable.
 		// Its fixed-value check fails closed, then its deferred teardown
