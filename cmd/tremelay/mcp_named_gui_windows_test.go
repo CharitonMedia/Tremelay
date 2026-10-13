@@ -271,12 +271,29 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 	var serverExit uint32
 	exitErr := windows.GetExitCodeProcess(serverHandle, &serverExit)
 	if exitErr != nil || serverExit != 0 {
-		// Expose only public process status and a fixed category. Never print
-		// raw Codex/client stderr, MCP traffic, or any synthetic credential.
+		// Tell the client driver the observed CLI exit was NOT acceptable.
+		// Its fixed-value check fails closed, then its deferred teardown
+		// drains stderr to EOF; no success receipt can be emitted here.
+		writeNamedGUIJSON(t, filepath.Join(root, "fixture-evidence.json"),
+			map[string]bool{"shipping_server_exited": false})
+		captureJoined := false
+		select {
+		case <-done:
+			joined, captureJoined = true, true
+		case <-time.After(25 * time.Second):
+			// Deferred process custody still terminates/reaps the driver.
+		}
+		// Expose only public process status, bounded stage counts, and a
+		// fixed category after capture quiescence. Never print raw client
+		// stderr, MCP traffic, or any synthetic credential.
 		_, statusErr := os.Stat(filepath.Join(root, "observations", "client-status.json"))
 		_, resultErr := os.Stat(filepath.Join(root, "client-result.json"))
-		t.Fatalf("shipping server did not exit successfully (exit=%d, status_seen=%t, result_seen=%t, client_log_category=%s, transcript_stage=%+v)",
-			serverExit, statusErr == nil, resultErr == nil, namedGUIClientLogCategory(root), namedGUIClientTraceStage(root))
+		category := "capture-not-joined"
+		if captureJoined {
+			category = namedGUIClientLogCategory(root)
+		}
+		t.Fatalf("shipping server did not exit successfully (exit=%d, capture_joined=%t, status_seen=%t, result_seen=%t, client_log_category=%s, transcript_stage=%+v)",
+			serverExit, captureJoined, statusErr == nil, resultErr == nil, category, namedGUIClientTraceStage(root))
 	}
 	writeNamedGUIJSON(t, filepath.Join(root, "fixture-evidence.json"), map[string]bool{"shipping_server_exited": true})
 	select {
