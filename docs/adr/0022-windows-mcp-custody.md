@@ -89,6 +89,43 @@ The candidate's ordinary native suite and shipping-CLI GUI fixture passed on
 Windows Server 2025; the exact commit, runner, and pinned helper are recorded in
 [the GUI evidence](../windows-gui-custody.md#measured-native-acceptance).
 
+## Named Codex client-owned termination versus server exit
+
+The pinned Codex 0.159.2 Windows MCP launcher uses a JobObject (or a
+process-handle fallback) and explicitly terminates it with **exit code 1**
+when closing its owned MCP child; see the immutable
+[`stdio_server_launcher.rs`](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/rmcp-client/src/stdio_server_launcher.rs)
+and [`job.rs`](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/utils/pty/src/win/job.rs).
+An observed one-valued exit code cannot distinguish a deliberate client kill
+from a Tremelay failure. The earlier attempted idle EOF production change
+did not solve this and was reverted; no transport/broker permission changed.
+
+The Codex test independently observes the retained Tremelay process handle
+alive after five successful RPC responses and before `thread/unsubscribe`.
+It verifies the real native client's completed control sequence, exact
+signature, authorized and revoked-grant audit, post-EOF secret scans and
+synthetic vault removal. Those are **operation-level compatibility and
+credential-custody observations**, not proof of process-termination cause.
+
+Codex's version-pinned source identifies a Windows terminate-with-1 cleanup
+path but does not establish that this path caused this specific exit. A
+spontaneous server exit 1 between the liveness check and Codex cleanup remains
+possible. A Codex operation-evidence receipt therefore explicitly reports:
+`server_exit_mode: unattributed-nonzero-client-runtime`,
+`server_graceful_exit_verified: false` and
+`server_termination_caller_verified: false`.
+Such evidence MUST NOT be cited as proof of successful server shutdown, a
+verified client-origin kill, or safe interruption of in-flight operations.
+
+The native-client operation-compatibility test verifies only the completed,
+independently validated grant use, audit and no-leak claims. It does not assert
+that the Codex process exited gracefully. The separate shipping CLI/Go SDK
+Windows test checks graceful zero-exit process custody. Claude and Hermes
+still require zero shipping server exit in their own named-client lanes.
+A later project may add a pinned, non-secret OS/debug causal witness for Codex.
+No agent-facing change, production shutdown alteration, or broader nonzero
+exit exception is introduced.
+
 ## Windows helper and console
 
 The initial helper contract is a directly invoked native GUI pinentry executable
@@ -120,6 +157,52 @@ failure. This never causes fallback to protocol input. Arbitrary console
 helpers and wrapper-launched descendant trees are not claimed. GUI usability
 is measured only for the exact package and runner in the linked fixture.
 The trusted helper is expected to be the directly launched process.
+
+## Native named-client test toolchain trust boundary
+
+The separately gated Windows Codex/Claude Code/Hermes acceptance lane requires
+CPython **3.14.8 x64** for its local control driver and isolated Hermes virtual
+environment. GitHub's `windows-latest` runner does not guarantee that exact
+patch version in the preinstalled tool cache. The workflow now runs the
+official `actions/setup-python` action at immutable commit
+`ece7cb06caefa5fff74198d8649806c4678c61a1` (v6.3.0), requesting
+only `python-version: '3.14.8'`, `architecture: 'x64'`, immediately
+before preparing the pinned native clients. This is a change to the
+**test-runner supply-chain trust boundary**, not to the shipping Tremelay
+program or broker authority.
+
+On a cache miss, the action can download and install Python using the
+`actions/python-versions` distribution and version manifest. Thus the
+trusted CI inputs include the pinned setup action, the hosted runner and its
+tool cache, the upstream GitHub-hosted version manifest (which can change),
+and the selected official Python distribution. An exact action commit does
+**not** cryptographically pin the mutable manifest or prove that the installed
+interpreter has a particular vendor binary digest. The preparation script
+independently rejects any missing, wrong-version or non-x64 interpreter and
+records its observed executable SHA-256, runner image/version and source
+commit/tree. Observing a hash is not equivalent to validating it against a
+fixed independent release checksum; that provenance limitation must accompany
+any native acceptance claim.
+
+For source-revision evidence the preparation script invokes exactly one
+`git.exe` application resolved first on the hosted runner's trusted
+`PATH`. PowerShell can return multiple application matches; their
+`Source` properties must never be implicitly concatenated into a process
+filename. The selected path must be absolute and an existing regular file.
+The workflow does not independently attest the runner-provided Git executable;
+it is an explicit hosted-runner trust assumption, not a shipping dependency.
+
+The action retains the existing `contents: read` workflow permission and
+runs on GitHub's ephemeral Windows runner with only synthetic vault contents;
+there are no account credentials, model-provider calls or release signing
+rights. No second-version fallback, unpinned ad-hoc installer, silent skip or
+substitution of the earlier Go SDK GUI fixture is allowed. If Python
+provisioning or any downstream locked-wheel/native-client step fails, the
+native acceptance is **not established**, even when ordinary CI passes.
+Shipping credential-broker risk and process custody remain governed by this
+ADR, ADRs 0020-0021 and the security invariants. This lane does not establish
+live SSH login, arbitrary handle modes, production identity or end-user
+credential custody.
 
 ## Evidence boundaries
 
@@ -157,3 +240,5 @@ process behavior. The existing security requirements remain unchanged.
 - [Completion notification modes](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setfilecompletionnotificationmodes)
 - [libuv child pipe creation](https://github.com/libuv/libuv/blob/v1.x/src/win/pipe.c)
 - [Console handles](https://learn.microsoft.com/en-us/windows/console/console-handles)
+- [Pinned Python setup action](https://github.com/actions/setup-python/tree/ece7cb06caefa5fff74198d8649806c4678c61a1)
+- [Official Python distribution manifest](https://github.com/actions/python-versions/blob/main/versions-manifest.json)

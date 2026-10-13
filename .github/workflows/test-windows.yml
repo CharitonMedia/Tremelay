@@ -29,6 +29,36 @@ jobs:
         run: |
           go build -o "$env:TREMELAY_TEST_WINDOWS_CLI" ./cmd/tremelay
           if ($LASTEXITCODE -ne 0) { throw 'Shipping CLI build failed.' }
+      - name: Provision exact Windows named-client Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14.8'
+          architecture: 'x64'
+      - name: Prepare pinned native named clients
+        shell: pwsh
+        timeout-minutes: 15
+        run: ./scripts/prepare_windows_named_clients.ps1
+      - name: Native named-client credential operation compatibility
+        shell: pwsh
+        timeout-minutes: 15
+        run: |
+          go test -c ./cmd/tremelay -o "$env:TREMELAY_TEST_WINDOWS_NAMED_TEST"
+          if ($LASTEXITCODE -ne 0) { throw 'Native custody test binary compilation failed.' }
+          $env:TREMELAY_TEST_WINDOWS_NAMED_REQUIRED = '1'
+          foreach ($client in @('codex', 'claude', 'hermes')) {
+            $env:TREMELAY_TEST_WINDOWS_NAMED_CLIENT = $client
+            $env:TREMELAY_TEST_WINDOWS_NATIVE = switch ($client) {
+              codex { $env:TREMELAY_TEST_WINDOWS_CODEX }
+              claude { $env:TREMELAY_TEST_WINDOWS_CLAUDE }
+              hermes { $env:TREMELAY_TEST_WINDOWS_HERMES_PYTHON }
+            }
+            $env:TREMELAY_TEST_WINDOWS_NAMED_EVIDENCE = Join-Path $env:TREMELAY_TEST_WINDOWS_NAMED_RESULTS "$client-operation.json"
+            & $env:TREMELAY_TEST_WINDOWS_NAMED_TEST '-test.run=^TestWindowsNamedClientCredentialOperation$' '-test.count=1' '-test.timeout=4m'
+            if ($LASTEXITCODE -ne 0) { throw "Native $client custody acceptance failed." }
+            if (-not (Test-Path -LiteralPath $env:TREMELAY_TEST_WINDOWS_NAMED_EVIDENCE -PathType Leaf)) {
+              throw 'Native custody evidence receipt is missing.'
+            }
+          }
       - name: Test
         run: go test ./...
       - name: Vet
@@ -37,3 +67,14 @@ jobs:
         run: cd tools && go test ./...
       - name: Vet build-evidence verifier
         run: cd tools && go vet ./...
+      - name: Retain allowlisted native custody receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-named-client-custody-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/preparation.json
+            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/codex-operation.json
+            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/claude-operation.json
+            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/hermes-operation.json

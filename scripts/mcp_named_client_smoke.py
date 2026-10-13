@@ -354,7 +354,8 @@ def checked_fixture(root):
     return result
 
 
-def codex_smoke(command, config, env, root, *, scenario=exercise, finalize=checked_fixture):
+def codex_smoke(command, config, env, root, *, scenario=exercise, finalize=checked_fixture,
+                process_factory=JsonProcess, before_unsubscribe=None):
     env = dict(env, RUST_LOG="error,codex_rmcp_client::stdio_server_launcher=info")
     path = root / "codex/config.toml"
     path.write_text('\n'.join([
@@ -366,7 +367,7 @@ def codex_smoke(command, config, env, root, *, scenario=exercise, finalize=check
         *[key + ' = ' + json.dumps(value) for key, value in config['env'].items()], '',
     ]))
     (root / "observations/codex-config.toml").write_bytes(path.read_bytes())
-    app = JsonProcess([str(command), "app-server", "--stdio"], env, root)
+    app = process_factory([str(command), "app-server", "--stdio"], env, root)
     try:
         initialized = app.rpc("initialize", {"clientInfo": {"name": "tremelay_broker_smoke", "version": "1"},
                                              "capabilities": {"experimentalApi": True}})
@@ -387,6 +388,11 @@ def codex_smoke(command, config, env, root, *, scenario=exercise, finalize=check
         result.update(client="Codex app-server", version=initialized["userAgent"], tools=sorted(inventory),
                       protocol=None, protocol_observed=False)
         check_observations(root / "observations")
+        # The Windows native controller may observe the real shipping CLI
+        # still running AFTER every tool result but BEFORE Codex shuts down
+        # its pinned JobObject. The optional barrier is never used by Linux.
+        if before_unsubscribe is not None:
+            before_unsubscribe(root)
         # Keep Tokio alive while Codex asynchronously closes its MCP transport.
         # App-server EOF alone does not join that background transport cleanup.
         unsubscribed = app.rpc("thread/unsubscribe", {"threadId": thread_id})
@@ -400,13 +406,13 @@ def codex_smoke(command, config, env, root, *, scenario=exercise, finalize=check
     return dict(result, cleanup=cleanup, model_turns=0)
 
 
-def claude_smoke(command, config, env, root, *, scenario=exercise):
+def claude_smoke(command, config, env, root, *, scenario=exercise, process_factory=JsonProcess):
     path = root / "observations/mcp-config.json"
     write_json(path, {"mcpServers": {NAME: dict(config, type="stdio")}})
     version = subprocess.run([str(command), "--version"], env=env, cwd=root / "work",
                              capture_output=True, check=True, timeout=10).stdout.decode().strip()
     require(version.startswith("2.1.296 "), "unreviewed Claude Code version")
-    app = JsonProcess([str(command), "--print", "--input-format", "stream-json",
+    app = process_factory([str(command), "--print", "--input-format", "stream-json",
                        "--output-format", "stream-json", "--verbose", "--no-session-persistence",
                        "--mcp-config", str(path), "--strict-mcp-config", "--tools", "",
                        "--permission-mode", "dontAsk"], env, root)
@@ -482,7 +488,7 @@ def hermes_child(config_path, *, scenario=exercise):
     print(json.dumps(result, sort_keys=True), flush=True)
 
 
-def hermes_smoke(python, source, config, env, root, *, child_script=None):
+def hermes_smoke(python, source, config, env, root, *, child_script=None, process_factory=JsonProcess):
     for relative, expected in HERMES_MODULES.items():
         require(hashlib.sha256((source / relative).read_bytes()).hexdigest() == expected,
                 "unreviewed Hermes runtime module: " + relative)
@@ -495,7 +501,7 @@ def hermes_smoke(python, source, config, env, root, *, child_script=None):
     write_json(root / "hermes/config.yaml", {"mcp_servers": {NAME: config}})
     write_json(root / "observations/hermes-config.yaml", {"mcp_servers": {NAME: config}})
     script = Path(__file__).resolve() if child_script is None else child_script
-    app = JsonProcess([str(python), str(script), "--hermes-child", str(path)], env, root)
+    app = process_factory([str(python), str(script), "--hermes-child", str(path)], env, root)
     # The child does not consume this control pipe; Hermes owns the fixture pipe.
     try:
         result = app.receive(time.monotonic() + 90)
