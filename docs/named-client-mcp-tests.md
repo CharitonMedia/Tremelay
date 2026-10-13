@@ -196,13 +196,15 @@ credential operation or a hostile-host isolation boundary.
 The shipping server PID count is a connected-session snapshot, not an exclusive
 launch marker or a count of every historical launch attempt.
 
-## Measured Linux acceptance: 2026-10-12
+## Measured Linux acceptance: 2026-10-13
 
-All six normal workflows passed on core tree
-`12aa634b0ced9b4ae88f8fdc6f37ae6ffaae8a20`. The
-[machine-readable evidence](evidence/named-client-mcp-2026-10-12.json) records
+All six Linux named-client scenarios passed on combined broker and Windows-support source tree
+`2e042a970d6853155254ac025f4ae79e64cfbaee`. The
+[machine-readable evidence](evidence/named-client-mcp-2026-10-13.json) records
 binary/driver hashes, audit heads, exact counts, shutdown classification, and
-scan coverage without retaining protected material.
+scan coverage without retaining protected material. The unchanged
+[October 12 evidence](evidence/named-client-mcp-2026-10-12.json) records the
+previous source and binaries as historical results.
 
 | Actual runtime | Protected HTTP/GitHub + revoked denial | Shipping CLI + official pinentry attestation | Negotiated MCP version |
 | --- | --- | --- | --- |
@@ -214,8 +216,8 @@ Every broker session completed exactly two authenticated upstream operations,
 two negative upstream authentication self-checks, and one audited revoked-grant
 denial. Claude additionally recorded one protocol denial, separately from the
 revoked-grant denial. The fixture accepted observed idle signal shutdown for
-Codex (SIGTERM) and Claude (SIGINT); Hermes used clean EOF. All native clients
-exited zero without driver escalation, and all fixture PIDs terminated. These
+Claude (SIGINT); Codex and Hermes used clean EOF. All native clients exited zero
+without driver escalation, and all fixture PIDs terminated. These
 observations do not expose the fixture's exit status.
 
 Every custody session independently verified its signature and exact
@@ -227,7 +229,7 @@ provider accounts, or credential-operation retries.
 
 These named-client runs are Linux evidence. Native Windows/macOS client runs,
 product GUIs, and Grok Bot remain untested here. An earlier client run without a
-complete receipt does not count toward the six passing workflows.
+complete receipt does not count toward the six passing scenarios.
 
 ## Grok Bot
 
