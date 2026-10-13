@@ -38,7 +38,7 @@ jobs:
         shell: pwsh
         timeout-minutes: 15
         run: ./scripts/prepare_windows_named_clients.ps1
-      - name: Native named-client shipping custody
+      - name: Native named-client credential operation compatibility
         shell: pwsh
         timeout-minutes: 15
         run: |
@@ -52,8 +52,8 @@ jobs:
               claude { $env:TREMELAY_TEST_WINDOWS_CLAUDE }
               hermes { $env:TREMELAY_TEST_WINDOWS_HERMES_PYTHON }
             }
-            $env:TREMELAY_TEST_WINDOWS_NAMED_EVIDENCE = Join-Path $env:TREMELAY_TEST_WINDOWS_NAMED_RESULTS "$client-custody.json"
-            & $env:TREMELAY_TEST_WINDOWS_NAMED_TEST '-test.run=^TestWindowsNamedClientShippingGUI$' '-test.count=1' '-test.timeout=4m'
+            $env:TREMELAY_TEST_WINDOWS_NAMED_EVIDENCE = Join-Path $env:TREMELAY_TEST_WINDOWS_NAMED_RESULTS "$client-operation.json"
+            & $env:TREMELAY_TEST_WINDOWS_NAMED_TEST '-test.run=^TestWindowsNamedClientCredentialOperation$' '-test.count=1' '-test.timeout=4m'
             if ($LASTEXITCODE -ne 0) { throw "Native $client custody acceptance failed." }
             if (-not (Test-Path -LiteralPath $env:TREMELAY_TEST_WINDOWS_NAMED_EVIDENCE -PathType Leaf)) {
               throw 'Native custody evidence receipt is missing.'
@@ -75,6 +75,6 @@ jobs:
           if-no-files-found: error
           path: |
             ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/preparation.json
-            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/codex-custody.json
-            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/claude-custody.json
-            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/hermes-custody.json
+            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/codex-operation.json
+            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/claude-operation.json
+            ${{ env.TREMELAY_TEST_WINDOWS_NAMED_RESULTS }}/hermes-operation.json

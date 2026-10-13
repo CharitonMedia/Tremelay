@@ -27,7 +27,7 @@ import (
 // This opt-in controller never substitutes the Go SDK for a named runtime.
 // The default suite's GUI/SDK fixture is separate. A selected lane fails when
 // any prerequisite, native control request, GUI operation or receipt is absent.
-func TestWindowsNamedClientShippingGUI(t *testing.T) {
+func TestWindowsNamedClientCredentialOperation(t *testing.T) {
 	client := os.Getenv("TREMELAY_TEST_WINDOWS_NAMED_CLIENT")
 	if client == "" {
 		if os.Getenv("TREMELAY_TEST_WINDOWS_NAMED_REQUIRED") == "1" {
@@ -306,12 +306,17 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 	}
 	var serverExit uint32
 	exitErr := windows.GetExitCodeProcess(serverHandle, &serverExit)
-	// Codex v0.159.2 explicitly uses Windows TerminateJobObject or
-	// TerminateProcess with exit code 1 on MCP teardown. Only accept this
-	// one code for the one pinned client with a confirmed pre-unsubscribe
-	// live-process barrier. Claude and Hermes still require exit code zero.
-	codexClientTerminated := client == "codex" && codexShutdownObserved && serverExit == 1
-	if exitErr != nil || (serverExit != 0 && !codexClientTerminated) {
+	// Codex v0.159.2 normally terminates Windows MCP child processes with
+	// exit code 1. Even with the post-operation liveness barrier, the exit
+	// origin CANNOT be attributed to Codex rather than an independent CLI
+	// failure. Do not report that the client terminated Tremelay or that
+	// this proves successful server shutdown. Preserve the separately
+	// verified operation, audit, denial and secret-isolation evidence only.
+	// Claude and Hermes still require a successful server exit.
+	serverExitMode, operationExitPermitted, serverShutdownVerified :=
+		namedGUIOperationExitPolicy(client, codexShutdownObserved, serverExit)
+	codexUnattributedExit := serverExitMode == "unattributed-nonzero-client-runtime"
+	if exitErr != nil || !operationExitPermitted {
 		// Tell the client driver the observed CLI exit was NOT acceptable.
 		// Its fixed-value check fails closed, then its deferred teardown
 		// drains stderr to EOF; no success receipt can be emitted here.
@@ -462,10 +467,6 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 	if os.Remove(path) != nil {
 		t.Fatal("synthetic vault removal failed")
 	}
-	serverExitMode := "graceful-server-exit"
-	if codexClientTerminated {
-		serverExitMode = "pinned-codex-windows-client-teardown-exit-one"
-	}
 	if destination := os.Getenv("TREMELAY_TEST_WINDOWS_NAMED_EVIDENCE"); destination != "" {
 		if !filepath.IsAbs(destination) {
 			t.Fatal("native evidence path must be absolute")
@@ -476,6 +477,8 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 			"tool_calls": 5, "credential_invocations": 2, "model_turns": 0, "driver_retries": 0,
 			"audit": counts, "audit_verified": true, "signature_verified": true,
 			"client_exit": 0, "server_exit": serverExit, "server_exit_mode": serverExitMode,
+			"server_graceful_exit_verified": serverShutdownVerified, "server_termination_caller_verified": false,
+			"verified_scope":                     "completed credential operations only; client-owned termination not established",
 			"codex_pre_unsubscribe_server_alive": codexShutdownObserved,
 			"helper_exited":                      true, "vault_removed": true,
 			"scanned_files": files, "observed_secret_absent": true,
@@ -483,6 +486,41 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 			"inherited_handle_modes_observed": false,
 			"cli_sha256":                      namedGUIHash(t, cli), "helper_sha256": namedGUIHash(t, helper), "native_sha256": namedGUIHash(t, native), "driver_sha256": namedGUIHash(t, driver),
 			"python_sha256": namedGUIHash(t, python), "control_driver_sha256": namedGUIHash(t, filepath.Join(filepath.Dir(driver), "mcp_named_client_smoke.py"))})
+	}
+}
+
+// A Codex exit 1 is permissible only as an UNATTRIBUTED observation in a
+// completed-operation test. It must never signal successful server shutdown.
+func namedGUIOperationExitPolicy(client string, barrier bool, code uint32) (string, bool, bool) {
+	if code == 0 {
+		return "observed-zero", true, true
+	}
+	if client == "codex" && barrier && code == 1 {
+		return "unattributed-nonzero-client-runtime", true, false
+	}
+	return "rejected-nonzero", false, false
+}
+
+func TestNamedGUIOperationExitPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, client, mode         string
+		barrier, allowed, graceful bool
+		code                       uint32
+	}{
+		{"codex-ambiguous", "codex", "unattributed-nonzero-client-runtime", true, true, false, 1},
+		{"codex-no-barrier", "codex", "rejected-nonzero", false, false, false, 1},
+		{"codex-other-code", "codex", "rejected-nonzero", true, false, false, 2},
+		{"claude-nonzero", "claude", "rejected-nonzero", false, false, false, 1},
+		{"hermes-nonzero", "hermes", "rejected-nonzero", false, false, false, 1},
+		{"codex-zero", "codex", "observed-zero", false, true, true, 0},
+		{"claude-zero", "claude", "observed-zero", false, true, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mode, allowed, graceful := namedGUIOperationExitPolicy(tc.client, tc.barrier, tc.code)
+			if mode != tc.mode || allowed != tc.allowed || graceful != tc.graceful {
+				t.Fatal("named-client operation and server-lifecycle outcomes conflated")
+			}
+		})
 	}
 }
 

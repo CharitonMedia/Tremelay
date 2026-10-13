@@ -100,20 +100,31 @@ An observed one-valued exit code cannot distinguish a deliberate client kill
 from a Tremelay failure. The earlier attempted idle EOF production change
 did not solve this and was reverted; no transport/broker permission changed.
 
-The **test-only** accepted Codex lane therefore requires an independent,
-retained-process-handle liveness check after all five RPC responses and before
-the client enters `thread/unsubscribe`. A public handshake freezes the
-client before that phase and resumes it only after the controller has
-observed the server still running. The controller then requires native Codex
-cleanup, independent signature verification, exact allowed and revoked audit
-records, unchanged post-EOF output/secret scans, and synthetic vault removal.
-Only under those conditions is code 1 an acceptable **pinned client-owned
-teardown outcome** for the named Codex test. This does not claim to observe
-the TerminateJobObject syscall directly or demonstrate graceful SDK shutdown;
-the test simply proves that Tremelay was alive immediately before the
-client requested teardown and that no failed audit or exposed secret appeared
-in the inspected boundary. Claude and Hermes keep their zero-server-exit
-requirements. No wider code-1 exception is introduced.
+The Codex test independently observes the retained Tremelay process handle
+alive after five successful RPC responses and before `thread/unsubscribe`.
+It verifies the real native client's completed control sequence, exact
+signature, authorized and revoked-grant audit, post-EOF secret scans and
+synthetic vault removal. Those are **operation-level compatibility and
+credential-custody observations**, not proof of process-termination cause.
+
+Codex's version-pinned source identifies a Windows terminate-with-1 cleanup
+path but does not establish that this path caused this specific exit. A
+spontaneous server exit 1 between the liveness check and Codex cleanup remains
+possible. A Codex operation-evidence receipt therefore explicitly reports:
+`server_exit_mode: unattributed-nonzero-client-runtime`,
+`server_graceful_exit_verified: false` and
+`server_termination_caller_verified: false`.
+Such evidence MUST NOT be cited as proof of successful server shutdown, a
+verified client-origin kill, or safe interruption of in-flight operations.
+
+The native-client operation-compatibility test verifies only the completed,
+independently validated grant use, audit and no-leak claims. It does not assert
+that the Codex process exited gracefully. The separate shipping CLI/Go SDK
+Windows test checks graceful zero-exit process custody. Claude and Hermes
+still require zero shipping server exit in their own named-client lanes.
+A later project may add a pinned, non-secret OS/debug causal witness for Codex.
+No agent-facing change, production shutdown alteration, or broader nonzero
+exit exception is introduced.
 
 ## Windows helper and console
 

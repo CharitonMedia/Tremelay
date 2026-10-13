@@ -1,16 +1,18 @@
-# Native Windows named-client custody acceptance
+# Native Windows named-client operation compatibility
 
-Status: **prepared locally, not executed on Windows**. This is a prospective
-acceptance lane, not another passing result. It changes no production code.
-Local-only changes append preparation, required native checks and allowlisted
-receipt retention to the existing Windows workflow, without changing triggers
-or permissions. They have not been published or run.
-The existing [Windows GUI/Go SDK result](windows-gui-custody.md)
-and [Linux named-client results](named-client-mcp-tests.md) remain separate.
+Status: **synthetic operation-compatibility acceptance run in Windows CI** on
+head `cf134e3` for Codex 0.159.2, Claude Code 2.1.296, and Hermes
+v0.21.7. Linux and general CI also passed at that head. The Windows result
+covers exact completed credential operations, grants, denial, audit,
+cryptographic verification, captured-output secret scans, and helper cleanup.
+It does NOT establish production credentials or remote SSH login. Codex
+native process shutdown remains explicitly unattributed/nonzero, unlike the
+separate [Windows GUI/Go SDK result](windows-gui-custody.md) or the
+[Linux named-client results](named-client-mcp-tests.md).
 
 ## Exact scope
 
-`TestWindowsNamedClientShippingGUI` runs the shipping `tremelay.exe` through one
+`TestWindowsNamedClientCredentialOperation` runs the shipping `tremelay.exe` through one
 actual pinned native runtime, driven by `scripts/mcp_windows_named_client.py`:
 
 - Codex 0.159.2 app-server: initialize, ephemeral thread, MCP status/tool calls,
@@ -65,10 +67,13 @@ Acceptance requires all of the following:
    issued grants. A vendor control error alone cannot prove the denial.
 4. Official helper exit, native runtime exit zero, completed controller and
    full client-output capture with no escalation. Claude Code and Hermes
-   require shipping CLI exit zero. Pinned Codex 0.159.2 on Windows may instead
-   terminate the owned MCP server with code 1 as described below; this is
-   accepted only after the host independently verifies the server was still
-   running *after* every tool response and *before* Codex unsubscribes.
+   require shipping CLI exit zero. Pinned Codex 0.159.2 may instead produce a
+   server exit code 1 after all operations finish. This is explicitly
+   **unattributed** and is NOT a passing server-shutdown/cause-of-exit result.
+   Codex operation compatibility is verified independently by the other
+   required receipts; it cannot be cited as graceful or caller-attributed
+   process termination. The independent pre-unsubscribe liveness barrier is
+   still mandatory and is not falsely presented as proof of causation.
 5. Post-EOF scans for passphrase/private-key bytes, base64 and hex across the
    complete manifest-listed captures/configuration, public receipts, controller
    output/launch configuration, operation audit records and encrypted vault.
@@ -104,19 +109,22 @@ and checks that `WaitForSingleObject(serverHandle, 0)` reports the server
 still active. Only then does it write the public
 `codex-server-alive.json` acknowledgement. The driver performs its normal
 unsubscribe, observes `thread/closed` and closes the pinned native Codex
-runtime. The controller may accept server exit code 1 only for this Codex
-version with that verified liveness barrier. The fixed process tree, helper
-custody, no-escalation client exit, exact signed response, revoked-grant
-denial, durable audit and every existing post-EOF secret scan remain required.
-Both barrier files are included in that scan.
+runtime. The controller observes exit code 1 for the pinned runtime but, even with
+the liveness barrier, cannot prove why the server exited. The fixed process
+tree, helper custody, no-escalation client exit, exact signature, revoked-grant
+denial, durable audit, and every existing post-EOF secret scan remain
+mandatory. Both barrier files are included in the scan.
 
-This establishes the externally observable **ordering**, not an ETW/kernel
-trace of the exact Windows TerminateJobObject call. It does not establish a
-graceful MCP server return or protection against abrupt loss of uncommitted
-operations. Other clients still require server exit zero and may not borrow
-Codex's pinned termination exception. If Codex changes its version or process
-lifetime, this exact contract must be re-evaluated, not silently generalized.
-No production process behavior, MCP broker or release path changes.
+The resulting Codex evidence uses
+`server_exit_mode: unattributed-nonzero-client-runtime`,
+`server_graceful_exit_verified: false` and
+`server_termination_caller_verified: false`.
+This is a synthetic **completed-operation compatibility** result, not a
+verified Codex-initiated kill, successful server shutdown, or guarantee about
+interrupted in-flight work. Claude and Hermes keep their zero-exit requirement.
+A true caller-attribution claim would need a separate, pinned OS/debug
+witness; merely citing the upstream Codex source and observing code 1 is
+insufficient. No production process behavior or broker permissions change.
 
 ## Reviewed acquisition pins
 
@@ -272,7 +280,7 @@ $env:TREMELAY_TEST_WINDOWS_NAMED_EVIDENCE = "$Results\codex-windows-custody.json
 # Existing GUI preparation supplies WINDOWS_CLI and WINDOWS_PINENTRY.
 # For Hermes, WINDOWS_NATIVE is its venv Python executable, and additionally:
 # $env:TREMELAY_TEST_WINDOWS_HERMES_SOURCE = "$Tools\hermes-source"
-go test -count=1 ./cmd/tremelay -run '^TestWindowsNamedClientShippingGUI$'
+go test -count=1 ./cmd/tremelay -run '^TestWindowsNamedClientCredentialOperation$'
 if ($LASTEXITCODE -ne 0) { throw 'Native named-client acceptance failed.' }
 ```
 
