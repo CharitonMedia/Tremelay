@@ -21,6 +21,14 @@ jobs:
           go-version: '1.26.9'
       - name: Verify required Cursor rule
         run: python scripts/verify_ponytail.py
+      - name: Prepare official Windows GUI helper
+        shell: pwsh
+        run: ./scripts/prepare_windows_pinentry.ps1
+      - name: Build shipping CLI for GUI custody fixture
+        shell: pwsh
+        run: |
+          go build -o "$env:TREMELAY_TEST_WINDOWS_CLI" ./cmd/tremelay
+          if ($LASTEXITCODE -ne 0) { throw 'Shipping CLI build failed.' }
       - name: Test
         run: go test ./...
       - name: Vet

@@ -14,18 +14,23 @@ See [ADR 0020](adr/0020-local-stdio-mcp.md) for process custody and
 
 ## Prerequisites and unlock
 
-- Build the CLI with the repository-pinned Go toolchain. Linux and macOS inherited
-  pipes and connected unnamed Unix stream pairs are implemented; Windows
-  `mcp serve` fails closed. Linux is runtime-tested;
-  macOS compilation alone is not terminal/display validation.
+- Build the CLI with the repository-pinned Go toolchain. Linux and macOS accept
+  inherited pipes and connected kernel-unnamed Unix stream pairs. Windows has
+  native byte-stream pipe custody and a local GUI-helper contract; see the
+  [Windows setup and evidence limits](windows-stdio-mcp.md). Other platforms
+  fail closed. Native transport tests do not establish every client or UI.
 - Create the agent and its narrowly scoped operation grant using the human CLI.
   The chosen agent ID is host authority, not an identity proven by MCP.
 - Select an already-installed, trusted pinentry executable by absolute path.
-  A GUI helper needs a working local display. A curses helper needs a separate
-  interactive terminal. The helper and display/terminal stack are trusted with
-  the passphrase. Tremelay does not install or configure them.
-- Launch from a client that owns stdin/stdout pipes or connected unnamed Unix
-  stream pairs. Named/abstract sockets and network sockets are not accepted.
+  A GUI helper needs a working local display. On Unix, a curses helper needs a
+  separate interactive terminal. Windows requires a native local `.exe` GUI
+  helper; `--pinentry-tty` is unsupported. The helper and display/terminal stack
+  are trusted with the passphrase. Tremelay does not install or configure them.
+- Launch from a client that owns stdin/stdout pipes, or on Linux/macOS connected
+  kernel-unnamed Unix stream pairs. Named/abstract Unix sockets and network
+  sockets are not accepted. The measured Windows contract uses ordinary
+  inherited byte-stream pipes; arbitrary overlapped/IOCP configurations are
+  not validated.
   Do not run this command with
   terminal stdin, redirect the protocol into a file, or send a passphrase on stdin.
 
@@ -40,11 +45,12 @@ The helper prompts once per process. Its private Assuan pipes are separate from
 MCP stdin/stdout. The passphrase is never a flag, config value, MCP message, or
 log value. `TREMELAY_PASSPHRASE` is ignored by `mcp serve` and is not passed to the
 helper. No passphrase cache or unattended unlock is enabled. Passphrases are
-limited to 1024 bytes. Interactive unlock defaults to two minutes; the host can
+limited to 1024 bytes; the selected helper may impose a lower UI limit.
+Interactive unlock defaults to two minutes; the host can
 set `--unlock-timeout` from `1s` through `5m`. Set the client's startup timeout
 long enough for human entry and the KDF (for example, 150 seconds for the default).
 
-For curses, the host can add `--pinentry-tty /absolute/terminal-device` for an
+For Unix curses, the host can add `--pinentry-tty /absolute/terminal-device` for an
 interactive terminal the human controls. `tty` in that separate terminal prints
 its device path. The terminal must remain available and must not simultaneously
 be used for another prompt. Many clients detach children from their own
@@ -55,8 +61,12 @@ terminal means unlock fails closed; it does not fall back to protocol stdin.
 Cancellation, timeout, unavailable UI, malformed helper output, or helper failure
 produces a fixed error on stderr and closes the process. The helper is reaped and
 captured terminal settings are restored, including after signals. A client that
-closes its pipes during the prompt cancels it. After unlock, EOF, SIGINT/SIGTERM,
-and broken output stop service and lock the session after its work is joined.
+closes its pipes during the prompt cancels it. After unlock, ordinary EOF stops
+service and locks the session after its work is joined. Unix signal handling
+also covers SIGINT/SIGTERM. Windows does not claim Unix-signal equivalence or
+that externally forcing process/job termination runs Go cleanup. Broken-output
+and full-output cancellation have distinct evidence limits on Windows; see
+[ADR 0022](adr/0022-windows-mcp-custody.md).
 
 Physical Ctrl-C with official pinentry-curses 1.2.1 can produce the fixed
 `pinentry failed; check the selected terminal or display` diagnostic instead of
@@ -108,12 +118,12 @@ startup_timeout_sec = 150
 tool_timeout_sec = 30
 ```
 
-The tested Codex 0.159.2 path uses its real app-server MCP implementation with a
+The tested Linux Codex 0.159.2 path uses its real app-server MCP implementation with a
 fresh ephemeral thread and direct `mcpServerStatus/list` / `mcpServer/tool/call`.
 It does not need a model turn or login. This is subprocess compatibility
 proof, not a claim that every Codex UI or a dot installation has been configured.
 
-### Claude Code (configuration reviewed; runtime untested here)
+### Claude Code
 
 ```sh
 claude mcp add --transport stdio --scope local tremelay -- /absolute/tremelay mcp serve --path /absolute/vault.db --agent AGENT_ID --pinentry /absolute/gui-pinentry
@@ -123,8 +133,11 @@ Give the MCP startup handshake enough time for human entry with Claude Code's
 `MCP_TIMEOUT` setting (milliseconds). Its documented client-runtime selection
 supports initialize-based MCP, including fallback from modern discovery. See
 [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
+The measured Linux path uses Claude Code 2.1.296's real stream-json MCP control
+runtime without a model turn. Its protected-operation and shipping-CLI custody
+receipts are in [named-client evidence](named-client-mcp-tests.md).
 
-### Hermes (configuration reviewed; runtime untested here)
+### Hermes
 
 ```yaml
 mcp_servers:
@@ -139,6 +152,13 @@ mcp_servers:
 This deliberately selects the initialize lifecycle. See the
 [Hermes MCP transport implementation](https://github.com/NousResearch/hermes-agent/blob/main/tools/mcp_tool_transport.py).
 Do not use a parallel-call setting as a substitute for exact grants.
+Hermes v0.21.7's native MCP discovery, handlers, and shutdown have measured Linux
+broker and shipping-CLI custody evidence. These examples do not claim native
+Windows or macOS execution of any named client.
+
+For Windows command paths and a shell-free configuration example, see
+[Windows stdio setup](windows-stdio-mcp.md#host-configuration). Never substitute
+a WSL path for a native Windows path or treat a WSL run as native evidence.
 
 ## Protocol and retry contract
 
@@ -217,6 +237,10 @@ client-side settling sleeps. The official Go SDK
 v1.8.0 tests also cover both supported revisions and modern auto-fallback.
 CLI process tests cover prompt cancellation by signals/EOF/output close/timeout,
 wrong-passphrase denial, broken stdout/SIGPIPE, and full-pipe cancellation.
-Claude Code and Hermes were not installed or runtime-tested; GUI pinentry and
-macOS UI behavior were not runtime-tested. Those limits are deliberate evidence
-boundaries, not interoperability claims.
+Those earlier Codex/Python results are separate from the newer
+[Codex, Claude Code and Hermes broker/custody receipts](named-client-mcp-tests.md).
+Native Windows GUI coverage is recorded separately in
+[the official-GUI fixture](windows-gui-custody.md); it does not establish named
+Windows clients. macOS GUI and native named-client behavior remain unmeasured.
+The integrated Windows-plus-broker candidate needs fresh combined gates and
+binary-bound client custody receipts before inheriting completion claims.

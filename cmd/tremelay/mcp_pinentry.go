@@ -91,7 +91,7 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 	if ctx.Err() != nil {
 		return nil, pinentryContextError(ctx)
 	}
-	if !filepath.IsAbs(options.path) {
+	if !validPinentryExecutable(options.path) {
 		return nil, errPinentryUnavailable
 	}
 	info, e := os.Stat(options.path)
@@ -111,18 +111,24 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 			pass = nil
 		}
 	}()
-	toHelper, input, e := os.Pipe()
+	toHelper, inputFile, e := os.Pipe()
 	if e != nil {
 		return nil, errPinentryUnavailable
 	}
 	defer toHelper.Close()
-	defer input.Close()
-	output, fromHelper, e := os.Pipe()
+	defer inputFile.Close()
+	outputFile, fromHelper, e := os.Pipe()
 	if e != nil {
 		return nil, errPinentryUnavailable
 	}
-	defer output.Close()
+	defer outputFile.Close()
 	defer fromHelper.Close()
+	input, output, e := pinentryPipeEnds(inputFile, outputFile)
+	if e != nil {
+		return nil, errPinentryUnavailable
+	}
+	defer input.Close()
+	defer output.Close()
 	devnull, e := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if e != nil {
 		return nil, errPinentryUnavailable
@@ -130,14 +136,7 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 	defer devnull.Close()
 	cmd := exec.Command(options.path)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = toHelper, fromHelper, devnull
-	// UI discovery only. In particular, no TREMELAY_PASSPHRASE or arbitrary
-	// agent/host environment is inherited by the helper.
-	cmd.Env = []string{}
-	for _, key := range []string{"HOME", "TERM", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LANG", "LC_CTYPE", "LC_MESSAGES"} {
-		if value, ok := os.LookupEnv(key); ok {
-			cmd.Env = append(cmd.Env, key+"="+value)
-		}
-	}
+	configurePinentry(cmd)
 	if e := cmd.Start(); e != nil {
 		return nil, errPinentryUnavailable
 	}
@@ -150,9 +149,11 @@ func readPinentry(ctx context.Context, options pinentryOptions) (pass []byte, er
 	afterDone := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		defer close(afterDone)
+		// Start termination before any pipe Close that joins pending I/O.
+		// In particular a synchronous Windows pipe must not hold up Kill.
+		_ = cmd.Process.Kill()
 		input.Close()
 		output.Close()
-		_ = cmd.Process.Kill()
 	})
 	defer func() {
 		if !stop() {

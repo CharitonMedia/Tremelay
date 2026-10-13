@@ -128,6 +128,7 @@ func TestPinentryDiagnosticPrecedence(t *testing.T) {
 func TestMain(m *testing.M) {
 	mode := strings.TrimPrefix(filepath.Base(os.Args[0]), "tremelay-pinentry-test-")
 	if mode != filepath.Base(os.Args[0]) {
+		mode = strings.TrimSuffix(mode, ".exe")
 		os.Exit(testPinentryHelper(mode))
 	}
 	os.Exit(m.Run())

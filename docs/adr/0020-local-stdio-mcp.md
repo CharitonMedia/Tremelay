@@ -153,8 +153,10 @@ before session lock. A full successful raw stdio write is not reclassified as
 failed solely because close acquires the accounting mutex first. Closed state
 still forbids admission; skipped, short, failed and pending writes retain their
 errors, as do required audit failures. The modern profile retains its existing
-post-close write classification. Other platforms fail closed for this command pending
-runtime implementation; the other CLI commands remain buildable.
+post-close write classification. This was the initial Unix runtime boundary;
+[ADR 0022](0022-windows-mcp-custody.md) adds Windows process custody and records
+its narrower native evidence. Remaining platforms fail closed for this command;
+the other CLI commands remain buildable.
 
 ### Inherited Unix stream compatibility
 
