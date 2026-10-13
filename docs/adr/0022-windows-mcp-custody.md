@@ -121,6 +121,44 @@ helpers and wrapper-launched descendant trees are not claimed. GUI usability
 is measured only for the exact package and runner in the linked fixture.
 The trusted helper is expected to be the directly launched process.
 
+## Native named-client test toolchain trust boundary
+
+The separately gated Windows Codex/Claude Code/Hermes acceptance lane requires
+CPython **3.14.8 x64** for its local control driver and isolated Hermes virtual
+environment. GitHub's `windows-latest` runner does not guarantee that exact
+patch version in the preinstalled tool cache. The workflow now runs the
+official `actions/setup-python` action at immutable commit
+`ece7cb06caefa5fff74198d8649806c4678c61a1` (v6.3.0), requesting
+only `python-version: '3.14.8'`, `architecture: 'x64'`, immediately
+before preparing the pinned native clients. This is a change to the
+**test-runner supply-chain trust boundary**, not to the shipping Tremelay
+program or broker authority.
+
+On a cache miss, the action can download and install Python using the
+`actions/python-versions` distribution and version manifest. Thus the
+trusted CI inputs include the pinned setup action, the hosted runner and its
+tool cache, the upstream GitHub-hosted version manifest (which can change),
+and the selected official Python distribution. An exact action commit does
+**not** cryptographically pin the mutable manifest or prove that the installed
+interpreter has a particular vendor binary digest. The preparation script
+independently rejects any missing, wrong-version or non-x64 interpreter and
+records its observed executable SHA-256, runner image/version and source
+commit/tree. Observing a hash is not equivalent to validating it against a
+fixed independent release checksum; that provenance limitation must accompany
+any native acceptance claim.
+
+The action retains the existing `contents: read` workflow permission and
+runs on GitHub's ephemeral Windows runner with only synthetic vault contents;
+there are no account credentials, model-provider calls or release signing
+rights. No second-version fallback, unpinned ad-hoc installer, silent skip or
+substitution of the earlier Go SDK GUI fixture is allowed. If Python
+provisioning or any downstream locked-wheel/native-client step fails, the
+native acceptance is **not established**, even when ordinary CI passes.
+Shipping credential-broker risk and process custody remain governed by this
+ADR, ADRs 0020-0021 and the security invariants. This lane does not establish
+live SSH login, arbitrary handle modes, production identity or end-user
+credential custody.
+
 ## Evidence boundaries
 
 New Windows-only tests cover owned-handle independence/noninheritance,
@@ -157,3 +195,5 @@ process behavior. The existing security requirements remain unchanged.
 - [Completion notification modes](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setfilecompletionnotificationmodes)
 - [libuv child pipe creation](https://github.com/libuv/libuv/blob/v1.x/src/win/pipe.c)
 - [Console handles](https://learn.microsoft.com/en-us/windows/console/console-handles)
+- [Pinned Python setup action](https://github.com/actions/setup-python/tree/ece7cb06caefa5fff74198d8649806c4678c61a1)
+- [Official Python distribution manifest](https://github.com/actions/python-versions/blob/main/versions-manifest.json)
