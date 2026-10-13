@@ -1,0 +1,8 @@
+# Prospective native Windows CPython 3.14.8 MCP-only closure, not a full Hermes install.
+# Upstream mcp 2.0.0 requires pywin32 on Windows; Click requires colorama.
+# Versions match Hermes v0.21.7 uv.lock, including its native timezone database.
+-r mcp_hermes_requirements.txt
+colorama==0.4.6; sys_platform == 'win32'
+portalocker==3.2.0; sys_platform == 'win32'
+pywin32==311; sys_platform == 'win32'
+tzdata==2025.3; sys_platform == 'win32'

@@ -231,6 +231,9 @@ These named-client runs are Linux evidence. Native Windows/macOS client runs,
 product GUIs, and Grok Bot remain untested here. An earlier client run without a
 complete receipt does not count toward the six passing scenarios.
 
+The [prospective native Windows custody lane](windows-named-client-custody.md)
+is prepared separately. It has not run and is not evidence in the table above.
+
 ## Grok Bot
 
 [Grok Bot](https://docs.x.ai/grok-bot/overview) is a distinct product. Its own
