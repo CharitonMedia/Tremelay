@@ -79,7 +79,9 @@ The human host can rewrap the existing DEK after reauthenticating the old passph
 
 M10a is one in-process message boundary for `local_artifact_attest`. The trusted host constructs it from an already-bound agent principal. Messages cannot choose or replace that principal, a human identity, the session, the vault path, unlock material, the clock, or a host callback. A handle locates one exact grant inside that adapter. It is not a new authentication credential and it is not accepted by a different adapter. Discovery metadata is advisory. Invocation rechecks the selected grant and does not move the handle onto another grant or key.
 
-The interface does not carry HTTP, SSH, or another principal's grants, and it does not accept `request_capability`. M10a itself has no socket, network listener, or MCP transport. A compromised host still holds the unlocked vault. This does not complete M9 or M10.
+The original M10a interface carried only attestation. ADR 0021 additionally
+carries exact single-user HTTP/GitHub grants. It still excludes SSH, class-scoped
+and mixed-operation grants, other principals, and `request_capability`. M10a itself has no socket, network listener, or MCP transport. A compromised host still holds the unlocked vault. This does not complete M9 or M10.
 
 ## Local MCP reference limits
 
@@ -125,9 +127,32 @@ One admitted call remains outstanding until response Write returns. The stdio
 profile can wait on that exact response's completion with a 10ms deadline before
 checking admission; it does not queue another operation or weaken the two-frame
 output bound. Deadline expiry is busy, and transport ambiguity never authorizes
-replay. Signals, EOF and broken output close owned interruptible pipes; helper
+replay. Signals, EOF and broken output close owned interruptible inherited pipes
+or connected unnamed Unix stream pairs. Sockets must be non-listening Unix
+streams with both endpoints unnamed; this adds no listener or remote identity.
+The classifier uses kernel address lengths on Linux, not lossy display names.
+Read-half-close is detected without consuming protocol bytes. Helper
 cleanup restores captured terminal state. The process joins work before locking
 the session. It does not enforce exclusive ownership against another process or
 protect secrets from a compromised host/helper. Linux runtime evidence does not
 prove macOS display behavior; unsupported platforms fail closed. M9/M10 remain
 open, and real production credentials are outside the demonstrated evidence.
+
+
+## MCP network capability limits
+
+[ADR 0021](docs/adr/0021-mcp-credential-brokers.md) exposes only grant-derived
+HTTP or GitHub issue requests, with the existing status-only or four-field
+response projection. Handles are not bearer authentication. Host identity,
+credential custody and public destination controls remain unchanged. A handle
+pins one grant and credential generation; an active duplicate cannot rescue a
+revoked/expired/replaced binding. Shared network approval is not added.
+
+Cancellation can interrupt DNS and network I/O but cannot recall an external
+operation or invalidate a credential already used. No automatic replay is
+permitted after an ambiguous transport result. Required audit failures override
+cancellation and withhold output. Pre-handle denials are sparse
+`agent_capability` events rather than guesses about the operation; resolved
+network attempts use the existing `broker_http` audit and response controls.
+The synthetic protected-upstream fixture proves actual MCP dispatch and broker
+credential use, not live GitHub or stock-CLI/default-network interoperability.

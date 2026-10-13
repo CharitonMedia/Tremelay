@@ -4,22 +4,29 @@
 The human chooses the vault, agent, and trusted pinentry executable before any
 protocol request. The client gets three tools: `list_capabilities`,
 `describe_capability`, and `invoke_capability`. Only existing exact
-`local_artifact_attest` grants are available; private keys never leave the vault.
+`local_artifact_attest`, `http_request`, and `github_issue_state` grants are available.
+Credentials never leave the broker through MCP; HTTP carries them only to the
+authorized service. Network capabilities require single-user, single-operation,
+exact credential-ID grants. Shared vaults still expose only approved attestation.
 This does not provision grants or finish the broader M10 authentication work.
-See [ADR 0020](adr/0020-local-stdio-mcp.md) for the security contract.
+See [ADR 0020](adr/0020-local-stdio-mcp.md) for process custody and
+[ADR 0021](adr/0021-mcp-credential-brokers.md) for credential-use capabilities.
 
 ## Prerequisites and unlock
 
-- Build the CLI with the repository-pinned Go toolchain. Linux and macOS process
-  pipes are implemented; Windows `mcp serve` fails closed. Linux is runtime-tested;
+- Build the CLI with the repository-pinned Go toolchain. Linux and macOS inherited
+  pipes and connected unnamed Unix stream pairs are implemented; Windows
+  `mcp serve` fails closed. Linux is runtime-tested;
   macOS compilation alone is not terminal/display validation.
-- Create the agent and its narrowly scoped attestation grant using the human CLI.
+- Create the agent and its narrowly scoped operation grant using the human CLI.
   The chosen agent ID is host authority, not an identity proven by MCP.
 - Select an already-installed, trusted pinentry executable by absolute path.
   A GUI helper needs a working local display. A curses helper needs a separate
   interactive terminal. The helper and display/terminal stack are trusted with
   the passphrase. Tremelay does not install or configure them.
-- Launch from a client that owns stdin/stdout pipes. Do not run this command with
+- Launch from a client that owns stdin/stdout pipes or connected unnamed Unix
+  stream pairs. Named/abstract sockets and network sockets are not accepted.
+  Do not run this command with
   terminal stdin, redirect the protocol into a file, or send a passphrase on stdin.
 
 The client launches this command, substituting real absolute paths and an
@@ -59,6 +66,32 @@ the helper is reaped, and captured terminal settings are restored. An unknown
 EOF or ordinary exit 1 is not relabeled as cancellation. Upstream added graceful
 SIGINT handling in [Pinentry 1.3.x](https://dev.gnupg.org/T7046.html), following
 [the curses/tty signal issue](https://dev.gnupg.org/T6641.html).
+
+## Using a protected service
+
+Create an exact `http_request` grant for `METHOD https://host/path` or an exact
+`github_issue_state` grant for `GET https://api.github.com/repos/OWNER/REPO/issues/NUMBER`
+using the existing human control plane. The same agent may hold separate grants
+for both operations, but one never authorizes the other's result.
+
+1. Call `list_capabilities` and select the desired operation/resource.
+2. Optionally call `describe_capability` with its opaque `handle`.
+3. Call `invoke_capability` with only `{"handle":"RETURNED_HANDLE"}`.
+
+The HTTP result is only `{"status_code":200}` (the actual allowed status varies).
+GitHub returns only `number`, `state`, `locked`, and `comments`. No headers or
+bodies are returned. The client cannot supply URLs, credential IDs, headers,
+bodies or response selectors. A payload is required only for attestation and is
+rejected on network handles. Class-scoped and multi-operation grants are not
+exposed. SSH requires its existing stateful host-binding protocol and is not an
+MCP capability in this slice.
+
+Handles are local to one adapter and pin the selected credential generation.
+Revocation, expiry, suspension and replacement are rechecked at use. Re-listing
+does not retarget an old handle; a fresh host-bound adapter is required after
+replacement. Cancellation reaches the network context but cannot undo a request
+already transmitted. Never automatically retry after cancellation, EOF, timeout
+or a missing response. Review the audit to resolve an ambiguous outcome.
 
 ## Client configuration examples
 
@@ -131,7 +164,7 @@ A held write still expires to busy; concurrent work is not queued for later
 execution. The modern reference retains immediate-busy behavior.
 
 A busy response is a correlated pre-dispatch denial. A timeout, EOF, cancellation,
-or missing response is ambiguous: an attestation may already have happened.
+or missing response is ambiguous: a credential-backed operation may already have happened.
 Never automatically replay an invocation because its response was missing.
 Cancellation does not recall an already released signature. Review the vault
 audit through the human CLI. Audit persistence failure stops service and takes

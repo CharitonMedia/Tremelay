@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/CharitonMedia/Tremelay/internal/mcpstdio"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
@@ -20,18 +21,18 @@ type mcpStdio struct {
 // Inherited os.Stdin/os.Stdout may be blocking, unpollable Go files. Duplicate
 // first, enable O_NONBLOCK, then construct Go files that register with netpoll.
 // Their Close interrupts blocked reads AND writes, as MCPEndpoint requires.
-// Only pipes are supported; a regular file or terminal is not an MCP session.
+// Only inherited pipes or connected unnamed Unix stream pairs are supported.
 func openMCPStdio(input io.Reader, output io.Writer) (*mcpStdio, error) {
 	r, okR := input.(*os.File)
 	w, okW := output.(*os.File)
 	if !okR || !okW {
 		return nil, errMCPStdio
 	}
-	in, inFD, err := duplicateMCPPipe(r)
+	in, inFD, err := duplicateMCPStream(r)
 	if err != nil {
 		return nil, err
 	}
-	out, outFD, err := duplicateMCPPipe(w)
+	out, outFD, err := duplicateMCPStream(w)
 	if err != nil {
 		in.Close()
 		return nil, err
@@ -44,11 +45,7 @@ func openMCPStdio(input io.Reader, output io.Writer) (*mcpStdio, error) {
 	return &mcpStdio{in: in, out: out, inFD: inFD, outFD: outFD}, nil
 }
 
-func duplicateMCPPipe(source *os.File) (*os.File, int, error) {
-	info, err := source.Stat()
-	if err != nil || info.Mode()&os.ModeNamedPipe == 0 {
-		return nil, 0, errMCPStdio
-	}
+func duplicateMCPStream(source *os.File) (*os.File, int, error) {
 	raw, err := source.SyscallConn()
 	if err != nil {
 		return nil, 0, errMCPStdio
@@ -59,6 +56,10 @@ func duplicateMCPPipe(source *os.File) (*os.File, int, error) {
 		fd, dupErr = unix.FcntlInt(sourceFD, unix.F_DUPFD_CLOEXEC, 3)
 	})
 	if err != nil || dupErr != nil || fd < 0 {
+		return nil, 0, errMCPStdio
+	}
+	if !mcpstdio.ValidInheritedStream(fd) {
+		unix.Close(fd)
 		return nil, 0, errMCPStdio
 	}
 	if err := unix.SetNonblock(fd, true); err != nil {
@@ -77,7 +78,7 @@ func (s *mcpStdio) watchDisconnect(cancel func()) func() {
 		// Darwin needs an interested read/write filter to report pipe EOF.
 		// Readiness itself is not a disconnect and must not consume MCP bytes.
 		fds := []unix.PollFd{
-			{Fd: int32(s.inFD), Events: unix.POLLIN},
+			{Fd: int32(s.inFD), Events: unix.POLLIN | mcpstdio.ReadHalfClosed},
 			{Fd: int32(s.outFD), Events: unix.POLLOUT},
 		}
 		pause := time.NewTimer(50 * time.Millisecond)
@@ -99,7 +100,7 @@ func (s *mcpStdio) watchDisconnect(cancel func()) func() {
 				// An interrupted poll need not refresh revents; inspect them
 				// only after a successful snapshot.
 				for _, fd := range fds {
-					if fd.Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
+					if fd.Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL|mcpstdio.ReadHalfClosed) != 0 {
 						cancel()
 						return
 					}

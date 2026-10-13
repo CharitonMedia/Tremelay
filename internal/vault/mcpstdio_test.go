@@ -145,14 +145,14 @@ func TestStdioMCPAdmission(t *testing.T) {
 	if got := readFrame(t, peer.r); !bytes.Contains(got, []byte(`"code":-32600`)) || bytes.Contains(got, []byte("signature")) {
 		t.Fatal("pre-init call was not denied")
 	}
-	assertSparse(t, s, before, actionLocalAttest)
+	assertSparse(t, s, before, actionAgentCap)
 	stdioInitialize(t, peer, mcpStdio20251125)
 	for _, tc := range []struct {
 		name, frame string
 		code        int64
 		action      string
 	}{
-		{"missing-arguments", `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"invoke_capability"}}`, jsonrpc.CodeInvalidParams, actionLocalAttest},
+		{"missing-arguments", `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"invoke_capability"}}`, jsonrpc.CodeInvalidParams, actionAgentCap},
 		{"extra-authority", `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_capabilities","arguments":{"agent":"another"}}}`, jsonrpc.CodeInvalidParams, actionAgentCap},
 		{"duplicate", `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{},"\u005fmeta":{}}}`, jsonrpc.CodeParseError, actionAgentCap},
 		{"modern-metadata", `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`, jsonrpc.CodeInvalidParams, actionAgentCap},

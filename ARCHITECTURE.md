@@ -62,6 +62,18 @@ profile supports `2025-06-18` and `2025-11-25`, while the modern reference remai
 separate. Admission, exact-grant rechecks and fail-closed audit are shared.
 A stdio-only 10ms response-write handoff deadline avoids spurious busy for normal
 sequential clients without releasing admission early. Linux/macOS use owned,
-close-interruptible pipes; cleanup joins dispatch/output before locking the
+close-interruptible inherited pipes or connected unnamed Unix stream pairs;
+cleanup joins dispatch/output before locking the
 session. No listener, callback, remote identity proof or new grant is added.
 See [the client guide](docs/local-stdio-mcp.md) for measured runtime support.
+
+
+## Exact network capabilities
+
+[ADR 0021](docs/adr/0021-mcp-credential-brokers.md) extends the same capability
+adapter and both MCP profiles to existing HTTP and GitHub issue brokers. Network
+handles bind one agent, grant, operation, credential generation and canonical
+resource. Invocation carries only the handle; the host-derived grant supplies
+the request. Existing destination policy, fixed projections, audit and M5
+response controls remain in force. Shared vaults remain attestation-only. SSH's
+stateful host-proof contract is not represented by these one-shot invocations.

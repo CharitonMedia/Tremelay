@@ -140,9 +140,10 @@ The stdio logger discards SDK records rather than retaining even fixed-token
 diagnostic history for the lifetime of a process. Responses and errors retain
 the existing bounds and closed projections.
 
-On Linux/macOS the command requires stdin/stdout pipes, duplicates them to owned
-close-on-exec descriptors, enables nonblocking mode before constructing Go
-files, and verifies deadline support. Closing those files interrupts blocked
+On Linux/macOS the command requires inherited stdin/stdout pipes or connected
+unnamed Unix stream pairs, duplicates them to owned close-on-exec descriptors,
+enables nonblocking mode before constructing Go files, and verifies deadline
+support. Closing those files interrupts blocked
 reads/writes. SIGINT/SIGTERM cancel service, SIGPIPE is handled as an output
 failure, and EOF closes the session. Terminal read failure closes owned pipes
 independently of SDK Wait, so an admitted response blocked on full output cannot
@@ -154,6 +155,47 @@ still forbids admission; skipped, short, failed and pending writes retain their
 errors, as do required audit failures. The modern profile retains its existing
 post-close write classification. Other platforms fail closed for this command pending
 runtime implementation; the other CLI commands remain buildable.
+
+### Inherited Unix stream compatibility
+
+Native client runtimes may supply an anonymous Unix socket pair for subprocess
+stdio instead of a FIFO. The same host-selected principal and bounded byte
+protocol apply. This is inherited-descriptor support, not a socket listener or
+remote authentication. The stdio transport never binds, connects or listens on
+a socket; credential brokers retain their separately authorized network use.
+
+The shared descriptor classifier runs on the owned duplicate before flags are
+changed. FIFOs remain accepted. A socket must be `SOCK_STREAM`, non-listening,
+and have successful local and peer Unix address checks proving both endpoints
+unnamed. TCP, datagrams, unconnected, pathname and abstract Unix sockets,
+regular files and terminals are rejected with the existing fixed error.
+
+Linux checks the actual `getsockname`/`getpeername` family and returned length
+against the family-only unnamed address. The pinned x/sys decoder maps both
+unnamed and empty abstract addresses to `@`, so matching that string is unsafe.
+Darwin's length-aware decoder maps XNU's zero-data `sun_noname` sentinel to an
+empty Unix name; Darwin has no Linux-style abstract namespace. The small shared
+helper never interprets or exposes address bytes. Both the CLI and synthetic
+credential fixture use this exact classifier.
+
+Non-listening proof is platform-specific. Linux requires a successful
+`SO_ACCEPTCONN` query returning zero. XNU exposes the constant but does not
+implement that option query: its getter returns `ENOPROTOOPT`. Darwin instead
+requires successful `Getpeername`, which the kernel restricts to connected
+sockets, together with both unnamed Unix endpoint checks. XNU forbids listening
+on connected sockets and requires a bound pathname for Unix listeners. No
+option-query error is ignored or reinterpreted as permission. See Apple's
+[socket option/listen implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket.c),
+[peer lookup](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_syscalls.c)
+and [Unix listener checks](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_usrreq.c).
+
+Linux requests `POLLRDHUP` only on protocol input and treats it as terminal,
+including when buffered bytes precede read-half-close. Darwin's interested read
+filter reports EOF through the existing `POLLHUP`. Neither watcher consumes MCP
+bytes. Existing nonblocking ownership, pacing, EINTR handling, deadline support
+and join-before-close remain mandatory. Ordinary descriptor classification,
+owned bounded I/O and buffered EOF tests cover this addition; no credential or
+agent authentication is inferred from the descriptor type.
 
 ### Evidence and remaining limits
 

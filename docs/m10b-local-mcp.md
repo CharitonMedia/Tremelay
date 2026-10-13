@@ -1,5 +1,11 @@
 # M10b — local MCP capability reference
 
+Current extension: [ADR 0021](adr/0021-mcp-credential-brokers.md) adds exact
+single-user HTTP and GitHub credential-use grants to the same adapter/tools.
+Network invocation is handle-only and retains each broker's closed response.
+The text below records the original attestation reference; see the
+[stdio guide](local-stdio-mcp.md#using-a-protected-service) for current use.
+
 This is a partial slice of M10. A trusted host binds one agent, then binds one MCP endpoint to that adapter. An official MCP client discovers the endpoint, lists three fixed tools, and lists, describes, and invokes that principal's `local_artifact_attest` grants. The invocation returns the same public attestation M10a returns. The client verifies it with the public key.
 
 This is a synthetic in-memory peer. It does not listen, authenticate a remote principal, or distribute a public SDK. It does not provision access or complete M9 or M10. See [ADR 0018](adr/0018-local-mcp-capability.md).
