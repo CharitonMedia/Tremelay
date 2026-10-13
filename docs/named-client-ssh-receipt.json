@@ -1,0 +1,191 @@
+{
+  "clients": [
+    {
+      "all_tool_responses_captured_before_close": true,
+      "changed_preimage_rejected": true,
+      "cleanup": {
+        "exit_code": 0,
+        "shutdown_escalated": false
+      },
+      "client": "Codex app-server",
+      "credential_invocations": 7,
+      "driver_retries": 0,
+      "exclusive_fixture_launch_marker": true,
+      "fixture": {
+        "audit_context_absent": true,
+        "audit_rows": 19,
+        "audit_verified": true,
+        "exact_authority": true,
+        "fixture": "synthetic-hostbound-ssh",
+        "observation_files": 10,
+        "observations_complete": true,
+        "observed_secret_absent": true,
+        "own_output_secret_absent": true,
+        "protocol_denials": 0,
+        "serve_clean": false,
+        "shutdown_accepted": true,
+        "shutdown_reason": "signal",
+        "shutdown_signal": "terminated",
+        "ssh_results": {
+          "active": {
+            "allowed": 3,
+            "completed": 1,
+            "denied": 3
+          },
+          "revoked": {
+            "denied_revoked": 1
+          }
+        },
+        "vault_secret_absent": true,
+        "version": 1
+      },
+      "fixture_exit_status_observed": false,
+      "fixture_process_exited": true,
+      "hostbound_signature_verified": true,
+      "hostbound_signatures_received": 1,
+      "model_turns": 0,
+      "postbind_identity_received": true,
+      "prebind_identity_hidden": true,
+      "protocol": null,
+      "protocol_observed": false,
+      "raw_client_output_capture_complete": true,
+      "revoked_exact_grant_denied": true,
+      "synthetic_vault_removed": true,
+      "thread_closed_before_app_server_eof": true,
+      "tool_calls": 10,
+      "version": "0.159.2",
+      "wrong_session_denied": true,
+      "wrong_username_denied": true
+    },
+    {
+      "all_tool_responses_captured_before_close": true,
+      "changed_preimage_rejected": true,
+      "cleanup": {
+        "exit_code": 0,
+        "shutdown_escalated": false
+      },
+      "client": "Claude Code stream-json control",
+      "credential_invocations": 7,
+      "driver_retries": 0,
+      "exclusive_fixture_launch_marker": true,
+      "fixture": {
+        "audit_context_absent": true,
+        "audit_rows": 20,
+        "audit_verified": true,
+        "exact_authority": true,
+        "fixture": "synthetic-hostbound-ssh",
+        "observation_files": 11,
+        "observations_complete": true,
+        "observed_secret_absent": true,
+        "own_output_secret_absent": true,
+        "protocol_denials": 1,
+        "serve_clean": false,
+        "shutdown_accepted": true,
+        "shutdown_reason": "signal",
+        "shutdown_signal": "interrupt",
+        "ssh_results": {
+          "active": {
+            "allowed": 3,
+            "completed": 1,
+            "denied": 3
+          },
+          "revoked": {
+            "denied_revoked": 1
+          }
+        },
+        "vault_secret_absent": true,
+        "version": 1
+      },
+      "fixture_exit_status_observed": false,
+      "fixture_process_exited": true,
+      "hostbound_signature_verified": true,
+      "hostbound_signatures_received": 1,
+      "model_turns": 0,
+      "postbind_identity_received": true,
+      "prebind_identity_hidden": true,
+      "protocol": null,
+      "protocol_observed": false,
+      "raw_client_output_capture_complete": true,
+      "revoked_exact_grant_denied": true,
+      "synthetic_vault_removed": true,
+      "tool_calls": 10,
+      "version": "2.1.296 (Claude Code)",
+      "wrong_session_denied": true,
+      "wrong_username_denied": true
+    },
+    {
+      "all_tool_responses_captured_before_close": true,
+      "changed_preimage_rejected": true,
+      "cleanup": {
+        "exit_code": 0,
+        "shutdown_escalated": false
+      },
+      "client": "Hermes native MCP runtime",
+      "commit": "71d34bad1045610252eda02ee79549436896e784",
+      "credential_invocations": 7,
+      "driver_retries": 0,
+      "exclusive_fixture_launch_marker": true,
+      "fixture": {
+        "audit_context_absent": true,
+        "audit_rows": 19,
+        "audit_verified": true,
+        "exact_authority": true,
+        "fixture": "synthetic-hostbound-ssh",
+        "observation_files": 13,
+        "observations_complete": true,
+        "observed_secret_absent": true,
+        "own_output_secret_absent": true,
+        "protocol_denials": 0,
+        "serve_clean": true,
+        "shutdown_accepted": true,
+        "shutdown_reason": "eof",
+        "ssh_results": {
+          "active": {
+            "allowed": 3,
+            "completed": 1,
+            "denied": 3
+          },
+          "revoked": {
+            "denied_revoked": 1
+          }
+        },
+        "vault_secret_absent": true,
+        "version": 1
+      },
+      "fixture_exit_status_observed": false,
+      "fixture_process_exited": true,
+      "hostbound_signature_verified": true,
+      "hostbound_signatures_received": 1,
+      "mcp": "2.0.0",
+      "model_turns": 0,
+      "postbind_identity_received": true,
+      "prebind_identity_hidden": true,
+      "protocol": "2025-11-25",
+      "protocol_observed": true,
+      "python": "3.12.14",
+      "raw_client_output_capture_complete": true,
+      "revoked_exact_grant_denied": true,
+      "synthetic_vault_removed": true,
+      "tool_calls": 10,
+      "version": "v0.21.7",
+      "wrong_session_denied": true,
+      "wrong_username_denied": true
+    }
+  ],
+  "cryptography": "50.0.1",
+  "date_utc": "2026-10-13",
+  "fixture_binary_sha256": "14afd77ae2abd66399d652632cf6e5d2b4ce5843e11fc54c1d911d0454780674",
+  "go": "1.26.9",
+  "mcp_go_sdk": "1.8.0",
+  "platform": "Linux x86_64",
+  "python": "3.12.14",
+  "scan_limit": "Fixture finalization snapshot only. Late shutdown output, native-home code, caches and SQLite excluded.",
+  "schema": 1,
+  "scope": "Actual named-client MCP transport to test-only hostbound SSH broker. No shipping-CLI custody, remote login or production credentials.",
+  "source_baseline": "3233c7e0c4c138297eb73454380ef3fdb2b675dd",
+  "test_source_sha256": {
+    "internal/vault/mcp_ssh_fixture_test.go": "5e37b7629878b61e944ef4f79326c294be556ff88f8cc261616503d6309a481d",
+    "scripts/mcp_named_client_smoke.py": "0cb69726bfb08cb46257353a8a6fd722e1840a97782ff3d404653833ac71fc20",
+    "scripts/mcp_named_client_ssh.py": "fb2b78ecd478f85f1199fcfc2a9e5524e4cf17efddfe309d337701f46e6c0fba"
+  }
+}

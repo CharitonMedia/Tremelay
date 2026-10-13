@@ -77,3 +77,12 @@ resource. Invocation carries only the handle; the host-derived grant supplies
 the request. Existing destination policy, fixed projections, audit and M5
 response controls remain in force. Shared vaults remain attestation-only. SSH's
 stateful host-proof contract is not represented by these one-shot invocations.
+
+## Bounded SSH capability streams
+
+[ADR 0023](docs/adr/0023-mcp-ssh-userauth.md) proposes carrying the existing
+hostbound SSH authentication-signing broker through the same local MCP tools.
+Exact private bindings include credential generation, username and host key;
+public discovery omits SSH key identity. One private, bounded stream epoch belongs
+to each Serve, with cancellation retirement and joined wiping. Raw Exchange cannot
+borrow that state. This adds no listener, remote SSH connection or command runner.

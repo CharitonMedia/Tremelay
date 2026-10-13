@@ -244,3 +244,28 @@ Native Windows GUI coverage is recorded separately in
 Windows clients. macOS GUI and native named-client behavior remain unmeasured.
 The integrated Windows-plus-broker candidate needs fresh combined gates and
 binary-bound client custody receipts before inheriting completion claims.
+
+## SSH authentication-signing bridge
+
+The proposed [ADR 0023](adr/0023-mcp-ssh-userauth.md) connects exact single-user
+ssh_userauth grants to the same three tools. Discovery omits the SSH public-key
+identity until host binding. Invoke sends handle plus payload: canonical padded
+base64 of one unframed SSH-agent message body (1–4096 bytes). The result contains
+only ssh_response, canonical base64 of a closed SSH-agent response of at most
+88 bytes. There is no four-byte length prefix in either payload.
+
+A caller first provides a valid session-bind@openssh.com proof for the granted
+host key, then requests identities or a hostbound userauth signature. Ordinary
+publickey authentication, forwarding and general signing are denied. Each MCP
+Serve session owns its streams; a cancelled handle is retired for that session,
+and a new session requires fresh binding. Do not automatically retry ambiguous
+bind or sign responses. Bare in-process Exchange does not provide this stateful
+invocation and records a denial.
+
+This is authentication-signing compatibility with a bounded SSH protocol subset.
+It does not open an SSH connection, log in, run commands, enforce shell/repository
+policy or recall an authenticated session. The separate
+[named-client SSH acceptance](named-client-ssh-tests.md) demonstrates actual
+Linux Codex, Claude Code and Hermes MCP runtimes with synthetic host proofs and
+vault-held keys. Shipping-CLI custody is a separate lane; remote login remains
+undemonstrated.

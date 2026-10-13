@@ -100,16 +100,19 @@ type MCPEndpoint struct {
 	logs   *mcpLog
 	stdio  bool // trusted host-selected legacy profile, never selected by a frame
 
-	mu          sync.Mutex
-	serving     bool
-	inCall      bool
-	callID      callKey
-	callInvoke  bool
-	callHandled bool
-	cancelSent  bool
-	auditErr    error
-	active      *mcpOutput
-	pending     *mcpOutput
+	mu            sync.Mutex
+	serving       bool
+	inCall        bool
+	callID        callKey
+	callInvoke    bool
+	callHandled   bool
+	cancelSent    bool
+	sshEpoch      *capSSHEpoch
+	callSSH       *agentCapGrant
+	callSSHHandle [32]byte
+	auditErr      error
+	active        *mcpOutput
+	pending       *mcpOutput
 }
 
 type callKey struct {
@@ -159,7 +162,7 @@ func bindMCPEndpoint(cap *AgentCapability, stdio bool) (*MCPEndpoint, error) {
 	}, ep.onTool)
 	ep.server.AddTool(&mcp.Tool{
 		Name:         toolInvoke,
-		Description:  "Invoke the exact capability named by handle. HTTP and GitHub accept only handle; local attestation also requires a base64 payload. Never replay an ambiguous or cancelled invocation.",
+		Description:  "Invoke the exact capability named by handle. HTTP and GitHub accept only handle; attestation requires a base64 payload; SSH requires one unframed base64 SSH-agent message (1–4096 bytes) after host session binding. Never replay an ambiguous or cancelled invocation.",
 		InputSchema:  json.RawMessage(mcpInvokeInSchema),
 		OutputSchema: json.RawMessage(mcpInvokeOutSchema),
 	}, ep.onTool)
@@ -185,9 +188,14 @@ func (e *MCPEndpoint) Serve(ctx context.Context, r io.ReadCloser, w io.WriteClos
 	}
 	e.serving = true
 	e.auditErr = nil
+	e.sshEpoch = newCapSSHEpoch()
 	e.mu.Unlock()
 	defer func() {
+		// All later defers join SDK dispatch and output before streams close.
+		e.sshEpoch.close()
 		e.mu.Lock()
+		e.sshEpoch = nil
+		e.callSSH = nil
 		e.serving = false
 		e.inCall = false
 		e.callHandled = false
@@ -277,6 +285,7 @@ func (e *MCPEndpoint) beginCallLocked(id callKey, invoke bool) bool {
 	e.callInvoke = invoke
 	e.callHandled = false
 	e.cancelSent = false
+	e.callSSH = nil
 	return true
 }
 
@@ -302,9 +311,12 @@ func (e *MCPEndpoint) settleDenied(id callKey) error {
 		e.mu.Unlock()
 		return nil
 	}
-	invoke := e.callInvoke
+	invoke, bound := e.callInvoke, e.callSSH
 	e.callHandled = true
 	e.mu.Unlock()
+	if bound != nil {
+		return e.cap.denySSH(*bound)
+	}
 	return e.cap.denyBound(invoke)
 }
 
@@ -328,12 +340,17 @@ func (e *MCPEndpoint) settleOutstanding() error {
 		e.mu.Unlock()
 		return nil
 	}
-	invoke := e.callInvoke
+	invoke, bound := e.callInvoke, e.callSSH
 	e.callHandled = true
 	e.inCall = false
 	e.cancelSent = false
 	e.mu.Unlock()
-	err := e.cap.denyBound(invoke)
+	var err error
+	if bound != nil {
+		err = e.cap.denySSH(*bound)
+	} else {
+		err = e.cap.denyBound(invoke)
+	}
 	if err != nil {
 		e.noteAudit(err)
 	}
@@ -353,11 +370,19 @@ func (e *MCPEndpoint) noteAudit(err error) {
 
 func (e *MCPEndpoint) acceptCancel(id callKey) bool {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if !e.inCall || e.cancelSent || !e.callID.matches(id) {
+		e.mu.Unlock()
 		return false
 	}
 	e.cancelSent = true
+	var idle *SSHUserAuth
+	if e.callSSH != nil {
+		idle = e.sshEpoch.retire(e.callSSHHandle)
+	}
+	e.mu.Unlock()
+	// Retirement detached only an idle stream. Active cleanup is the handler's
+	// job, so this never waits for vault work before forwarding cancellation.
+	idle.Close()
 	return true
 }
 
@@ -379,7 +404,10 @@ func (e *MCPEndpoint) onTool(ctx context.Context, req *mcp.CallToolRequest) (*mc
 	if ctx != nil && ctx.Err() != nil {
 		return e.toolFail(invoke, mcpCodeCancelled)
 	}
-	raw, err := e.cap.exchange(ctx, msg)
+	e.mu.Lock()
+	epoch := e.sshEpoch
+	e.mu.Unlock()
+	raw, err := e.cap.exchangeSSH(ctx, msg, epoch)
 	// A required vault audit/storage failure cannot disappear behind a fixed
 	// JSON-RPC projection or a racing request cancellation.
 	if err != nil {
@@ -389,7 +417,21 @@ func (e *MCPEndpoint) onTool(ctx context.Context, req *mcp.CallToolRequest) (*mc
 }
 
 func (e *MCPEndpoint) toolFail(invoke bool, code int64) (*mcp.CallToolResult, error) {
-	if err := e.cap.denyBound(invoke); err != nil {
+	e.mu.Lock()
+	bound := e.callSSH
+	var idle *SSHUserAuth
+	if bound != nil && code == mcpCodeCancelled {
+		idle = e.sshEpoch.retire(e.callSSHHandle)
+	}
+	e.mu.Unlock()
+	idle.Close()
+	var err error
+	if bound != nil && code == mcpCodeCancelled {
+		err = e.cap.denySSH(*bound)
+	} else {
+		err = e.cap.denyBound(invoke)
+	}
+	if err != nil {
 		e.noteAudit(err)
 		return nil, rpcError(jsonrpc.CodeInternalError)
 	}
@@ -504,6 +546,11 @@ func projectCap(raw []byte, err error) (*mcp.CallToolResult, error) {
 	case capMethodDescribe:
 		return toolValue(entryBody(resp.entry))
 	case capMethodInvoke:
+		if resp.sshResponse != nil {
+			return toolValue(struct {
+				Response string `json:"ssh_response"`
+			}{base64.StdEncoding.EncodeToString(resp.sshResponse)})
+		}
 		switch resp.network.operation {
 		case OpHTTPRequest:
 			return toolValue(struct {
@@ -670,12 +717,16 @@ func (c *admitConn) Close() error {
 	c.once.Do(func() {
 		c.ep.mu.Lock()
 		c.closed = true
+		idle := c.ep.sshEpoch.stop()
 		if c.ep.pending != nil {
 			c.ep.pending.done <- io.ErrClosedPipe
 			close(c.ep.pending.complete)
 			c.ep.pending = nil
 		}
 		c.ep.mu.Unlock()
+		for _, stream := range idle {
+			stream.Close()
+		}
 		c.signalWriter()
 		// Neither the endpoint nor the session lock is held over transport I/O.
 		err = errors.Join(c.raw.Close(), c.rawW.Close())
@@ -696,6 +747,9 @@ func (c *admitConn) admit(d frameDecision) bool {
 	// Even an error write must finish before new credential work starts:
 	// otherwise a broken output stream could execute an unrelated invocation.
 	ok := !c.closed && !c.terminal && c.ep.active == nil && c.ep.pending == nil && c.ep.beginCallLocked(d.key, d.invoke)
+	if ok {
+		c.ep.callSSH, c.ep.callSSHHandle = d.sshBound, d.sshHandle
+	}
 	if ok && c.ep.stdio && d.method == "initialize" {
 		c.legacyPhase = stdioInitializing
 		c.initializeID = d.key
@@ -838,6 +892,7 @@ func (c *admitConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 			// Admission never releases the prior call early. The stdio-only
 			// bounded handoff above may observe its completed write; otherwise
 			// this remains the same fail-closed busy decision.
+			d.sshBound, d.sshHandle = c.ep.cap.resolveSSHFrame(frame, d.invoke)
 			if !c.admit(d) {
 				if err := c.reject(d, mcpCodeBusy); err != nil {
 					return nil, err
@@ -1072,6 +1127,8 @@ type frameDecision struct {
 	idOK      bool
 	requested string
 	method    string // fixed supported method, used only by legacy lifecycle
+	sshBound  *agentCapGrant
+	sshHandle [32]byte
 }
 
 func classifyFrame(frame []byte) frameDecision {
@@ -1758,7 +1815,7 @@ func (h *mcpLog) text() string {
 	return h.buf.String()
 }
 
-const mcpEntrySchema = `{"type":"object","additionalProperties":false,"required":["handle","operation","resource","status","expiry"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"operation":{"type":"string","enum":["local_artifact_attest","http_request","github_issue_state"]},"resource":{"type":"string"},"key_id":{"type":"string","minLength":64,"maxLength":64},"status":{"type":"string","enum":["active","revoked","expired"]},"expiry":{"type":"string"}},"oneOf":[{"properties":{"operation":{"const":"local_artifact_attest"}},"required":["key_id"]},{"properties":{"operation":{"enum":["http_request","github_issue_state"]}},"not":{"required":["key_id"]}}]}`
+const mcpEntrySchema = `{"type":"object","additionalProperties":false,"required":["handle","operation","resource","status","expiry"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"operation":{"type":"string","enum":["local_artifact_attest","http_request","github_issue_state","ssh_userauth"]},"resource":{"type":"string"},"key_id":{"type":"string","minLength":64,"maxLength":64},"status":{"type":"string","enum":["active","revoked","expired"]},"expiry":{"type":"string"}},"oneOf":[{"properties":{"operation":{"const":"local_artifact_attest"}},"required":["key_id"]},{"properties":{"operation":{"enum":["http_request","github_issue_state","ssh_userauth"]}},"not":{"required":["key_id"]}}]}`
 
 const mcpListInSchema = `{"type":"object","additionalProperties":false,"properties":{}}`
 
@@ -1772,4 +1829,6 @@ const mcpAttestOutSchema = `{"type":"object","additionalProperties":false,"requi
 
 const mcpHTTPOutSchema = `{"type":"object","additionalProperties":false,"required":["status_code"],"properties":{"status_code":{"type":"integer","minimum":200,"maximum":599,"not":{"minimum":300,"maximum":399}}}}`
 const mcpGitHubOutSchema = `{"type":"object","additionalProperties":false,"required":["number","state","locked","comments"],"properties":{"number":{"type":"integer","minimum":1,"maximum":999999999},"state":{"type":"string","enum":["open","closed"]},"locked":{"type":"boolean"},"comments":{"type":"integer","minimum":0,"maximum":1000000}}}`
-const mcpInvokeOutSchema = `{"type":"object","oneOf":[` + mcpAttestOutSchema + `,` + mcpHTTPOutSchema + `,` + mcpGitHubOutSchema + `]}`
+const mcpSSHOutSchema = `{"type":"object","additionalProperties":false,"required":["ssh_response"],"properties":{"ssh_response":{"type":"string","minLength":4,"maxLength":120,"contentEncoding":"base64"}}}`
+
+const mcpInvokeOutSchema = `{"type":"object","oneOf":[` + mcpAttestOutSchema + `,` + mcpHTTPOutSchema + `,` + mcpGitHubOutSchema + `,` + mcpSSHOutSchema + `]}`

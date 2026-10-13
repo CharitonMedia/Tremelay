@@ -206,7 +206,7 @@ func TestSSHUserAuthConstructorPreservesLifecycle(t *testing.T) {
 			}
 			before := len(mustAudit(t, env.path))
 			stream, err := env.principal.SSHUserAuth(env.grant.ID)
-			if err != nil || stream == nil || stream.bound || len(mustAudit(t, env.path)) != before {
+			if err != nil || stream == nil || stream.hasBinding || len(mustAudit(t, env.path)) != before {
 				t.Fatalf("construction changed authority or wrote a row: %v", err)
 			}
 			defer stream.Close()
