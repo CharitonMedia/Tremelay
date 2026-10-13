@@ -269,8 +269,14 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 		t.Fatal("native client did not close its shipping server")
 	}
 	var serverExit uint32
-	if windows.GetExitCodeProcess(serverHandle, &serverExit) != nil || serverExit != 0 {
-		t.Fatal("shipping server did not exit successfully")
+	exitErr := windows.GetExitCodeProcess(serverHandle, &serverExit)
+	if exitErr != nil || serverExit != 0 {
+		// Expose only public process status and a fixed category. Never print
+		// raw Codex/client stderr, MCP traffic, or any synthetic credential.
+		_, statusErr := os.Stat(filepath.Join(root, "observations", "client-status.json"))
+		_, resultErr := os.Stat(filepath.Join(root, "client-result.json"))
+		t.Fatalf("shipping server did not exit successfully (exit=%d, status_seen=%t, result_seen=%t, client_log_category=%s)",
+			serverExit, statusErr == nil, resultErr == nil, namedGUIClientLogCategory(root))
 	}
 	writeNamedGUIJSON(t, filepath.Join(root, "fixture-evidence.json"), map[string]bool{"shipping_server_exited": true})
 	select {
@@ -408,6 +414,41 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 			"cli_sha256":                      namedGUIHash(t, cli), "helper_sha256": namedGUIHash(t, helper), "native_sha256": namedGUIHash(t, native), "driver_sha256": namedGUIHash(t, driver),
 			"python_sha256": namedGUIHash(t, python), "control_driver_sha256": namedGUIHash(t, filepath.Join(filepath.Dir(driver), "mcp_named_client_smoke.py"))})
 	}
+}
+
+// This diagnostic does not change the acceptance condition. It classifies
+// known, fixed CLI diagnostic strings from a bounded, private synthetic client
+// capture without disclosing any log bytes or a command-line argument.
+func namedGUIClientLogCategory(root string) string {
+	path := filepath.Join(root, "observations", "client-stderr.log")
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 4<<20 {
+		return "unavailable"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) > 4<<20 {
+		return "unavailable"
+	}
+	defer vault.Wipe(data)
+	for _, candidate := range []struct {
+		message  string
+		category string
+	}{
+		{"mcp serve requires supported, close-interruptible stdin and stdout pipes", "stdio-rejected"},
+		{"vault unlock failed", "vault-unlock-failed"},
+		{"mcp agent binding failed", "agent-binding-failed"},
+		{"mcp session cancelled", "session-cancelled"},
+		{"mcp session failed; inspect the vault audit before retrying an operation", "session-failed"},
+		{"pinentry", "pinentry-mentioned"},
+	} {
+		if bytes.Contains(data, []byte(candidate.message)) {
+			return candidate.category
+		}
+	}
+	if len(data) == 0 {
+		return "empty"
+	}
+	return "other-private-log"
 }
 
 func namedGUIHash(t *testing.T, path string) string {
