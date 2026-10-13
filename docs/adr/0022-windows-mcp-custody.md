@@ -89,26 +89,6 @@ The candidate's ordinary native suite and shipping-CLI GUI fixture passed on
 Windows Server 2025; the exact commit, runner, and pinned helper are recorded in
 [the GUI evidence](../windows-gui-custody.md#measured-native-acceptance).
 
-## Quiescent EOF and final SDK cleanup
-
-The native Codex Windows acceptance fixture observed all five MCP tool
-requests and responses, with no control error, then thread unsubscribe and
-closure; the shipping CLI nevertheless returned exit 1. The transport reader
-had closed both inherited pipe duplicates as soon as it saw input EOF, before
-the SDK could finish joining the now-idle server session. The correction
-distinguishes **clean EOF with no partial frame and no outstanding call or
-queued/active output** from terminal input loss with work pending.
-
-Only in that fully quiescent case does the reader return EOF without closing
-the write half itself; the parent `Serve` still closes and joins the writer
-after the SDK session exits. All partial frames, terminal states, outstanding
-calls, and pending output preserve immediate Close/cancellation and existing
-audit settlement. No SDK error is normalized into success, no method replay
-occurs, and no agent-facing credential or debugging channel is added.
-
-Native Windows acceptance remains the gate for claiming that this fix is
-sufficient; until it passes, a clean shutdown has not been established.
-
 ## Windows helper and console
 
 The initial helper contract is a directly invoked native GUI pinentry executable

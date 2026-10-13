@@ -849,24 +849,6 @@ func (c *admitConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 		}
 		frame, err := c.nextFrame()
 		if err != nil {
-			// A complete, idle peer EOF is orderly transport shutdown. Let
-			// the SDK finish its reader/writer lifecycle before Close releases
-			// output; closing both pipes in this Read can spuriously fail the
-			// final SDK wait after the peer received every response.
-			//
-			// This exception is never taken with an outstanding call, active
-			// or pending output, a terminal protocol state, or a partial
-			// frame. Those paths MUST still close immediately to interrupt a
-			// blocked Write and settle any unfinished audit attempt.
-			if len(frame) == 0 && errors.Is(err, io.EOF) {
-				c.ep.mu.Lock()
-				idle := !c.closed && !c.terminal && !c.ep.inCall &&
-					c.ep.active == nil && c.ep.pending == nil
-				c.ep.mu.Unlock()
-				if idle {
-					return nil, io.EOF
-				}
-			}
 			// Terminal input loss must interrupt output independently of SDK
 			// Wait: an admitted response may still be blocked in Write. Audit
 			// any consumed partial frame first; a failed denial remains the

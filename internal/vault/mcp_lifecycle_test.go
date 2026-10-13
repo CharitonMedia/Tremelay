@@ -18,45 +18,6 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// A clean EOF with no outstanding work leaves the write half open only
-// until ServerSession.Wait joins it. An EOF while credential work is still
-// outstanding must instead interrupt output and settle that attempt.
-func TestMCPIdleEOFWriterLifecycle(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		inCall   bool
-		terminal bool
-		closed   bool
-	}{
-		{name: "idle", closed: false},
-		{name: "in-flight-call", inCall: true, closed: true},
-		{name: "terminal-protocol", terminal: true, closed: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ep := &MCPEndpoint{inCall: tc.inCall}
-			in := io.NopCloser(bytes.NewReader(nil))
-			conn := &admitConn{
-				ep: ep, in: bufio.NewReader(in), raw: in, rawW: discardWC{},
-				terminal: tc.terminal,
-			}
-			conn.startWriter()
-			t.Cleanup(func() {
-				_ = conn.Close()
-				<-conn.writerDone
-			})
-			if _, err := conn.Read(context.Background()); !errors.Is(err, io.EOF) {
-				t.Fatalf("read EOF changed: %v", err)
-			}
-			ep.mu.Lock()
-			closed := conn.closed
-			ep.mu.Unlock()
-			if closed != tc.closed {
-				t.Fatalf("writer close transition on clean EOF: closed=%t, want=%t", closed, tc.closed)
-			}
-		})
-	}
-}
-
 // These are transport/SDK regressions, not calls into output helpers. Channels
 // expose the writer's real delivery transitions without changing production code.
 func TestMCPOutputLifecycle(t *testing.T) {
