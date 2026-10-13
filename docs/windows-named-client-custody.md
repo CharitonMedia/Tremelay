@@ -1,14 +1,24 @@
 # Native Windows named-client operation compatibility
 
-Status: **synthetic operation-compatibility acceptance run in Windows CI** on
-head `cf134e3` for Codex 0.159.2, Claude Code 2.1.296, and Hermes
-v0.21.7. Linux and general CI also passed at that head. The Windows result
-covers exact completed credential operations, grants, denial, audit,
-cryptographic verification, captured-output secret scans, and helper cleanup.
-It does NOT establish production credentials or remote SSH login. Codex
-native process shutdown remains explicitly unattributed/nonzero, unlike the
-separate [Windows GUI/Go SDK result](windows-gui-custody.md) or the
-[Linux named-client results](named-client-mcp-tests.md).
+Status: **the narrowed synthetic native Windows operation-compatibility
+acceptance PASSED**, on code head `ad92c05ac70c258cb5687e5e0a2e6d7519bd65a6`
+in [Test Windows run 38454970400](https://github.com/CharitonMedia/Tremelay/actions/runs/38454970400)
+for Codex 0.159.2, Claude Code 2.1.296 and Hermes v0.21.7. The workflow
+ran `TestWindowsNamedClientCredentialOperation` and recorded the new
+explicitly unattributed/non-graceful Codex exit fields; it did not merely
+reuse an earlier passing test. Linux and general CI were checked separately.
+
+Earlier Windows tests at `cf134e3` exercised the same underlying
+cryptographic, grant, denial, audit, GUI and secret-scan operations, but
+used the older `TestWindowsNamedClientShippingGUI` name and the
+incorrectly attributed Codex exit result. That historical success is NOT
+acceptance evidence for the revised operation-only contract.
+
+This is synthetic operation evidence, not production credentials, remote SSH
+login, or verified Codex process shutdown. The separate
+[Windows GUI/Go SDK evidence](windows-gui-custody.md) addresses normal
+shipping-CLI/SDK lifecycle; the
+[Linux named-client evidence](named-client-mcp-tests.md) remains distinct.
 
 ## Exact scope
 

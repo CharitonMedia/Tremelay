@@ -36,8 +36,12 @@ Raw client output is captured through its eventual EOF; late shutdown output is
 retained but not covered by the earlier fixture secret-scan snapshot.
 No token, token digest, or unlock material is exported to a separate auditor.
 
-The process observer currently requires POSIX. No native Windows, macOS GUI,
-WSL-to-Windows, or product UI compatibility is implied by a Linux run.
+The process observer for the **Linux protected HTTP/GitHub fixture
+described here** requires POSIX. That Linux fixture does not establish
+native Windows network-broker, macOS GUI, WSL-to-Windows, or product UI
+compatibility. A separate Windows test exercises synthetic **shipping CLI
+attestation and revoked-grant operations**, not network-broker behavior;
+see [native Windows operation compatibility](windows-named-client-custody.md).
 
 ## Pinned actual runtimes
 
@@ -227,12 +231,20 @@ vault and key file. All scans were complete within their declared scope; no
 passphrase, signing key, or bearer token was observed. There were no model turns,
 provider accounts, or credential-operation retries.
 
-These named-client runs are Linux evidence. Native Windows/macOS client runs,
-product GUIs, and Grok Bot remain untested here. An earlier client run without a
-complete receipt does not count toward the six passing scenarios.
+These six named-client scenarios are **Linux evidence only**. Native
+macOS/Grok Bot, product GUIs and public-network Windows broker operations
+remain untested here. An earlier client run without a complete receipt
+does not count toward the six passing Linux scenarios.
 
-The [prospective native Windows custody lane](windows-named-client-custody.md)
-is prepared separately. It has not run and is not evidence in the table above.
+The separate [native Windows synthetic operation-compatibility lane](windows-named-client-custody.md)
+ran successfully on code head `ad92c05` in
+[Test Windows run 38454970400](https://github.com/CharitonMedia/Tremelay/actions/runs/38454970400).
+It used real Windows Codex, Claude Code and Hermes clients with a shipping CLI,
+official GUI helper, public signature verification and independently audited
+allowed/revoked grants. It is **not** part of the Linux table and does not prove
+Windows HTTP/GitHub broker, Windows SSH live login, or Codex-initiated process
+termination. Codex's exit 1 remains explicitly unattributed and cannot be
+cited as successful server shutdown.
 
 ## Grok Bot
 
