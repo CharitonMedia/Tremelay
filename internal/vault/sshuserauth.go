@@ -52,10 +52,11 @@ var errSSHTransport = errors.New("ssh stream failed")
 
 // SSHUserAuth is one protocol stream bound to one existing principal and one
 // selected ssh_userauth grant. Wire messages cannot choose the principal,
-// grant, credential, resource, clock, or host key. The unlocked Session is not
-// safe for concurrent callers. Serve and roundTrip serialize this stream's
-// state transitions and signing on mu; the host must not call other Session
-// methods on another goroutine while one of those calls is running.
+// grant, credential, resource, clock, or host key. The authority snapshot is
+// immutable and includes the credential generation, username, and host key.
+// Serve and roundTrip serialize this stream's state transitions on mu. Broker
+// work is separately serialized by the Session, including initial checks and
+// denial auditing; unlocked callbacks never retain a signing key.
 //
 // A binding is one verified host-key signature over one session identifier
 // with is_forwarding false. It is not proof of a live local SSH transport.
@@ -64,24 +65,25 @@ var errSSHTransport = errors.New("ssh stream failed")
 type SSHUserAuth struct {
 	broker  sshBroker
 	agentID string
-	grantID string
+	bound   agentCapGrant
 
-	mu        sync.Mutex
-	closed    bool
-	bound     bool
-	hostKey   []byte
-	sessionID []byte
-	hostSig   []byte
+	mu         sync.Mutex
+	closed     bool
+	hasBinding bool
+	hostKey    []byte
+	sessionID  []byte
+	hostSig    []byte
 }
 
 // sshBroker is the in-process session surface used by one stream.
 // It is not *Session, and it has no boolean that marks a host or a session as trusted.
 type sshBroker interface {
-	sshConstruct(agentID, grantID string) error
-	sshJudge(agentID, grantID string) (auditEvent, []byte, error)
+	sshConstruct(agentID, grantID string) (agentCapGrant, error)
+	sshJudge(agentID string, bound agentCapGrant) (auditEvent, []byte, error)
 	sshRecord(ev auditEvent) error
-	sshShowKey(agentID, grantID string, hostKey, sessionID, hostSig []byte) ([]byte, error)
-	sshRelease(agentID, grantID string, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error)
+	sshDeny(agentID string, bound agentCapGrant) error
+	sshShowKey(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig []byte) ([]byte, error)
+	sshRelease(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error)
 }
 
 // SSHUserAuth binds a new stream to grantID. grantID must already name an
@@ -98,10 +100,11 @@ func (a *AgentPrincipal) SSHUserAuth(grantID string) (*SSHUserAuth, error) {
 	if !ok {
 		return nil, ErrUnauthenticated
 	}
-	if err := broker.sshConstruct(a.id, grantID); err != nil {
+	bound, err := broker.sshConstruct(a.id, grantID)
+	if err != nil {
 		return nil, err
 	}
-	return &SSHUserAuth{broker: broker, agentID: a.id, grantID: grantID}, nil
+	return &SSHUserAuth{broker: broker, agentID: a.id, bound: bound}, nil
 }
 
 // Serve reads SSH agent frames from rw until EOF. A clean EOF before the next
@@ -149,7 +152,7 @@ func (a *SSHUserAuth) Close() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.closed = true
-	a.bound = false
+	a.hasBinding = false
 	wipe(a.hostKey)
 	wipe(a.sessionID)
 	wipe(a.hostSig)
@@ -170,8 +173,8 @@ func (a *SSHUserAuth) roundTrip(body []byte) ([]byte, error) {
 }
 
 func (a *SSHUserAuth) noteFrameErr(err error) error {
-	ev, _, jerr := a.broker.sshJudge(a.agentID, a.grantID)
-	if errors.Is(jerr, ErrUnauthenticated) {
+	ev, _, jerr := a.broker.sshJudge(a.agentID, a.bound)
+	if stopSSH(jerr) {
 		return jerr
 	}
 	if jerr != nil {
@@ -191,8 +194,8 @@ func (a *SSHUserAuth) handle(body []byte) ([]byte, error) {
 	if len(body) == 0 {
 		return a.deny(resultDenied)
 	}
-	ev, pinned, jerr := a.broker.sshJudge(a.agentID, a.grantID)
-	if errors.Is(jerr, ErrUnauthenticated) {
+	ev, pinned, jerr := a.broker.sshJudge(a.agentID, a.bound)
+	if stopSSH(jerr) {
 		return nil, jerr
 	}
 	if jerr != nil {
@@ -225,10 +228,10 @@ func (a *SSHUserAuth) identities(body []byte, ev auditEvent) ([]byte, error) {
 	if len(body) != 1 {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
-	if !a.bound {
+	if !a.hasBinding {
 		return a.record(ev, resultDenied, sshEmptyIdentities())
 	}
-	blob, err := a.broker.sshShowKey(a.agentID, a.grantID, a.hostKey, a.sessionID, a.hostSig)
+	blob, err := a.broker.sshShowKey(a.agentID, a.bound, a.hostKey, a.sessionID, a.hostSig)
 	if err != nil {
 		if stopSSH(err) {
 			return nil, err
@@ -239,10 +242,10 @@ func (a *SSHUserAuth) identities(body []byte, ev auditEvent) ([]byte, error) {
 }
 
 func (a *SSHUserAuth) sign(body []byte, ev auditEvent) ([]byte, error) {
-	if !a.bound {
+	if !a.hasBinding {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
-	sig, err := a.broker.sshRelease(a.agentID, a.grantID, a.hostKey, a.sessionID, a.hostSig, body)
+	sig, err := a.broker.sshRelease(a.agentID, a.bound, a.hostKey, a.sessionID, a.hostSig, body)
 	if err != nil {
 		if stopSSH(err) {
 			return nil, err
@@ -264,7 +267,7 @@ func (a *SSHUserAuth) extension(body []byte, ev auditEvent, pinned []byte) ([]by
 	if name != sshExtSessionBind {
 		return a.record(ev, resultDenied, []byte{sshAgentExtensionFailure})
 	}
-	if a.bound {
+	if a.hasBinding {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
 	host, sid, sig, ok := parseSessionBind(rest)
@@ -280,13 +283,13 @@ func (a *SSHUserAuth) extension(body []byte, ev auditEvent, pinned []byte) ([]by
 	a.hostKey = dup(host)
 	a.sessionID = dup(sid)
 	a.hostSig = dup(sig)
-	a.bound = true
+	a.hasBinding = true
 	return resp, nil
 }
 
 func (a *SSHUserAuth) deny(result string) ([]byte, error) {
-	ev, _, jerr := a.broker.sshJudge(a.agentID, a.grantID)
-	if errors.Is(jerr, ErrUnauthenticated) {
+	ev, _, jerr := a.broker.sshJudge(a.agentID, a.bound)
+	if stopSSH(jerr) {
 		return nil, jerr
 	}
 	if jerr != nil {
@@ -307,7 +310,7 @@ func (a *SSHUserAuth) record(ev auditEvent, result string, resp []byte) ([]byte,
 }
 
 func stopSSH(err error) bool {
-	return errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrAudit) || errors.Is(err, ErrIO) || errors.Is(err, ErrCorrupt)
+	return errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrStale) || errors.Is(err, ErrAudit) || errors.Is(err, ErrIO) || errors.Is(err, ErrCorrupt)
 }
 
 // fixedStreamErr drops reader and writer text. A short frame is ErrInvalid.
@@ -318,10 +321,14 @@ func fixedStreamErr(err error) error {
 		return nil
 	case errors.Is(err, ErrUnauthenticated):
 		return ErrUnauthenticated
+	case errors.Is(err, ErrStale):
+		return ErrStale
 	case errors.Is(err, ErrAudit):
 		return ErrAudit
 	case errors.Is(err, ErrIO):
 		return ErrIO
+	case errors.Is(err, ErrCorrupt):
+		return ErrCorrupt
 	case errors.Is(err, errSSHTransport):
 		return errSSHTransport
 	case errors.Is(err, ErrInvalid), errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
@@ -331,18 +338,18 @@ func fixedStreamErr(err error) error {
 	}
 }
 
-func (b agentBinder) sshConstruct(agentID, grantID string) error {
+func (b agentBinder) sshConstruct(agentID, grantID string) (agentCapGrant, error) {
 	if b.s == nil {
-		return ErrUnauthenticated
+		return agentCapGrant{}, ErrUnauthenticated
 	}
 	return b.s.sshConstruct(agentID, grantID)
 }
 
-func (b agentBinder) sshJudge(agentID, grantID string) (auditEvent, []byte, error) {
+func (b agentBinder) sshJudge(agentID string, bound agentCapGrant) (auditEvent, []byte, error) {
 	if b.s == nil {
 		return auditEvent{}, nil, ErrUnauthenticated
 	}
-	return b.s.sshJudge(agentID, grantID)
+	return b.s.sshJudge(agentID, bound)
 }
 
 func (b agentBinder) sshRecord(ev auditEvent) error {
@@ -352,53 +359,64 @@ func (b agentBinder) sshRecord(ev auditEvent) error {
 	return b.s.sshRecord(ev)
 }
 
-func (b agentBinder) sshShowKey(agentID, grantID string, hostKey, sessionID, hostSig []byte) ([]byte, error) {
+func (b agentBinder) sshDeny(agentID string, bound agentCapGrant) error {
+	if b.s == nil {
+		return ErrUnauthenticated
+	}
+	return b.s.sshDeny(agentID, bound)
+}
+
+func (b agentBinder) sshShowKey(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig []byte) ([]byte, error) {
 	if b.s == nil {
 		return nil, ErrUnauthenticated
 	}
-	return b.s.sshShowKey(agentID, grantID, hostKey, sessionID, hostSig)
+	return b.s.sshShowKey(agentID, bound, hostKey, sessionID, hostSig)
 }
 
-func (b agentBinder) sshRelease(agentID, grantID string, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
+func (b agentBinder) sshRelease(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
 	if b.s == nil {
 		return nil, ErrUnauthenticated
 	}
-	return b.s.sshRelease(agentID, grantID, hostKey, sessionID, hostSig, signBody)
+	return b.s.sshRelease(agentID, bound, hostKey, sessionID, hostSig, signBody)
 }
 
-func (s *Session) sshConstruct(agentID, grantID string) error {
+func (s *Session) sshConstruct(agentID, grantID string) (agentCapGrant, error) {
 	if err := s.begin(); err != nil {
-		return err
+		return agentCapGrant{}, err
 	}
 	defer s.end()
 	return s.sshConstructUnlocked(agentID, grantID)
 }
 
-func (s *Session) sshConstructUnlocked(agentID, grantID string) error {
+func (s *Session) sshConstructUnlocked(agentID, grantID string) (agentCapGrant, error) {
 	if err := s.live(); err != nil {
-		return err
+		return agentCapGrant{}, err
 	}
 	if safeID(agentID) == "" || safeID(grantID) == "" {
-		return s.denySSHConstruct(agentID, ErrInvalid)
+		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrInvalid)
 	}
 	if !s.agentExists(agentID) {
-		return s.denySSHConstruct(agentID, ErrDeniedAgent)
+		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrDeniedAgent)
 	}
 	g, ok := s.grantByID(grantID)
 	if !ok {
-		return s.denySSHConstruct(agentID, ErrGrantNotFound)
+		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrGrantNotFound)
 	}
 	if g.AgentID != agentID {
-		return s.denySSHConstruct(agentID, ErrDeniedAgent)
+		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrDeniedAgent)
 	}
-	if !sshGrantShape(g) {
-		return s.denySSHConstruct(agentID, ErrDeniedOperation)
+	if s.shared() || !sshGrantShape(g) || validateResource(g.Resource) != nil {
+		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrDeniedOperation)
 	}
 	c, ok := s.credByID(g.CredentialID)
 	if !ok || c.Type != CredTypeEd25519 {
-		return s.denySSHConstruct(agentID, ErrInvalid)
+		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrInvalid)
 	}
-	return nil
+	return agentCapGrant{
+		grantID: g.ID, credID: g.CredentialID, keyID: g.KeyID,
+		resource: g.Resource, operation: OpSSHUserAuth, credGen: c.Gen,
+		sshUser: g.SSHUsername, sshHost: string(g.SSHHostKey),
+	}, nil
 }
 
 func (s *Session) denySSHConstruct(agentID string, cause error) error {
@@ -409,13 +427,24 @@ func (s *Session) denySSHConstruct(agentID string, cause error) error {
 	return s.finish(ev, cause)
 }
 
-// sshJudge re-reads the selected grant. It does not look for another grant,
-// and it does not write an audit row.
-func (s *Session) sshJudge(agentID, grantID string) (auditEvent, []byte, error) {
+// sshJudge re-reads the exact selected authority under the session lock. It
+// never searches for another grant and does not write an audit row.
+func (s *Session) sshJudge(agentID string, bound agentCapGrant) (auditEvent, []byte, error) {
+	if err := s.begin(); err != nil {
+		return auditEvent{}, nil, err
+	}
+	defer s.end()
+	return s.sshJudgeUnlocked(agentID, bound)
+}
+
+func (s *Session) sshJudgeUnlocked(agentID string, bound agentCapGrant) (auditEvent, []byte, error) {
 	if err := s.live(); err != nil {
 		return auditEvent{}, nil, err
 	}
-	ev := auditEvent{Action: actionSSHUserAuth, AgentID: agentID, GrantID: grantID, Operation: OpSSHUserAuth}
+	if err := s.requireCurrent(); err != nil {
+		return auditEvent{}, nil, err
+	}
+	ev := auditEvent{Action: actionSSHUserAuth, AgentID: agentID, GrantID: bound.grantID, Operation: OpSSHUserAuth}
 	if safeID(agentID) == "" || !s.agentExists(agentID) {
 		ev.AgentID = ""
 		ev.GrantID = ""
@@ -423,7 +452,7 @@ func (s *Session) sshJudge(agentID, grantID string) (auditEvent, []byte, error) 
 		ev.Result = resultDeniedAgent
 		return ev, nil, ErrDeniedAgent
 	}
-	g, ok := s.grantByID(grantID)
+	g, ok := s.grantByID(bound.grantID)
 	if ok && g.AgentID == agentID && g.CredentialID != "" {
 		ev.CredID = g.CredentialID
 		ev.CredType = CredTypeEd25519
@@ -432,7 +461,10 @@ func (s *Session) sshJudge(agentID, grantID string) (auditEvent, []byte, error) 
 		ev.Result = resultDeniedAgent
 		return ev, nil, ErrDeniedAgent
 	}
-	if !ok || g.AgentID != agentID || !sshGrantShape(g) {
+	if !ok || s.shared() || g.AgentID != agentID || !sshGrantShape(g) ||
+		bound.operation != OpSSHUserAuth || g.CredentialID != bound.credID || g.KeyID != bound.keyID ||
+		g.Resource != bound.resource || validateResource(g.Resource) != nil ||
+		g.SSHUsername != bound.sshUser || string(g.SSHHostKey) != bound.sshHost {
 		ev.Result = resultFailed
 		return ev, nil, ErrSignFailed
 	}
@@ -445,6 +477,15 @@ func (s *Session) sshJudge(agentID, grantID string) (auditEvent, []byte, error) 
 		ev.Result = resultDeniedExpired
 		return ev, nil, ErrDeniedExpired
 	}
+	c, ok := s.credByID(bound.credID)
+	if !ok || c.Type != CredTypeEd25519 || c.Lifecycle.State != StateActive {
+		ev.Result = resultFailed
+		return ev, nil, ErrSignFailed
+	}
+	if c.Gen != bound.credGen {
+		ev.Result = resultDeniedKey
+		return ev, nil, ErrDeniedKey
+	}
 	priv, err := s.sshPrivate(g)
 	wipe(priv)
 	if err != nil {
@@ -455,141 +496,181 @@ func (s *Session) sshJudge(agentID, grantID string) (auditEvent, []byte, error) 
 }
 
 func (s *Session) sshRecord(ev auditEvent) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	return s.sshRecordUnlocked(ev)
+}
+
+func (s *Session) sshRecordUnlocked(ev auditEvent) error {
 	if err := s.live(); err != nil {
+		return err
+	}
+	if err := s.requireCurrent(); err != nil {
 		return err
 	}
 	ev.Action = actionSSHUserAuth
 	return s.finish(ev, nil)
 }
 
-func (s *Session) sshShowKey(agentID, grantID string, hostKey, sessionID, hostSig []byte) ([]byte, error) {
+// sshDeny audits a resolved SSH capability rejected before frame handling.
+// No caller bytes are parsed or copied into the row. A current authority
+// denial keeps its fixed result; otherwise this is a plain denied attempt.
+func (s *Session) sshDeny(agentID string, bound agentCapGrant) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	ev, _, err := s.sshJudgeUnlocked(agentID, bound)
+	if stopSSH(err) {
+		return err
+	}
+	if err == nil {
+		ev.Result = resultDenied
+	}
+	return s.sshRecordUnlocked(ev)
+}
+
+// sshRecheckUnlocked runs after any unlocked callback and immediately before
+// signing or releasing a public result. A failed required audit overrides the
+// ordinary authority denial. It never obtains an alternate grant.
+func (s *Session) sshRecheckUnlocked(agentID string, bound agentCapGrant) error {
+	ev, _, err := s.sshJudgeUnlocked(agentID, bound)
+	if err == nil || stopSSH(err) {
+		return err
+	}
+	if rec := s.sshRecordUnlocked(ev); rec != nil {
+		return rec
+	}
+	return err
+}
+
+func (s *Session) sshShowKey(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig []byte) ([]byte, error) {
 	if err := s.begin(); err != nil {
 		return nil, err
 	}
 	defer s.end()
-	return s.sshShowKeyUnlocked(agentID, grantID, hostKey, sessionID, hostSig)
+	return s.sshShowKeyUnlocked(agentID, bound, hostKey, sessionID, hostSig)
 }
 
-func (s *Session) sshShowKeyUnlocked(agentID, grantID string, hostKey, sessionID, hostSig []byte) ([]byte, error) {
-	ev, pinned, err := s.sshJudge(agentID, grantID)
+func (s *Session) sshShowKeyUnlocked(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig []byte) ([]byte, error) {
+	ev, pinned, err := s.sshJudgeUnlocked(agentID, bound)
 	if err != nil {
-		if errors.Is(err, ErrUnauthenticated) {
+		if stopSSH(err) {
 			return nil, err
 		}
-		if rec := s.sshRecord(ev); rec != nil {
+		if rec := s.sshRecordUnlocked(ev); rec != nil {
 			return nil, rec
 		}
 		return nil, err
 	}
 	if !sshProof(pinned, hostKey, sessionID, hostSig) {
 		ev.Result = resultDenied
-		if rec := s.sshRecord(ev); rec != nil {
+		if rec := s.sshRecordUnlocked(ev); rec != nil {
 			return nil, rec
 		}
 		return nil, ErrInvalid
 	}
-	blob, err := s.sshUserBlob(grantID)
+	blob, err := s.sshUserBlob(bound.grantID)
 	if err != nil {
 		ev.Result = resultFrom(err)
-		if rec := s.sshRecord(ev); rec != nil {
+		if rec := s.sshRecordUnlocked(ev); rec != nil {
 			return nil, rec
 		}
 		return nil, err
 	}
 	ev.Result = resultAllowed
-	if rec := s.sshRecord(ev); rec != nil {
+	if rec := s.sshRecordUnlocked(ev); rec != nil {
+		wipe(blob)
 		return nil, rec
+	}
+	if err := s.sshRecheckUnlocked(agentID, bound); err != nil {
+		wipe(blob)
+		return nil, err
 	}
 	return blob, nil
 }
 
-func (s *Session) sshRelease(agentID, grantID string, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
+func (s *Session) sshRelease(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
 	if err := s.begin(); err != nil {
 		return nil, err
 	}
 	defer s.end()
-	return s.sshReleaseUnlocked(agentID, grantID, hostKey, sessionID, hostSig, signBody)
+	return s.sshReleaseUnlocked(agentID, bound, hostKey, sessionID, hostSig, signBody)
 }
 
-func (s *Session) sshReleaseUnlocked(agentID, grantID string, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
-	ev, pinned, err := s.sshJudge(agentID, grantID)
+func (s *Session) sshReleaseUnlocked(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
+	ev, pinned, err := s.sshJudgeUnlocked(agentID, bound)
 	if err != nil {
-		if errors.Is(err, ErrUnauthenticated) {
+		if stopSSH(err) {
 			return nil, err
 		}
-		if rec := s.sshRecord(ev); rec != nil {
+		if rec := s.sshRecordUnlocked(ev); rec != nil {
 			return nil, rec
 		}
 		return nil, err
 	}
-	userBlob, uerr := s.sshUserBlob(grantID)
+	userBlob, uerr := s.sshUserBlob(bound.grantID)
 	if uerr != nil {
 		ev.Result = resultFrom(uerr)
-		if rec := s.sshRecord(ev); rec != nil {
+		if rec := s.sshRecordUnlocked(ev); rec != nil {
 			return nil, rec
 		}
 		return nil, uerr
 	}
-	if !sshProof(pinned, hostKey, sessionID, hostSig) || !sshSignBody(pinned, sessionID, signBody, s.grantUser(grantID), userBlob) {
+	if !sshProof(pinned, hostKey, sessionID, hostSig) || !sshSignBody(pinned, sessionID, signBody, bound.sshUser, userBlob) {
 		ev.Result = resultDenied
-		if rec := s.sshRecord(ev); rec != nil {
+		if rec := s.sshRecordUnlocked(ev); rec != nil {
 			return nil, rec
 		}
 		return nil, ErrInvalid
 	}
+	// Keep only the validated message across callbacks, never a private key.
+	preimage := sshSignData(signBody)
+	defer wipe(preimage)
 	// Allowed is durable before the private key is used.
 	ev.Result = resultAllowed
-	if rec := s.sshRecord(ev); rec != nil {
+	if rec := s.sshRecordUnlocked(ev); rec != nil {
 		return nil, rec
 	}
-	g, _ := s.grantByID(grantID)
-	priv, err := s.sshPrivate(g)
-	if err != nil {
-		wipe(priv)
-		ev.Result = resultFrom(err)
-		if rec := s.sshRecord(ev); rec != nil {
-			return nil, rec
-		}
-		return nil, err
-	}
-	if s.sshFault != nil {
+	// Snapshot under the lock. A callback may replace or clear itself while
+	// the Session mutex is released.
+	fault := s.sshFault
+	if fault != nil {
 		var faultErr error
 		s.duringCallback(func() {
-			if s.sshFault != nil {
-				faultErr = s.sshFault()
-			}
+			faultErr = fault()
 		})
 		if faultErr != nil {
-			wipe(priv)
 			ev.Result = resultFailed
-			if rec := s.sshRecord(ev); rec != nil {
+			if rec := s.sshRecordUnlocked(ev); rec != nil {
 				return nil, rec
 			}
 			return nil, ErrSignFailed
 		}
 	}
-	if err := s.sharedGrantLive(grantID); err != nil {
-		wipe(priv)
-		if errors.Is(err, ErrStale) {
-			return nil, err
-		}
-		ev.Result = resultDeniedRevoked
-		if errors.Is(err, ErrDeniedExpired) {
-			ev.Result = resultDeniedExpired
-		}
-		if rec := s.sshRecord(ev); rec != nil {
-			return nil, rec
-		}
+	if err := s.sshRecheckUnlocked(agentID, bound); err != nil {
 		return nil, err
 	}
-	preimage := sshSignData(signBody)
 	if len(preimage) == 0 {
-		wipe(priv)
 		ev.Result = resultFailed
-		if rec := s.sshRecord(ev); rec != nil {
+		if rec := s.sshRecordUnlocked(ev); rec != nil {
 			return nil, rec
 		}
 		return nil, ErrSignFailed
+	}
+	// The exact authority and generation have just been checked under the
+	// Session lock. Obtain the private key only now, with no intervening callback.
+	g, _ := s.grantByID(bound.grantID)
+	priv, err := s.sshPrivate(g)
+	if err != nil {
+		wipe(priv)
+		ev.Result = resultFrom(err)
+		if rec := s.sshRecordUnlocked(ev); rec != nil {
+			return nil, rec
+		}
+		return nil, err
 	}
 	raw := ed25519.Sign(priv, preimage)
 	wipe(priv)
@@ -597,9 +678,13 @@ func (s *Session) sshReleaseUnlocked(agentID, grantID string, hostKey, sessionID
 	blob := marshalEd25519Sig(raw)
 	wipe(raw)
 	ev.Result = resultCompleted
-	if rec := s.sshRecord(ev); rec != nil {
+	if rec := s.sshRecordUnlocked(ev); rec != nil {
 		wipe(blob)
 		return nil, rec
+	}
+	if err := s.sshRecheckUnlocked(agentID, bound); err != nil {
+		wipe(blob)
+		return nil, err
 	}
 	return blob, nil
 }
@@ -642,14 +727,6 @@ func (s *Session) sshUserBlob(grantID string) ([]byte, error) {
 	defer wipe(priv)
 	pub, _ := priv.Public().(ed25519.PublicKey)
 	return marshalEd25519Pub(pub), nil
-}
-
-func (s *Session) grantUser(grantID string) string {
-	g, ok := s.grantByID(grantID)
-	if !ok {
-		return ""
-	}
-	return g.SSHUsername
 }
 
 func resultFrom(err error) string {

@@ -51,6 +51,7 @@ const (
 	capFieldIssueState    = 17
 	capFieldIssueLocked   = 18
 	capFieldIssueComments = 19
+	capFieldSSHResponse   = 20
 
 	capTypeBytes  = 1
 	capTypeString = 2
@@ -83,6 +84,8 @@ type agentCapGrant struct {
 	resource  string
 	operation string
 	credGen   uint64
+	sshUser   string
+	sshHost   string
 }
 
 type agentCapSnapshot struct {
@@ -153,6 +156,14 @@ func (a *AgentCapability) exchange(ctx context.Context, message []byte) ([]byte,
 	if a == nil || a.broker == nil || safeID(a.agentID) == "" {
 		return nil, ErrUnauthenticated
 	}
+	return a.exchangeSSH(ctx, message, nil)
+}
+
+// The epoch is private host-owned MCP state; bare Exchange cannot borrow it.
+func (a *AgentCapability) exchangeSSH(ctx context.Context, message []byte, epoch *capSSHEpoch) ([]byte, error) {
+	if a == nil || a.broker == nil || safeID(a.agentID) == "" {
+		return nil, ErrUnauthenticated
+	}
 	req, code := parseCapRequest(message)
 	defer wipe(req.payload)
 	if code != "" {
@@ -164,7 +175,7 @@ func (a *AgentCapability) exchange(ctx context.Context, message []byte) ([]byte,
 	case capMethodDescribe:
 		return a.describe(req.handle)
 	case capMethodInvoke:
-		return a.invokeContext(ctx, req.handle, req.payload)
+		return a.invokeSSHContext(ctx, req.handle, req.payload, epoch)
 	default:
 		return a.protocolDeny(false, capUnknownMethod)
 	}
@@ -226,7 +237,7 @@ func (a *AgentCapability) describe(handle [32]byte) ([]byte, error) {
 	if err != nil {
 		return nil, ErrInvalid
 	}
-	entry, err := encodeEntry(capEntry{handle: handle, operation: bound.operation, resource: bound.resource, keyID: bound.keyID, status: view.status, expires: exp})
+	entry, err := encodeEntry(capEntry{handle: handle, operation: bound.operation, resource: bound.resource, keyID: disclosedCapKey(bound.operation, bound.keyID), status: view.status, expires: exp})
 	if err != nil {
 		return nil, err
 	}
@@ -238,9 +249,19 @@ func (a *AgentCapability) invoke(handle [32]byte, payload []byte) ([]byte, error
 }
 
 func (a *AgentCapability) invokeContext(ctx context.Context, handle [32]byte, payload []byte) ([]byte, error) {
+	return a.invokeSSHContext(ctx, handle, payload, nil)
+}
+
+func (a *AgentCapability) invokeSSHContext(ctx context.Context, handle [32]byte, payload []byte, epoch *capSSHEpoch) ([]byte, error) {
 	bound, ok := a.lookup(handle)
 	if !ok {
 		return a.protocolDeny(true, capUnknownHandle)
+	}
+	if bound.operation == OpSSHUserAuth {
+		if len(payload) == 0 || len(payload) > MaxSSHFrame {
+			return a.protocolDeny(false, capMalformed)
+		}
+		return a.invokeSSH(ctx, handle, bound, payload, epoch)
 	}
 	if networkOperation(bound.operation) {
 		if payload != nil {
@@ -305,7 +326,7 @@ func (a *AgentCapability) bindAll(snaps []agentCapSnapshot) ([]capEntry, error) 
 		// An existing handle keeps its original grant, credential, key, and
 		// resource. A later list does not point it at another grant.
 		stored := a.byHandle[handle]
-		if networkOperation(stored.operation) && stored != sn.agentCapGrant {
+		if (networkOperation(stored.operation) || stored.operation == OpSSHUserAuth) && stored != sn.agentCapGrant {
 			sn.status = GrantRevoked
 		}
 		exp, err := requireTime(sn.expires)
@@ -316,7 +337,7 @@ func (a *AgentCapability) bindAll(snaps []agentCapSnapshot) ([]capEntry, error) 
 			handle:    handle,
 			operation: stored.operation,
 			resource:  stored.resource,
-			keyID:     stored.keyID,
+			keyID:     disclosedCapKey(stored.operation, stored.keyID),
 			status:    sn.status,
 			expires:   exp,
 		})
@@ -381,7 +402,7 @@ func (s *Session) agentCapList(agentID string) ([]agentCapSnapshot, error) {
 		c, _ := s.credByID(g.CredentialID)
 		snaps = append(snaps, agentCapSnapshot{
 			agentCapGrant: agentCapGrant{
-				grantID: g.ID, credID: g.CredentialID, keyID: g.KeyID, resource: g.Resource, operation: g.Operations[0], credGen: c.Gen,
+				grantID: g.ID, credID: g.CredentialID, keyID: g.KeyID, resource: g.Resource, operation: g.Operations[0], credGen: c.Gen, sshUser: g.SSHUsername, sshHost: string(g.SSHHostKey),
 			},
 			status:  s.attestCapStatus(g, now),
 			expires: g.ExpiresAt.UTC(),
@@ -423,7 +444,7 @@ func (s *Session) agentCapDescribe(agentID string, bound agentCapGrant) (agentCa
 	deny := s.boundAgentDenial(agentID)
 	deny.Action = actionAgentCap
 	g, ok := s.grantByID(bound.grantID)
-	if !ok || g.AgentID != agentID || g.CredentialID != bound.credID || g.Resource != bound.resource || g.KeyID != bound.keyID || !s.capGrantSupported(g) || g.Operations[0] != bound.operation {
+	if !ok || g.AgentID != agentID || g.CredentialID != bound.credID || g.Resource != bound.resource || g.KeyID != bound.keyID || g.SSHUsername != bound.sshUser || string(g.SSHHostKey) != bound.sshHost || !s.capGrantSupported(g) || g.Operations[0] != bound.operation {
 		if err := s.finish(deny, nil); err != nil {
 			return agentCapView{}, err
 		}
@@ -448,7 +469,7 @@ func (s *Session) agentCapDescribe(agentID string, bound agentCapGrant) (agentCa
 		return agentCapView{}, ErrInvalid
 	}
 	status := s.attestCapStatus(g, now)
-	if networkOperation(bound.operation) {
+	if networkOperation(bound.operation) || bound.operation == OpSSHUserAuth {
 		c, ok := s.credByID(bound.credID)
 		if !ok || c.Gen != bound.credGen || c.Lifecycle.State != StateActive {
 			status = GrantRevoked
@@ -648,13 +669,14 @@ type capEntry struct {
 }
 
 type capResponse struct {
-	method  byte
-	code    string
-	message string
-	entries []capEntry
-	entry   capEntry
-	att     LocalAttestation
-	network capNetworkResult
+	method      byte
+	code        string
+	message     string
+	entries     []capEntry
+	entry       capEntry
+	att         LocalAttestation
+	network     capNetworkResult
+	sshResponse []byte
 }
 
 func parseCapRequest(msg []byte) (capRequest, string) {
@@ -927,7 +949,7 @@ func decodeCapEntryFields(fields map[byte]capWire) (capEntry, error) {
 	keyID, kok := capString(fields, capFieldKeyID)
 	status, sok := capString(fields, capFieldStatus)
 	expiry, eok := capString(fields, capFieldExpiry)
-	if !hok || !ook || !rok || !sok || !eok || (op == OpLocalArtifactAttest && (!kok || len(fields) != 6)) || (networkOperation(op) && (kok || len(fields) != 5)) {
+	if !hok || !ook || !rok || !sok || !eok || (op == OpLocalArtifactAttest && (!kok || len(fields) != 6)) || ((networkOperation(op) || op == OpSSHUserAuth) && (kok || len(fields) != 5)) {
 		return capEntry{}, ErrInvalid
 	}
 	if !capEntryScopeOK(op, resource, keyID) || !capStatusOK(status) {
@@ -948,6 +970,12 @@ func decodeCapEntryFields(fields map[byte]capWire) (capEntry, error) {
 }
 
 func decodeCapInvoke(fields map[byte]capWire) (capResponse, error) {
+	if f, ok := fields[capFieldSSHResponse]; ok {
+		if len(fields) != 1 || f.typ != capTypeBytes || !validCapSSHResponse(f.val) {
+			return capResponse{}, ErrInvalid
+		}
+		return capResponse{method: capMethodInvoke, sshResponse: f.val}, nil
+	}
 	if _, ok := fields[capFieldHTTPStatus]; ok {
 		return decodeNetworkResult(fields)
 	}

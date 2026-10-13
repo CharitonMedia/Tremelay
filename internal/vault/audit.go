@@ -682,7 +682,7 @@ func validSSHUserAuthAudit(ev auditEvent) error {
 // Handles, payloads, and caller method text are not fields.
 func validAgentCapAudit(ev auditEvent) error {
 	if ev.Result == resultAllowed {
-		if ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || (ev.Operation == OpLocalArtifactAttest && ev.CredType != CredTypeEd25519) || (ev.Operation != OpLocalArtifactAttest && (!networkOperation(ev.Operation) || ev.CredType == "")) {
+		if ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ((ev.Operation == OpLocalArtifactAttest || ev.Operation == OpSSHUserAuth) && ev.CredType != CredTypeEd25519) || (ev.Operation != OpLocalArtifactAttest && ev.Operation != OpSSHUserAuth && (!networkOperation(ev.Operation) || ev.CredType == "")) {
 			return ErrAudit
 		}
 		return nil

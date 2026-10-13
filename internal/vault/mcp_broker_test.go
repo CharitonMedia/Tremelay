@@ -351,12 +351,23 @@ func TestMCPNetworkBrokerCatalogScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := startMCP(t, bindCap(t, e.s, e.agent.ID))
-	handles := mcpNetworkHandles(t, client)
-	if len(handles) != 2 || e.calls != 0 || e.lookups != 0 {
+	entries := entriesOf(t, mustCall(t, client, toolList, map[string]any{}))
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		op, _ := entry["operation"].(string)
+		if seen[op] || (op != OpHTTPRequest && op != OpGitHubIssueState && op != OpSSHUserAuth) || len(entry) != 5 || entry["key_id"] != nil {
+			t.Fatal("catalogue broadened authority or identity disclosure")
+		}
+		seen[op] = true
+		if op == OpSSHUserAuth && entry["resource"] != "hidden-ssh" {
+			t.Fatal("SSH catalogue retargeted resource")
+		}
+	}
+	if len(entries) != 3 || !seen[OpHTTPRequest] || !seen[OpGitHubIssueState] || !seen[OpSSHUserAuth] || e.calls != 0 || e.lookups != 0 {
 		t.Fatal("catalogue included unbound authority or performed credential use")
 	}
 	list := mustCall(t, client, toolList, map[string]any{})
-	for _, hidden := range []string{foreignResource, "class.example", "hidden-signing", "hidden-ssh", "hidden-account", "API.github.com", "/017"} {
+	for _, hidden := range []string{foreignResource, "class.example", "hidden-signing", "hidden-account", "API.github.com", "/017"} {
 		if bytes.Contains(mustJSON(t, list), []byte(hidden)) {
 			t.Fatal("catalogue disclosed an excluded grant")
 		}

@@ -234,10 +234,15 @@ func TestAgentCapIsolationAndCatalog(t *testing.T) {
 	for _, entry := range decoded.entries {
 		seen[entry.resource] = entry.operation
 	}
-	if len(decoded.entries) != 2 || seen[resource] != OpLocalArtifactAttest || seen[httpResource] != OpHTTPRequest {
+	if len(decoded.entries) != 3 || seen[resource] != OpLocalArtifactAttest || seen[httpResource] != OpHTTPRequest || seen[sshResource] != OpSSHUserAuth {
 		t.Fatalf("filtered catalog %+v code %s", decoded.entries, decoded.code)
 	}
-	for _, hidden := range []string{sshResource, sshUser, OpSSHUserAuth, "ssh-ed25519"} {
+	for _, entry := range decoded.entries {
+		if entry.operation == OpSSHUserAuth && entry.keyID != "" {
+			t.Fatal("SSH catalogue disclosed identity before binding")
+		}
+	}
+	for _, hidden := range []string{sshUser, "ssh-ed25519"} {
 		if bytes.Contains(catalog, []byte(hidden)) {
 			t.Fatalf("catalog exposed %s", hidden)
 		}

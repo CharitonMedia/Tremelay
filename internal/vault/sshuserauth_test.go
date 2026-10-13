@@ -198,11 +198,11 @@ func TestSSHUserAuthContextDenials(t *testing.T) {
 		append(env.bindBody(sessionID, env.hostBlob, env.hostSig(env.hostPriv, sessionID), 0), 0),
 	}
 	for i, body := range badBinds {
-		if resp, err := env.stream.roundTrip(body); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) || env.stream.bound {
-			t.Fatalf("bad bind %d resp %x bound %v err %v", i, resp, env.stream.bound, err)
+		if resp, err := env.stream.roundTrip(body); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) || env.stream.hasBinding {
+			t.Fatalf("bad bind %d resp %x bound %v err %v", i, resp, env.stream.hasBinding, err)
 		}
 	}
-	if resp, err := env.stream.roundTrip(env.bindBody(sessionID, env.hostBlob, env.hostSig(env.hostPriv, sessionID), 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentSuccess}) || !env.stream.bound {
+	if resp, err := env.stream.roundTrip(env.bindBody(sessionID, env.hostBlob, env.hostSig(env.hostPriv, sessionID), 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentSuccess}) || !env.stream.hasBinding {
 		t.Fatalf("bind %x %v", resp, err)
 	}
 	if resp, err := env.stream.roundTrip(env.bindBody(sessionID, env.hostBlob, env.hostSig(env.hostPriv, sessionID), 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) || !bytes.Equal(env.stream.sessionID, sessionID) {
@@ -528,8 +528,8 @@ func TestSSHUserAuthGrantPinOrder(t *testing.T) {
 			sid := bytes.Repeat([]byte{0x3c}, 32)
 			sig := marshalEd25519Sig(ed25519.Sign(hostPriv, sid))
 			bind := bindMessage(hostBlob, sid, sig, 0)
-			if resp, err := staleStream.roundTrip(bind); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) || staleStream.bound {
-				t.Fatalf("stale grant accepted a binding %x bound %v %v", resp, staleStream.bound, err)
+			if resp, err := staleStream.roundTrip(bind); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) || staleStream.hasBinding {
+				t.Fatalf("stale grant accepted a binding %x bound %v %v", resp, staleStream.hasBinding, err)
 			}
 			if resp, err := currentStream.roundTrip(bind); err != nil || !bytes.Equal(resp, []byte{sshAgentSuccess}) {
 				t.Fatalf("current bind %x %v", resp, err)
@@ -697,8 +697,8 @@ func TestSSHUserAuthBindAuditAndTruncatedFrame(t *testing.T) {
 	env.session.commitFault = func() error { return errors.New("induced " + env.user) }
 	resp, err := stream.roundTrip(env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, sid), 0))
 	env.session.commitFault = nil
-	if resp != nil || !errors.Is(err, ErrAudit) || stream.bound || strings.Contains(err.Error(), env.user) {
-		t.Fatalf("bind audit failure resp %x bound %v err %v", resp, stream.bound, err)
+	if resp != nil || !errors.Is(err, ErrAudit) || stream.hasBinding || strings.Contains(err.Error(), env.user) {
+		t.Fatalf("bind audit failure resp %x bound %v err %v", resp, stream.hasBinding, err)
 	}
 	if sshCount(t, env.path, resultAllowed) != allowed+1 {
 		t.Fatal("failed bind wrote allowed")
@@ -968,12 +968,12 @@ func TestSSHUserAuthLocked(t *testing.T) {
 func TestSSHUserAuthDirectRelease(t *testing.T) {
 	env := newSSHEnv(t)
 	sid := env.sessionID(32)
-	sig, err := env.session.sshRelease(env.agent.ID, env.grant.ID, nil, nil, nil, env.signBody(env.userBlob, []byte("raw"), 0))
+	sig, err := env.session.sshRelease(env.agent.ID, env.stream.bound, nil, nil, nil, env.signBody(env.userBlob, []byte("raw"), 0))
 	if sig != nil || err == nil {
 		t.Fatal("direct release signed without a proof")
 	}
 	env.mustBind(t, sid)
-	sig, err = env.session.sshRelease(env.agent.ID, env.grant.ID, env.stream.hostKey, env.stream.sessionID, env.stream.hostSig, env.signBody(env.userBlob, env.methodPreimage(sid, "publickey"), 0))
+	sig, err = env.session.sshRelease(env.agent.ID, env.stream.bound, env.stream.hostKey, env.stream.sessionID, env.stream.hostSig, env.signBody(env.userBlob, env.methodPreimage(sid, "publickey"), 0))
 	if sig != nil || err == nil {
 		t.Fatal("direct release signed ordinary publickey")
 	}

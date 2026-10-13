@@ -80,8 +80,8 @@ The human host can rewrap the existing DEK after reauthenticating the old passph
 M10a is one in-process message boundary for `local_artifact_attest`. The trusted host constructs it from an already-bound agent principal. Messages cannot choose or replace that principal, a human identity, the session, the vault path, unlock material, the clock, or a host callback. A handle locates one exact grant inside that adapter. It is not a new authentication credential and it is not accepted by a different adapter. Discovery metadata is advisory. Invocation rechecks the selected grant and does not move the handle onto another grant or key.
 
 The original M10a interface carried only attestation. ADR 0021 additionally
-carries exact single-user HTTP/GitHub grants. It still excludes SSH, class-scoped
-and mixed-operation grants, other principals, and `request_capability`. M10a itself has no socket, network listener, or MCP transport. A compromised host still holds the unlocked vault. This does not complete M9 or M10.
+carries exact single-user HTTP/GitHub grants. ADR 0023 separately adds bounded SSH streams. Class-scoped and mixed-operation
+grants, other principals, and `request_capability` remain excluded. M10a itself has no socket, network listener, or MCP transport. A compromised host still holds the unlocked vault. This does not complete M9 or M10.
 
 ## Local MCP reference limits
 
@@ -156,3 +156,15 @@ cancellation and withhold output. Pre-handle denials are sparse
 network attempts use the existing `broker_http` audit and response controls.
 The synthetic protected-upstream fixture proves actual MCP dispatch and broker
 credential use, not live GitHub or stock-CLI/default-network interoperability.
+
+## MCP SSH authentication-signing limits
+
+[ADR 0023](docs/adr/0023-mcp-ssh-userauth.md) carries the existing hostbound SSH
+subset through local MCP. An exact handle pins credential generation and all SSH
+scope, and discovery withholds the SSH identity until host proof. Each Serve owns
+at most 64 lazy retained stream slots, including retired tombstones. Cancellation
+retires the resolved handle for that epoch and wipes its binding after active
+work joins; a later Serve requires fresh binding. No automatic retry is permitted
+after ambiguous output. Existing host-key/username enforcement and replay limits
+remain unchanged. This proves neither remote login nor command/channel policy.
+Shared authority and remote principal authentication are not added.

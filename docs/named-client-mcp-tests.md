@@ -248,3 +248,11 @@ API do not count as Grok Bot runtime evidence.
 - [Hermes native discovery at the pinned commit](https://github.com/NousResearch/hermes-agent/blob/71d34bad1045610252eda02ee79549436896e784/tools/mcp_tool_discovery.py)
 - [Hermes native handlers at the pinned commit](https://github.com/NousResearch/hermes-agent/blob/71d34bad1045610252eda02ee79549436896e784/tools/mcp_tool_handlers.py)
 - [Hermes native shutdown at the pinned commit](https://github.com/NousResearch/hermes-agent/blob/71d34bad1045610252eda02ee79549436896e784/tools/mcp_tool_lifecycle.py)
+
+## Hostbound SSH runtime acceptance
+
+The separate [SSH acceptance driver and fixed receipt](named-client-ssh-tests.md)
+uses the same actual Linux client runtimes and lifecycle controls for the bounded
+ADR 0023 bridge. It verifies identity hiding, host binding, one hostbound Ed25519
+signature and exact-grant/context denials. It uses no network service or remote
+SSH login and does not replace the shipping-CLI custody lane above.

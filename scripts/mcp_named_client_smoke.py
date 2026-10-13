@@ -84,8 +84,8 @@ def fixture_config(binary, root):
 
 
 def observation_manifest(root, client, scenario="credential-brokers"):
-    require(scenario in {"credential-brokers", "shipping-attestation"}, "unknown observation scenario")
-    extra = {"public-challenge.json"} if scenario == "shipping-attestation" else set()
+    require(scenario in {"credential-brokers", "shipping-attestation", "ssh-userauth"}, "unknown observation scenario")
+    extra = {"public-challenge.json"} if scenario in {"shipping-attestation", "ssh-userauth"} else set()
     write_json(root / "observations/observation-manifest.json", {
         "client": client, "scenario": scenario,
         "required_files": sorted(OBSERVATION_COMMON | OBSERVATION_CLIENT[client] | extra),
@@ -96,8 +96,8 @@ def observation_manifest(root, client, scenario="credential-brokers"):
 def check_observations(directory):
     manifest = json.loads((directory / "observation-manifest.json").read_text())
     expected = OBSERVATION_COMMON | OBSERVATION_CLIENT[manifest["client"]]
-    require(manifest["scenario"] in {"credential-brokers", "shipping-attestation"}, "unknown observation scenario")
-    if manifest["scenario"] == "shipping-attestation":
+    require(manifest["scenario"] in {"credential-brokers", "shipping-attestation", "ssh-userauth"}, "unknown observation scenario")
+    if manifest["scenario"] in {"shipping-attestation", "ssh-userauth"}:
         expected = expected | {"public-challenge.json"}
     require(set(manifest["required_files"]) == expected, "observation manifest mismatch")
     require({p.name for p in directory.iterdir()} == expected | {"observation-manifest.json"},

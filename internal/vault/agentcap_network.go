@@ -22,6 +22,9 @@ func capEntryScopeOK(op, resource, keyID string) bool {
 	if op == OpLocalArtifactAttest {
 		return canonicalKeyID(keyID) && validateResource(resource) == nil
 	}
+	if op == OpSSHUserAuth {
+		return keyID == "" && validateResource(resource) == nil
+	}
 	if !networkOperation(op) || keyID != "" {
 		return false
 	}
@@ -60,6 +63,10 @@ func (s *Session) capGrantSupported(g grantRecord) bool {
 		return false
 	}
 	op := g.Operations[0]
+	if op == OpSSHUserAuth {
+		c, ok := s.credByID(g.CredentialID)
+		return !s.shared() && sshGrantShape(g) && validateResource(g.Resource) == nil && ok && c.Type == CredTypeEd25519
+	}
 	if !capEntryScopeOK(op, g.Resource, g.KeyID) {
 		return false
 	}
