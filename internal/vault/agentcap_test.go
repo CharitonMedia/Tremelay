@@ -128,9 +128,6 @@ func TestAgentCapSchemaAndFixedErrors(t *testing.T) {
 				t.Fatalf("reflected %q in %q", sentinel, resp.message)
 			}
 			want := actionAgentCap
-			if len(tc.msg) >= 2 && tc.msg[0] == AgentCapVersion && tc.msg[1] == capMethodInvoke && tc.code == capMalformed {
-				want = actionLocalAttest
-			}
 			if len(session.audit) != before+1 {
 				t.Fatalf("audit rows %d", len(session.audit)-before)
 			}
@@ -233,10 +230,14 @@ func TestAgentCapIsolationAndCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded.entries) != 1 || decoded.entries[0].resource != resource || decoded.entries[0].operation != OpLocalArtifactAttest {
+	seen := map[string]string{}
+	for _, entry := range decoded.entries {
+		seen[entry.resource] = entry.operation
+	}
+	if len(decoded.entries) != 2 || seen[resource] != OpLocalArtifactAttest || seen[httpResource] != OpHTTPRequest {
 		t.Fatalf("filtered catalog %+v code %s", decoded.entries, decoded.code)
 	}
-	for _, hidden := range []string{httpResource, sshResource, sshUser, OpHTTPRequest, OpSSHUserAuth, "ssh-ed25519"} {
+	for _, hidden := range []string{sshResource, sshUser, OpSSHUserAuth, "ssh-ed25519"} {
 		if bytes.Contains(catalog, []byte(hidden)) {
 			t.Fatalf("catalog exposed %s", hidden)
 		}

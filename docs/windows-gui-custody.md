@@ -1,8 +1,9 @@
 # Windows official-GUI custody fixture
 
-Status: native GUI evidence pending. This fixture extends the candidate in
-[ADR 0022](adr/0022-windows-mcp-custody.md); preparing the files or compiling the
-CLI does not establish that the GUI works.
+Status: native GUI custody passed on the candidate recorded below. This fixture
+extends [ADR 0022](adr/0022-windows-mcp-custody.md). Final integrated
+broker/Windows validation remains separate; preparing files or compiling the
+CLI alone does not establish that the GUI works.
 
 ## Pinned helper, without installation
 
@@ -32,6 +33,35 @@ provides 7-Zip; its [NSIS extractor](https://github.com/ip7z/7zip/blob/main/CPP/
 reads package members without running installer actions. Nothing is installed
 on a user computer.
 
+## Measured native acceptance
+
+All six ordinary workflows passed for commit
+`7eabe383a72d7df3b20659462198f9b4c67574af`, tree
+`cc464c3342a815b230d5d286f78b20ca13b14b12`. The
+[native Windows job](https://github.com/CharitonMedia/Tremelay/actions/runs/38324770192/job/115060785160)
+ran on Microsoft Windows Server 2025, image `windows-2025-vs2026`, version
+`20260925.250.1`, with Go 1.26.9. Exact archive size/hash verification, extraction,
+and shipping-CLI build passed. `TREMELAY_TEST_WINDOWS_GUI_REQUIRED=1` was set
+for the ordinary whole suite, so a missing helper or desktop could not skip
+the two GUI cases. The command package passed in 30.921 seconds, vault package
+in 145.620 seconds, and root/tools tests and vet passed.
+
+Verified same-archive member SHA-256 values:
+
+```text
+pinentry-basic.exe  e498f66104a286544488fb2ac4aec72ccd1e6de2c0ec7b7e7ae9fc733c54775a
+libassuan-9.dll     479887bebb8929cc3e9cffaa4cc7140705fa2dcb57a3a5f3db90d949bf097052
+libgpg-error-0.dll  dd0c8cd53fcc7745da4ee3f3227dc7e2a5257e9f1f7be490f88d9ff7a9353d2f
+```
+
+This establishes actual GUI unlock and Cancel through the shipping CLI on that
+runner, with public attestation verification, revoked denial, audit, redaction
+checks, and ordinary EOF cleanup described below. It also establishes that the
+extracted helper loads under the production restricted environment for these
+paths; it is not an exhaustive static inventory of dynamic dependencies. The
+later combined broker/Windows tree needs its own gates and binary-bound Linux
+client custody receipts because shared helper plumbing changes.
+
 ## Required native acceptance
 
 The workflow builds the shipping `tremelay.exe` into runner-temporary storage
@@ -53,7 +83,8 @@ keyboard evidence. A usable graphical session is a runtime prerequisite:
 [Microsoft's CI guidance](https://learn.microsoft.com/en-us/windows/apps/develop/ai-assisted/testing)
 does not prove that a particular runner session has one. Missing archive
 members, dependency-loading failures, and display failures remain explicit
-blockers; the fixture must not change security settings to work around them.
+blockers on another environment; the fixture must not change security settings
+to work around them.
 
 The ordinary suite discovers `TestWindowsMCPShippingCLIWithOfficialGUI`. Its
 two cases use a fresh encrypted vault and random in-memory values. The success

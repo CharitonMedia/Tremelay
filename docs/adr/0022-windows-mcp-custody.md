@@ -1,6 +1,7 @@
 # ADR 0022: Windows MCP process custody
 
-Status: Proposed; native Windows evidence pending
+Status: Proposed; native custody and official-GUI candidate validated;
+final integrated validation pending
 
 ## Scope and ordering
 
@@ -76,7 +77,7 @@ before verifying both ends also fails closed.
 
 ### Native runtime evidence requirement
 
-The first runtime target is ordinary inherited synchronous byte-stream pipes.
+The measured runtime target is ordinary inherited synchronous byte-stream pipes.
 No claim is made yet for arbitrary externally configured overlapped handles or
 completion-port associations. Standard libuv child stdio is synchronous unless
 nonblocking/IPC flags request otherwise; its parent pipe can be overlapped.
@@ -84,6 +85,9 @@ That source evidence is not proof of a particular installed client's behavior.
 Establish each named client's actual inherited handle modes and collect native
 runtime evidence before expanding the supported contract. No mode bootstrap
 or mutation of shared completion modes is required for the metadata query.
+The candidate's ordinary native suite and shipping-CLI GUI fixture passed on
+Windows Server 2025; the exact commit, runner, and pinned helper are recorded in
+[the GUI evidence](../windows-gui-custody.md#measured-native-acceptance).
 
 ## Windows helper and console
 
@@ -113,7 +117,8 @@ a console exists, independently opened, non-inheritable `CONIN$`/`CONOUT$`
 handles capture both modes and restore them after the helper is reaped. Missing
 console is allowed for a GUI helper; display failure remains a bounded helper
 failure. This never causes fallback to protocol input. Arbitrary console
-helpers, wrapper-launched descendant trees, and GUI usability are not claimed.
+helpers and wrapper-launched descendant trees are not claimed. GUI usability
+is measured only for the exact package and runner in the linked fixture.
 The trusted helper is expected to be the directly launched process.
 
 ## Evidence boundaries
@@ -128,10 +133,13 @@ not claim subprocess unlock or Codex/Claude Code/Hermes integration.
 The test helper is a copy of the test executable, not a symlink requiring extra
 privilege. Synthetic passphrase bytes are generated in memory and traverse only
 private helper pipes; there are no real credentials or user-host operations.
-The existing Windows suite can collect these tests without workflow changes.
+The component tests are collected by the existing ordinary Windows suite. Its
+GUI lane additionally extracts a pinned official package and builds the shipping
+CLI before that same suite; no installer, account, or security change is needed.
 
-Cross-compilation proves compilation only. Native Windows CI, official GUI
-pinentry behavior, and actual named-client integrations remain separate evidence
+Cross-compilation proves compilation only. Native Windows CI and official GUI
+pinentry behavior passed on the recorded candidate. Actual native named-client
+integrations and final combined broker/Windows gates remain separate evidence
 requirements. Full-output/blocked-output process cancellation is not established
 by this slice. The new reservation and reader tests do not demonstrate that
 process behavior. The existing security requirements remain unchanged.

@@ -12,7 +12,69 @@ import (
 	"time"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
+	"golang.org/x/sys/unix"
 )
+
+func TestMCPStdioUnnamedStreamOwnershipEOF(t *testing.T) {
+	pair := func() (*os.File, *os.File) {
+		t.Helper()
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, b := os.NewFile(uintptr(fds[0]), "mcp-test-local"), os.NewFile(uintptr(fds[1]), "mcp-test-peer")
+		t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+		return a, b
+	}
+	in, peerIn := pair()
+	out, peerOut := pair()
+	s, err := openMCPStdio(in, out)
+	if err != nil {
+		t.Fatal("unnamed stream stdio rejected")
+	}
+	t.Cleanup(s.close)
+	for _, fd := range []int{s.inFD, s.outFD} {
+		cloexec, e1 := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+		flags, e2 := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+		if e1 != nil || e2 != nil || cloexec&unix.FD_CLOEXEC == 0 || flags&unix.O_NONBLOCK == 0 {
+			t.Fatal("owned stream lacks required descriptor flags")
+		}
+	}
+	_ = in.Close()
+	_ = out.Close()
+	if s.in.SetReadDeadline(time.Now().Add(time.Second)) != nil || s.out.SetWriteDeadline(time.Now().Add(time.Second)) != nil {
+		t.Fatal("owned stream deadlines unavailable")
+	}
+	if _, err := s.out.Write([]byte{'o'}); err != nil {
+		t.Fatal(err)
+	}
+	var value [1]byte
+	if _, err := io.ReadFull(peerOut, value[:]); err != nil || value[0] != 'o' {
+		t.Fatal("owned output did not survive original descriptor close")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stop := s.watchDisconnect(cancel)
+	t.Cleanup(stop) // Join before closing/reusing watched descriptors.
+	if _, err := peerIn.Write([]byte{'i'}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Shutdown(int(peerIn.Fd()), unix.SHUT_WR); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("stream read-half-close was not observed")
+	}
+	stop()
+	if _, err := io.ReadFull(s.in, value[:]); err != nil || value[0] != 'i' {
+		t.Fatal("disconnect watcher consumed input")
+	}
+	if _, err := s.in.Read(value[:]); err != io.EOF {
+		t.Fatal("stream did not reach ordinary EOF")
+	}
+}
 
 func TestPinentryPrivateHelper(t *testing.T) {
 	t.Setenv("TREMELAY_PASSPHRASE", randHex(t, 24))

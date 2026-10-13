@@ -147,19 +147,19 @@ func bindMCPEndpoint(cap *AgentCapability, stdio bool) (*MCPEndpoint, error) {
 	})
 	ep.server.AddTool(&mcp.Tool{
 		Name:         toolList,
-		Description:  "List this endpoint's local attestation capabilities.",
+		Description:  "List this endpoint's exact credential-use capabilities.",
 		InputSchema:  json.RawMessage(mcpListInSchema),
 		OutputSchema: json.RawMessage(mcpListOutSchema),
 	}, ep.onTool)
 	ep.server.AddTool(&mcp.Tool{
 		Name:         toolDescribe,
-		Description:  "Describe one local attestation capability by handle.",
+		Description:  "Describe one exact credential-use capability by handle.",
 		InputSchema:  json.RawMessage(mcpDescribeInSchema),
 		OutputSchema: json.RawMessage(mcpEntrySchema),
 	}, ep.onTool)
 	ep.server.AddTool(&mcp.Tool{
 		Name:         toolInvoke,
-		Description:  "Attest one payload with the capability named by handle.",
+		Description:  "Invoke the exact capability named by handle. HTTP and GitHub accept only handle; local attestation also requires a base64 payload. Never replay an ambiguous or cancelled invocation.",
 		InputSchema:  json.RawMessage(mcpInvokeInSchema),
 		OutputSchema: json.RawMessage(mcpInvokeOutSchema),
 	}, ep.onTool)
@@ -379,7 +379,12 @@ func (e *MCPEndpoint) onTool(ctx context.Context, req *mcp.CallToolRequest) (*mc
 	if ctx != nil && ctx.Err() != nil {
 		return e.toolFail(invoke, mcpCodeCancelled)
 	}
-	raw, err := e.cap.Exchange(msg)
+	raw, err := e.cap.exchange(ctx, msg)
+	// A required vault audit/storage failure cannot disappear behind a fixed
+	// JSON-RPC projection or a racing request cancellation.
+	if err != nil {
+		e.noteAudit(err)
+	}
 	return projectCap(raw, err)
 }
 
@@ -448,24 +453,17 @@ func toolHandle(args json.RawMessage, withPayload bool) ([32]byte, error) {
 func toolInvokeArgs(args json.RawMessage) ([32]byte, []byte, error) {
 	var handle [32]byte
 	v, err := parseJSONValue(args)
-	if err != nil || v.kind != 'o' || len(v.obj) != 2 {
+	if err != nil || !invokeArgsOK(v) {
 		return handle, nil, errMCPSyntax
 	}
-	h, ok := v.field("handle")
-	p, pok := v.field("payload")
-	if !ok || !pok || h.kind != 's' || p.kind != 's' {
-		return handle, nil, errMCPSyntax
-	}
-	buf, ok := canonicalB64(h.s, 32)
-	if !ok {
-		return handle, nil, errMCPSyntax
-	}
-	payload, ok := canonicalB64Range(p.s, 1, MaxAttestPayload)
-	if !ok {
-		return handle, nil, errMCPSyntax
-	}
+	h, _ := v.field("handle")
+	buf, _ := canonicalB64(h.s, 32)
 	copy(handle[:], buf)
-	return handle, payload, nil
+	if p, ok := v.field("payload"); ok {
+		payload, _ := canonicalB64Range(p.s, 1, MaxAttestPayload)
+		return handle, payload, nil
+	}
+	return handle, nil, nil
 }
 
 func canonicalB64(s string, n int) ([]byte, bool) {
@@ -506,6 +504,14 @@ func projectCap(raw []byte, err error) (*mcp.CallToolResult, error) {
 	case capMethodDescribe:
 		return toolValue(entryBody(resp.entry))
 	case capMethodInvoke:
+		switch resp.network.operation {
+		case OpHTTPRequest:
+			return toolValue(struct {
+				Status int `json:"status_code"`
+			}{resp.network.status})
+		case OpGitHubIssueState:
+			return toolValue(resp.network.issue)
+		}
 		body := mcpInvokeBody{
 			Resource:  resp.att.Resource,
 			Signature: base64.StdEncoding.EncodeToString(resp.att.Signature[:]),
@@ -576,7 +582,7 @@ type mcpEntryBody struct {
 	Handle    string `json:"handle"`
 	Operation string `json:"operation"`
 	Resource  string `json:"resource"`
-	KeyID     string `json:"key_id"`
+	KeyID     string `json:"key_id,omitempty"`
 	Status    string `json:"status"`
 	Expiry    string `json:"expiry"`
 }
@@ -960,6 +966,11 @@ func (c *admitConn) finishAuditFailure(d frameDecision, auditErr error) error {
 
 func (c *admitConn) Write(ctx context.Context, msg jsonrpc.Message) error {
 	auditErr := c.settleWrite(msg)
+	if auditErr == nil {
+		c.ep.mu.Lock()
+		auditErr = c.ep.auditErr
+		c.ep.mu.Unlock()
+	}
 	frame := frameFor(msg)
 	if auditErr != nil {
 		c.ep.noteAudit(auditErr)
@@ -1075,7 +1086,7 @@ func classifyFrame(frame []byte) frameDecision {
 		}
 		return deny
 	}
-	// An unambiguous tools/call named invoke_capability stays a local_attest
+	// An unambiguous tools/call named invoke_capability is marked as an invoke
 	// denial even when a later envelope or id check rejects the frame.
 	// Unparseable input does not reach this assignment.
 	deny.invoke = recognizedInvoke(v)
@@ -1470,15 +1481,21 @@ func describeArgsOK(v jv) bool {
 }
 
 func invokeArgsOK(v jv) bool {
-	if v.kind != 'o' || len(v.obj) != 2 {
+	if v.kind != 'o' || (len(v.obj) != 1 && len(v.obj) != 2) {
 		return false
 	}
 	h, ok := v.field("handle")
-	p, pok := v.field("payload")
-	if !ok || !pok || h.kind != 's' || p.kind != 's' {
+	if !ok || h.kind != 's' {
 		return false
 	}
 	if _, good := canonicalB64(h.s, 32); !good {
+		return false
+	}
+	p, pok := v.field("payload")
+	if !pok {
+		return len(v.obj) == 1
+	}
+	if p.kind != 's' || len(v.obj) != 2 {
 		return false
 	}
 	_, good := canonicalB64Range(p.s, 1, MaxAttestPayload)
@@ -1741,7 +1758,7 @@ func (h *mcpLog) text() string {
 	return h.buf.String()
 }
 
-const mcpEntrySchema = `{"type":"object","additionalProperties":false,"required":["handle","operation","resource","key_id","status","expiry"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"operation":{"type":"string","const":"local_artifact_attest"},"resource":{"type":"string"},"key_id":{"type":"string","minLength":64,"maxLength":64},"status":{"type":"string","enum":["active","revoked","expired"]},"expiry":{"type":"string"}}}`
+const mcpEntrySchema = `{"type":"object","additionalProperties":false,"required":["handle","operation","resource","status","expiry"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"operation":{"type":"string","enum":["local_artifact_attest","http_request","github_issue_state"]},"resource":{"type":"string"},"key_id":{"type":"string","minLength":64,"maxLength":64},"status":{"type":"string","enum":["active","revoked","expired"]},"expiry":{"type":"string"}},"oneOf":[{"properties":{"operation":{"const":"local_artifact_attest"}},"required":["key_id"]},{"properties":{"operation":{"enum":["http_request","github_issue_state"]}},"not":{"required":["key_id"]}}]}`
 
 const mcpListInSchema = `{"type":"object","additionalProperties":false,"properties":{}}`
 
@@ -1749,6 +1766,10 @@ const mcpListOutSchema = `{"type":"object","additionalProperties":false,"require
 
 const mcpDescribeInSchema = `{"type":"object","additionalProperties":false,"required":["handle"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"}}}`
 
-const mcpInvokeInSchema = `{"type":"object","additionalProperties":false,"required":["handle","payload"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"payload":{"type":"string","minLength":4,"maxLength":87384,"contentEncoding":"base64"}}}`
+const mcpInvokeInSchema = `{"type":"object","additionalProperties":false,"required":["handle"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"payload":{"type":"string","minLength":4,"maxLength":87384,"contentEncoding":"base64"}}}`
 
-const mcpInvokeOutSchema = `{"type":"object","additionalProperties":false,"required":["resource","signature","public_key","domain","purpose"],"properties":{"resource":{"type":"string"},"signature":{"type":"string","minLength":88,"maxLength":88,"contentEncoding":"base64"},"public_key":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"domain":{"type":"string","const":"tremelay/local-artifact-attestation/v1"},"purpose":{"type":"string","const":"local-artifact-attestation"}}}`
+const mcpAttestOutSchema = `{"type":"object","additionalProperties":false,"required":["resource","signature","public_key","domain","purpose"],"properties":{"resource":{"type":"string"},"signature":{"type":"string","minLength":88,"maxLength":88,"contentEncoding":"base64"},"public_key":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"domain":{"type":"string","const":"tremelay/local-artifact-attestation/v1"},"purpose":{"type":"string","const":"local-artifact-attestation"}}}`
+
+const mcpHTTPOutSchema = `{"type":"object","additionalProperties":false,"required":["status_code"],"properties":{"status_code":{"type":"integer","minimum":200,"maximum":599,"not":{"minimum":300,"maximum":399}}}}`
+const mcpGitHubOutSchema = `{"type":"object","additionalProperties":false,"required":["number","state","locked","comments"],"properties":{"number":{"type":"integer","minimum":1,"maximum":999999999},"state":{"type":"string","enum":["open","closed"]},"locked":{"type":"boolean"},"comments":{"type":"integer","minimum":0,"maximum":1000000}}}`
+const mcpInvokeOutSchema = `{"type":"object","oneOf":[` + mcpAttestOutSchema + `,` + mcpHTTPOutSchema + `,` + mcpGitHubOutSchema + `]}`

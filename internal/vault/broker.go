@@ -56,6 +56,9 @@ type brokerAttempt struct {
 	operation    string
 	prepare      func(*http.Request)
 	accept       func([]byte) error
+	// These are host-bound by the capability adapter, never caller fields.
+	bound *agentCapGrant
+	ctx   context.Context
 }
 
 // brokerHTTP is the trusted broker path for one agent id.
@@ -111,9 +114,15 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 	case targetOrigin:
 		return s.failExchange(s.policyDenial(agentID, call.credentialID, call.method, call.target, resultDeniedOrigin, call.operation), call.method, ErrDeniedOrigin)
 	}
-	partial, cause := s.judge(agentID, call.credentialID, call.operation, resource)
+	var partial auditEvent
+	var cause error
+	if call.bound != nil {
+		partial, cause = s.judgeExactNetwork(agentID, *call.bound)
+	} else {
+		partial, cause = s.judge(agentID, call.credentialID, call.operation, resource)
+	}
 	if cause != nil {
-		if partial.Result == resultDeniedScope {
+		if call.bound == nil && partial.Result == resultDeniedScope {
 			if class, id, ok := reclassifyScope(s.grants, agentID, partial.CredID, partial.CredType, call.method, call.target, call.operation); ok {
 				partial.Result = class
 				partial.GrantID = id
@@ -126,8 +135,13 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		partial.Result = resultDeniedDestructive
 		return s.failExchange(partial, call.method, ErrDeniedDestructive)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), brokerTimeout)
+	base := call.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(base, brokerTimeout)
 	defer cancel()
+	call.ctx = ctx
 	ips, err := s.lookupBroker(ctx, host)
 	if err != nil || len(ips) == 0 {
 		partial.Result = resultDeniedDestination
@@ -169,7 +183,11 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		_, err := s.brokerAudit(partial, ErrDeniedAbuse)
 		return 0, err
 	}
-	if s.header.AuditSeq != seq || s.defunct {
+	if call.bound != nil {
+		if err := s.checkExactNetwork(agentID, call, false); err != nil {
+			return 0, err
+		}
+	} else if s.header.AuditSeq != seq || s.defunct {
 		return 0, ErrStale
 	}
 	secret, ok := s.copySecret(partial.CredID)
@@ -188,9 +206,9 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 	upstream.Header.Set("Authorization", "Bearer "+string(secret))
 	defer upstream.Header.Del("Authorization")
 	if call.accept == nil {
-		return s.finishStatus(partial, upstream, pin, port, call.method)
+		return s.finishStatus(partial, upstream, pin, port, call)
 	}
-	return s.finishAccepted(partial, upstream, pin, port, call.method, call.accept)
+	return s.finishAccepted(partial, upstream, pin, port, call)
 }
 
 func (s *Session) failExchange(ev auditEvent, method string, cause error) (int, error) {
@@ -211,7 +229,8 @@ func (s *Session) failTransport(partial auditEvent, method string, err error) (i
 	return s.failExchange(partial, method, ErrBrokerUpstream)
 }
 
-func (s *Session) finishStatus(partial auditEvent, upstream *http.Request, pin net.IP, port, method string) (int, error) {
+func (s *Session) finishStatus(partial auditEvent, upstream *http.Request, pin net.IP, port string, call brokerAttempt) (int, error) {
+	method := call.method
 	resp, err := s.doBroker(upstream, pin, port)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
@@ -220,10 +239,14 @@ func (s *Session) finishStatus(partial auditEvent, upstream *http.Request, pin n
 		return s.failTransport(partial, method, err)
 	}
 	status, kind := takeStatus(resp)
+	if err := s.checkExactNetwork(partial.AgentID, call, true); err != nil {
+		return 0, err
+	}
 	return s.finishKind(partial, method, status, kind)
 }
 
-func (s *Session) finishAccepted(partial auditEvent, upstream *http.Request, pin net.IP, port, method string, accept func([]byte) error) (int, error) {
+func (s *Session) finishAccepted(partial auditEvent, upstream *http.Request, pin net.IP, port string, call brokerAttempt) (int, error) {
+	method, accept := call.method, call.accept
 	resp, err := s.roundTrip(upstream, pin, port)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
@@ -247,6 +270,9 @@ func (s *Session) finishAccepted(partial auditEvent, upstream *http.Request, pin
 	}
 	if kind == brokerBodyOK && accept(body) != nil {
 		kind = brokerBodyBad
+	}
+	if err := s.checkExactNetwork(partial.AgentID, call, true); err != nil {
+		return 0, err
 	}
 	return s.finishKind(partial, method, status, kind)
 }
