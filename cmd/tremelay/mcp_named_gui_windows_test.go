@@ -275,8 +275,8 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 		// raw Codex/client stderr, MCP traffic, or any synthetic credential.
 		_, statusErr := os.Stat(filepath.Join(root, "observations", "client-status.json"))
 		_, resultErr := os.Stat(filepath.Join(root, "client-result.json"))
-		t.Fatalf("shipping server did not exit successfully (exit=%d, status_seen=%t, result_seen=%t, client_log_category=%s)",
-			serverExit, statusErr == nil, resultErr == nil, namedGUIClientLogCategory(root))
+		t.Fatalf("shipping server did not exit successfully (exit=%d, status_seen=%t, result_seen=%t, client_log_category=%s, transcript_stage=%+v)",
+			serverExit, statusErr == nil, resultErr == nil, namedGUIClientLogCategory(root), namedGUIClientTraceStage(root))
 	}
 	writeNamedGUIJSON(t, filepath.Join(root, "fixture-evidence.json"), map[string]bool{"shipping_server_exited": true})
 	select {
@@ -414,6 +414,69 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 			"cli_sha256":                      namedGUIHash(t, cli), "helper_sha256": namedGUIHash(t, helper), "native_sha256": namedGUIHash(t, native), "driver_sha256": namedGUIHash(t, driver),
 			"python_sha256": namedGUIHash(t, python), "control_driver_sha256": namedGUIHash(t, filepath.Join(filepath.Dir(driver), "mcp_named_client_smoke.py"))})
 	}
+}
+
+// Only count fixed Codex RPC stages from bounded private synthetic traffic.
+// No tool argument, response body, request identifier or client output is
+// included in the CI diagnostic, including on an incomplete JSONL last line.
+type namedGUITraceCounts struct {
+	ToolRequests  int
+	ToolResponses int
+	ToolErrors    int
+	Unsubscribe   bool
+	ThreadClosed  bool
+}
+
+func namedGUIClientTraceStage(root string) (summary namedGUITraceCounts) {
+	path := filepath.Join(root, "observations", "client-transcript.jsonl")
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 4<<20 {
+		return summary
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) > 4<<20 {
+		return summary
+	}
+	defer vault.Wipe(data)
+	ids := map[string]struct{}{}
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var event struct {
+			Direction string `json:"direction"`
+			Message   struct {
+				Method string          `json:"method"`
+				ID     json.RawMessage `json:"id"`
+				Error  json.RawMessage `json:"error"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(line, &event) != nil {
+			continue
+		}
+		message := event.Message
+		if event.Direction == "in" {
+			if message.Method == "mcpServer/tool/call" {
+				summary.ToolRequests++
+				ids[string(message.ID)] = struct{}{}
+			}
+			if message.Method == "thread/unsubscribe" {
+				summary.Unsubscribe = true
+			}
+		} else if event.Direction == "out" {
+			if message.Method == "thread/closed" {
+				summary.ThreadClosed = true
+			}
+			if _, ok := ids[string(message.ID)]; ok && len(message.ID) != 0 {
+				summary.ToolResponses++
+				if len(message.Error) > 0 && !bytes.Equal(message.Error, []byte("null")) {
+					summary.ToolErrors++
+				}
+				delete(ids, string(message.ID))
+			}
+		}
+	}
+	return summary
 }
 
 // This diagnostic does not change the acceptance condition. It classifies

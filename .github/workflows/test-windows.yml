@@ -29,14 +29,6 @@ jobs:
         run: |
           go build -o "$env:TREMELAY_TEST_WINDOWS_CLI" ./cmd/tremelay
           if ($LASTEXITCODE -ne 0) { throw 'Shipping CLI build failed.' }
-      - name: Test
-        run: go test ./...
-      - name: Vet
-        run: go vet ./...
-      - name: Test build-evidence verifier
-        run: cd tools && go test ./...
-      - name: Vet build-evidence verifier
-        run: cd tools && go vet ./...
       - name: Provision exact Windows named-client Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -67,6 +59,14 @@ jobs:
               throw 'Native custody evidence receipt is missing.'
             }
           }
+      - name: Test
+        run: go test ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test build-evidence verifier
+        run: cd tools && go test ./...
+      - name: Vet build-evidence verifier
+        run: cd tools && go vet ./...
       - name: Retain allowlisted native custody receipts
         uses: actions/upload-artifact@v4
         with:
