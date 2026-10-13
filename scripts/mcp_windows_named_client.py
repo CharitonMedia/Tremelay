@@ -129,6 +129,28 @@ def scenario(call, challenge):
     return {"tool_calls": 5, "credential_invocations": 2, "driver_retries": 0, "attestation": attestation}
 
 
+def codex_before_unsubscribe(root):
+    # The test controller owns the process handle and must independently
+    # prove the shipping CLI is STILL RUNNING after all five MCP requests.
+    # A file marker alone is never interpreted as process-liveness proof.
+    ready = root / "codex-pre-unsubscribe.json"
+    temporary = root / "codex-pre-unsubscribe.tmp"
+    runtime.write_json(temporary, {"stage": "post-tool-calls", "tool_calls": 5})
+    temporary.replace(ready)
+    approved = root / "codex-server-alive.json"
+    deadline = time.monotonic() + 18
+    while time.monotonic() < deadline:
+        try:
+            marker = json.loads(approved.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.02)
+            continue
+        runtime.require(marker == {"server_alive_before_unsubscribe": True},
+                        "native Codex parent server-liveness attestation changed")
+        return
+    raise RuntimeError("native Codex pre-unsubscribe process-liveness barrier timed out")
+
+
 def hermes_child(path):
     challenge = json.loads((path.parent / "public-challenge.json").read_text())
     runtime.hermes_child(path, scenario=lambda call: scenario(call, challenge))
@@ -159,7 +181,8 @@ def main():
 
     kwargs = {"scenario": lambda call: scenario(call, challenge), "process_factory": WindowsJsonProcess}
     if client == "codex":
-        result = runtime.codex_smoke(Path(request["executable"]), config, env, root, finalize=finalize, **kwargs)
+        result = runtime.codex_smoke(Path(request["executable"]), config, env, root, finalize=finalize,
+                                     before_unsubscribe=codex_before_unsubscribe, **kwargs)
     elif client == "claude":
         result = runtime.claude_smoke(Path(request["executable"]), config, env, root, **kwargs)
     else:

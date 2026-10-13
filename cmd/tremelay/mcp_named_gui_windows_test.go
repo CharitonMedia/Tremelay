@@ -265,12 +265,53 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 	if state, err := windows.WaitForSingleObject(helperHandle, 5000); err != nil || state != windows.WAIT_OBJECT_0 {
 		t.Fatal("official helper did not exit after unlock")
 	}
+	// The exact pinned Codex Windows client hard-terminates MCP children
+	// with JobObject/TerminateProcess exit code 1 on thread teardown.
+	// Require an independently observed, still-running shipping CLI AFTER
+	// all five RPCs but BEFORE Codex unsubscribes. An exit code alone cannot
+	// prove that the client (rather than Tremelay) terminated the process.
+	codexShutdownObserved := false
+	if client == "codex" {
+		readyPath := filepath.Join(root, "codex-pre-unsubscribe.json")
+		barrierDeadline := time.Now().Add(18 * time.Second)
+		for time.Now().Before(barrierDeadline) {
+			if info, e := os.Lstat(readyPath); e == nil {
+				if !info.Mode().IsRegular() || !namedGUICodexReady(readNamedGUIBounded(t, readyPath)) {
+					t.Fatal("Codex pre-unsubscribe marker differs from its fixed public contract")
+				}
+				state, e := windows.WaitForSingleObject(serverHandle, 0)
+				if e != nil || state != windows.WAIT_TIMEOUT {
+					t.Fatal("Codex shipping server not alive before client shutdown")
+				}
+				writeNamedGUIJSON(t, filepath.Join(root, "codex-server-alive.json"),
+					map[string]bool{"server_alive_before_unsubscribe": true})
+				codexShutdownObserved = true
+				break
+			} else if !os.IsNotExist(e) {
+				t.Fatal("Codex pre-unsubscribe marker unavailable")
+			}
+			select {
+			case <-done:
+				joined = true
+				t.Fatal("Codex client terminated before the server-liveness barrier")
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+		if !codexShutdownObserved {
+			t.Fatal("Codex pre-unsubscribe server-liveness barrier was not completed")
+		}
+	}
 	if state, err := windows.WaitForSingleObject(serverHandle, 60000); err != nil || state != windows.WAIT_OBJECT_0 {
 		t.Fatal("native client did not close its shipping server")
 	}
 	var serverExit uint32
 	exitErr := windows.GetExitCodeProcess(serverHandle, &serverExit)
-	if exitErr != nil || serverExit != 0 {
+	// Codex v0.159.2 explicitly uses Windows TerminateJobObject or
+	// TerminateProcess with exit code 1 on MCP teardown. Only accept this
+	// one code for the one pinned client with a confirmed pre-unsubscribe
+	// live-process barrier. Claude and Hermes still require exit code zero.
+	codexClientTerminated := client == "codex" && codexShutdownObserved && serverExit == 1
+	if exitErr != nil || (serverExit != 0 && !codexClientTerminated) {
 		// Tell the client driver the observed CLI exit was NOT acceptable.
 		// Its fixed-value check fails closed, then its deferred teardown
 		// drains stderr to EOF; no success receipt can be emitted here.
@@ -399,6 +440,12 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 	}
 	scan(auditBytes)
 	files := 0
+	if client == "codex" {
+		for _, name := range []string{"codex-pre-unsubscribe.json", "codex-server-alive.json"} {
+			scan(readNamedGUIBounded(t, filepath.Join(root, name)))
+			files++
+		}
+	}
 	for _, name := range []string{"request.json", "client-result.json", "client-launch.json", "client-cleanup.json", "fixture-evidence.json", "synthetic.vault"} {
 		scan(readNamedGUIBounded(t, filepath.Join(root, name)))
 		files++
@@ -415,6 +462,10 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 	if os.Remove(path) != nil {
 		t.Fatal("synthetic vault removal failed")
 	}
+	serverExitMode := "graceful-server-exit"
+	if codexClientTerminated {
+		serverExitMode = "pinned-codex-windows-client-teardown-exit-one"
+	}
 	if destination := os.Getenv("TREMELAY_TEST_WINDOWS_NAMED_EVIDENCE"); destination != "" {
 		if !filepath.IsAbs(destination) {
 			t.Fatal("native evidence path must be absolute")
@@ -424,12 +475,48 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 			"scope":      "native Windows shipping CLI, official GUI, synthetic attestation and revoked denial; no network broker evidence",
 			"tool_calls": 5, "credential_invocations": 2, "model_turns": 0, "driver_retries": 0,
 			"audit": counts, "audit_verified": true, "signature_verified": true,
-			"client_exit": 0, "server_exit": serverExit, "helper_exited": true, "vault_removed": true,
+			"client_exit": 0, "server_exit": serverExit, "server_exit_mode": serverExitMode,
+			"codex_pre_unsubscribe_server_alive": codexShutdownObserved,
+			"helper_exited":                      true, "vault_removed": true,
 			"scanned_files": files, "observed_secret_absent": true,
 			"scan_scope":                      "completed manifest captures/configuration, controller output, selected audit, encrypted vault; excludes client home/cache/database files",
 			"inherited_handle_modes_observed": false,
 			"cli_sha256":                      namedGUIHash(t, cli), "helper_sha256": namedGUIHash(t, helper), "native_sha256": namedGUIHash(t, native), "driver_sha256": namedGUIHash(t, driver),
 			"python_sha256": namedGUIHash(t, python), "control_driver_sha256": namedGUIHash(t, filepath.Join(filepath.Dir(driver), "mcp_named_client_smoke.py"))})
+	}
+}
+
+// Require exactly the model-free signal emitted by the pinned Windows
+// Codex driver after it completed its five RPC calls; reject unknown keys.
+func namedGUICodexReady(data []byte) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) != nil || len(fields) != 2 {
+		return false
+	}
+	var stage string
+	var calls int
+	return json.Unmarshal(fields["stage"], &stage) == nil &&
+		json.Unmarshal(fields["tool_calls"], &calls) == nil &&
+		stage == "post-tool-calls" && calls == 5
+}
+
+func TestNamedGUICodexReadyMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		ok    bool
+	}{
+		{"complete", `{"stage":"post-tool-calls","tool_calls":5}`, true},
+		{"wrong-stage", `{"stage":"starting","tool_calls":5}`, false},
+		{"wrong-count", `{"stage":"post-tool-calls","tool_calls":4}`, false},
+		{"extra-field", `{"stage":"post-tool-calls","tool_calls":5,"skip":true}`, false},
+		{"malformed", `{"stage":"post-tool-calls"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := namedGUICodexReady([]byte(tc.value)); got != tc.ok {
+				t.Fatal("Codex readiness marker validation mismatch")
+			}
+		})
 	}
 }
 

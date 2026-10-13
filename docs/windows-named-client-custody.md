@@ -63,8 +63,12 @@ Acceptance requires all of the following:
 3. Verified audit chain, exactly one allowed/completed pair and one
    `denied_revoked`, all attributed to the fixed agent, credential and exact
    issued grants. A vendor control error alone cannot prove the denial.
-4. Official helper exit, shipping CLI exit zero, native runtime exit zero,
-   completed controller and full client-output capture with no escalation.
+4. Official helper exit, native runtime exit zero, completed controller and
+   full client-output capture with no escalation. Claude Code and Hermes
+   require shipping CLI exit zero. Pinned Codex 0.159.2 on Windows may instead
+   terminate the owned MCP server with code 1 as described below; this is
+   accepted only after the host independently verifies the server was still
+   running *after* every tool response and *before* Codex unsubscribes.
 5. Post-EOF scans for passphrase/private-key bytes, base64 and hex across the
    complete manifest-listed captures/configuration, public receipts, controller
    output/launch configuration, operation audit records and encrypted vault.
@@ -77,6 +81,42 @@ receipt, helper, graphical session, client, supported control response or
 process handle is a failure in a selected lane, never a successful skip.
 The ordinary suite skips this optional lane only when it was not selected;
 `TREMELAY_TEST_WINDOWS_NAMED_REQUIRED=1` makes a missing selection fatal.
+
+## Pinned Codex Windows MCP child termination contract
+
+The exact tested Codex CLI is v0.159.2. Its
+[`StdioServerProcessHandleInner::drop`](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/rmcp-client/src/stdio_server_launcher.rs)
+and transport shutdown call `LocalProcessTerminator::terminate()` on Windows.
+The same version's
+[`JobObject` implementation](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/utils/pty/src/win/job.rs)
+hard-terminates with `TerminateJobObject(..., 1)`, falling back to
+`TerminateProcess(..., 1)` if job containment is unavailable. A one-valued
+Windows MCP subprocess exit code by itself is therefore ambiguous: it may be
+pinned-client teardown rather than a Tremelay failure, but it must **never**
+be interpreted as proof of client-driven termination without more evidence.
+
+The selected Codex-only lane uses a two-party, model-free barrier. After
+five successful fixed MCP tool RPCs and **before** `thread/unsubscribe`,
+the isolated client driver atomically publishes the fixed
+`codex-pre-unsubscribe.json` marker and waits. The Go controller retains
+the actual Tremelay process handle, validates the marker's exact public fields
+and checks that `WaitForSingleObject(serverHandle, 0)` reports the server
+still active. Only then does it write the public
+`codex-server-alive.json` acknowledgement. The driver performs its normal
+unsubscribe, observes `thread/closed` and closes the pinned native Codex
+runtime. The controller may accept server exit code 1 only for this Codex
+version with that verified liveness barrier. The fixed process tree, helper
+custody, no-escalation client exit, exact signed response, revoked-grant
+denial, durable audit and every existing post-EOF secret scan remain required.
+Both barrier files are included in that scan.
+
+This establishes the externally observable **ordering**, not an ETW/kernel
+trace of the exact Windows TerminateJobObject call. It does not establish a
+graceful MCP server return or protection against abrupt loss of uncommitted
+operations. Other clients still require server exit zero and may not borrow
+Codex's pinned termination exception. If Codex changes its version or process
+lifetime, this exact contract must be re-evaluated, not silently generalized.
+No production process behavior, MCP broker or release path changes.
 
 ## Reviewed acquisition pins
 

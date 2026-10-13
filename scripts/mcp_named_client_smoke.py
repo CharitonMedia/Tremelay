@@ -354,7 +354,8 @@ def checked_fixture(root):
     return result
 
 
-def codex_smoke(command, config, env, root, *, scenario=exercise, finalize=checked_fixture, process_factory=JsonProcess):
+def codex_smoke(command, config, env, root, *, scenario=exercise, finalize=checked_fixture,
+                process_factory=JsonProcess, before_unsubscribe=None):
     env = dict(env, RUST_LOG="error,codex_rmcp_client::stdio_server_launcher=info")
     path = root / "codex/config.toml"
     path.write_text('\n'.join([
@@ -387,6 +388,11 @@ def codex_smoke(command, config, env, root, *, scenario=exercise, finalize=check
         result.update(client="Codex app-server", version=initialized["userAgent"], tools=sorted(inventory),
                       protocol=None, protocol_observed=False)
         check_observations(root / "observations")
+        # The Windows native controller may observe the real shipping CLI
+        # still running AFTER every tool result but BEFORE Codex shuts down
+        # its pinned JobObject. The optional barrier is never used by Linux.
+        if before_unsubscribe is not None:
+            before_unsubscribe(root)
         # Keep Tokio alive while Codex asynchronously closes its MCP transport.
         # App-server EOF alone does not join that background transport cleanup.
         unsubscribed = app.rpc("thread/unsubscribe", {"threadId": thread_id})
