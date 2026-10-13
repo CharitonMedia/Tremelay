@@ -136,16 +136,20 @@ Python 3.12.14 is security-source-only and has no Windows entry in the official
 [Actions version manifest](https://github.com/actions/python-versions/blob/main/versions-manifest.json).
 Hermes's pinned pyproject identifies 3.14 as its supported runtime.
 
-This first lane requires an already provisioned exact 3.14.8 x64 interpreter
-at `RUNNER_TOOL_CACHE\Python\3.14.8\x64\python.exe`. The published
-[Windows 2025 image manifest at commit 8197087](https://github.com/actions/runner-images/blob/8197087fc536320d1441203fdb5da9ae1b44b863/images/windows/Windows2025-Readme.md)
-identifies image `20261004.281.1` and lists Python 3.14.8 in its toolcache;
-the image's default command-line Python is separately 3.12.10. A future runner
-may differ. Preparation checks the actual interpreter's exact version and
-64-bit architecture, records the actual runner image/version and executable
-hash, and fails if that interpreter is absent. That is a preparation failure,
-not evidence of named-client incompatibility. No automatic installer fallback,
-registry change, toolcache deletion or pip upgrade is added.
+The Windows workflow provisions exact CPython 3.14.8 x64 with the official
+`actions/setup-python` action pinned to commit
+`ece7cb06caefa5fff74198d8649806c4678c61a1` (v6.3.0).
+The [official Python version manifest](https://github.com/actions/python-versions/blob/main/versions-manifest.json)
+lists the Windows x64 3.14.8 archive. When the hosted runner image does not
+have that exact patch level, the pinned action can obtain the distribution
+through the official Actions toolchain path. The preparation script still
+requires the interpreter at
+`RUNNER_TOOL_CACHE\Python\3.14.8\x64\python.exe`, checks version and
+64-bit architecture independently, and records runner image/version and the
+observed executable hash. It does not select a different version, run a
+fallback installer, delete the toolcache, or upgrade pip. If provisioning
+fails, the named-client runtime tests do not run, and no compatibility claim
+is made. The workflow uses only the existing `contents: read` permission.
 The [Actions-hosted 3.14.8 release](https://github.com/actions/python-versions/releases/tag/3.14.8-36806082737)
 has [Windows x64 archive](https://github.com/actions/python-versions/releases/download/3.14.8-36806082737/python-3.14.8-win32-x64.zip),
 size `33100332`, SHA-256
@@ -153,9 +157,10 @@ size `33100332`, SHA-256
 The archive was downloaded, size/hash-checked and inspected without execution;
 it contains the official installer and Actions setup script, not a portable
 Python tree. Its hash is a provenance reference, not proof that the actual
-runner interpreter equals bytes extracted from that archive. The runner image
-is trusted to provision Python; the executable hash is an observation. The
-Python driver rejects other versions.
+runner interpreter equals bytes extracted from that archive. The pinned
+setup-python action and official toolchain distribution are trusted to
+provision Python; the executable hash is an observation. The Python driver
+rejects other versions.
 
 Retrieve the exact [Hermes source commit](https://github.com/NousResearch/hermes-agent/tree/71d34bad1045610252eda02ee79549436896e784)
 with unchanged file bytes. The preparation script pins the official

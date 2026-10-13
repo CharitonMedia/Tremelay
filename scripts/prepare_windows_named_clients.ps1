@@ -1,5 +1,6 @@
 # Inert until the ordinary Windows workflow runs. No accounts or model turns.
-# Python must already exist in the hosted image; no installer fallback is used.
+# The pinned setup-python action provisions exact CPython into the runner toolcache.
+# No unreviewed interpreter fallback or ad-hoc installer is used.
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version Latest
@@ -13,7 +14,7 @@ if (-not $IsWindows -or $env:RUNNER_ARCH -ne 'X64' -or
 $repo = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $env:RUNNER_TOOL_CACHE 'Python\3.14.8\x64\python.exe'
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-    throw 'Preparation unavailable: exact pre-provisioned Python 3.14.8 x64 is missing; no native runtime was tested.'
+    throw 'Preparation unavailable: exact workflow-provisioned Python 3.14.8 x64 is missing; no native runtime was tested.'
 }
 $root = Join-Path $env:RUNNER_TEMP ('tremelay-named-' + [guid]::NewGuid().ToString('N'))
 if ($root -match '[\r\n]') { throw 'Runner temporary path cannot be exported safely.' }
@@ -155,7 +156,7 @@ $record = @{
     schema = 1; status = 'preparation-only'; source_commit = $source; source_tree = $tree
     runner_image = $env:ImageOS; runner_image_version = $env:ImageVersion
     python_version = '3.14.8'; python_sha256 = (Get-FileHash -LiteralPath $python -Algorithm SHA256).Hash.ToLowerInvariant()
-    python_provenance = 'pre-provisioned hosted-runner toolcache; version checked; executable hash observed; no binary-to-installer equivalence claim'
+    python_provenance = 'pinned setup-python v6.3.0 with official python-versions manifest; version checked; executable hash observed; no binary-to-installer equivalence claim'
     codex_version = '0.159.2'; codex_sha256 = (Get-FileHash -LiteralPath $codex -Algorithm SHA256).Hash.ToLowerInvariant()
     claude_version = '2.1.296'; claude_archive_sha256 = (Get-FileHash -LiteralPath $claudeArchive -Algorithm SHA256).Hash.ToLowerInvariant()
     hermes_commit = '71d34bad1045610252eda02ee79549436896e784'
