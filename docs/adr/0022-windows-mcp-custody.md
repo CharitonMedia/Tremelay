@@ -147,6 +147,14 @@ commit/tree. Observing a hash is not equivalent to validating it against a
 fixed independent release checksum; that provenance limitation must accompany
 any native acceptance claim.
 
+For source-revision evidence the preparation script invokes exactly one
+`git.exe` application resolved first on the hosted runner's trusted
+`PATH`. PowerShell can return multiple application matches; their
+`Source` properties must never be implicitly concatenated into a process
+filename. The selected path must be absolute and an existing regular file.
+The workflow does not independently attest the runner-provided Git executable;
+it is an explicit hosted-runner trust assumption, not a shipping dependency.
+
 The action retains the existing `contents: read` workflow permission and
 runs on GitHub's ephemeral Windows runner with only synthetic vault contents;
 there are no account credentials, model-provider calls or release signing

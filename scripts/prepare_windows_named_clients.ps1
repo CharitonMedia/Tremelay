@@ -148,7 +148,15 @@ $lock = Join-Path $PSScriptRoot 'mcp_hermes_windows_lock.txt'
 $results = Join-Path $root 'results'
 $driver = Join-Path $PSScriptRoot 'mcp_windows_named_client.py'
 $testBinary = Join-Path $root 'tremelay-command.test.exe'
-$git = (Get-Command git.exe -CommandType Application).Source
+# A hosted runner can expose multiple git.exe PATH matches. Select one
+# actual application rather than letting PowerShell join a Source string[].
+$gitCommand = Get-Command git.exe -CommandType Application | Select-Object -First 1
+if ($null -eq $gitCommand -or [string]::IsNullOrWhiteSpace($gitCommand.Source) -or
+    -not [IO.Path]::IsPathRooted($gitCommand.Source) -or
+    -not (Test-Path -LiteralPath $gitCommand.Source -PathType Leaf)) {
+    throw 'Runner Git executable resolution failed.'
+}
+$git = [string]$gitCommand.Source
 $source = (Invoke-BoundedProcess $git @('-C', $repo, 'rev-parse', 'HEAD') 20).Trim()
 $tree = (Invoke-BoundedProcess $git @('-C', $repo, 'rev-parse', 'HEAD^{tree}') 20).Trim()
 if ($source -notmatch '^[0-9a-f]{40}$' -or $tree -notmatch '^[0-9a-f]{40}$') { throw 'Source identity unavailable.' }
