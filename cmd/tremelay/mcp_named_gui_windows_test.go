@@ -280,7 +280,7 @@ func TestWindowsNamedClientShippingGUI(t *testing.T) {
 					t.Fatal("Codex pre-unsubscribe marker differs from its fixed public contract")
 				}
 				state, e := windows.WaitForSingleObject(serverHandle, 0)
-				if e != nil || state != windows.WAIT_TIMEOUT {
+				if e != nil || state != uint32(windows.WAIT_TIMEOUT) {
 					t.Fatal("Codex shipping server not alive before client shutdown")
 				}
 				writeNamedGUIJSON(t, filepath.Join(root, "codex-server-alive.json"),
