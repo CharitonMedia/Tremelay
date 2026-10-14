@@ -105,7 +105,7 @@ func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv fu
 		locked:  make(chan struct{}),
 	}
 	defer d.timer.Stop()
-	go d.accept(listener)
+	d.conns.Go(func() { d.accept(listener) })
 	if _, err := fmt.Fprintln(stdout, endpoint); err != nil {
 		cancelConns()
 		listener.Close()
