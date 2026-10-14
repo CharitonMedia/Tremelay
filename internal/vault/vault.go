@@ -728,16 +728,17 @@ func (c credential) public() Credential {
 // Unlock's verification.
 //
 // ponytail: one indexed single-row read per session entry, and re-verification
-// only when the sequence moved. A document rewritten under an unchanged
-// sequence is not detected, which is the same reach this process had before
-// reloading existed. Upgrade path: a cheap per-commit document tag to compare
-// without decrypting.
+// only when the audit tip moved. A document rewritten under an unchanged tip
+// is not detected, which is the same reach this process had before reloading
+// existed. Upgrade path: a cheap per-commit document tag to compare without
+// decrypting.
 func (s *Session) adoptLocked() error {
 	if s == nil || s.defunct {
 		return ErrStale
 	}
 	var seq int64
-	if err := s.db.QueryRow(`SELECT audit_seq FROM vault WHERE id=?`, s.id).Scan(&seq); err != nil {
+	var head string
+	if err := s.db.QueryRow(`SELECT audit_seq, audit_head FROM vault WHERE id=?`, s.id).Scan(&seq, &head); err != nil {
 		// A read that cannot happen is an IO failure, not a verdict about the
 		// chain, and it does not retire the session.
 		return ErrIO
@@ -747,6 +748,10 @@ func (s *Session) adoptLocked() error {
 	}
 	switch {
 	case uint64(seq) == s.header.AuditSeq:
+		if head != s.header.AuditHead {
+			s.defunct = true
+			return ErrCorrupt
+		}
 		return nil
 	case uint64(seq) < s.header.AuditSeq:
 		s.defunct = true

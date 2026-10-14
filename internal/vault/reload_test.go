@@ -195,6 +195,61 @@ func TestSessionRefusesForkedChain(t *testing.T) {
 	}
 }
 
+func TestSessionRefusesSameSequenceFork(t *testing.T) {
+	env := newAttestEnv(t)
+	grant := env.grant(t, time.Hour)
+	cap := bindCap(t, env.s, env.agent.ID)
+	handle := capCall(t, cap, okBytes(t)(encodeCapList())).entries[0].handle
+
+	// Keep an authentic copy, then advance the resident session's branch
+	// without changing the grant.
+	var nonce, doc []byte
+	var head string
+	var seq int64
+	mutateDB(t, env.path, func(db *sql.DB) {
+		if err := db.QueryRow(`SELECT data_nonce, encrypted_document, audit_head, audit_seq FROM vault`).Scan(&nonce, &doc, &head, &seq); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for range 2 {
+		if _, err := env.s.List(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Restore the copy. Unlock and revoke advance this branch to the same
+	// sequence as the resident branch, but with a different audit head.
+	mutateDB(t, env.path, func(db *sql.DB) {
+		execSQL(t, db, `DELETE FROM audit WHERE seq > ?`, seq)
+		execSQL(t, db, `UPDATE vault SET data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=?`, nonce, doc, head, seq)
+	})
+	owner, err := Unlock(env.path, env.pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.RevokeGrant(grant.ID); err != nil {
+		t.Fatal(err)
+	}
+	if owner.header.AuditSeq != env.s.header.AuditSeq || owner.header.AuditHead == env.s.header.AuditHead {
+		t.Fatalf("fork tips: resident %d %s, durable %d %s",
+			env.s.header.AuditSeq, env.s.header.AuditHead, owner.header.AuditSeq, owner.header.AuditHead)
+	}
+	owner.Lock()
+
+	// Equality of sequence numbers must not let the resident release a
+	// signature under the grant revoked on the durable branch.
+	payload := []byte("same-sequence-fork-" + randHex(t, 16))
+	if raw, err := cap.Exchange(okBytes(t)(encodeCapInvoke(handle, payload))); raw != nil || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("same-sequence fork released a signature: %x %v", raw, err)
+	}
+	if _, err := env.s.List(); !errors.Is(err, ErrStale) {
+		t.Fatalf("retired session still served: %v", err)
+	}
+	if _, err := VerifyAudit(env.path, env.pass); err != nil {
+		t.Fatalf("durable revoked branch was changed: %v", err)
+	}
+}
+
 // TestSessionReloadUnderConcurrentCalls runs the session's own entry points
 // against each other while another holder commits, which is where a reload
 // swaps the credential, grant and audit state underneath them. Under -race
