@@ -65,16 +65,12 @@ func (s *Session) capGrantSupported(g grantRecord) bool {
 	op := g.Operations[0]
 	if op == OpSSHUserAuth {
 		c, ok := s.credByID(g.CredentialID)
-		return !s.shared() && sshGrantShape(g) && validateResource(g.Resource) == nil && ok && c.Type == CredTypeEd25519
+		return sshGrantShape(g) && validateResource(g.Resource) == nil && ok && c.Type == CredTypeEd25519
 	}
 	if !capEntryScopeOK(op, g.Resource, g.KeyID) {
 		return false
 	}
 	if networkOperation(op) {
-		// M9 approval provenance is exclusively local_artifact_attest.
-		if s.shared() {
-			return false
-		}
 		_, ok := s.credByID(g.CredentialID)
 		return ok
 	}

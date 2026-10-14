@@ -231,8 +231,8 @@ func (s *Session) releaseAttestation(partial auditEvent, priv ed25519.PrivateKey
 			return LocalAttestation{}, ErrSignFailed
 		}
 	}
-	// The callback, or another session, may have replaced the key, revoked the
-	// grant, or removed a member. Recheck this grant and this key. Do not
+	// The callback, or another session, may have replaced the key or revoked
+	// the grant. Recheck this grant and this key. Do not
 	// retarget onto a grant that appeared during the callback.
 	if err := s.attestStillBound(partial, priv, boundGen, resource); err != nil {
 		wipe(priv)
@@ -285,9 +285,6 @@ func (s *Session) attestStillBound(partial auditEvent, priv ed25519.PrivateKey, 
 	}
 	if !s.agentActive(partial.AgentID) {
 		return ErrDeniedAgent
-	}
-	if err := s.sharedGrantLive(partial.GrantID); err != nil {
-		return err
 	}
 	g, ok := s.grantByID(partial.GrantID)
 	if !ok || g.RevokedAt != nil {
@@ -386,7 +383,7 @@ func (s *Session) matchAttestKey(partial auditEvent) (ed25519.PrivateKey, auditE
 // retargetAttestGrant moves an allowed decision onto the grant bound to pub.
 // An empty match leaves partial unchanged.
 func (s *Session) retargetAttestGrant(partial auditEvent, resource string, pub ed25519.PublicKey) (auditEvent, error) {
-	matched := grantsForAttestKey(s.decisionGrants(), partial.AgentID, partial.CredID, resource, hex.EncodeToString(pub))
+	matched := grantsForAttestKey(s.grants, partial.AgentID, partial.CredID, resource, hex.EncodeToString(pub))
 	if len(matched) == 0 {
 		return partial, nil
 	}

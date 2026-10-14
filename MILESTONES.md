@@ -63,11 +63,13 @@ The local slice is one Ed25519 attestation. An agent with an expiring `local_art
 
 The SSH slice is one host-bound user authentication signature. An already-bound principal with an expiring `ssh_userauth` grant can obtain an SSH Ed25519 signature through an in-memory agent stream. The signature covers one approved username, one grant-pinned server host key, and one session identifier whose host signature was checked. The private key stays in the vault. `sign`, `local_artifact_attest`, `http_request`, and `github_issue_state` do not authorize it, and it does not authorize them. The grant authorizes authentication to that account on that host-key identity. It does not enforce a remote command, path, repository, SFTP session, shell, or forwarding channel. Destinations that share the host key and username are not distinguished. A binding can be replayed on a new stream. Revocation stops later signatures and does not invalidate a signature already released or an SSH session already authenticated. Acceptance is the synthetic in-memory test in [ADR 0013](docs/adr/0013-ssh-userauth.md) and [docs/m8-ssh-userauth.md](docs/m8-ssh-userauth.md). It does not log in to a server, open a socket, or read live keys.
 
-## M9 — Multi-user and shared vaults
+## M9 — Local backup
 
-**Goal:** Support organizations, ownership, shared vaults, recovery, role separation, and approvals without weakening earlier invariants.
+**Goal:** Let the single passphrase holder take and restore a consistent local snapshot without weakening earlier invariants.
 
-M9 is not complete. M9a is the local shared-vault authorization reference in [ADR 0015](docs/adr/0015-local-shared-vault-authorization.md) and [docs/m9a-shared-vault.md](docs/m9a-shared-vault.md). A bound member requests one exact local attestation, a different bound owner approves the stored request, and the designated agent uses the grant through the existing broker. Revocation or membership removal stops later use. M9b is a local checkpoint-bound snapshot of that vault ([ADR 0016](docs/adr/0016-local-checkpoint-backup.md), [docs/m9b-local-backup.md](docs/m9b-local-backup.md)). The host supplies the existing unlock material and a checkpoint kept outside the artifact. An old backup paired with its own old checkpoint is not detected as stale. Real authentication, lost-secret recovery, independent custody, freshness services, cross-machine cutover, and production shared access remain open.
+Multiple humans, organizations, ownership roles and approval workflows are out of v1 ([V1.md](V1.md)); they stay on the community roadmap. The M9a authorization reference that explored them was removed, and ADR 0015 is superseded.
+
+M9b is the remaining slice: a local checkpoint-bound snapshot of a single-user vault ([ADR 0016](docs/adr/0016-local-checkpoint-backup.md), [docs/m9b-local-backup.md](docs/m9b-local-backup.md)). The host supplies the existing unlock material and a checkpoint kept outside the artifact. An old backup paired with its own old checkpoint is not detected as stale. Lost-secret recovery, independent custody, freshness services, and cross-machine cutover remain open.
 
 ## M10 — Agent SDK / MCP integration
 
@@ -85,4 +87,4 @@ transport support and production deployment assurance remain open.
 
 **Goal:** Produce a documented, reproducible, security-reviewed v1 suitable for serious self-hosting, including threat-model review, dependency audit, SBOM, signed releases, backup/recovery documentation, migration tests, hardened defaults, and independent security review where practical.
 
-M11 is not complete. M11a is one unsigned linux/amd64 build of the existing `tremelay` human CLI, with a validated CycloneDX SBOM, checksums, pinned build inputs, and dated govulncheck evidence ([docs/m11a-unsigned-linux-candidate.md](docs/m11a-unsigned-linux-candidate.md)). It is not a published release, a signed artifact, or a production-credential claim. Threat-model review, signed releases, and independent security review remain open. M9 and M10 remain incomplete.
+M11 is not complete. M11a is one unsigned linux/amd64 build of the existing `tremelay` human CLI, with a validated CycloneDX SBOM, checksums, pinned build inputs, and dated govulncheck evidence ([docs/m11a-unsigned-linux-candidate.md](docs/m11a-unsigned-linux-candidate.md)). It is not a published release, a signed artifact, or a production-credential claim. Threat-model review, signed releases, and independent security review remain open. M10 remains incomplete.

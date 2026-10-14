@@ -405,7 +405,7 @@ func (s *Session) sshConstructUnlocked(agentID, grantID string) (agentCapGrant, 
 	if g.AgentID != agentID {
 		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrDeniedAgent)
 	}
-	if s.shared() || !sshGrantShape(g) || validateResource(g.Resource) != nil {
+	if !sshGrantShape(g) || validateResource(g.Resource) != nil {
 		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrDeniedOperation)
 	}
 	c, ok := s.credByID(g.CredentialID)
@@ -461,7 +461,7 @@ func (s *Session) sshJudgeUnlocked(agentID string, bound agentCapGrant) (auditEv
 		ev.Result = resultDeniedAgent
 		return ev, nil, ErrDeniedAgent
 	}
-	if !ok || s.shared() || g.AgentID != agentID || !sshGrantShape(g) ||
+	if !ok || g.AgentID != agentID || !sshGrantShape(g) ||
 		bound.operation != OpSSHUserAuth || g.CredentialID != bound.credID || g.KeyID != bound.keyID ||
 		g.Resource != bound.resource || validateResource(g.Resource) != nil ||
 		g.SSHUsername != bound.sshUser || string(g.SSHHostKey) != bound.sshHost {

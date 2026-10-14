@@ -14,7 +14,7 @@ type passphraseWrap struct {
 // ChangePassphrase reauthenticates the current passphrase and rewraps the
 // existing DEK with a fresh salt and nonce. The wrap, encrypted state, and
 // vault_passphrase_change audit row commit atomically. A stale session cannot
-// replace a newer wrap. This is host custody, not a member or agent operation.
+// replace a newer wrap. This is host custody, not an agent operation.
 // Snapshots keep their original passphrase. This does not revoke a DEK that
 // another process already holds or defend against a compromised host.
 func (s *Session) ChangePassphrase(oldPassphrase, newPassphrase []byte) error {
@@ -57,7 +57,7 @@ func (s *Session) ChangePassphrase(oldPassphrase, newPassphrase []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := s.commitBatchWrap([]auditEvent{ev}, s.creds, s.agents, s.grants, true, nil, nil,
+	if err := s.commitBatchWrap([]auditEvent{ev}, s.creds, s.agents, s.grants, true, nil,
 		&passphraseWrap{kdf: kdf, nonce: nonce, ciphertext: ciphertext}); err != nil {
 		return err
 	}

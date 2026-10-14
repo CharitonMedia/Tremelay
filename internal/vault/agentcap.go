@@ -424,7 +424,7 @@ func (s *Session) agentCapList(agentID string) ([]agentCapSnapshot, error) {
 }
 
 func (s *Session) attestCapStatus(g grantRecord, now time.Time) string {
-	if g.RevokedAt != nil || (s.shared() && !s.provenanceLive(g.Provenance)) {
+	if g.RevokedAt != nil {
 		return GrantRevoked
 	}
 	if !now.Before(g.ExpiresAt) {
@@ -548,16 +548,6 @@ func (s *Session) prepareExactAttest(agentID, grantID string) (ed25519.PrivateKe
 	partial := auditEvent{
 		AgentID: agentID, GrantID: g.ID, CredID: g.CredentialID,
 		CredType: CredTypeEd25519, Operation: OpLocalArtifactAttest,
-	}
-	if err := s.sharedGrantLive(grantID); err != nil {
-		if capHost(err) {
-			return nil, partial, err
-		}
-		partial.Result = resultDeniedRevoked
-		if errors.Is(err, ErrDeniedExpired) {
-			partial.Result = resultDeniedExpired
-		}
-		return nil, partial, err
 	}
 	if g.RevokedAt != nil {
 		partial.Result = resultDeniedRevoked

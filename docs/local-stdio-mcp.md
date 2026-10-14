@@ -7,7 +7,7 @@ protocol request. The client gets three tools: `list_capabilities`,
 `local_artifact_attest`, `http_request`, and `github_issue_state` grants are available.
 Credentials never leave the broker through MCP; HTTP carries them only to the
 authorized service. Network capabilities require single-user, single-operation,
-exact credential-ID grants. Shared vaults still expose only approved attestation.
+exact credential-ID grants.
 This does not provision grants or finish the broader M10 authentication work.
 See [ADR 0020](adr/0020-local-stdio-mcp.md) for process custody and
 [ADR 0021](adr/0021-mcp-credential-brokers.md) for credential-use capabilities.
