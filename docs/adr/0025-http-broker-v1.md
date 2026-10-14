@@ -97,11 +97,16 @@ and no destination field beyond the granted origin.
 
 Refused, before DNS and before any secret is copied: `Authorization`,
 `Proxy-Authorization`, `Cookie`, `Host`, `Content-Length`,
-`Transfer-Encoding`, `Expect`, `Accept-Encoding`, `Range`, `If-Range`, the
+`Transfer-Encoding`, `Expect`, `Accept-Encoding`, `Range`, `If-Range`,
+`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`,
+`X-Original-URL`, `X-Original-URI`, `X-Rewrite-URL`, `Forwarded`, the
+`X-Forwarded-*` set (`Host`, `Prefix`, `Proto`, `Port`, `Ssl`, `For`), the
 hop-by-hop names (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`,
 `Trailer`, `Trailers`, `Upgrade`), the grant's own named injection header,
-and — for query injection — any query parameter with the grant's parameter
-name.
+any `_method` parameter (case-insensitive) in the query or in the request
+body, because Rack and Spring read it from either and retarget the method of
+a POST with it, and — for query injection — any query parameter with the
+grant's parameter name.
 
 `Accept-Encoding`, `Range` and `If-Range` are refused for the same reason as
 the framing headers: they choose the *form* of the response bytes, and
@@ -161,6 +166,34 @@ fail-closed `upstream_error` path as a surviving credential form. A
 transparently decoded gzip body is unaffected: the transport removes
 `Content-Encoding` when it does the decoding, and the decoded bytes are an
 ordinary literal match.
+
+`2026-10-14`: The header check alone was not enough. An upstream that simply
+omitted `Content-Encoding` and answered with gzip bytes got them projected
+whole, and the agent recovered the credential with `gunzip`. Two changes:
+
+- Every coding in every `Content-Encoding` field is read, not just the first.
+  A response listing `identity, deflate` — in two fields or one — is coded.
+- After the body is read, it is projected only if it is text the scan can
+  actually read: valid UTF-8 with no NUL. Anything else is withheld whole.
+
+The second rule is deliberately a property of the bytes rather than a list of
+container magics. A list is a denylist, and the first draft of this amendment
+enumerated gzip, zstd, xz and bzip2 while a review got the credential out
+through zlib, raw deflate, a ZIP member, a zstd skippable frame, one leading
+newline before the gzip magic, and zlib nested inside a declared gzip the
+transport had already decoded. UTF-8 validity covers that class in one check.
+A truncated body may end mid-rune, so up to three trailing bytes are dropped
+before the verdict.
+
+Residual, unchanged in kind and now stated plainly: an upstream that wants to
+hand the agent the credential can encode it as text — base64, hex with a
+separator, a custom cipher, a value split across JSON fields — and a literal
+scan over text will not see it. The broker keeps the credential out of
+responses from an upstream that echoes it by accident or by reflection. It
+does not make a hostile upstream safe to grant a credential to, any more than
+H1 makes hostile response content safe to read. Binary responses are not
+projected to agents at all in v1; a grant whose upstream answers with images
+or another binary framing is outside what the broker serves.
 
 ### 6. Defences kept unchanged
 
@@ -309,6 +342,14 @@ Synthetic only. No live API is called by the test suite.
   a `206`, and a `Content-Range` without a `206` are each withheld whole as
   `upstream_error`; neither the compressed bytes, the decompressed token nor a
   range fragment reaches the agent.
+- `TestBrokerWithholdsBodiesTheScanCannotRead` — gzip (also after a leading
+  newline), zlib, raw deflate, a ZIP member, a zstd skippable frame, and a
+  deflate body behind a leading `identity` coding are each withheld as
+  `upstream_error`; a text body starting with `0x78` is still projected and
+  redacted.
+- `TestBrokerRefusesHeaderSmuggling` also covers method/path override headers,
+  `Forwarded`, the `X-Forwarded-*` set, and a `_method` parameter in the query
+  or in a form body (each denied before upstream).
 - `TestBrokerRefusesRedirect` — a 3xx is refused, its `Location` and body are
   not projected, and the credential is not forwarded.
 - `TestBrokerGrantMatching` — positive and negative origin, prefix and method
