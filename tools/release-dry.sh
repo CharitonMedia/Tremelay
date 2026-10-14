@@ -15,7 +15,7 @@ case $version in
 		exit 1
 		;;
 esac
-out=$root/dist/release
+out=${TREMELAY_RELEASE_OUT:-$root/dist/release}
 stage=$out/stage
 
 export GOTOOLCHAIN=go1.26.9
@@ -54,11 +54,14 @@ for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 wi
 	TZ=UTC touch -t 198001010000 "$stage/$name$exe" "$stage/LICENSE"
 	case $os in
 	windows)
-		(cd "$stage" && zip -qX9 "$out/$name.zip" "$name$exe" LICENSE)
+		(cd "$stage" && TZ=UTC zip -qX9 "$out/$name.zip" "$name$exe" LICENSE)
 		;;
 	*)
+		tar_tmp=$(mktemp)
 		tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@315532800 \
-			-C "$stage" -cf - "$name$exe" LICENSE | gzip -n9 >"$out/$name.tar.gz"
+			-C "$stage" -cf "$tar_tmp" "$name$exe" LICENSE
+		gzip -n9 -c "$tar_tmp" >"$out/$name.tar.gz"
+		rm -f "$tar_tmp"
 		;;
 	esac
 	rm -f "$stage/$name$exe" "$stage/LICENSE"

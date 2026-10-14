@@ -98,7 +98,18 @@ From a clone, `make build` or `go build ./cmd/tremelay` does the same thing.
 Releases will carry per-platform archives, a CycloneDX SBOM and a `SHA256SUMS`
 file — a checksum detects a corrupt download, not a substituted release. Signed
 releases are not in v1. `make release-dry` builds those artifacts locally; see
-[ADR 0027](docs/adr/0027-release-artifacts.md).
+[ADR 0027](docs/adr/0027-release-artifacts.md). After downloading the archives
+and `SHA256SUMS` into one directory, verify with:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+On macOS:
+
+```sh
+shasum -a 256 -c --ignore-missing SHA256SUMS
+```
 
 ## Quickstarts
 

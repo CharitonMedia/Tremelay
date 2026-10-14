@@ -34,3 +34,20 @@ func TestGoInstallPathPreconditions(t *testing.T) {
 		t.Errorf("cmd/tremelay/main.go: %v", err)
 	}
 }
+
+func TestREADMEChecksumVerifyOneLiner(t *testing.T) {
+	root := filepath.Join("..", "..")
+	data, err := os.ReadFile(filepath.Join(root, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{
+		"sha256sum -c --ignore-missing SHA256SUMS",
+		"shasum -a 256 -c --ignore-missing SHA256SUMS",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("README.md missing checksum verify one-liner %q (ADR 0027)", want)
+		}
+	}
+}
