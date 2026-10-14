@@ -14,7 +14,13 @@ import (
 // columns existed is an intact vault. Verify and backup read it without
 // writing, unlock migrates it, and a backup taken before the migration restores.
 func TestPre3eVaultUnlocksAndBacksUp(t *testing.T) {
-	path, pass, s := mustCreate(t, nil)
+	// Backup and Restore refuse symlinked ancestors (macOS /var).
+	path := filepath.Join(canonicalTemp(t), "vault.db")
+	pass := []byte(randHex(t, 16))
+	s, err := Create(path, pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	secret := []byte("pre3e-" + randHex(t, 12))
 	cred, err := s.Put("api", "api_key", secret, PutOptions{})
 	if err != nil {
@@ -40,7 +46,7 @@ func TestPre3eVaultUnlocksAndBacksUp(t *testing.T) {
 	if _, err := VerifyAudit(path, pass); err != nil {
 		t.Fatalf("verify pre-3e vault: %v", err)
 	}
-	artifact := filepath.Join(t.TempDir(), "pre3e.backup")
+	artifact := filepath.Join(canonicalTemp(t), "pre3e.backup")
 	cp, err := Backup(path, artifact, pass, nil)
 	if err != nil {
 		t.Fatalf("backup pre-3e vault: %v", err)
@@ -57,7 +63,7 @@ func TestPre3eVaultUnlocksAndBacksUp(t *testing.T) {
 		t.Fatalf("credential after migration: %v", err)
 	}
 	u.Lock()
-	restored := filepath.Join(t.TempDir(), "restored.db")
+	restored := filepath.Join(canonicalTemp(t), "restored.db")
 	if err := Restore(artifact, restored, pass, cp, nil); err != nil {
 		t.Fatalf("restore pre-3e artifact: %v", err)
 	}
