@@ -159,7 +159,13 @@ func TestBackupRestoreNegative(t *testing.T) {
 		}
 		t.Cleanup(func() { restorePublishFault = nil })
 		dest := filepath.Join(dir, "stale-race.db")
-		if err := Restore(artGranted, dest, env.pass, cpGranted, nil); !errors.Is(err, ErrCheckpoint) {
+		want := ErrCheckpoint
+		if runtime.GOOS == "windows" {
+			// As in "sync rollback": Windows cannot confirm the rollback's
+			// directory flush, so a removed name is reported as uncertain.
+			want = ErrPublicationUncertain
+		}
+		if err := Restore(artGranted, dest, env.pass, cpGranted, nil); !errors.Is(err, want) {
 			t.Fatalf("stale staging publication: %v", err)
 		}
 		if _, err := os.Lstat(dest); !errors.Is(err, os.ErrNotExist) {
