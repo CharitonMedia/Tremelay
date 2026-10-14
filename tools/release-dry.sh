@@ -16,7 +16,20 @@ case $version in
 		;;
 esac
 out=${TREMELAY_RELEASE_OUT:-$root/dist/release}
+# The script cds twice and rm -rf's this tree, so a relative path would name
+# a different directory at each step, starting with the caller's own.
+case $out in
+	/*) ;;
+	*)
+		echo "release-dry: TREMELAY_RELEASE_OUT must be an absolute path" >&2
+		exit 1
+		;;
+esac
 stage=$out/stage
+
+# zip and tar read options from the environment, and an --exclude there would
+# ship an archive with no binary in it that still matches its checksum.
+unset ZIPOPT ZIP TAR_OPTIONS GZIP
 
 export GOTOOLCHAIN=go1.26.9
 export CGO_ENABLED=0
@@ -50,14 +63,19 @@ for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 wi
 		-noserial -notimestamp -version "$version" \
 		-output "$out/$name.cdx.json" "$stage/$name$exe")
 
-	# Fixed names, owners and timestamps keep the archives byte-identical.
+	# Fixed names, owners, modes and timestamps keep the archives
+	# byte-identical: zip stores the unix mode, which follows the umask.
+	chmod 0755 "$stage/$name$exe"
+	chmod 0644 "$stage/LICENSE"
 	TZ=UTC touch -t 198001010000 "$stage/$name$exe" "$stage/LICENSE"
 	case $os in
 	windows)
 		(cd "$stage" && TZ=UTC zip -qX9 "$out/$name.zip" "$name$exe" LICENSE)
 		;;
 	*)
-		tar_tmp=$(mktemp)
+		# Inside $out, so a failed run leaves nothing behind in TMPDIR and
+		# the next run's rm -rf clears it.
+		tar_tmp=$out/.tar.tmp
 		tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@315532800 \
 			-C "$stage" -cf "$tar_tmp" "$name$exe" LICENSE
 		gzip -n9 -c "$tar_tmp" >"$out/$name.tar.gz"

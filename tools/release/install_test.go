@@ -43,8 +43,8 @@ func TestREADMEChecksumVerifyOneLiner(t *testing.T) {
 	}
 	text := string(data)
 	for _, want := range []string{
-		"sha256sum -c --ignore-missing SHA256SUMS",
-		"shasum -a 256 -c --ignore-missing SHA256SUMS",
+		"SHA256SUMS | sha256sum -c -",
+		"shasum -a 256 -c -",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("README.md missing checksum verify one-liner %q (ADR 0027)", want)

@@ -1,10 +1,15 @@
 package release
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -79,10 +84,113 @@ func TestReleaseDryArtifacts(t *testing.T) {
 	if len(lines) != 12 {
 		t.Fatalf("SHA256SUMS has %d lines, want 12", len(lines))
 	}
-	verify := exec.Command("sha256sum", "-c", "--ignore-missing", "SHA256SUMS")
+	verify := exec.Command("sha256sum", "-c", "SHA256SUMS")
 	verify.Dir = out
 	if outVerify, err := verify.CombinedOutput(); err != nil {
 		t.Fatalf("sha256sum -c: %v\n%s", err, outVerify)
+	}
+	// A checksum says nothing about what is inside the archive: zip and tar
+	// take options from the environment, and an --exclude there would ship a
+	// LICENSE-only archive that verifies.
+	assertArchivesHoldTheBinary(t, out)
+}
+
+// TestReleaseDryIgnoresArchiveOptionsFromTheEnvironment covers a builder whose
+// environment carries ZIPOPT or TAR_OPTIONS: Info-ZIP appends the first and GNU
+// tar prepends the second, so an --exclude there would ship an archive with no
+// binary that still matches its checksum.
+func TestReleaseDryIgnoresArchiveOptionsFromTheEnvironment(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("release-dry integration needs GNU tar and a Linux builder")
+	}
+	out := t.TempDir()
+	if err := runReleaseDry(t, repoRoot(t), out,
+		"ZIPOPT=-x *.exe", "TAR_OPTIONS=--exclude=tremelay*"); err != nil {
+		t.Fatal(err)
+	}
+	assertArchivesHoldTheBinary(t, out)
+}
+
+// TestReleaseDryRefusesRelativeOutput covers the output override naming a
+// different directory at each of the script's cd steps, starting with the
+// caller's own, which it would rm -rf.
+func TestReleaseDryRefusesRelativeOutput(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("release-dry integration needs a POSIX shell")
+	}
+	caller := t.TempDir()
+	precious := filepath.Join(caller, "dist", "release")
+	if err := os.MkdirAll(precious, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(precious, "sentinel-not-ours-to-delete")
+	if err := os.WriteFile(keep, []byte("sentinel"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", filepath.Join(repoRoot(t), "tools", "release-dry.sh"))
+	cmd.Dir = caller
+	cmd.Env = append(os.Environ(), "TREMELAY_VERSION=v0.0.0-test", "TREMELAY_RELEASE_OUT=dist/release")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("a relative output path was accepted")
+	}
+	if !strings.Contains(string(output), "must be an absolute path") {
+		t.Fatalf("unexpected failure: %s", output)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("the caller's directory was touched: %v", err)
+	}
+}
+
+// assertArchivesHoldTheBinary opens every archive and requires the binary its
+// name promises, plus LICENSE.
+func assertArchivesHoldTheBinary(t *testing.T, out string) {
+	t.Helper()
+	for _, name := range listNames(t, out) {
+		path := filepath.Join(out, name)
+		var members []string
+		switch {
+		case strings.HasSuffix(name, ".zip"):
+			zr, err := zip.OpenReader(path)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			for _, f := range zr.File {
+				members = append(members, f.Name)
+			}
+			zr.Close()
+		case strings.HasSuffix(name, ".tar.gz"):
+			f, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gz, err := gzip.NewReader(f)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			tr := tar.NewReader(gz)
+			for {
+				h, err := tr.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+				members = append(members, h.Name)
+			}
+			f.Close()
+		default:
+			continue
+		}
+		base := strings.TrimSuffix(strings.TrimSuffix(name, ".zip"), ".tar.gz")
+		want := base
+		if strings.Contains(base, "windows") {
+			want += ".exe"
+		}
+		if !slices.Contains(members, want) || !slices.Contains(members, "LICENSE") {
+			t.Fatalf("%s holds %v, want %s and LICENSE", name, members, want)
+		}
 	}
 }
 
