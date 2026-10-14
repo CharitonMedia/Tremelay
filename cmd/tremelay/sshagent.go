@@ -1,3 +1,5 @@
+//go:build linux || darwin
+
 package main
 
 import (
@@ -97,7 +99,7 @@ func serveSSHAgentSocket(ctx context.Context, getenv func(string) string, tokenF
 // so each client gets a fresh conversation with no state from another. The
 // protocol bytes are copied, never inspected, rewritten, or logged.
 func relaySSHAgent(getenv func(string) string, conn net.Conn, token []byte) error {
-	if !daemonPeerAllowed(conn, os.Getuid()) {
+	if !daemonPeerAllowed(conn) {
 		return errSSHAgentRelay // A foreign peer gets no answer and no bytes.
 	}
 	up, err := daemonDial(getenv)

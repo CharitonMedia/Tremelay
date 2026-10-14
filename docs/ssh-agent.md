@@ -7,8 +7,9 @@ authentication signature at a time, for one username, to one server host key,
 under one `ssh_userauth` grant ([ADR 0013](adr/0013-ssh-userauth.md),
 [ADR 0026](adr/0026-ssh-agent-socket.md)). Revoking the grant stops it.
 
-**Linux and macOS only**, like the daemon. On other platforms the command
-fails closed.
+**Linux and macOS only.** The daemon itself also runs on Windows, but this
+command does not and fails closed there; see
+[ADR 0024](adr/0024-headless-unlock-daemon.md).
 
 **Your server must be OpenSSH 8.9 or later.** This agent signs only
 `publickey-hostbound-v00@openssh.com` requests, so the server has to offer

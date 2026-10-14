@@ -71,24 +71,104 @@ the machine, so it is checked rather than assumed.
 Permission and ownership checks protect the path; the peer-uid check protects
 the connection. Neither is sufficient alone, so both are enforced.
 
-### Windows is deferred and fails closed
+## Windows named pipe (amended 2026-10-13, V1.md item 3b)
 
-V1.md item 3 names a Windows named pipe. This slice does not ship one. On any
-platform that is not Linux or macOS, `tremelay daemon`, `tremelay lock` and
-`tremelay mcp --daemon` refuse to run with a fixed diagnostic; the ADR 0020
-pinentry path remains available there.
+The original slice deferred Windows and failed closed there. Patrick reversed
+that: *"we need windows ... it is the largest pool."* `tremelay daemon`,
+`tremelay lock` and `tremelay mcp --daemon` now serve the same handshake, the
+same two verbs, the same token authentication, the same idle timeout and the
+same dispatch-join-before-lock ordering on Windows, over a named pipe. Only the
+listener, the dialer and the peer check differ; `daemon.go` is one core both
+platforms share, as are the token-file read and write paths.
 
-This follows the precedent this repository already set: ADR 0020 shipped a
-Unix-only stdio profile and ADR 0022 brought Windows custody separately, under
-its own native-evidence requirements, because Windows handle and overlapped-I/O
-behavior cannot be argued from the Unix implementation. A named pipe holding an
-unlocked DEK needs an SDDL granting only the current user SID, correct
-`ImpersonateNamedPipeClient` identity checks, and the interruptible-close
-analysis ADR 0022 had to do. Shipping that untested, from a Linux host, into
-the one process that holds the vault key is not a tradeoff worth taking for a
-convenience feature. Per AGENTS.md rule 9 the conflict is documented here
-instead of papered over: **the item 3 acceptance line is met on Linux and macOS
-only, and Windows headless unlock remains open work.**
+The endpoint is `\\.\pipe\tremelay-<user SID>`. The SID makes it per-user by
+construction, and `TREMELAY_DAEMON_INSTANCE` appends one short label of
+`[A-Za-z0-9_-]` for a second daemon or a test. Neither the SID nor the label
+can widen anything: an unusable identity or an unsafe label yields no endpoint
+at all, the server always creates the first instance itself, and the client
+checks the owner before it sends a byte. That environment variable is the
+Windows counterpart of `XDG_RUNTIME_DIR` on Unix and carries the same trust.
+
+Custody is enforced four ways, none of them sufficient alone:
+
+- **Owner-only descriptor.** The pipe is created with an explicit descriptor,
+  `O:<SID>G:<SID>D:P(A;;GRGW;;;<SID>)`, built by Windows' own SDDL parser from
+  the token user: this user owns it, one entry grants this user
+  `GENERIC_READ|GENERIC_WRITE`, the DACL is protected so nothing is inherited,
+  and Everyone, Authenticated Users, Administrators and SYSTEM appear nowhere.
+  Only the same SID can match any of them. `GENERIC_WRITE` carries
+  `FILE_CREATE_PIPE_INSTANCE`, which is what lets the owner — and nobody
+  else — create the further instances the accept loop needs.
+- **`FILE_FLAG_FIRST_PIPE_INSTANCE`.** A squatter who created the name first
+  makes startup fail with the existing endpoint-in-use diagnostic rather than
+  sharing a name with the process holding the unlocked DEK. The listener then
+  holds one unconnected instance at all times, creating the replacement before
+  handing over the connected one, so the name never becomes free while the
+  daemon runs.
+- **`PIPE_REJECT_REMOTE_CLIENTS`.** The pipe namespace is reachable over SMB;
+  the pipe itself refuses a remote client. The boundary is this machine's user,
+  not a name that happens to resolve.
+- **Per-connection peer SID.** Before a single byte is read,
+  `GetNamedPipeClientProcessId` plus `OpenProcessToken`/`GetTokenUser` must
+  report the same SID as this process. `ImpersonateNamedPipeClient` is the
+  race-free identity source but requires client data to have been read first,
+  which this handshake will not do; the process-id path keeps the
+  "identify before reading" ordering that the Unix `SO_PEERCRED` check has.
+  The client holds the connection open across the check, and the descriptor
+  already admits only this SID, so the process-id lookup is the independent
+  second check rather than the only one.
+
+Anti-squatting also runs in the client's direction: `mcp --daemon` and `lock`
+read the owner SID of the pipe they opened and refuse to send the agent token
+unless it is this user's. A name that resolved to somebody else's pipe gets no
+token and no bytes.
+
+`golang.org/x/sys/windows` carries every call used here, so it moves from an
+indirect to a direct dependency and no new module is added. `go-winio` was
+considered and rejected: it exists mainly for the overlapped transport Go now
+provides, and a new dependency in the process that holds the vault key needs a
+better reason than convenience.
+
+The transport is ordinary overlapped I/O. Each instance is created with
+`FILE_FLAG_OVERLAPPED` and wrapped by `os.NewFile`, which associates it with
+the Go runtime's completion port; that is what makes handshake deadlines work
+and makes `Close` interrupt a blocked read, which the daemon needs to join
+every connection before it locks. `os.NewFile` falls back to synchronous I/O
+when the association fails, so a connection that cannot carry a deadline is
+refused when it is accepted rather than discovered mid-handshake.
+`Accept` is the one operation Go's poller cannot carry: it uses an explicit
+`OVERLAPPED` with its own event, and `Close` repeats `CancelIoEx` at 10ms
+intervals until the accept actually ends before releasing the handle, because
+a cancellation can reach the kernel before the operation it is meant to stop —
+the same reservation discipline ADR 0022 established for the stdio transport.
+The native handle is released only under the mutex cancellation also takes, so
+no cancellation can reach a recycled handle.
+
+Two shared behaviours had to change for a transport with no half-close. The
+relay closes the whole connection when the client's stdin ends, instead of
+`CloseWrite`, and does not treat the resulting read failure as an error.
+Token-file custody moves from a mode check to a per-platform one: Windows
+creates the file with the same owner-only descriptor (a file inheriting a
+normal profile's permissions would also admit SYSTEM and Administrators) and
+refuses to read a token file whose owner or DACL names anyone else.
+
+### `tremelay ssh-agent` stays closed on Windows
+
+`ssh-agent` is explicitly out of scope here and refuses to run on Windows with
+a fixed diagnostic. It would need a listening endpoint and peer check of its
+own, and the Windows OpenSSH agent its clients expect speaks a different
+named-pipe convention; neither is argued by this slice's evidence. Agents reach
+the Windows daemon with `mcp --daemon`. ADR 0026 is unchanged.
+
+### What this slice does not establish
+
+Windows CI exercises the daemon end to end on `windows-latest`. It does not
+establish behavior with a real MCP client on a real Windows desktop; V1.md item
+3b keeps that as separate evidence. The relay's own inherited stdin and stdout
+are ordinary synchronous process pipes, as in ADR 0022; the relay holds only a
+bearer token, no vault state. A process running as this user while the daemon
+is unlocked can still use every granted capability, exactly as on Unix — the
+boundary moved platform, not width.
 
 ## Agent tokens
 
@@ -200,7 +280,15 @@ under `-race`.
   (chosen) versus re-authenticating per MCP call. Per-call authentication would
   multiply `daemon_auth` rows without narrowing anything: the connection is
   already pinned to one principal for its lifetime.
-- **Ship a Windows named pipe in this slice.** Rejected; see above.
+- **Add `go-winio` for the Windows transport.** Rejected; `x/sys/windows` and
+  `os.NewFile` cover it, and a new dependency inside the process holding the
+  vault key needs a stronger reason.
+- **Identify the Windows peer by `ImpersonateNamedPipeClient`.** Rejected as
+  the primary check: it needs client data read first, which would break the
+  identify-before-reading ordering the Unix check holds to.
+- **A fixed pipe name with no per-user component.** Rejected: the name would
+  be contended on a multi-user machine, and `FILE_FLAG_FIRST_PIPE_INSTANCE`
+  would turn an ordinary second user into a denial of service.
 
 ## Tests and verification
 
@@ -211,7 +299,7 @@ sequence, a locked session refusing, token and passphrase absent from the
 sealed file and from logs, a corrupt digest length rejected as `ErrCorrupt`, and
 `VerifyAudit` still valid afterwards.
 
-In `cmd/tremelay` (the daemon, over real sockets and the real CLI): unlock then
+In `cmd/tremelay` (the daemon, over real endpoints and the real CLI): unlock then
 a capability call with no prompt; a wrong token refused and audited; two agents
 served simultaneously with neither seeing the other's grant; `tremelay lock`
 and idle-timeout expiry each making the next call fail closed; a grant revoked
@@ -222,16 +310,32 @@ and refusal for another uid, an unknown identity and a non-Unix connection;
 token-file mode, `O_EXCL` and malformed-content refusals; handshake bounds; and
 the token absent from captured stdout and stderr. The suite runs under `-race`.
 
+Those daemon tests are one suite both platforms run. The endpoint-custody
+tests are the half that cannot be shared. On Linux and macOS they are the
+directory/socket mode, ownership, type and peer-uid cases above. On Windows,
+run by the `windows-latest` jobs in `ci.yml` and `test-windows.yml`: the
+descriptor the pipe is created with, read back entry by entry (this user owns
+it, exactly one entry, `GENERIC_READ|GENERIC_WRITE`, this user's SID, and no
+well-known principal named anywhere); a second daemon refused on a name the
+first still holds, and that name reusable once released; instance labels that
+are not plainly safe producing no endpoint, and an unformable endpoint
+refusing before the passphrase is read; a token file widened to Everyone
+refused; and `ssh-agent` failing closed. The end-to-end acceptance — unlock,
+an agent capability call with no prompt, a wrong token refused and audited,
+`lock` making the next call fail closed — is the shared test, running over a
+real named pipe.
+
 Tests are security controls (invariant 13); none of these may be weakened to
 make CI pass.
 
 ## Consequences
 
-- The item 3 acceptance line is demonstrable on Linux and macOS: an unlocked
-  daemon serves capability calls with no prompt, `tremelay lock` and the idle
-  timeout make the next call fail closed, and a wrong or inactive agent token
-  is refused and audited.
-- Pinentry (ADR 0020) stays supported and is the only option on Windows.
+- The item 3 acceptance line is demonstrable on Linux, macOS and Windows: an
+  unlocked daemon serves capability calls with no prompt, `tremelay lock` and
+  the idle timeout make the next call fail closed, and a wrong or inactive
+  agent token is refused and audited.
+- Pinentry (ADR 0020) stays supported on every platform, as the option it was.
+- `tremelay ssh-agent` is the one daemon command Windows does not carry.
 - A resident unlocked daemon is a new persistent asset for the M5 detection
   work to reason about. Repeated `daemon_auth` denials are ordinary expected
   denials today, not a detection class; that is marked in the code as a

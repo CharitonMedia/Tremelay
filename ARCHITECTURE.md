@@ -92,11 +92,13 @@ borrow that state. This adds no listener, remote SSH connection or command runne
 [ADR 0024](docs/adr/0024-headless-unlock-daemon.md) adds `tremelay daemon`, the
 one resident process that holds an unlocked session for unattended agents. The
 human unlocks it once in a terminal; agents authenticate with per-agent bearer
-tokens whose SHA-256 the vault seals, over a user-only local endpoint with
-peer-uid enforcement. It serves the same capability adapter and the same stdio
-MCP profile, adds `daemon_auth` audit rows, and exposes no human operation and
-no raw secret. The boundary becomes the owner's uid rather than the owner's
-presence at a prompt; Linux and macOS only, elsewhere it fails closed.
+tokens whose SHA-256 the vault seals, over a user-only local endpoint whose
+peer is identified on every connection: a Unix socket with peer-uid enforcement
+on Linux and macOS, an owner-only named pipe with a client-SID check on
+Windows. It serves the same capability adapter and the same stdio MCP profile,
+adds `daemon_auth` audit rows, and exposes no human operation and no raw
+secret. The boundary becomes the owner's account rather than the owner's
+presence at a prompt.
 
 ## SSH agent socket
 

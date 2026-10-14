@@ -59,6 +59,28 @@ jobs:
               throw 'Native custody evidence receipt is missing.'
             }
           }
+      # The ordinary suite below also runs these. This step additionally names
+      # them, because a build tag that silently excluded the Windows daemon
+      # tests would leave `go test ./...` green with nothing exercised.
+      - name: Daemon over a Windows named pipe
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $log = go test -v -count=1 -run '^(TestDaemon|TestAgentTokenFile|TestSSHAgentFailsClosedOnWindows)' ./cmd/tremelay 2>&1 | Out-String
+          Write-Output $log
+          if ($LASTEXITCODE -ne 0) { throw 'Windows daemon suite failed.' }
+          foreach ($name in @(
+            'TestDaemonUnlockedAgentCall',
+            'TestDaemonConcurrentAgentsStayIsolated',
+            'TestDaemonIdleTimeoutFailsClosed',
+            'TestDaemonFailsClosedAfterGrantRevoke',
+            'TestDaemonPipeDescriptorIsOwnerOnly',
+            'TestDaemonPipeNameIsClaimedExclusively',
+            'TestDaemonPipeNameRejectsUnsafeInstance',
+            'TestAgentTokenFileRefusesWiderDACL',
+            'TestSSHAgentFailsClosedOnWindows')) {
+            if ($log -notmatch "--- PASS: $name\b") { throw "$name did not run on windows-latest." }
+          }
       - name: Test
         run: go test ./...
       - name: Vet

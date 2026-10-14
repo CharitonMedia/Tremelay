@@ -20,7 +20,7 @@ to call, and every attempt — allowed or denied — lands in a hash-chained aud
 
 Agents connect over MCP (`list_capabilities`, `describe_capability`,
 `invoke_capability`), or over an ssh-agent socket for SSH signing. Everything is
-local: one SQLite vault file, one Unix socket, no server, no account, no telemetry.
+local: one SQLite vault file, one user-only socket or named pipe, no server, no account, no telemetry.
 
 ## Demo
 
@@ -121,10 +121,9 @@ Read this before you trust it with anything.
 
 - **One human.** Single user, single vault. No multi-user, no orgs, no shared
   vaults, no team policy.
-- **One machine.** Unix socket and stdio only; there is no network or remote MCP
-  transport. The daemon and `tremelay ssh-agent` are Linux and macOS only — on
-  Windows they fail closed, and only the
-  [pinentry stdio path](docs/windows-stdio-mcp.md) works there today.
+- **One machine.** A user-only Unix socket or Windows named pipe, and stdio;
+  there is no network or remote MCP transport. `tremelay ssh-agent` is Linux and
+  macOS only and fails closed on Windows.
 - **The agent still reads broker responses.** An `http_broker` grant returns the
   status code, an allowlisted set of response headers, and up to 32 KiB of the
   body with every spelling of the credential redacted. The agent never sees the
