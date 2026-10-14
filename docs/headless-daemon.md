@@ -51,10 +51,16 @@ counts only time with no agent connected. Keep this terminal, a `tmux` window,
 or a user service running — the key lives nowhere else, so closing the process
 or rebooting locks the vault.
 
-Leave the control plane alone while it runs. Creating an agent or changing a
-grant commits to the same vault, which makes the daemon's session stale; it
-then zeroises and exits with a fixed diagnostic rather than serving. Lock
-first, make the change, unlock again.
+The control plane stays usable while it runs. Creating an agent, issuing a
+grant or revoking one commits to the same vault; the daemon re-reads and
+re-verifies the file with the key it already holds, and the change takes
+effect on the agent's next call. Nothing re-prompts, and open client
+connections stay up. If a command reports a stale session, an agent call
+committed at the same moment and nothing of your command was written: run it
+again.
+
+The daemon still locks and exits when it cannot verify the file — a tampered
+document, a broken audit chain or a rolled-back audit head.
 
 ## Register the stdio command with a client
 

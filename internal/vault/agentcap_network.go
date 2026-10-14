@@ -77,9 +77,6 @@ func (s *Session) agentCapNetwork(ctx context.Context, agentID string, bound age
 		return capNetworkResult{}, err
 	}
 	defer s.end()
-	if err := s.requireCurrent(); err != nil {
-		return capNetworkResult{}, err
-	}
 	partial, err := s.judgeExactNetwork(agentID, bound)
 	if err != nil {
 		if capHost(err) {
@@ -153,7 +150,7 @@ func (s *Session) judgeExactNetwork(agentID string, bound agentCapGrant) (auditE
 	if err := s.live(); err != nil {
 		return auditEvent{}, err
 	}
-	if err := s.requireCurrent(); err != nil {
+	if err := s.adoptLocked(); err != nil {
 		return auditEvent{}, err
 	}
 	bare := s.boundAgentDenial(agentID)

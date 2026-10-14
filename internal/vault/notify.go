@@ -2,6 +2,7 @@ package vault
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -357,11 +358,12 @@ func notificationFrom(ev auditEvent, class Classification) Notification {
 
 // noticeApplyVisits counts audit rows applied to the notice index.
 // A commit applies its new rows. Unlock applies the chain once.
-var noticeApplyVisits int
+// Two sessions on one vault count in parallel, so the counters are atomic.
+var noticeApplyVisits atomic.Int64
 
 // noticeScanVisits counts rows read by a per-source chain scan.
 // Immediate delivery and DeliverPending use the index and leave this at zero.
-var noticeScanVisits int
+var noticeScanVisits atomic.Int64
 
 type noticeSrc struct {
 	decision  string
@@ -396,7 +398,7 @@ func noticeIndex(events []auditEvent) map[uint64]noticeSrc {
 }
 
 func applyNotice(idx map[uint64]noticeSrc, ev auditEvent) {
-	noticeApplyVisits++
+	noticeApplyVisits.Add(1)
 	if idx == nil || ev.RefSeq == 0 {
 		return
 	}
@@ -456,7 +458,7 @@ func noticeAlertClass(src auditEvent, st noticeSrc) Classification {
 // is a legacy try from before reservations existed. A modern outcome pairs
 // with its reservation and is not a second try.
 func notifyAttempts(events []auditEvent, ref uint64) int {
-	noticeScanVisits += len(events)
+	noticeScanVisits.Add(int64(len(events)))
 	n := 0
 	pending := 0
 	for _, ev := range events {
@@ -479,7 +481,7 @@ func notifyAttempts(events []auditEvent, ref uint64) int {
 }
 
 func notifyDelivered(events []auditEvent, ref uint64) bool {
-	noticeScanVisits += len(events)
+	noticeScanVisits.Add(int64(len(events)))
 	for _, ev := range events {
 		if ev.Action == actionNotify && ev.RefSeq == ref && ev.Result == resultDelivered {
 			return true
@@ -493,7 +495,7 @@ func notifyDelivered(events []auditEvent, ref uint64) bool {
 // a notify row already records that delivery was chosen. Current session
 // policy is not a substitute for either record.
 func notifyChosen(events []auditEvent, ref uint64) bool {
-	noticeScanVisits += len(events)
+	noticeScanVisits.Add(int64(len(events)))
 	switch responseDecision(events, ref) {
 	case resultDecisionNotify:
 		return true

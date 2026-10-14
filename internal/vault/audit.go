@@ -129,31 +129,15 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 		return "", ErrUnauthenticated
 	}
 	defer wipe(dek)
-	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
+	// openDocument authenticates the sealed document under the plaintext audit
+	// head, checks the detection mirror and health against the chain, and
+	// wipes anything it rejects. Every one of those failures is a failed
+	// verification here, not a clean tip.
+	doc, _, err := openDocument(dek, header, events)
 	if err != nil {
 		return "", ErrAudit
 	}
-	defer wipe(plain)
-	var doc document
-	// The closure reads doc after unmarshal. A deferred wipeCredentials(doc.Credentials)
-	// would capture the nil slice header from before the decode.
-	defer func() { wipeCredentials(doc.Credentials) }()
-	if err := unmarshalStrict(plain, &doc); err != nil {
-		return "", ErrAudit
-	}
-	// The detection mirror is inside the authenticated document. A pre-M5
-	// document has no member; the chain supplies it. A stored member that
-	// does not match the chain is a failed verification, not a clean tip.
-	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
-	if err != nil || matchDetection(indexFromAudit(events).state(), doc.Detection) != nil {
-		return "", ErrAudit
-	}
-	if matchHealth(events, doc.Credentials) != nil {
-		return "", ErrAudit
-	}
-	if validateDocument(doc) != nil {
-		return "", ErrAudit
-	}
+	defer wipeCredentials(doc.Credentials)
 	return events[len(events)-1].Hash, nil
 }
 

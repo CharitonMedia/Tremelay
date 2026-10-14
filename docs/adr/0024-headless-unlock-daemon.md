@@ -239,13 +239,11 @@ only then locks — the transport/dispatch-join-before-lock ordering ADR 0020 an
 ADR 0022 require. After a lock, every client call fails closed with a generic
 error.
 
-The daemon also locks when its session becomes permanently unusable. A human
-control-plane command run against the same vault advances the durable audit
-sequence, which makes the daemon's cached session stale; a stale or
-audit-failed session can never serve again, so the daemon prints a fixed
-diagnostic, zeroises and exits rather than refusing calls indefinitely with no
-explanation. **Operational consequence: change agents or grants while the
-daemon is locked, or expect to restart it.**
+The daemon also locks when its session becomes permanently unusable: a
+document, chain or audit head it cannot verify with the key it holds. It prints
+a fixed diagnostic, zeroises and exits rather than refusing calls indefinitely
+with no explanation. A human control-plane command is no longer one of those
+cases; see the 2026-10-13 amendment.
 
 ## Concurrency
 
@@ -302,9 +300,9 @@ sealed file and from logs, a corrupt digest length rejected as `ErrCorrupt`, and
 In `cmd/tremelay` (the daemon, over real endpoints and the real CLI): unlock then
 a capability call with no prompt; a wrong token refused and audited; two agents
 served simultaneously with neither seeing the other's grant; `tremelay lock`
-and idle-timeout expiry each making the next call fail closed; a grant revoked
-through the human control plane making the daemon fail closed, zeroise and
-exit; directory and socket mode/ownership/type refusals including a live
+and idle-timeout expiry each making the next call fail closed; grants created
+and revoked through the human control plane taking effect on the daemon's next
+call; directory and socket mode/ownership/type refusals including a live
 endpoint, a stale socket and a regular file; peer-uid acceptance for this uid
 and refusal for another uid, an unknown identity and a non-Unix connection;
 token-file mode, `O_EXCL` and malformed-content refusals; handshake bounds; and
@@ -342,3 +340,67 @@ make CI pass.
   deliberate simplification with its upgrade path.
 - Token files are a new on-disk secret class. They are 0600, their path is the
   thing that gets printed, and a file with wider permissions is refused on use.
+
+## Amendment 2026-10-13: the daemon reloads instead of dying (V1.md item 3d)
+
+Status stays Accepted pending owner veto.
+
+The original slice turned every human control-plane commit into the end of the
+daemon. That is a denial of service the operator inflicts on themselves by
+using the product as documented, and the workaround the docs gave — lock the
+daemon before touching grants — is the opposite of the "unlock once" property
+item 3 exists to deliver.
+
+An unlocked session now adopts the vault it is already holding the key to. At
+every `Session` entry point, under the same mutex the dispatch discipline
+above describes, the session compares the durable audit sequence with its own.
+When the file has moved forward it re-reads the header and the whole chain in
+one transaction and re-verifies them with `Unlock`'s own code — one verifier,
+not a second one: `readVaultState` checks the header shape, the hash chain and
+the locked-denial suffix, and `openDocument` authenticates the sealed document
+under the plaintext audit head and checks the detection mirror, the health
+mirror and the stored credential, agent and grant shapes. Only a document that
+passes all of it is swapped in, and the swap happens with the mutex held, so
+no in-flight call sees half of it.
+
+What this changes for an operator: grants created while the daemon serves are
+usable on the agent's next call, and revoked grants, suspended agents and
+retired tokens are refused on the next call. Existing agent connections stay
+up. Nothing re-prompts for the passphrase.
+
+What it does not change: a reload that fails verification is fatal exactly as
+before. A tampered document, a broken chain, a rolled-back audit head or a
+vault id that is not this vault retires the session, and the daemon zeroises
+and exits with the same fixed diagnostic. Rollback detection is the session's
+memory of the tip it already served — an older authentic copy verifies on its
+own terms, so only a live session can notice the substitution.
+
+Two security expectations changed shape and were reviewed against invariant 13
+rather than quietly dropped:
+
+- A session that loses a race no longer refuses every later call. The property
+  that mattered was never the refusal, it was that no call is served from an
+  unverified view, and that is what the re-verification enforces. The tests
+  that asserted the refusal now assert the verification: a withdrawn grant is
+  refused on the grant's own merits and audited, an unchanged grant keeps
+  working, and an unverifiable file still fails closed.
+- A passphrase change committed by another holder is adopted like any other
+  commit, so the session's later writes use the new wrap. The old passphrase
+  stays dead: a rewrap presented with it is refused as unauthenticated, and
+  `VerifyAudit` accepts only the new one.
+
+A reload appends no audit row. The commit being adopted is already in the
+chain, written by whoever made it, and re-reading a file with a key already
+held is not a credential-backed operation (invariant 4 is about attempted
+operations, and no capability is exercised here).
+
+Concurrency ceiling, recorded rather than hidden: commits stay optimistic. A
+writer compares and swaps on the audit sequence, and the comparison sits
+outside the write transaction, so a human command racing a continuous stream
+of agent calls can lose repeatedly and must be re-run. A lost race is now
+reported as a stale session rather than as corruption, nothing of it is
+written, and neither side locks. Measured, a human command is unaffected at a
+working agent's call rate and loses outright against roughly a hundred agent
+calls per second. The upgrade path is in the code next to the check: take the
+write transaction first and re-run the caller's mutation against the state
+read inside it, which requires every mutating method to be a redoable closure.

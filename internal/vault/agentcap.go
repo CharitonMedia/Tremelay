@@ -405,9 +405,6 @@ func (s *Session) agentCapList(agentID string) ([]agentCapSnapshot, error) {
 		return nil, err
 	}
 	defer s.end()
-	if err := s.requireCurrent(); err != nil {
-		return nil, err
-	}
 	now, err := s.evaluationTime()
 	if err != nil {
 		return nil, s.denyAction(actionCapList, err)
@@ -466,9 +463,6 @@ func (s *Session) agentCapDescribe(agentID string, bound agentCapGrant) (agentCa
 		return agentCapView{}, err
 	}
 	defer s.end()
-	if err := s.requireCurrent(); err != nil {
-		return agentCapView{}, err
-	}
 	deny := s.boundAgentDenial(agentID)
 	deny.Action = actionAgentCap
 	g, ok := s.grantByID(bound.grantID)
@@ -511,9 +505,6 @@ func (s *Session) agentCapDeny(agentID string, invoke bool) error {
 		return err
 	}
 	defer s.end()
-	if err := s.requireCurrent(); err != nil {
-		return err
-	}
 	ev := s.boundAgentDenial(agentID)
 	ev.Action = actionAgentCap
 	// Before resolving a handle, its operation is unknown. Never guess it.
@@ -536,9 +527,6 @@ func (s *Session) localAttestExact(agentID, grantID string, payload []byte) (Loc
 		return LocalAttestation{}, err
 	}
 	defer s.end()
-	if err := s.requireCurrent(); err != nil {
-		return LocalAttestation{}, err
-	}
 	if s.agentExists(agentID) && !s.agentActive(agentID) {
 		return s.attestDeny(s.destinationEvent(agentID, "", resultDeniedAgent, OpLocalArtifactAttest), ErrDeniedAgent)
 	}

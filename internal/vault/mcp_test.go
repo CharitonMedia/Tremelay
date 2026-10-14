@@ -501,31 +501,47 @@ func TestMCPAuthority(t *testing.T) {
 			t.Fatal("new handle used the old key")
 		}
 
-		stale := grantedAttestEnv(t)
-		staleSess := startMCP(t, bindCap(t, stale.s, stale.agent.ID))
-		staleHandle := entriesOf(t, mustCall(t, staleSess, toolList, map[string]any{}))[0]["handle"]
-		other, err := Unlock(stale.path, stale.pass, nil)
+		// A second session's commit moves the durable audit tip past the view
+		// this bound capability holds. Since V1.md item 3d the session adopts
+		// that commit under Unlock's verification instead of refusing every
+		// later call, so a handle whose authority did not change keeps
+		// working, and a withdrawal has to be refused on the grant's own
+		// merits rather than by staleness.
+		adopted := newAttestEnv(t)
+		adoptedGrant := adopted.grant(t, time.Hour)
+		adoptedSess := startMCP(t, bindCap(t, adopted.s, adopted.agent.ID))
+		adoptedHandle := entriesOf(t, mustCall(t, adoptedSess, toolList, map[string]any{}))[0]["handle"]
+		other, err := Unlock(adopted.path, adopted.pass, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(other.Lock)
-		// A commit from the second session moves the durable audit tip past
-		// the view the bound capability still holds.
 		if _, err := other.CreateAgent("worker-2"); err != nil {
 			t.Fatal(err)
 		}
-		before := len(mcpAuditSnapshot(stale.s))
-		res, err := staleSess.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolInvoke, Arguments: invokeArgs(staleHandle, []byte("stale-artifact"))})
-		if err == nil || (res != nil && !res.IsError) || strings.Contains(err.Error(), "stale-artifact") || len(mcpAuditSnapshot(stale.s)) != before {
-			t.Fatalf("stale %v %+v rows %d", err, res, len(mcpAuditSnapshot(stale.s))-before)
+		carried := mustCall(t, adoptedSess, toolInvoke, invokeArgs(adoptedHandle, []byte("adopted-artifact")))
+		if carried.IsError || toolObject(t, carried)["signature"] == nil {
+			t.Fatalf("an unrelated commit broke an unchanged handle: %+v", carried)
+		}
+		if err := other.RevokeGrant(adoptedGrant.ID); err != nil {
+			t.Fatal(err)
+		}
+		before := len(mcpAuditSnapshot(adopted.s))
+		withdrawn := mustCall(t, adoptedSess, toolInvoke, invokeArgs(adoptedHandle, []byte("withdrawn-artifact")))
+		raw, _ := json.Marshal(toolObject(t, withdrawn))
+		if !withdrawn.IsError || toolObject(t, withdrawn)["code"] != capDeniedRevoked || bytes.Contains(raw, []byte("signature")) {
+			t.Fatalf("a grant revoked by another session still invoked: %s", raw)
+		}
+		if len(mcpAuditSnapshot(adopted.s)) == before {
+			t.Fatal("the withdrawn-authority refusal was not audited")
 		}
 
 		locked := grantedAttestEnv(t)
 		lockedSess := startMCP(t, bindCap(t, locked.s, locked.agent.ID))
 		lockedHandle := entriesOf(t, mustCall(t, lockedSess, toolList, map[string]any{}))[0]["handle"]
 		locked.s.Lock()
-		res, err = lockedSess.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolList, Arguments: map[string]any{}})
-		if err == nil || strings.Contains(err.Error(), lockedHandle.(string)) {
+		if _, err := lockedSess.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolList, Arguments: map[string]any{}}); err == nil ||
+			strings.Contains(err.Error(), lockedHandle.(string)) {
 			t.Fatalf("locked %v", err)
 		}
 	})

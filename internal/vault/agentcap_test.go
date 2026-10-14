@@ -401,23 +401,35 @@ func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
 		t.Fatal("suspended payload was stored")
 	}
 
-	stale := grantedAttestEnv(t)
-	staleCap := bindCap(t, stale.s, stale.agent.ID)
-	staleHandle := capCall(t, staleCap, okBytes(t)(encodeCapList())).entries[0].handle
-	other, err := Unlock(stale.path, stale.pass, nil)
+	// A second session's commit moves the durable audit tip past the view this
+	// bound capability holds. Since V1.md item 3d the session adopts that
+	// commit under Unlock's verification instead of refusing every later
+	// call, so an unchanged handle still signs and authority withdrawn by the
+	// control plane is what refuses it.
+	adopted := newAttestEnv(t)
+	adoptedGrant := adopted.grant(t, time.Hour)
+	adoptedCap := bindCap(t, adopted.s, adopted.agent.ID)
+	adoptedHandle := capCall(t, adoptedCap, okBytes(t)(encodeCapList())).entries[0].handle
+	other, err := Unlock(adopted.path, adopted.pass, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(other.Lock)
-	// A commit from the second session moves the durable audit tip past the
-	// view the bound capability still holds.
 	if _, err := other.CreateAgent("worker-2"); err != nil {
 		t.Fatal(err)
 	}
-	before := len(stale.s.audit)
-	raw, err = staleCap.Exchange(okBytes(t)(encodeCapInvoke(staleHandle, payload)))
-	if raw != nil || !errors.Is(err, ErrStale) || len(stale.s.audit) != before {
-		t.Fatalf("stale %x %v rows %d", raw, err, len(stale.s.audit)-before)
+	if got := capCall(t, adoptedCap, okBytes(t)(encodeCapInvoke(adoptedHandle, payload))); got.code != "" {
+		t.Fatalf("an unrelated commit broke an unchanged handle: %q", got.code)
+	}
+	if err := other.RevokeGrant(adoptedGrant.ID); err != nil {
+		t.Fatal(err)
+	}
+	before := len(adopted.s.audit)
+	if got := capCall(t, adoptedCap, okBytes(t)(encodeCapInvoke(adoptedHandle, payload))); got.code != capDeniedRevoked {
+		t.Fatalf("a grant revoked by another session still invoked: %q", got.code)
+	}
+	if len(adopted.s.audit) == before {
+		t.Fatal("the withdrawn-authority refusal was not audited")
 	}
 
 	fault := grantedAttestEnv(t)
@@ -470,7 +482,7 @@ func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
 	if !allowed || completed {
 		t.Fatalf("allowed %v completed %v", allowed, completed)
 	}
-	for _, s := range []*Session{env.s, exp.s, sus.s, stale.s, fault.s, cut.s} {
+	for _, s := range []*Session{env.s, exp.s, sus.s, adopted.s, fault.s, cut.s} {
 		if err := verifyChain(s.audit); err != nil {
 			t.Fatal(err)
 		}

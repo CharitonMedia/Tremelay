@@ -441,7 +441,7 @@ func (s *Session) sshJudgeUnlocked(agentID string, bound agentCapGrant) (auditEv
 	if err := s.live(); err != nil {
 		return auditEvent{}, nil, err
 	}
-	if err := s.requireCurrent(); err != nil {
+	if err := s.adoptLocked(); err != nil {
 		return auditEvent{}, nil, err
 	}
 	ev := auditEvent{Action: actionSSHUserAuth, AgentID: agentID, GrantID: bound.grantID, Operation: OpSSHUserAuth}
@@ -507,7 +507,7 @@ func (s *Session) sshRecordUnlocked(ev auditEvent) error {
 	if err := s.live(); err != nil {
 		return err
 	}
-	if err := s.requireCurrent(); err != nil {
+	if err := s.adoptLocked(); err != nil {
 		return err
 	}
 	ev.Action = actionSSHUserAuth

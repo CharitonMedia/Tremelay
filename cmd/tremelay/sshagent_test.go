@@ -359,16 +359,20 @@ func TestSSHAgentRevokedGrantStopsSigning(t *testing.T) {
 
 	f.cli(t, "grant", "revoke", "--path", f.path, "--id", f.grantID)
 
-	// The control-plane commit makes the daemon's session stale, so it
-	// zeroises and exits. Either way the next signature is refused.
+	// The daemon adopts that commit and keeps serving (ADR 0024, item 3d), so
+	// the refusal has to come from the grant itself rather than from a dead
+	// daemon: the socket still answers, lists nothing, and signs nothing.
 	after := f.connect(t)
+	if keys, err := after.List(); err != nil || len(keys) != 0 {
+		t.Fatalf("revoked grant was still listed: %v, %d keys", err, len(keys))
+	}
 	if err := f.bind(t, after, sessionID); err == nil {
 		if _, err := after.Sign(userKey, preimage); err == nil {
 			t.Fatal("a revoked grant still signed")
 		}
 	}
-	if code := f.wait(t, 15*time.Second); code != 0 {
-		t.Fatalf("daemon exited %d: %q", code, f.stderr.String())
+	if f.exited() {
+		t.Fatalf("daemon exited on an ordinary revocation: %q", f.stderr.String())
 	}
 	if _, err := vault.VerifyAudit(f.path, []byte(f.pass)); err != nil {
 		t.Fatalf("audit chain invalid: %v", err)

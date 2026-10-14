@@ -270,13 +270,16 @@ func (d *daemon) serveSSHAgent(conn net.Conn, principal *vault.AgentPrincipal) {
 	}
 }
 
-// checkTerminal locks and exits when this session can never serve again. A
-// human control-plane command run against the same vault advances the durable
-// audit sequence, which makes the daemon's cached session stale: it then
-// refuses every operation. Holding an unusable DEK serves nobody, so the
-// daemon zeroises it and says so instead of refusing calls indefinitely.
+// checkTerminal locks and exits when this session can never serve again.
+// Neither an ordinary control-plane commit nor a write that lost the race to
+// one is such a case any more: the session re-reads and re-verifies the vault
+// and keeps serving, so a human can create and revoke grants while agents
+// work. What reaches here is a failed verification — a tampered document, a
+// broken chain, or a rolled-back audit head. Holding a DEK that can never be
+// trusted again serves nobody, so the daemon zeroises it and says so instead
+// of refusing calls indefinitely.
 func (d *daemon) checkTerminal(err error) {
-	if errors.Is(err, vault.ErrStale) || errors.Is(err, vault.ErrCorrupt) || errors.Is(err, vault.ErrAudit) {
+	if errors.Is(err, vault.ErrCorrupt) || errors.Is(err, vault.ErrAudit) {
 		fmt.Fprintln(d.stderr, errDaemonTerminal.Error())
 		d.requestLock()
 	}
