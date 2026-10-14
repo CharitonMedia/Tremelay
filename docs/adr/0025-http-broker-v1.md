@@ -266,6 +266,14 @@ the credential has left scope.
 - **Auto-migrate `github_issue_state` grants on unlock.** Mints unapproved
   authority during a key operation.
 
+## Note (2026-10-14)
+
+Response redaction now treats hex spellings case-insensitively on `a-f`/`A-F`,
+includes the JSON `\/` solidus escape alongside `encoding/json.Marshal`’s raw
+`/`, and withholds broker responses when `json.Marshal` of the MCP projection
+would introduce any credential spelling—the same gate already applied to
+`body_base64`.
+
 ## Acceptance
 
 Synthetic only. No live API is called by the test suite.

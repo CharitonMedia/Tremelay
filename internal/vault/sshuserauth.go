@@ -12,7 +12,8 @@ import (
 )
 
 const (
-	// OpSSHUserAuth authorizes one host-bound SSH user authentication signature.
+	// OpSSHUserAuth authorizes one SSH user authentication signature bound to a
+	// session this stream verified against the grant's pinned host key.
 	// It is not an alias of sign, local_artifact_attest, http_request, or http_broker.
 	OpSSHUserAuth = "ssh_userauth"
 
@@ -28,6 +29,7 @@ const (
 	sshAlgoEd25519        = "ssh-ed25519"
 	sshServiceConnection  = "ssh-connection"
 	sshUserAuthMethod     = "publickey-hostbound-v00@openssh.com"
+	sshUserAuthPlain      = "publickey"
 	sshExtSessionBind     = "session-bind@openssh.com"
 	sshMsgUserAuthRequest = 50
 
@@ -934,7 +936,18 @@ func sshSignBody(pinned, sessionID, body []byte, user string, userBlob []byte) b
 	if !ok || !validSSHUsername(parts.user) || parts.user != user {
 		return false
 	}
-	return sshBytesEq(parts.sessionID, sessionID) && sshBytesEq(parts.hostKey, pinned) && sshBytesEq(parts.userKey, userBlob)
+	if !sshBytesEq(parts.sessionID, sessionID) || !sshBytesEq(parts.userKey, userBlob) {
+		return false
+	}
+	if !parts.hostBound {
+		// A plain publickey request carries no host key. Its session
+		// identifier is the whole destination evidence, and it is only
+		// reached when the caller matched the session identifier of a
+		// non-forwarding bind this stream already verified against the
+		// grant's pinned host key.
+		return true
+	}
+	return sshBytesEq(parts.hostKey, pinned)
 }
 
 // sshSignData returns the exact bytes to sign: the data string inside the
@@ -952,6 +965,7 @@ type userauthParts struct {
 	user      string
 	userKey   []byte
 	hostKey   []byte
+	hostBound bool
 }
 
 func parseUserauth(data []byte) (userauthParts, bool) {
@@ -976,7 +990,11 @@ func parseUserauth(data []byte) (userauthParts, bool) {
 		return zero, false
 	}
 	method, rest, ok := takeSSHBytes(rest, len(sshUserAuthMethod))
-	if !ok || string(method) != sshUserAuthMethod {
+	if !ok {
+		return zero, false
+	}
+	hostBound := string(method) == sshUserAuthMethod
+	if !hostBound && string(method) != sshUserAuthPlain {
 		return zero, false
 	}
 	if len(rest) < 1 || rest[0] != 1 {
@@ -991,11 +1009,19 @@ func parseUserauth(data []byte) (userauthParts, bool) {
 	if !ok || len(userKey) != sshEd25519BlobLen {
 		return zero, false
 	}
+	parts := userauthParts{sessionID: sid, user: string(user), userKey: userKey, hostBound: hostBound}
+	if !hostBound {
+		if len(rest) != 0 {
+			return zero, false
+		}
+		return parts, true
+	}
 	hostKey, rest, ok := takeSSHBytes(rest, sshEd25519BlobLen)
 	if !ok || len(hostKey) != sshEd25519BlobLen || len(rest) != 0 {
 		return zero, false
 	}
-	return userauthParts{sessionID: sid, user: string(user), userKey: userKey, hostKey: hostKey}, true
+	parts.hostKey = hostKey
+	return parts, true
 }
 
 func parseSignBody(body []byte) (key, data []byte, flags uint32, ok bool) {

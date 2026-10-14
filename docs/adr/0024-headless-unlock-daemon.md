@@ -434,11 +434,14 @@ working agent's call rate and loses outright against roughly a hundred agent
 calls per second. The upgrade path is in the code next to the check: take the
 write transaction first and re-run the caller's mutation against the state
 read inside it, which requires every mutating method to be a redoable closure.
-The loss can also be `ErrIO` rather than a stale session: SQLite's busy wait
-is not fair, so a connection committing back to back can starve the other
-side past the 5 s `busy_timeout` (seen on slow disks and Windows CI). Either
-side can be the one starved; nothing is written and neither side locks.
-A fair lock or another journal mode would change ADR 0003 and is not done.
+The loss could also be `ErrIO` rather than a stale session when SQLite's busy
+wait starved a writer past the 5 s `busy_timeout` (seen on slow disks and
+Windows CI). V1 item 3f (ADR 0003 amendment 2026-10-14) addresses that for
+daemon-scale concurrency: process-wide write serialization plus bounded retry on
+`SQLITE_BUSY` at transaction boundaries. Stale-session races from optimistic
+compare-and-swap outside the write transaction remain; cross-process writers
+still depend on busy timeout and the bounded retry rather than a cluster-wide
+queue.
 
 ## Amendment 2026-10-13: agent token custody (V1.md item 3c)
 

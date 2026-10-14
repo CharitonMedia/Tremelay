@@ -978,8 +978,116 @@ func TestSSHUserAuthDirectRelease(t *testing.T) {
 	env.mustBind(t, sid)
 	sig, err = env.session.sshRelease(env.agent.ID, env.stream.bound, env.stream.hostKey, env.stream.sessionID, env.stream.hostSig, env.signBody(env.userBlob, env.methodPreimage(sid, "publickey"), 0))
 	if sig != nil || err == nil {
-		t.Fatal("direct release signed ordinary publickey")
+		t.Fatal("direct release signed a publickey request carrying a host key")
 	}
+}
+
+// TestSSHUserAuthPlainPublickey is V1 item 5b. A plain publickey request is
+// signed only when its session identifier is the one a verified, non-forwarded
+// session-bind for this grant's pinned host key already put on this same
+// stream. Servers that do not implement publickey-hostbound-v00@openssh.com,
+// github.com among them, ask for exactly this request.
+func TestSSHUserAuthPlainPublickey(t *testing.T) {
+	logs := &bytes.Buffer{}
+	env := newSSHEnvLog(t, logs)
+	sid := env.sessionID(32)
+	otherID := env.sessionID(32)
+	plain := plainPreimage(sid, env.user, env.userBlob)
+	otherUserPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherUser := marshalEd25519Pub(otherUserPub)
+	_, otherHostPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherHost := marshalEd25519Pub(otherHostPriv.Public().(ed25519.PublicKey))
+
+	// No binding means no proved destination, so nothing is signed.
+	if resp, err := env.stream.roundTrip(env.signBody(env.userBlob, plain, 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+		t.Fatalf("unbound plain publickey %x %v", resp, err)
+	}
+
+	// A bind that proves nothing about the pinned destination leaves the
+	// stream unbound, and the same request stays refused after each one.
+	badBinds := map[string][]byte{
+		"another host key":                 env.bindBody(sid, otherHost, env.hostSig(otherHostPriv, sid), 0),
+		"an invalid host signature":        env.bindBody(sid, env.hostBlob, env.hostSig(otherHostPriv, sid), 0),
+		"a signature over another session": env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, otherID), 0),
+		"forwarding":                       env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, sid), 1),
+	}
+	for name, body := range badBinds {
+		if resp, err := env.stream.roundTrip(body); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) || env.stream.hasBinding {
+			t.Fatalf("bind with %s: %x bound %v %v", name, resp, env.stream.hasBinding, err)
+		}
+		if resp, err := env.stream.roundTrip(env.signBody(env.userBlob, plain, 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+			t.Fatalf("plain publickey signed after a bind with %s: %x %v", name, resp, err)
+		}
+	}
+
+	env.mustBind(t, sid)
+	resp, err := env.stream.roundTrip(env.signBody(env.userBlob, plain, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := signatureRaw(t, resp)
+	parsed, err := ssh.ParsePublicKey(env.userBlob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parsed.Verify(plain, &ssh.Signature{Format: sshAlgoEd25519, Blob: sig}); err != nil {
+		t.Fatalf("plain publickey signature did not verify: %v", err)
+	}
+
+	// Everything else about the request still has to match the grant and the
+	// binding, and the plain encoding has no host-key field to carry.
+	refused := map[string][]byte{
+		"another session identifier": plainPreimage(otherID, env.user, env.userBlob),
+		"another username":           plainPreimage(sid, "root", env.userBlob),
+		"another user key":           plainPreimage(sid, env.user, otherUser),
+		"an appended host key":       append(plainPreimage(sid, env.user, env.userBlob), appendSSHString(nil, env.hostBlob)...),
+		"a trailing byte":            append(plainPreimage(sid, env.user, env.userBlob), 0),
+	}
+	for name, data := range refused {
+		if resp, err := env.stream.roundTrip(env.signBody(env.userBlob, data, 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+			t.Fatalf("signed a plain publickey request with %s: %x %v", name, resp, err)
+		}
+	}
+	if resp, err := env.stream.roundTrip(env.signBody(env.userBlob, plain, 1)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+		t.Fatalf("signed with a non-zero flag %x %v", resp, err)
+	}
+
+	// A binding belongs to one agent connection. Another stream holding the
+	// same grant cannot use this one's session, in either direction.
+	other := env.secondStream(t)
+	if resp, err := other.roundTrip(env.signBody(env.userBlob, plain, 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+		t.Fatalf("a second connection used this connection's bind %x %v", resp, err)
+	}
+	if resp, err := other.roundTrip(env.bindBody(otherID, env.hostBlob, env.hostSig(env.hostPriv, otherID), 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentSuccess}) {
+		t.Fatalf("second bind %x %v", resp, err)
+	}
+	if resp, err := other.roundTrip(env.signBody(env.userBlob, plain, 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+		t.Fatalf("the second connection signed the first session %x %v", resp, err)
+	}
+
+	// Revocation stops the next request on the already bound stream.
+	if err := env.session.RevokeGrant(env.grant.ID); err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := env.stream.roundTrip(env.signBody(env.userBlob, plain, 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+		t.Fatalf("a revoked grant signed %x %v", resp, err)
+	}
+	if got := sshCount(t, env.path, resultCompleted); got != 1 {
+		t.Fatalf("%d signature releases, want 1", got)
+	}
+	if got := sshCount(t, env.path, resultDenied); got < len(badBinds)*2+len(refused)+2 {
+		t.Fatalf("%d audited refusals", got)
+	}
+	if got := sshCount(t, env.path, resultDeniedRevoked); got < 1 {
+		t.Fatal("the revoked attempt was not audited")
+	}
+	env.assertClean(t, plain, sid, sig, logs.Bytes())
 }
 
 type sshEnv struct {
@@ -1194,6 +1302,20 @@ func userauthPreimage(sessionID []byte, user string, userBlob, hostBlob []byte) 
 	body = appendSSHString(body, []byte(sshAlgoEd25519))
 	body = appendSSHString(body, userBlob)
 	return appendSSHString(body, hostBlob)
+}
+
+// plainPreimage is the OpenSSH `publickey` userauth preimage: the same request
+// without the host-key field, which is what a client asks for when the server
+// does not offer publickey-hostbound-v00@openssh.com.
+func plainPreimage(sessionID []byte, user string, userBlob []byte) []byte {
+	body := appendSSHString(nil, sessionID)
+	body = append(body, sshMsgUserAuthRequest)
+	body = appendSSHString(body, []byte(user))
+	body = appendSSHString(body, []byte(sshServiceConnection))
+	body = appendSSHString(body, []byte(sshUserAuthPlain))
+	body = append(body, 1)
+	body = appendSSHString(body, []byte(sshAlgoEd25519))
+	return appendSSHString(body, userBlob)
 }
 
 func signMessage(key, data []byte, flags uint32) []byte {

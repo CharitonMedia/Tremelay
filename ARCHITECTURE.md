@@ -112,7 +112,11 @@ ssh-agent-protocol socket under the same endpoint custody. The relay holds no
 vault state. Inside the daemon, one conversation owns one ADR 0013 stream per
 active `ssh_userauth` grant: identities are merged, a session binding is
 offered to each grant that may pin a different host key, and any other message
-stops at the first stream that does not refuse it. No grant check, preimage
-rule, audit row or dependency changes, and ordinary `publickey` stays denied,
-so the socket works only with servers that offer
-`publickey-hostbound-v00@openssh.com`.
+stops at the first stream that does not refuse it. No grant check, audit row or
+dependency changes. The signed message set is
+`publickey-hostbound-v00@openssh.com` plus, since the ADR 0013 amendment of
+2026-10-14, the ordinary `publickey` preimage whose session identifier is the
+one a verified non-forwarded binding for that grant's pinned host key put on
+the same connection ([V1 item 5b](V1.md)). Servers that do not implement the
+host-bound method, github.com among them, therefore work; clients that send no
+binding still get nothing.

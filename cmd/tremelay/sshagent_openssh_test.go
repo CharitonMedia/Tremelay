@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -83,16 +84,51 @@ func (f *sshAgentFixture) clientEnv() []string {
 
 func (f *sshAgentFixture) knownHosts(t *testing.T, port int) string {
 	t.Helper()
-	hostKey, err := ssh.ParsePublicKey(f.hostBlob)
+	return f.knownHostsFor(t, f.hostBlob, port)
+}
+
+// knownHostsFor lets a test trust a host key the grant does not pin, so the
+// client reaches userauth and the refusal comes from the agent rather than
+// from StrictHostKeyChecking.
+func (f *sshAgentFixture) knownHostsFor(t *testing.T, blob []byte, port int) string {
+	t.Helper()
+	hostKey, err := ssh.ParsePublicKey(blob)
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(f.dir, "known_hosts")
+	path := filepath.Join(f.dir, fmt.Sprintf("known_hosts_%d", port))
 	line := fmt.Sprintf("[127.0.0.1]:%d %s", port, ssh.MarshalAuthorizedKey(hostKey))
 	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// serveOneHandshake accepts one connection, runs the SSH server handshake, and
+// reports the authenticated username or the handshake failure. The library
+// implements no host-bound userauth method on either side, so this is a stand
+// in for a server that only offers plain publickey, github.com among them.
+func serveOneHandshake(listener net.Listener, config *ssh.ServerConfig) <-chan string {
+	result := make(chan string, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			result <- "accept failed: " + err.Error()
+			return
+		}
+		defer conn.Close()
+		server, chans, reqs, err := ssh.NewServerConn(conn, config)
+		if err != nil {
+			result <- "handshake failed: " + err.Error()
+			return
+		}
+		result <- "authenticated " + server.User()
+		go ssh.DiscardRequests(reqs)
+		for newChannel := range chans {
+			newChannel.Reject(ssh.Prohibited, "")
+		}
+	}()
+	return result
 }
 
 // startSSHD runs a real OpenSSH server on the host key this grant pins, with
@@ -212,15 +248,9 @@ func TestSSHAgentOpenSSHGitPush(t *testing.T) {
 	}
 }
 
-// TestSSHAgentOpenSSHRefusesPlainPublickey points the same real client at a
-// server that cannot speak publickey-hostbound-v00@openssh.com. The client
-// binds the agent and sees the identity, then asks for an ordinary publickey
-// signature, which this agent refuses: authentication fails and no signature
-// is released.
-func TestSSHAgentOpenSSHRefusesPlainPublickey(t *testing.T) {
-	sshBin := lookOpenSSH(t, "ssh")[0]
-	f := startSSHAgent(t)
-	config := &ssh.ServerConfig{
+// userKeyOnly accepts exactly the granted public key and nothing else.
+func (f *sshAgentFixture) userKeyOnly() *ssh.ServerConfig {
+	return &ssh.ServerConfig{
 		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			if !bytes.Equal(key.Marshal(), f.userBlob) {
 				return nil, fmt.Errorf("unauthorized key")
@@ -228,33 +258,91 @@ func TestSSHAgentOpenSSHRefusesPlainPublickey(t *testing.T) {
 			return &ssh.Permissions{}, nil
 		},
 	}
+}
+
+// TestSSHAgentOpenSSHPlainPublickey is the V1 item 5b acceptance shape with a
+// shipping client: a server that cannot speak
+// publickey-hostbound-v00@openssh.com asks for a plain publickey signature,
+// and the real `ssh` client authenticates through this socket. The signature
+// is released only because the client first proved the grant's pinned host
+// key with session-bind@openssh.com over this same connection.
+func TestSSHAgentOpenSSHPlainPublickey(t *testing.T) {
+	sshBin := lookOpenSSH(t, "ssh")[0]
+	f := startSSHAgent(t)
+	config := f.userKeyOnly()
 	config.AddHostKey(f.hostSigner)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		if _, _, _, err := ssh.NewServerConn(conn, config); err == nil {
-			t.Error("a server without host-bound userauth completed authentication")
-		}
-	}()
+	handshake := serveOneHandshake(listener, config)
 	port := listener.Addr().(*net.TCPAddr).Port
+
+	// The command itself cannot run: this server opens no session channel.
+	// Authentication is the claim under test.
 	login := exec.Command(sshBin, append(f.sshOptions(f.knownHosts(t, port), port), f.username+"@127.0.0.1", "true")...)
 	login.Env = f.clientEnv()
+	out, _ := login.CombinedOutput()
+	select {
+	case got := <-handshake:
+		if got != "authenticated "+f.username {
+			t.Fatalf("server reported %q, client said: %s\nrelay said %q", got, out, f.agentErr.String())
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the server never finished a handshake: %s", out)
+	}
+	completed, _ := f.auditCounts(t)
+	if completed != 1 {
+		t.Fatalf("%d signatures released for one plain publickey login", completed)
+	}
+}
+
+// TestSSHAgentOpenSSHUnpinnedHostKey is the adversarial half: the same client
+// and the same plain-publickey server, but the server presents a host key the
+// grant does not pin. The client trusts it (its own known_hosts says so) and
+// binds the agent with it, the agent refuses the binding, so no identity is
+// disclosed, authentication fails, and nothing is signed.
+func TestSSHAgentOpenSSHUnpinnedHostKey(t *testing.T) {
+	sshBin := lookOpenSSH(t, "ssh")[0]
+	f := startSSHAgent(t)
+	otherPub, otherPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherSigner, err := ssh.NewSignerFromKey(otherPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := f.userKeyOnly()
+	config.AddHostKey(otherSigner)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	handshake := serveOneHandshake(listener, config)
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	options := f.sshOptions(f.knownHostsFor(t, sshBlob(t, otherPub), port), port)
+	login := exec.Command(sshBin, append(options, f.username+"@127.0.0.1", "true")...)
+	login.Env = f.clientEnv()
 	if out, err := login.CombinedOutput(); err == nil {
-		t.Fatalf("ordinary publickey authentication succeeded: %s", out)
+		t.Fatalf("authentication to an unpinned host key succeeded: %s", out)
+	}
+	select {
+	case got := <-handshake:
+		if strings.HasPrefix(got, "authenticated") {
+			t.Fatalf("the server authenticated a client the agent refused to serve: %q", got)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the server never reported its handshake")
 	}
 	completed, denied := f.auditCounts(t)
 	if completed != 0 {
-		t.Fatalf("%d signatures released for ordinary publickey", completed)
+		t.Fatalf("%d signatures released for an unpinned host key", completed)
 	}
 	if denied == 0 {
-		t.Fatal("the refused signing attempt was not audited")
+		t.Fatal("the refused binding was not audited")
 	}
 }
