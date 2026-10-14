@@ -82,7 +82,10 @@ func openExclusiveOwnerOnly(path string, flag int) (*os.File, error) {
 	sa := windows.SecurityAttributes{SecurityDescriptor: sd}
 	sa.Length = uint32(unsafe.Sizeof(sa))
 	access := windowsAccess(flag)
-	handle, err := windows.CreateFile(wide, access, 0, &sa, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	// SQLite opens the same file by name while this handle is held (backup, restore
+	// staging), and publication hardlinks/renames it, so share read, write and delete.
+	share := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE)
+	handle, err := windows.CreateFile(wide, access, share, &sa, windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_FILE_EXISTS) {
 			return nil, os.ErrExist
