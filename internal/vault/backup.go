@@ -34,8 +34,9 @@ var restorePublishFault func() error
 var ioFault func(step string) error
 
 // ErrPublished means Restore linked the destination and left that name in
-// place. A later directory sync or staging cleanup failed, and the
-// destination was not removed. The destination is the restored vault.
+// place. Post-link validation, directory sync, or staging cleanup failed,
+// and the destination was not removed. If validation failed, the
+// destination does not match the checkpoint and must not be used.
 // Its directory durability or staging cleanup may be incomplete. Do not
 // blindly retry Restore after this result.
 var ErrPublished = errors.New("vault restore destination remains")
@@ -186,9 +187,10 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 // read, not written. Validation, mode 0600, and the sidecar check run before
 // the destination name is published.
 //
-// The link is the commit. ErrPublished means destPath remains after a later
-// directory sync or staging cleanup failed. ErrPublicationUncertain means
-// a linked destination was removed but rollback durability is unconfirmed.
+// The link is the commit. ErrPublished means destPath remains after later
+// validation, directory sync, or staging cleanup failed.
+// ErrPublicationUncertain means a linked destination was removed but
+// rollback durability is unconfirmed.
 // Neither outcome is safe to retry blindly. Other errors mean this call did
 // not leave a newly restored destination; pre-existing collisions stay intact.
 // A failure before the link removes private staging data. Restore does not
@@ -531,6 +533,19 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 	// The destination name is committed. Later steps must not report
 	// absence while this name remains.
 	published = true
+	sum, err = fileSHA256(dest)
+	if err == nil && sum == want.Digest {
+		view, err = readSnapshot(dest, passphrase)
+		if err == nil {
+			err = want.matches(view)
+		}
+	}
+	if err != nil || sum != want.Digest {
+		return rollbackPublish(staging, dest, ErrCheckpoint)
+	}
+	// ponytail: an owner-equivalent process can still mutate the destination
+	// after this check. Upgrade path: isolate publication under a principal
+	// that alone can write the destination directory and file.
 	return finishPublish(staging, dest)
 }
 
@@ -541,24 +556,28 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 // it was removed but the rollback directory sync failed.
 func finishPublish(staging, dest string) error {
 	if err := syncDir(filepath.Dir(dest)); err != nil || ioFaultStep("sync") != nil {
-		if ioFaultStep("rollback") != nil || os.Remove(dest) != nil {
-			// The destination name is still there. Dropping the staging
-			// link is cleanup; it does not make this absence.
-			os.Remove(staging)
-			removeSidecars(staging)
-			return ErrPublished
-		}
-		os.Remove(staging)
-		removeSidecars(staging)
-		if err := syncDirStrict(filepath.Dir(dest)); err != nil || ioFaultStep("rollback-sync") != nil {
-			return ErrPublicationUncertain
-		}
-		return ErrIO
+		return rollbackPublish(staging, dest, ErrIO)
 	}
 	if ioFaultStep("unlink") != nil || os.Remove(staging) != nil {
 		return ErrPublished
 	}
 	return nil
+}
+
+func rollbackPublish(staging, dest string, result error) error {
+	if ioFaultStep("rollback") != nil || os.Remove(dest) != nil {
+		// The destination name is still there. Dropping the staging
+		// link is cleanup; it does not make this absence.
+		os.Remove(staging)
+		removeSidecars(staging)
+		return ErrPublished
+	}
+	os.Remove(staging)
+	removeSidecars(staging)
+	if err := syncDirStrict(filepath.Dir(dest)); err != nil || ioFaultStep("rollback-sync") != nil {
+		return ErrPublicationUncertain
+	}
+	return result
 }
 
 func createStaging(dir string) (string, error) {
