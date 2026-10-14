@@ -269,3 +269,17 @@ authentication fails, no signature is released and the refusal is audited.
 `TestSSHAgentOpenSSHGitPush` keeps the real-`sshd` host-bound evidence. The
 in-vault conversation tests cover the same release and refusals through the
 official agent client.
+
+### Note — 2026-10-14: a forwarding bind poisons its stream
+
+A review proved that the plain-publickey path above could be relayed by the
+pinned host itself over a forwarded agent channel: OpenSSH sends a
+`session-bind@openssh.com` with `is_forwarding` set there, which was refused
+and forgotten, so the far host (which holds the pinned host key) could follow
+with its own bind for another server's session and the flag cleared. That flag
+is outside the host signature, and the plain preimage names no host key, so the
+signature logged in to a different server. Any bind with a non-zero
+`is_forwarding` now marks the stream forwarded for good: later binds, identity
+listing and signing are refused on it. Local streams are unaffected; a server
+that holds the pinned host key and is not reached through a forwarded agent
+still learns only signatures over sessions it terminates.

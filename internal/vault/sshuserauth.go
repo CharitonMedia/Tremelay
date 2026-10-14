@@ -72,6 +72,12 @@ type SSHUserAuth struct {
 	mu         sync.Mutex
 	closed     bool
 	hasBinding bool
+	// forwarded is set for good by any session-bind that claims forwarding.
+	// OpenSSH sends that bind first on a forwarded agent channel, so the far
+	// host can never follow it with a non-forwarding bind of its own choosing:
+	// is_forwarding is outside the host signature, and a plain publickey
+	// preimage names no host key, so such a signature could log in elsewhere.
+	forwarded bool
 	hostKey    []byte
 	sessionID  []byte
 	hostSig    []byte
@@ -231,7 +237,7 @@ func (a *SSHUserAuth) identities(body []byte, ev auditEvent) ([]byte, error) {
 	if len(body) != 1 {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
-	if !a.hasBinding {
+	if !a.hasBinding || a.forwarded {
 		return a.record(ev, resultDenied, sshEmptyIdentities())
 	}
 	blob, err := a.broker.sshShowKey(a.agentID, a.bound, a.hostKey, a.sessionID, a.hostSig)
@@ -245,7 +251,7 @@ func (a *SSHUserAuth) identities(body []byte, ev auditEvent) ([]byte, error) {
 }
 
 func (a *SSHUserAuth) sign(body []byte, ev auditEvent) ([]byte, error) {
-	if !a.hasBinding {
+	if !a.hasBinding || a.forwarded {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
 	sig, err := a.broker.sshRelease(a.agentID, a.bound, a.hostKey, a.sessionID, a.hostSig, body)
@@ -270,7 +276,10 @@ func (a *SSHUserAuth) extension(body []byte, ev auditEvent, pinned []byte) ([]by
 	if name != sshExtSessionBind {
 		return a.record(ev, resultDenied, []byte{sshAgentExtensionFailure})
 	}
-	if a.hasBinding {
+	if len(rest) > 0 && rest[len(rest)-1] != 0 {
+		a.forwarded = true
+	}
+	if a.hasBinding || a.forwarded {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
 	host, sid, sig, ok := parseSessionBind(rest)
