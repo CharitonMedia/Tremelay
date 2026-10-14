@@ -848,9 +848,14 @@ func TestBrokerCapsExpandedRedaction(t *testing.T) {
 	for {
 		secret = randBytesT(t, 1)
 		forms := credentialForms(grantInjection{style: InjectBearer}, secret)
+		// A one-byte secret is short enough for one of its spellings to sit
+		// inside the marker or the MCP JSON field names ("ea" in "headers"),
+		// which is withheld on purpose. This test is about the cap, so draw
+		// a byte whose spellings appear in neither.
+		scaffold := []byte(redacted + `{"status_code":0,"headers":{},"body":"","body_base64":"","truncated":true}`)
 		safeMarker := true
 		for _, form := range forms {
-			if bytes.Contains([]byte(redacted), form) {
+			if containsCredentialForm(scaffold, [][]byte{form}) {
 				safeMarker = false
 			}
 		}
