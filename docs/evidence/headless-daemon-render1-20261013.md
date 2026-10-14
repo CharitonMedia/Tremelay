@@ -22,4 +22,5 @@ at a private 0700 directory. All of it was deleted after the run.
    token, digest or passphrase appears in any row or output.
 
 Revoked/suspended-agent refusal and audit is covered by unit tests in this commit, not repeated
-here. macOS peer-credential code is compiled and unit-tested only; Windows is deferred (ADR 0024).
+here. macOS peer-credential code is compiled and unit-tested only. Windows was deferred at this
+commit; V1.md item 3b reversed that afterwards and ADR 0024 now carries the named-pipe endpoint.

@@ -79,10 +79,10 @@ replaced, and a kernel peer-uid check on every connection before a byte is
 read. The default path sits beside the daemon endpoint
 (`$XDG_RUNTIME_DIR/tremelay/ssh-agent.sock`); `--socket` moves it, and its
 parent directory must pass the same checks. Token files keep ADR 0024's
-treatment: a regular file, 0600, refused otherwise.
+treatment: a regular file only this user can read, refused otherwise.
 
-Linux and macOS only. Elsewhere this command fails closed with the daemon's
-fixed diagnostic, exactly as `tremelay daemon` does.
+Linux and macOS only. Elsewhere, including on the Windows daemon ADR 0024
+later added, this command fails closed with a fixed diagnostic of its own.
 
 ### No new dependency, and no `agent.ServeAgent`
 

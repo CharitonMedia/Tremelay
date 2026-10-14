@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -186,7 +187,7 @@ func (d *daemon) requestLock() {
 // token. No frame, argument, or caller-supplied identifier can select it.
 func (d *daemon) handle(conn net.Conn) {
 	defer conn.Close()
-	if !daemonPeerAllowed(conn, os.Getuid()) {
+	if !daemonPeerAllowed(conn) {
 		return // A foreign peer gets no answer and no audit attribution.
 	}
 	if conn.SetDeadline(time.Now().Add(daemonHelloWait)) != nil {
@@ -383,17 +384,22 @@ func relayDaemonMCP(getenv func(string) string, tokenFile string, stdin io.Reade
 	}
 	// Protocol bytes only. Nothing here inspects, logs, or rewrites them.
 	done := make(chan struct{})
+	var ended atomic.Bool
 	go func() {
 		defer close(done)
 		_, _ = io.Copy(conn, stdin)
-		if half, ok := conn.(interface{ CloseWrite() error }); ok {
-			_ = half.CloseWrite()
+		if half, ok := conn.(interface{ CloseWrite() error }); ok && half.CloseWrite() == nil {
+			return
 		}
+		// A named pipe has no half-close. The client's stdin ending ends the
+		// session, so the whole connection goes and the read below stops.
+		ended.Store(true)
+		conn.Close()
 	}()
 	_, copyErr := io.Copy(stdout, conn)
 	conn.Close()
 	<-done
-	if copyErr != nil {
+	if copyErr != nil && !ended.Load() {
 		fmt.Fprintln(stderr, errDaemonReach.Error())
 		return 1
 	}
@@ -416,11 +422,14 @@ func daemonRequest(conn net.Conn, line string) error {
 	return conn.SetDeadline(time.Time{})
 }
 
-// readAgentToken reads one user-only token file. A group- or world-accessible
-// file is refused rather than used.
+// readAgentToken reads one user-only token file. A file any other principal
+// can read is refused rather than used.
 func readAgentToken(path string) ([]byte, error) {
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, errAgentToken
+	}
+	if err := userOnlyFile(path); err != nil {
 		return nil, errAgentToken
 	}
 	f, err := os.Open(path)
@@ -448,10 +457,10 @@ func readAgentToken(path string) ([]byte, error) {
 	return token, nil
 }
 
-// writeAgentToken stores one new token at 0600 and refuses to replace a file
-// that already exists. The token is never printed.
+// writeAgentToken stores one new user-only token and refuses to replace a
+// file that already exists. The token is never printed.
 func writeAgentToken(path string, token []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := createUserOnlyFile(path)
 	if err != nil {
 		return errAgentToken
 	}

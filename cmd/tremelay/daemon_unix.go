@@ -89,6 +89,21 @@ func daemonDial(getenv func(string) string) (net.Conn, error) {
 	return net.Dial("unix", daemonEndpoint(getenv))
 }
 
+// userOnlyFile refuses a token file any other user can read. Mode 0 is the
+// regular-file case of the same ownership and permission rule the endpoint
+// directory and socket are held to.
+func userOnlyFile(path string) error {
+	if ownedExclusively(path, 0) != nil {
+		return errAgentToken
+	}
+	return nil
+}
+
+// createUserOnlyFile writes a new token file nothing but this user can read.
+func createUserOnlyFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+}
+
 // ownedExclusively requires the exact file type, this uid as owner, and no
 // group or other permission bits.
 func ownedExclusively(path string, kind os.FileMode) error {
@@ -109,7 +124,9 @@ func ownedExclusively(path string, kind os.FileMode) error {
 // daemonPeerAllowed requires the connected peer to run as self. A Unix socket
 // inside a 0700 directory already restricts who can reach it; this is the
 // independent kernel-reported check that does not depend on path permissions.
-func daemonPeerAllowed(conn net.Conn, self int) bool {
+func daemonPeerAllowed(conn net.Conn) bool { return peerIsSelf(conn, os.Getuid()) }
+
+func peerIsSelf(conn net.Conn, self int) bool {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok || self < 0 {
 		return false

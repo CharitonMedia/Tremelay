@@ -1,4 +1,4 @@
-//go:build linux || darwin
+//go:build linux || darwin || windows
 
 package main
 
@@ -72,25 +72,11 @@ func (f *daemonFixture) wait(t *testing.T, timeout time.Duration) int {
 	return f.code
 }
 
-// socketDir is a 0700 temporary directory with a short path. A Unix socket
-// path is limited to about 104 bytes on macOS, which t.TempDir's test-named
-// path can exhaust on its own.
-func socketDir(t *testing.T) string {
-	t.Helper()
-	dir, err := os.MkdirTemp("", "tr")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	return dir
-}
-
 // startDaemon builds a synthetic vault through the human CLI, then unlocks it
 // once in the daemon. No prompt, helper, or display is involved afterwards.
 func startDaemon(t *testing.T, idle time.Duration) *daemonFixture {
 	t.Helper()
 	dir := t.TempDir()
-	runtimeDir := socketDir(t)
 	f := &daemonFixture{
 		t:      t,
 		path:   filepath.Join(dir, "vault.db"),
@@ -99,7 +85,10 @@ func startDaemon(t *testing.T, idle time.Duration) *daemonFixture {
 		stderr: &daemonOutput{},
 		exit:   make(chan int, 1),
 	}
-	f.env = map[string]string{"TREMELAY_PASSPHRASE": f.pass, "XDG_RUNTIME_DIR": runtimeDir}
+	// daemonTestEnv gives each test its own endpoint, exactly as the platform
+	// makes one available to a user running more than one daemon.
+	f.env = daemonTestEnv(t)
+	f.env["TREMELAY_PASSPHRASE"] = f.pass
 
 	seed := randBytes(t, ed25519.SeedSize)
 	key := ed25519.NewKeyFromSeed(seed)
@@ -289,8 +278,9 @@ func TestDaemonUnlockedAgentCall(t *testing.T) {
 	}
 	// The in-flight session ends without a response; the next call fails closed.
 	agent.finish(t)
-	if _, err := os.Lstat(f.endpoint); err == nil {
-		t.Fatal("locked daemon left its endpoint in place")
+	if conn, err := daemonDial(envGet(f.env)); err == nil {
+		conn.Close()
+		t.Fatal("locked daemon left its endpoint reachable")
 	}
 	after := f.relay(t, worker.tokenFile)
 	if code := after.finish(t); code != 1 || !strings.Contains(after.stderr.String(), errDaemonReach.Error()) {
@@ -451,102 +441,6 @@ func TestDaemonFailsClosedAfterGrantRevoke(t *testing.T) {
 	}
 }
 
-// TestDaemonEndpointPermissions covers the refusals that protect the socket.
-func TestDaemonEndpointPermissions(t *testing.T) {
-	getenv := envGet(map[string]string{"XDG_RUNTIME_DIR": socketDir(t)})
-	listener, endpoint, err := daemonListen(getenv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for path, want := range map[string]os.FileMode{
-		filepath.Dir(endpoint): 0o700,
-		endpoint:               0o600,
-	} {
-		info, err := os.Lstat(path)
-		if err != nil || info.Mode().Perm() != want {
-			t.Fatalf("%s has mode %v, want %v (%v)", path, info.Mode().Perm(), want, err)
-		}
-	}
-	if _, _, err := daemonListen(getenv); err != errDaemonRunning {
-		t.Fatalf("second daemon on a live endpoint: %v", err)
-	}
-	// Leave the socket file behind with nothing listening on it.
-	listener.(*net.UnixListener).SetUnlinkOnClose(false)
-	listener.Close()
-	if _, err := os.Lstat(endpoint); err != nil {
-		t.Fatalf("stale endpoint fixture: %v", err)
-	}
-
-	// A stale socket this user owns is replaced; anything else is refused.
-	stale, _, err := daemonListen(getenv)
-	if err != nil {
-		t.Fatalf("stale endpoint was not replaced: %v", err)
-	}
-	stale.Close()
-	if err := os.Chmod(filepath.Dir(endpoint), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := daemonListen(getenv); err != errDaemonEndpoint {
-		t.Fatalf("group-readable endpoint directory accepted: %v", err)
-	}
-	if err := os.Chmod(filepath.Dir(endpoint), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(endpoint); err != nil && !os.IsNotExist(err) {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(endpoint, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := daemonListen(getenv); err != errDaemonEndpoint {
-		t.Fatalf("regular file at the endpoint path accepted: %v", err)
-	}
-	if err := os.Chmod(endpoint, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := daemonListen(getenv); err != errDaemonEndpoint {
-		t.Fatalf("world-writable endpoint path accepted: %v", err)
-	}
-	// Ownership by another uid is not creatable in an unprivileged test; the
-	// stat check that rejects it is the same one exercised above.
-	if err := ownedExclusively(endpoint, os.ModeSocket); err != errDaemonEndpoint {
-		t.Fatalf("wrong file type accepted: %v", err)
-	}
-}
-
-// TestDaemonPeerUID exercises the kernel peer-credential check on a real
-// connection, including refusal when the daemon runs as a different uid.
-func TestDaemonPeerUID(t *testing.T) {
-	path := filepath.Join(socketDir(t), "peer.sock")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	client, err := net.Dial("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	server, err := listener.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.Close()
-	if !daemonPeerAllowed(server, os.Getuid()) {
-		t.Fatal("a peer running as this user was refused")
-	}
-	if daemonPeerAllowed(server, os.Getuid()+1) {
-		t.Fatal("a peer running as another uid was accepted")
-	}
-	if daemonPeerAllowed(server, -1) {
-		t.Fatal("an unknown daemon identity was accepted")
-	}
-	if daemonPeerAllowed(&net.TCPConn{}, os.Getuid()) {
-		t.Fatal("a non-Unix connection was accepted")
-	}
-}
-
 func TestAgentTokenFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "agent.token")
@@ -554,9 +448,8 @@ func TestAgentTokenFile(t *testing.T) {
 	if err := writeAgentToken(path, token); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("token file mode %v (%v)", info.Mode().Perm(), err)
+	if err := userOnlyFile(path); err != nil {
+		t.Fatalf("a token file this command wrote is not user-only: %v", err)
 	}
 	if err := writeAgentToken(path, token); err != errAgentToken {
 		t.Fatalf("existing token file was replaced: %v", err)
@@ -564,12 +457,6 @@ func TestAgentTokenFile(t *testing.T) {
 	got, err := readAgentToken(path)
 	if err != nil || !bytes.Equal(got, token) {
 		t.Fatalf("token round trip: %v", err)
-	}
-	if err := os.Chmod(path, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := readAgentToken(path); err != errAgentToken {
-		t.Fatalf("group-readable token file accepted: %v", err)
 	}
 	for name, content := range map[string]string{
 		"empty":        "",
@@ -579,15 +466,30 @@ func TestAgentTokenFile(t *testing.T) {
 		"with padding": " " + hex.EncodeToString(token),
 	} {
 		bad := filepath.Join(dir, "bad-"+strings.ReplaceAll(name, " ", "-"))
-		if err := os.WriteFile(bad, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writeUserOnlyFile(t, bad, content)
 		if _, err := readAgentToken(bad); err != errAgentToken {
 			t.Fatalf("%s token file accepted: %v", name, err)
 		}
 	}
 	if _, err := readAgentToken(dir); err != errAgentToken {
 		t.Fatalf("directory accepted as a token file: %v", err)
+	}
+}
+
+// writeUserOnlyFile puts exact content in a file only this user can read, so
+// that a refusal is about the content and not about the permissions.
+func writeUserOnlyFile(t *testing.T, path, content string) {
+	t.Helper()
+	f, err := createUserOnlyFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.WriteString(f, content)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -620,27 +522,14 @@ func TestDaemonHandshakeBounds(t *testing.T) {
 }
 
 // handshakePeer returns the daemon side of a connection already holding line.
+// The handshake parser is transport-independent, so this needs no endpoint.
 func handshakePeer(t *testing.T, line string) net.Conn {
 	t.Helper()
-	path := filepath.Join(socketDir(t), "hello.sock")
-	listener, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	client, err := net.Dial("unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { client.Close() })
-	server, err := listener.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { server.Close() })
+	server, client := net.Pipe()
+	t.Cleanup(func() { server.Close(); client.Close() })
 	go func() {
 		_, _ = io.WriteString(client, line)
-		client.(*net.UnixConn).CloseWrite()
+		client.Close()
 	}()
 	if err := server.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -669,13 +558,15 @@ func TestDaemonAndLockUsage(t *testing.T) {
 			t.Fatalf("%v wrote to stdout: %q", args, stdout.String())
 		}
 	}
-	// A daemon that cannot reach an endpoint must not reach the passphrase.
-	stderr.Reset()
-	blocked := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	env := map[string]string{"XDG_RUNTIME_DIR": blocked, "TREMELAY_PASSPHRASE": randHex(t, 16)}
+}
+
+// assertEndpointRefusesPassphrase checks that a daemon which cannot hold its
+// endpoint never reaches the passphrase. The unusable endpoint is whatever
+// the platform's env gives it.
+func assertEndpointRefusesPassphrase(t *testing.T, env map[string]string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	env["TREMELAY_PASSPHRASE"] = randHex(t, 16)
 	if code := run([]string{"daemon", "--vault", filepath.Join(t.TempDir(), "absent.db")}, envGet(env),
 		strings.NewReader(""), &stdout, &stderr); code != 1 {
 		t.Fatalf("daemon on an unusable endpoint exited %d: %q", code, stderr.String())
