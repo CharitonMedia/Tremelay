@@ -1,6 +1,8 @@
 package vault
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"slices"
 	"strings"
 	"time"
@@ -18,10 +20,15 @@ const (
 	// OpSign authorizes a future signing operation. Authorizing it does not sign
 	// or reveal key material, and it does not authorize local attestation.
 	OpSign = "sign"
-	// OpGitHubIssueState authorizes one typed GitHub issue-state read.
-	// It does not authorize BrokerHTTP, and an http_request grant does not
-	// authorize this response projection.
-	OpGitHubIssueState = "github_issue_state"
+	// OpHTTPBroker authorizes brokered HTTP requests inside one origin, one
+	// allowed method set and one path prefix, with one credential injection
+	// style. It is the only operation whose response carries upstream headers
+	// and body bytes. An http_request grant does not authorize it, and it does
+	// not authorize BrokerHTTP. See ADR 0025.
+	OpHTTPBroker = "http_broker"
+
+	// AgentTokenLen is the size of a per-agent bearer token from crypto/rand.
+	AgentTokenLen = 32
 
 	// GrantActive, GrantRevoked, and GrantExpired are capability lifecycle states.
 	GrantActive  = "active"
@@ -31,7 +38,7 @@ const (
 
 // grantOperations is the closed set of capability operations. Secret retrieval
 // is not in the set.
-var grantOperations = []string{OpHTTPRequest, OpSign, OpGitHubIssueState, OpLocalArtifactAttest, OpSSHUserAuth}
+var grantOperations = []string{OpHTTPRequest, OpSign, OpHTTPBroker, OpLocalArtifactAttest, OpSSHUserAuth}
 
 // GrantOperations returns a copy of the operation allowlist.
 func GrantOperations() []string {
@@ -39,10 +46,14 @@ func GrantOperations() []string {
 }
 
 // Agent is a software principal. It is not a human user.
+// Token is the one-time bearer token minted by CreateAgent. Only its SHA-256
+// is stored. The human control plane writes it to a user-only file and wipes
+// this copy; it is never recoverable from the vault.
 type Agent struct {
 	ID        string
 	Label     string
 	CreatedAt time.Time
+	Token     []byte
 }
 
 // GrantSpec is a human request to issue one capability.
@@ -58,6 +69,13 @@ type GrantSpec struct {
 	// on every other operation. SSHHostKey is the canonical ssh-ed25519 blob.
 	SSHUsername string
 	SSHHostKey  []byte
+	// HTTPMethods, HTTPInject and HTTPInjectName are required for http_broker
+	// and forbidden on every other operation. Resource carries that grant's
+	// origin and path prefix. HTTPInjectName is the header name, the basic
+	// user, or the query parameter name, and is empty for bearer.
+	HTTPMethods    []string
+	HTTPInject     string
+	HTTPInjectName string
 }
 
 // Grant is a persisted capability. It does not carry credential plaintext.
@@ -80,6 +98,12 @@ type Grant struct {
 	// constrain the account, the host, or anything that happens after authentication.
 	SSHUsername string
 	SSHHostKey  []byte
+	// HTTPMethods, HTTPInject and HTTPInjectName are the http_broker scope.
+	// Resource carries the origin and path prefix. They are empty for every
+	// other operation. The credential value is not stored here.
+	HTTPMethods    []string
+	HTTPInject     string
+	HTTPInjectName string
 }
 
 // Capability is the agent-visible description of one grant.
@@ -100,6 +124,11 @@ type Capability struct {
 	// They are empty for every other operation.
 	SSHUsername string
 	SSHHostKey  []byte
+	// HTTPMethods, HTTPInject and HTTPInjectName describe an http_broker
+	// grant. HTTPInjectName names the injection slot, never its value.
+	HTTPMethods    []string
+	HTTPInject     string
+	HTTPInjectName string
 }
 
 type agentRecord struct {
@@ -108,6 +137,23 @@ type agentRecord struct {
 	Kind      string    `json:"kind"`
 	CreatedAt time.Time `json:"created_at"`
 	State     string    `json:"state"`
+	// TokenHash is SHA-256 of this agent's bearer token. The token itself is
+	// never stored. It is absent on an agent sealed before ADR 0024 and on
+	// one whose token was revoked; neither can authenticate to the daemon.
+	TokenHash []byte `json:"token_hash,omitempty"`
+	// TokenGen counts the tokens this agent has been given. Issue and rotate
+	// raise it, revoke keeps it, so a token minted after a revocation is
+	// never the generation of the one it replaced. An agent sealed before
+	// the generation existed reads as generation 1 when it holds a digest.
+	TokenGen uint64 `json:"token_gen,omitempty"`
+}
+
+// tokenGen is the stored generation with the pre-generation shape normalized.
+func (a agentRecord) tokenGen() uint64 {
+	if a.TokenGen == 0 && len(a.TokenHash) == sha256.Size {
+		return 1
+	}
+	return a.TokenGen
 }
 
 type grantRecord struct {
@@ -123,9 +169,9 @@ type grantRecord struct {
 	KeyID           string     `json:"key_id,omitempty"`
 	SSHUsername     string     `json:"ssh_username,omitempty"`
 	SSHHostKey      []byte     `json:"ssh_host_key,omitempty"`
-	// Provenance is set only on a grant issued by shared-mode approval.
-	// Legacy grants leave it empty. A legacy grant cannot gain it later.
-	Provenance *grantProvenance `json:"provenance,omitempty"`
+	HTTPMethods     []string   `json:"http_methods,omitempty"`
+	HTTPInject      string     `json:"http_inject,omitempty"`
+	HTTPInjectName  string     `json:"http_inject_name,omitempty"`
 }
 
 // capabilityView is the slice of the vault an agent principal can call.
@@ -134,52 +180,67 @@ type capabilityView interface {
 	listCapabilities(agentID string) ([]Capability, error)
 	authorizeCapability(agentID, credentialID, operation, resource string) (string, error)
 	brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error)
-	githubIssueState(agentID string, req GitHubIssueRequest) (GitHubIssueState, error)
+	brokerRequest(agentID string, req HTTPRequest) (HTTPResponse, error)
 	localAttest(agentID string, req LocalAttestRequest) (LocalAttestation, error)
 }
 
+// agentBinder is one principal's view of a session. gen is the agent token
+// generation that principal authenticated with, so the binding outlives the
+// handshake: see bound.
 type agentBinder struct {
-	s *Session
+	s   *Session
+	gen uint64
+}
+
+// bound is the gate every agent-facing call passes. A daemon connection
+// authenticates once (ADR 0024), so without this a daemon already serving
+// would keep honouring a token the owner has rotated away or revoked: the
+// reload makes the changed digest visible, and this is what acts on it.
+func (b agentBinder) bound(agentID string) error {
+	if b.s == nil {
+		return ErrUnauthenticated
+	}
+	return b.s.requireAgentToken(agentID, b.gen)
 }
 
 func (b agentBinder) listCapabilities(agentID string) ([]Capability, error) {
-	if b.s == nil {
-		return nil, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return nil, err
 	}
 	return b.s.listCapabilities(agentID)
 }
 
 func (b agentBinder) authorizeCapability(agentID, credentialID, operation, resource string) (string, error) {
-	if b.s == nil {
-		return "", ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return "", err
 	}
 	return b.s.authorizeCapability(agentID, credentialID, operation, resource)
 }
 
 func (b agentBinder) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error) {
-	if b.s == nil {
-		return HTTPBrokerResponse{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return HTTPBrokerResponse{}, err
 	}
 	return b.s.brokerHTTP(agentID, req)
 }
 
-func (b agentBinder) githubIssueState(agentID string, req GitHubIssueRequest) (GitHubIssueState, error) {
-	if b.s == nil {
-		return GitHubIssueState{}, ErrUnauthenticated
+func (b agentBinder) brokerRequest(agentID string, req HTTPRequest) (HTTPResponse, error) {
+	if err := b.bound(agentID); err != nil {
+		return HTTPResponse{}, err
 	}
-	return b.s.githubIssueState(agentID, req)
+	return b.s.brokerRequest(agentID, req)
 }
 
 func (b agentBinder) localAttest(agentID string, req LocalAttestRequest) (LocalAttestation, error) {
-	if b.s == nil {
-		return LocalAttestation{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return LocalAttestation{}, err
 	}
 	return b.s.localAttest(agentID, req)
 }
 
 // AgentPrincipal is the agent-facing handle for one identity.
 // Its method set is capability listing, authorization, the HTTP broker, the
-// GitHub issue read, local attestation, and one host-bound SSH userauth stream.
+// GitHub issue read, local attestation, and one session-bound SSH userauth stream.
 // It has no credential retrieval, grant issuance, clock, or way to select a different principal.
 type AgentPrincipal struct {
 	view capabilityView
@@ -226,19 +287,21 @@ func (a *AgentPrincipal) BrokerHTTP(req HTTPBrokerRequest) (HTTPBrokerResponse, 
 	return a.view.brokerHTTP(a.id, req)
 }
 
-// GitHubIssueState reads one authorized GitHub issue and returns its state
-// summary. The credential stays inside the broker. An http_request grant does
-// not authorize this call.
-func (a *AgentPrincipal) GitHubIssueState(req GitHubIssueRequest) (GitHubIssueState, error) {
+// BrokerRequest performs one prefix-scoped HTTP request on an http_broker
+// grant. The credential is injected inside the broker and is not a request
+// field. The response carries the status, the allowlisted response headers and
+// the capped body with every occurrence of the credential redacted. An
+// http_request grant does not authorize this call.
+func (a *AgentPrincipal) BrokerRequest(req HTTPRequest) (HTTPResponse, error) {
 	if a == nil || a.view == nil {
-		return GitHubIssueState{}, ErrUnauthenticated
+		return HTTPResponse{}, ErrUnauthenticated
 	}
-	return a.view.githubIssueState(a.id, req)
+	return a.view.brokerRequest(a.id, req)
 }
 
 // LocalAttest signs one bounded payload with the vault-held Ed25519 key named
 // by an exact local_artifact_attest grant. The private key is not returned.
-// A sign, http_request, or github_issue_state grant does not authorize this call.
+// A sign, http_request, or http_broker grant does not authorize this call.
 func (a *AgentPrincipal) LocalAttest(req LocalAttestRequest) (LocalAttestation, error) {
 	if a == nil || a.view == nil {
 		return LocalAttestation{}, ErrUnauthenticated
@@ -246,22 +309,13 @@ func (a *AgentPrincipal) LocalAttest(req LocalAttestRequest) (LocalAttestation, 
 	return a.view.localAttest(a.id, req)
 }
 
-// CreateAgent persists a new agent principal.
+// CreateAgent persists a new agent principal and mints its bearer token.
+// The returned Agent.Token is the only copy; the vault seals only its SHA-256.
 func (s *Session) CreateAgent(label string) (Agent, error) {
 	if err := s.begin(); err != nil {
 		return Agent{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.finish(auditEvent{Action: actionAgentCreate, Result: resultDenied}, ErrDenied); err != nil {
-			return Agent{}, err
-		}
-		return Agent{}, ErrDenied
-	}
-	return s.createAgentUnlocked(label)
-}
-
-func (s *Session) createAgentUnlocked(label string) (Agent, error) {
 	if err := validateLabel(label); err != nil {
 		return Agent{}, s.denyAction(actionAgentCreate, err)
 	}
@@ -269,19 +323,106 @@ func (s *Session) createAgentUnlocked(label string) (Agent, error) {
 	if err != nil {
 		return Agent{}, err
 	}
+	token, err := randBytes(AgentTokenLen)
+	if err != nil {
+		return Agent{}, err
+	}
+	sum := sha256.Sum256(token)
 	rec := agentRecord{
 		ID:        id,
 		Label:     label,
 		Kind:      principalAgent,
 		CreatedAt: time.Now().UTC(),
 		State:     agentStateActive,
+		TokenHash: sum[:],
+		TokenGen:  1,
 	}
 	next := append(append([]agentRecord{}, s.agents...), rec)
 	partial := auditEvent{Action: actionAgentCreate, Result: resultAllowed, AgentID: id}
 	if err := s.writeAudit(partial, s.creds, next, s.grants); err != nil {
+		wipe(token)
 		return Agent{}, err
 	}
-	return rec.public(), nil
+	out := rec.public()
+	out.Token = token
+	return out, nil
+}
+
+// AuthenticateAgentToken resolves one active agent principal from a bearer
+// token and nothing else. The caller cannot name an agent, a human, the
+// session, the vault, or the clock. The vault holds only SHA-256(token) and
+// the comparison is constant time. Every attempt appends one daemon_auth row:
+// the verified agent on success, the verified agent on a suspended principal,
+// and no attribution at all for an unknown token. The token, its hash, and
+// its length are never audit fields, log text, or error text.
+//
+// ponytail: a linear constant-time scan over the agent list, and repeated
+// failures are ordinary expected denials rather than a detection class. The
+// endpoint already restricts callers to the vault owner's uid. Upgrade path:
+// a keyed index plus a daemon_auth failure class in the M5 lookback.
+func (s *Session) AuthenticateAgentToken(token []byte) (*AgentPrincipal, error) {
+	if err := s.begin(); err != nil {
+		return nil, err
+	}
+	defer s.end()
+	sum := sha256.Sum256(token)
+	defer wipe(sum[:])
+	matched, active, gen := "", false, uint64(0)
+	if len(token) == AgentTokenLen {
+		for i := range s.agents {
+			if len(s.agents[i].TokenHash) != sha256.Size {
+				continue
+			}
+			if subtle.ConstantTimeCompare(s.agents[i].TokenHash, sum[:]) == 1 {
+				matched, active = s.agents[i].ID, s.agents[i].State == agentStateActive
+				gen = s.agents[i].tokenGen()
+				break
+			}
+		}
+	}
+	if matched == "" {
+		return nil, s.finish(auditEvent{Action: actionDaemonAuth, Result: resultDenied}, ErrUnauthenticated)
+	}
+	if !active {
+		return nil, s.finish(auditEvent{Action: actionDaemonAuth, Result: resultDeniedAgent, AgentID: matched}, ErrDeniedAgent)
+	}
+	if err := s.finish(auditEvent{Action: actionDaemonAuth, Result: resultAllowed, AgentID: matched}, nil); err != nil {
+		return nil, err
+	}
+	// The principal is bound to this token, not just to its agent: see
+	// requireAgentToken.
+	return &AgentPrincipal{view: agentBinder{s: s, gen: gen}, id: matched}, nil
+}
+
+// requireAgentToken refuses a call whose principal was authenticated by a
+// token the agent no longer holds. gen is the generation that authenticated
+// it; generation 0 is a principal the human control plane bound by id, which
+// has no token to be bound to. A digest that is gone — revoked, or the agent
+// deleted — or a generation that has moved on after a reload is refused, and
+// the refusal is audited as the daemon_auth denial it is. Nothing derived
+// from the token reaches the row: not the material, not its digest, not the
+// generation (ADR 0024).
+//
+// ponytail: one more indexed single-row read per agent call, and the check
+// takes the session mutex separately from the operation that follows it, so a
+// rotation committing in that gap is caught on the call after. Upgrade path:
+// thread the binding through begin so one critical section covers both.
+func (s *Session) requireAgentToken(agentID string, gen uint64) error {
+	if gen == 0 {
+		return nil
+	}
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	idx := s.agentIndex(agentID)
+	if idx < 0 {
+		return s.finish(auditEvent{Action: actionDaemonAuth, Result: resultDenied}, ErrUnauthenticated)
+	}
+	if rec := s.agents[idx]; len(rec.TokenHash) != sha256.Size || rec.tokenGen() != gen {
+		return s.finish(auditEvent{Action: actionDaemonAuth, Result: resultDeniedAgent, AgentID: rec.ID}, ErrUnauthenticated)
+	}
+	return nil
 }
 
 // IssueGrant persists a revocable, expiring capability for one agent.
@@ -291,21 +432,6 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 		return Grant{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		return s.issueDenied(ErrDenied)
-	}
-	return s.issueGrantUnlocked(spec)
-}
-
-func (s *Session) issueDenied(cause error) (Grant, error) {
-	partial := auditEvent{Action: actionGrantCreate, Result: resultDenied}
-	if err := s.writeAudit(partial, s.creds, s.agents, s.grants); err != nil {
-		return Grant{}, err
-	}
-	return Grant{}, cause
-}
-
-func (s *Session) issueGrantUnlocked(spec GrantSpec) (Grant, error) {
 	now := time.Now().UTC()
 	agentID := ""
 	if safeID(spec.AgentID) != "" && s.agentExists(spec.AgentID) {
@@ -345,6 +471,10 @@ func (s *Session) issueGrantUnlocked(spec GrantSpec) (Grant, error) {
 	if err := sshGrantOK(ops, spec, credType); err != nil {
 		return deny(err)
 	}
+	if err := brokerGrantOK(ops, spec); err != nil {
+		return deny(err)
+	}
+	methods, _ := canonicalMethods(spec.HTTPMethods)
 	keyID := ""
 	if soleLocalAttest(ops) || soleSSH(ops) {
 		secret, ok := s.copySecret(credID)
@@ -362,15 +492,18 @@ func (s *Session) issueGrantUnlocked(spec GrantSpec) (Grant, error) {
 		return Grant{}, err
 	}
 	rec := grantRecord{
-		ID:          id,
-		AgentID:     agentID,
-		Operations:  ops,
-		Resource:    spec.Resource,
-		CreatedAt:   now,
-		ExpiresAt:   expires,
-		KeyID:       keyID,
-		SSHUsername: spec.SSHUsername,
-		SSHHostKey:  dup(spec.SSHHostKey),
+		ID:             id,
+		AgentID:        agentID,
+		Operations:     ops,
+		Resource:       spec.Resource,
+		CreatedAt:      now,
+		ExpiresAt:      expires,
+		KeyID:          keyID,
+		SSHUsername:    spec.SSHUsername,
+		SSHHostKey:     dup(spec.SSHHostKey),
+		HTTPMethods:    methods,
+		HTTPInject:     spec.HTTPInject,
+		HTTPInjectName: spec.HTTPInjectName,
 	}
 	if spec.CredentialID != "" {
 		rec.CredentialID = credID
@@ -399,13 +532,6 @@ func (s *Session) RevokeGrant(id string) error {
 		return err
 	}
 	defer s.end()
-	if s.shared() {
-		return s.finish(auditEvent{Action: actionGrantRevoke, Result: resultDenied}, ErrDenied)
-	}
-	return s.revokeGrantUnlocked(id)
-}
-
-func (s *Session) revokeGrantUnlocked(id string) error {
 	if safeID(id) == "" {
 		return s.finish(auditEvent{Action: actionGrantRevoke, Result: resultDenied}, ErrInvalid)
 	}
@@ -445,6 +571,123 @@ func (s *Session) revokeGrantUnlocked(id string) error {
 		CredType:  credType,
 		Operation: ops,
 	}, s.creds, s.agents, next)
+}
+
+// IssueAgentToken mints the first bearer token for an agent that has none,
+// which is how an agent created before ADR 0024, or one whose token was
+// revoked, reaches the daemon without being recreated. It refuses an agent
+// that still holds a token: replacing a live token is RotateAgentToken, so
+// neither call can retire a working client by accident. The returned
+// Agent.Token is the only copy.
+func (s *Session) IssueAgentToken(id string) (Agent, error) {
+	return s.mintAgentToken(actionAgentTokenIssue, id)
+}
+
+// RotateAgentToken replaces the token of an agent that holds one. The old
+// token stops authenticating at once, including in a running daemon, which
+// re-reads the vault (ADR 0024, amendment of 2026-10-13). The agent keeps its
+// id, its state and every grant, so no client configuration changes.
+func (s *Session) RotateAgentToken(id string) (Agent, error) {
+	return s.mintAgentToken(actionAgentTokenRotate, id)
+}
+
+// mintAgentToken is issue and rotate, which differ only in whether a token
+// must already be there. One body, so the digest, the generation and the
+// audit row cannot drift apart between them.
+func (s *Session) mintAgentToken(action, id string) (Agent, error) {
+	if err := s.begin(); err != nil {
+		return Agent{}, err
+	}
+	defer s.end()
+	idx := s.agentIndex(id)
+	if idx < 0 {
+		return Agent{}, s.finish(auditEvent{Action: action, Result: resultDenied}, ErrAgentNotFound)
+	}
+	cur := s.agents[idx]
+	held := len(cur.TokenHash) == sha256.Size
+	if held && action == actionAgentTokenIssue {
+		return Agent{}, s.finish(auditEvent{Action: action, Result: resultDeniedAgent, AgentID: cur.ID}, ErrAgentTokenPresent)
+	}
+	if !held && action == actionAgentTokenRotate {
+		return Agent{}, s.finish(auditEvent{Action: action, Result: resultDeniedAgent, AgentID: cur.ID}, ErrAgentTokenAbsent)
+	}
+	token, err := randBytes(AgentTokenLen)
+	if err != nil {
+		return Agent{}, err
+	}
+	sum := sha256.Sum256(token)
+	next := append([]agentRecord{}, s.agents...)
+	next[idx].TokenHash = sum[:]
+	next[idx].TokenGen = cur.tokenGen() + 1
+	if err := s.writeAudit(auditEvent{Action: action, Result: resultAllowed, AgentID: cur.ID}, s.creds, next, s.grants); err != nil {
+		wipe(token)
+		return Agent{}, err
+	}
+	out := next[idx].public()
+	out.Token = token
+	return out, nil
+}
+
+// RevokeAgentToken clears an agent's token digest. The agent keeps its id,
+// its state and its grants, and a later IssueAgentToken restores access to
+// exactly those grants under a new generation. A daemon serving the old token
+// refuses it on the next call.
+func (s *Session) RevokeAgentToken(id string) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	idx := s.agentIndex(id)
+	if idx < 0 {
+		return s.finish(auditEvent{Action: actionAgentTokenRevoke, Result: resultDenied}, ErrAgentNotFound)
+	}
+	cur := s.agents[idx]
+	if len(cur.TokenHash) != sha256.Size {
+		return s.finish(auditEvent{Action: actionAgentTokenRevoke, Result: resultDeniedAgent, AgentID: cur.ID}, ErrAgentTokenAbsent)
+	}
+	next := append([]agentRecord{}, s.agents...)
+	next[idx].TokenHash = nil
+	next[idx].TokenGen = cur.tokenGen()
+	return s.writeAudit(auditEvent{Action: actionAgentTokenRevoke, Result: resultAllowed, AgentID: cur.ID}, s.creds, next, s.grants)
+}
+
+func (s *Session) agentIndex(id string) int {
+	if safeID(id) == "" {
+		return -1
+	}
+	for i := range s.agents {
+		if s.agents[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// RejectAgentTokenIssue records a metadata-free agent_token_issue denial.
+func (s *Session) RejectAgentTokenIssue(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	return s.denyAction(actionAgentTokenIssue, cause)
+}
+
+// RejectAgentTokenRotate records a metadata-free agent_token_rotate denial.
+func (s *Session) RejectAgentTokenRotate(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	return s.denyAction(actionAgentTokenRotate, cause)
+}
+
+// RejectAgentTokenRevoke records a metadata-free agent_token_revoke denial.
+func (s *Session) RejectAgentTokenRevoke(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	return s.denyAction(actionAgentTokenRevoke, cause)
 }
 
 // RejectAgentCreate records a metadata-free agent_create denial.
@@ -510,7 +753,7 @@ func (s *Session) listCapabilities(agentID string) ([]Capability, error) {
 		}
 		return nil, ErrAgentNotFound
 	}
-	caps := capabilitiesFor(s.decisionGrants(), agentID, now)
+	caps := capabilitiesFor(s.grants, agentID, now)
 	if err := s.finish(auditEvent{Action: actionCapList, Result: resultAllowed, AgentID: agentID}, nil); err != nil {
 		return nil, err
 	}
@@ -574,7 +817,7 @@ func (s *Session) judge(agentID, credentialID, operation, resource string) (audi
 	}
 	agentOK := s.agentExists(agentID)
 	credID, credType, credOK := s.lookupCred(credentialID)
-	result, grantID := decideAccess(s.decisionGrants(), agentOK, agentID, credID, credType, credOK, operation, resource, now)
+	result, grantID := decideAccess(s.grants, agentOK, agentID, credID, credType, credOK, operation, resource, now)
 	partial := auditEvent{Result: result, Operation: operation, GrantID: grantID}
 	if agentOK {
 		partial.AgentID = agentID
@@ -582,14 +825,6 @@ func (s *Session) judge(agentID, credentialID, operation, resource string) (audi
 	if agentOK && credOK && result != resultDeniedAgent {
 		partial.CredID = credID
 		partial.CredType = credType
-	}
-	if result == resultAllowed && s.shared() {
-		g, ok := s.grantByID(grantID)
-		if !ok || !s.provenanceLive(g.Provenance) {
-			partial.Result = resultDeniedRevoked
-			partial.GrantID = grantID
-			return partial, ErrDeniedRevoked
-		}
 	}
 	if result != resultAllowed {
 		return partial, denialError(result)
@@ -617,12 +852,7 @@ func (s *Session) finish(partial auditEvent, cause error) error {
 }
 
 func (s *Session) agentExists(id string) bool {
-	for i := range s.agents {
-		if s.agents[i].ID == id {
-			return true
-		}
-	}
-	return false
+	return s.agentIndex(id) >= 0
 }
 
 func (s *Session) agentActive(id string) bool {
@@ -810,6 +1040,9 @@ func (g grantRecord) capability(now time.Time) Capability {
 		KeyID:           g.KeyID,
 		SSHUsername:     g.SSHUsername,
 		SSHHostKey:      dup(g.SSHHostKey),
+		HTTPMethods:     append([]string(nil), g.HTTPMethods...),
+		HTTPInject:      g.HTTPInject,
+		HTTPInjectName:  g.HTTPInjectName,
 	}
 }
 
@@ -841,6 +1074,9 @@ func (g grantRecord) public() Grant {
 		KeyID:           g.KeyID,
 		SSHUsername:     g.SSHUsername,
 		SSHHostKey:      dup(g.SSHHostKey),
+		HTTPMethods:     append([]string(nil), g.HTTPMethods...),
+		HTTPInject:      g.HTTPInject,
+		HTTPInjectName:  g.HTTPInjectName,
 	}
 }
 
@@ -944,6 +1180,14 @@ func validateAgentsAndGrants(doc document) error {
 		if _, err := requireTime(a.CreatedAt); err != nil {
 			return ErrCorrupt
 		}
+		// Absent is a pre-ADR-0024 agent or a revoked token, neither of which
+		// can authenticate. Any other length is not a SHA-256 digest and is
+		// not silently accepted. A digest with no generation is the shape
+		// sealed before generations existed; a generation with no digest is
+		// a revoked token and keeps its count.
+		if a.TokenHash != nil && len(a.TokenHash) != sha256.Size {
+			return ErrCorrupt
+		}
 		if _, ok := agents[a.ID]; ok {
 			return ErrCorrupt
 		}
@@ -1007,6 +1251,9 @@ func validateAgentsAndGrants(doc document) error {
 			}
 		}
 		if err := validateGrantKey(g, credTypes); err != nil {
+			return err
+		}
+		if err := validateBrokerGrant(g); err != nil {
 			return err
 		}
 	}

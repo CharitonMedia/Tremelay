@@ -15,8 +15,8 @@ jobs:
     name: Windows core suite
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26.9'
       - name: Verify required Cursor rule
@@ -59,8 +59,33 @@ jobs:
               throw 'Native custody evidence receipt is missing.'
             }
           }
+      # The ordinary suite below also runs these. This step additionally names
+      # them, because a build tag that silently excluded the Windows daemon
+      # tests would leave `go test ./...` green with nothing exercised.
+      - name: Daemon over a Windows named pipe
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $log = go test -v -count=1 -run '^(TestDaemon|TestAgentTokenFile|TestSSHAgentFailsClosedOnWindows)' ./cmd/tremelay 2>&1 | Out-String
+          Write-Output $log
+          if ($LASTEXITCODE -ne 0) { throw 'Windows daemon suite failed.' }
+          foreach ($name in @(
+            'TestDaemonUnlockedAgentCall',
+            'TestDaemonConcurrentAgentsStayIsolated',
+            'TestDaemonIdleTimeoutFailsClosed',
+            'TestDaemonReloadsOnControlPlaneChange',
+            'TestDaemonLocksOnUnverifiableVault',
+            'TestDaemonAgentTokenCustody',
+            'TestDaemonPipeDescriptorIsOwnerOnly',
+            'TestDaemonPipeNameIsClaimedExclusively',
+            'TestDaemonPipeNameRejectsUnsafeInstance',
+            'TestAgentTokenFileRefusesWiderDACL',
+            'TestSSHAgentFailsClosedOnWindows')) {
+            if ($log -notmatch "--- PASS: $name\b") { throw "$name did not run on windows-latest." }
+          }
       - name: Test
-        run: go test ./...
+        # internal/vault took 190-600s on windows-latest; the default is 10m.
+        run: go test -timeout 20m ./...
       - name: Vet
         run: go vet ./...
       - name: Test build-evidence verifier
@@ -68,7 +93,7 @@ jobs:
       - name: Vet build-evidence verifier
         run: cd tools && go vet ./...
       - name: Retain allowlisted native custody receipts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-named-client-custody-${{ github.sha }}
           retention-days: 7

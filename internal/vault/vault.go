@@ -2,11 +2,10 @@
 //
 // Retrieval requires an unlocked session, which requires the vault passphrase.
 // Agent principals and capability grants are a separate authority from that
-// human session. A shared vault binds host-asserted humans to owner and member
-// roles; those handles are not authentication and cannot retrieve plaintext.
+// human session. One human holds the passphrase; many agents hold grants.
 // AgentPrincipal can list capabilities, authorize them, invoke
 // the HTTP broker, request one local Ed25519 attestation, and open one
-// host-bound SSH userauth stream for one identity.
+// session-bound SSH userauth stream for one identity.
 // BindAgentCapability is a separate in-process byte interface for that
 // principal's local attestation grants. BindMCPEndpoint is one in-memory MCP
 // peer for an adapter the host already bound. Neither can retrieve credential
@@ -109,6 +108,12 @@ var (
 	ErrAgentNotFound = errors.New("agent not found")
 	// ErrGrantNotFound means the grant id is not in this vault.
 	ErrGrantNotFound = errors.New("grant not found")
+	// ErrAgentTokenPresent means this agent already holds a token. Issuing a
+	// second one would retire a working client silently; rotate instead.
+	ErrAgentTokenPresent = errors.New("agent already holds a token; rotate it instead")
+	// ErrAgentTokenAbsent means this agent holds no token to replace or
+	// revoke. Issuing one gives it daemon access without touching its grants.
+	ErrAgentTokenAbsent = errors.New("agent holds no token; issue one instead")
 	// ErrDeniedAgent means authorization failed because the principal does not hold the grant.
 	ErrDeniedAgent = errors.New("denied_agent")
 	// ErrDeniedCredential means authorization failed because the credential does not match.
@@ -233,16 +238,19 @@ type kdfParams struct {
 }
 
 type fileHeader struct {
-	Version    int
-	ID         string
-	Root       string
-	KDF        kdfParams
-	WrapNonce  []byte
-	WrappedDEK []byte
-	DataNonce  []byte
-	Data       []byte
-	AuditHead  string
-	AuditSeq   uint64
+	Version         int
+	ID              string
+	Root            string
+	KDF             kdfParams
+	WrapNonce       []byte
+	WrappedDEK      []byte
+	DataNonce       []byte
+	Data            []byte
+	AuditHead       string
+	AuditSeq        uint64
+	DEKReloadPubKey []byte
+	DEKHandoffNonce []byte
+	DEKHandoff      []byte
 }
 
 // document is the plaintext inside the encrypted blob. Audit history lives
@@ -252,18 +260,15 @@ type document struct {
 	Credentials []credential  `json:"credentials"`
 	Agents      []agentRecord `json:"agents,omitempty"`
 	Grants      []grantRecord `json:"grants,omitempty"`
+	// DEKReloadPubKey is an ephemeral X25519 public key for resident DEK handoff.
+	// It is authenticated by the DEK; the plaintext dek_reload_pubkey column is not trusted.
+	DEKReloadPubKey []byte `json:"dek_reload_pubkey,omitempty"`
 	// Detection is always written, including when empty. A missing member
 	// means the document was sealed before M5. See sealedDetection.
 	Detection detectionState `json:"detection"`
 	// HealthPolicy is absent on vaults sealed before M6. Absence means the
 	// documented defaults, not a fabricated healthy assessment.
 	HealthPolicy healthPolicy `json:"health_policy,omitempty"`
-	// Organization is absent on a legacy single-user vault. Presence binds
-	// this database to one organization. A malformed member is corrupt;
-	// it is not a downgrade to legacy mode. See ADR 0015.
-	Organization *orgRecord         `json:"organization,omitempty"`
-	Memberships  []membershipRecord `json:"memberships,omitempty"`
-	Requests     []requestRecord    `json:"requests,omitempty"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -282,6 +287,11 @@ type Session struct {
 	// commitFault, when set, fails a credential-state transaction before commit.
 	// Tests use it to prove rollback. Production leaves it nil.
 	commitFault func() error
+	// rotateFault, when set, fails ChangePassphrase at named steps. Tests only.
+	rotateFault func(step string) error
+	// postCommitFault, when set, fails after a successful durable commit before
+	// the session cache is updated. Tests only.
+	postCommitFault func() error
 	// attestFault, when set, runs after the local-attestation allowed row
 	// commits and before Ed25519 signing. A non-nil error withholds the
 	// signature. Tests use it. Production leaves it nil.
@@ -332,28 +342,19 @@ type Session struct {
 	// checker is the process-local compromise lookup. Nil means no lookup.
 	// It is not sealed, and a new process starts without one. See ADR 0010.
 	checker CompromiseChecker
-	// org, members, and requests are shared-mode state. Nil org means legacy
-	// single-user mode. They are sealed with every document write.
-	org      *orgRecord
-	members  []membershipRecord
-	requests []requestRecord
-	// bootstrap is the allowed shared-bootstrap binding derived from the
-	// audit chain. Unlock builds it once. A commit extends it with the new
-	// rows and stores the result only after that commit succeeds, so the
-	// existing prefix is not copied. Reopen builds it again.
-	bootstrap bootstrapBind
 	// mu serializes authorization and document writes on this session.
 	// Callbacks run outside it. A second unlocked session is not covered by
 	// mu; its commit must match the durable audit sequence or it fails closed.
 	mu     sync.Mutex
 	locked atomic.Bool
-	// defunct is set when a commit loses a race. Later calls return ErrStale.
+	// defunct is set when a commit loses a race it cannot recover from.
+	// Later calls return ErrStale.
 	defunct bool
-	// boundActor, when set, attributes the commit with one version-5 inventory
-	// row. Human inventory methods set it for the duration of one call and
-	// restore the previous value, including across a callback. It is not a
-	// caller-supplied audit id.
-	boundActor string
+	// dekReloadPubKey is a 3e reload public key carried in the authenticated
+	// document of older vaults. Nothing seals to it any more (item 3g).
+	dekReloadPubKey []byte
+	rekeyOnce       sync.Once
+	rekeyed         chan struct{}
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -432,6 +433,52 @@ var unlockDecoded func([]credential)
 // is zeroed. Tests hold that buffer. Production leaves it nil.
 var wipedSecret func([]byte)
 
+// openDocument authenticates the sealed document under the plaintext audit
+// head and checks every invariant that document must satisfy: strict decoding,
+// the detection mirror against the chain, health against the chain, and the
+// stored credential, agent and grant shapes. It is the whole verification
+// Unlock performs once the DEK is in hand, and the whole verification
+// Session.reloadLocked performs with the DEK it already holds. A rejected document
+// is wiped here, so no caller receives decoded credential bytes to leak.
+func openDocument(dek []byte, header fileHeader, events []auditEvent) (document, *detectionIndex, error) {
+	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
+	if err != nil {
+		return document{}, nil, ErrCorrupt
+	}
+	defer wipe(plain)
+	var doc document
+	// retained is set only when the caller keeps these buffers. Every
+	// rejection, including a partial decode, zeroes them before returning.
+	retained := false
+	defer func() {
+		if !retained {
+			wipeCredentials(doc.Credentials)
+		}
+	}()
+	if err := unmarshalStrict(plain, &doc); err != nil {
+		return document{}, nil, ErrCorrupt
+	}
+	if unlockDecoded != nil {
+		unlockDecoded(doc.Credentials)
+	}
+	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
+	if err != nil {
+		return document{}, nil, err
+	}
+	if err := validateDocument(doc); err != nil {
+		return document{}, nil, err
+	}
+	idx := indexFromAudit(events)
+	if err := matchDetection(idx.state(), doc.Detection); err != nil {
+		return document{}, nil, ErrCorrupt
+	}
+	if err := matchHealth(events, doc.Credentials); err != nil {
+		return document{}, nil, ErrCorrupt
+	}
+	retained = true
+	return doc, idx, nil
+}
+
 // Unlock opens path with passphrase. A rejected unlock appends a denial and
 // does not update encrypted credential state. The denial has no passphrase
 // bytes. A later valid unlock checks that denial suffix and links its own
@@ -464,59 +511,17 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	if err != nil {
 		return nil, deny(ErrUnauthenticated)
 	}
-	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
+	doc, idx, err := openDocument(dek, header, events)
 	if err != nil {
 		wipe(dek)
-		return nil, deny(ErrCorrupt)
+		return nil, deny(err)
 	}
-	defer wipe(plain)
-	var doc document
-	// retained is set only when the session keeps these buffers. Every earlier
-	// return, including a partial decode, zeroes them. VerifyAudit does the same.
 	retained := false
 	defer func() {
 		if !retained {
 			wipeCredentials(doc.Credentials)
 		}
 	}()
-	if err := unmarshalStrict(plain, &doc); err != nil {
-		wipe(dek)
-		return nil, deny(ErrCorrupt)
-	}
-	if unlockDecoded != nil {
-		unlockDecoded(doc.Credentials)
-	}
-	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
-	if err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
-	if err := validateDocument(doc); err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
-	if err := sharedMatchesVault(doc, header.ID); err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
-	bind, err := (bootstrapBind{}).extend(events)
-	if err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
-	if err := bind.check(doc.Organization, doc.Memberships, doc.Requests, doc.Grants); err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
-	idx := indexFromAudit(events)
-	if err := matchDetection(idx.state(), doc.Detection); err != nil {
-		wipe(dek)
-		return nil, deny(ErrCorrupt)
-	}
-	if err := matchHealth(events, doc.Credentials); err != nil {
-		wipe(dek)
-		return nil, deny(ErrCorrupt)
-	}
 	red := &Redactor{}
 	// A logger cannot be attached later. A logger-free host (including stdio)
 	// must not retain an unnecessary passphrase copy for the session lifetime.
@@ -527,26 +532,23 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		red.Add(doc.Credentials[i].Secret)
 	}
 	s := &Session{
-		path:        path,
-		id:          header.ID,
-		dek:         dek,
-		header:      header,
-		creds:       doc.Credentials,
-		agents:      doc.Agents,
-		grants:      doc.Grants,
-		audit:       events,
-		detection:   doc.Detection,
-		denials:     idx,
-		notices:     noticeIndex(events),
-		suspensions: suspensionFromAudit(events),
-		redactor:    red,
-		logger:      logger,
-		db:          db,
-		hpolicy:     doc.HealthPolicy,
-		org:         doc.Organization,
-		members:     doc.Memberships,
-		requests:    doc.Requests,
-		bootstrap:   bind,
+		path:            path,
+		id:              header.ID,
+		dek:             dek,
+		header:          header,
+		creds:           doc.Credentials,
+		agents:          doc.Agents,
+		grants:          doc.Grants,
+		audit:           events,
+		detection:       doc.Detection,
+		denials:         idx,
+		notices:         noticeIndex(events),
+		suspensions:     suspensionFromAudit(events),
+		redactor:        red,
+		logger:          logger,
+		db:              db,
+		hpolicy:         doc.HealthPolicy,
+		dekReloadPubKey: append([]byte(nil), doc.DEKReloadPubKey...),
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -588,10 +590,7 @@ func (s *Session) lockLocked() {
 	s.responding = false
 	s.checker = nil
 	s.hpolicy = healthPolicy{}
-	s.org = nil
-	s.members = nil
-	s.requests = nil
-	s.bootstrap = bootstrapBind{}
+	s.dekReloadPubKey = nil
 	s.locked.Store(false)
 	if s.redactor != nil {
 		s.redactor.Wipe()
@@ -609,13 +608,6 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 		return Credential{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		return s.denyPut(ErrDenied)
-	}
-	return s.putUnlocked(label, typ, secret, opt)
-}
-
-func (s *Session) putUnlocked(label, typ string, secret []byte, opt PutOptions) (Credential, error) {
 	if err := validateLabel(label); err != nil {
 		return s.denyPut(err)
 	}
@@ -683,17 +675,6 @@ func (s *Session) Get(id string) (Credential, error) {
 		return Credential{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.persistEvent(actionGet, "", "", resultDenied); err != nil {
-			return Credential{}, err
-		}
-		s.logf("credential_get result=denied")
-		return Credential{}, ErrDenied
-	}
-	return s.getUnlocked(id)
-}
-
-func (s *Session) getUnlocked(id string) (Credential, error) {
 	for i := range s.creds {
 		c := &s.creds[i]
 		if c.ID != id {
@@ -722,17 +703,6 @@ func (s *Session) List() ([]Credential, error) {
 		return nil, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.persistEvent(actionList, "", "", resultDenied); err != nil {
-			return nil, err
-		}
-		s.logf("credential_list result=denied")
-		return nil, ErrDenied
-	}
-	return s.listUnlocked()
-}
-
-func (s *Session) listUnlocked() ([]Credential, error) {
 	if err := s.persistEvent(actionList, "", "", resultAllowed); err != nil {
 		return nil, err
 	}
@@ -762,6 +732,164 @@ func (c credential) public() Credential {
 	}
 }
 
+// adoptLocked brings this session up to the durable audit tip. The caller
+// holds s.mu, so an in-flight call can never observe a half-swapped session.
+// A sequence that has not moved needs no work; one that moved forward is
+// re-read and re-verified; one that moved backwards is a vault file replaced
+// by an older copy, which verifies on its own terms and can only be caught by
+// this process's memory of the tip.
+//
+// Before item 3d a session that lost this race refused every later call, which
+// cost `tremelay daemon` its vault on any control-plane command. Adopting is
+// the stronger of the two: refusing leaves the caller with no current view,
+// while this gives it the one the owner just committed, under the whole of
+// Unlock's verification.
+//
+// ponytail: one indexed single-row read per session entry, and re-verification
+// only when the authenticated head or audit tip moved. A document rewritten
+// under an unchanged tip is not detected, which is the same reach this process
+// had before reloading existed. Upgrade path: a cheap per-commit document tag
+// to compare without decrypting.
+func (s *Session) adoptLocked() error {
+	if s == nil || s.defunct {
+		return ErrStale
+	}
+	var seq, tip int64
+	var head string
+	if err := s.db.QueryRow(`SELECT audit_seq, audit_head, COALESCE((SELECT seq FROM audit ORDER BY seq DESC LIMIT 1), 0) FROM vault WHERE id=?`, s.id).Scan(&seq, &head, &tip); err != nil {
+		// A read that cannot happen is an IO failure, not a verdict about the
+		// chain, and it does not retire the session.
+		return ErrIO
+	}
+	if seq < 0 || tip < 0 {
+		s.defunct = true
+		return ErrAudit
+	}
+	switch {
+	case uint64(seq) == s.header.AuditSeq && head == s.header.AuditHead && uint64(tip) == s.header.AuditSeq:
+		return nil
+	case uint64(seq) < s.header.AuditSeq || uint64(tip) < s.header.AuditSeq:
+		s.defunct = true
+		return ErrCorrupt
+	}
+	return s.reloadLocked()
+}
+
+// reloadLocked replaces this session's cached authority with the durable state
+// under the DEK it already holds. No passphrase is involved: the KEK was
+// consumed at unlock. A passphrase change rotates the DEK, and a resident
+// session never adopts the new one (V1 item 3g): it zeroises, records the
+// refused key as a vault_unlock denial, and signals Rekeyed so the daemon
+// locks and the human unlocks again. Verification is Unlock's, through readVaultState
+// and openDocument, so a tampered document, a broken chain, a forged denial
+// suffix or a foreign vault id all fail here. Nothing is swapped until every
+// check passes, and a failure makes the session permanently unusable rather
+// than leaving it serving unverified state.
+func (s *Session) reloadLocked() error {
+	fail := func(err error) error {
+		s.defunct = true
+		return err
+	}
+	header, events, err := readVaultSnapshot(s.db, false)
+	// A failed verification is terminal; a database that is merely busy or
+	// unwritable is not, so the transient error does not retire the session.
+	if errors.Is(err, ErrIO) {
+		return err
+	}
+	if err != nil {
+		return fail(err)
+	}
+	if header.ID != s.id {
+		// A different vault at this handle is not a newer commit of this one.
+		return fail(ErrCorrupt)
+	}
+	if !containsEvent(events, s.header.AuditSeq, s.header.AuditHead) {
+		// A higher sequence is not by itself a continuation. An older
+		// authentic copy of this vault verifies on its own terms, so an
+		// attacker who restores one and lets ordinary commands push it past
+		// this session's tip would otherwise have the revocations, rotations
+		// and suspensions this session already served quietly undone. The
+		// chain being adopted must extend the history this session verified.
+		return fail(ErrCorrupt)
+	}
+	if passphraseChangedAfter(events, s.header.AuditSeq) {
+		// ponytail: the chain read here is not yet authenticated, so a forged
+		// change row also locks; same-uid file write can deny service anyway.
+		// The key this session holds no longer opens the vault: refuse it the
+		// way a wrong passphrase is refused, then forget it.
+		wipe(s.dek)
+		s.dek = nil
+		wipeCredentials(s.creds)
+		s.creds = nil
+		s.defunct = true
+		close(s.rekeyCh())
+		if aerr := appendDenial(s.db, s.id); aerr != nil {
+			return ErrAudit
+		}
+		s.logf("vault_unlock result=denied")
+		return ErrStale
+	}
+	doc, idx, err := openDocument(s.dek, header, events)
+	if err != nil {
+		return fail(err)
+	}
+	for i := range doc.Credentials {
+		s.redactor.Add(doc.Credentials[i].Secret)
+	}
+	// Zeroing the superseded secrets matches Lock, which an entrant holding
+	// this mutex can already call between a callback and its continuation.
+	wipeCredentials(s.creds)
+	s.header = header
+	s.creds = doc.Credentials
+	s.agents = doc.Agents
+	s.grants = doc.Grants
+	s.audit = events
+	s.detection = doc.Detection
+	s.denials = idx
+	s.notices = noticeIndex(events)
+	s.suspensions = suspensionFromAudit(events)
+	s.hpolicy = doc.HealthPolicy
+	s.dekReloadPubKey = append([]byte(nil), doc.DEKReloadPubKey...)
+	return nil
+}
+
+// passphraseChangedAfter reports whether a passphrase change, and with it a
+// fresh DEK, was committed after seq.
+func passphraseChangedAfter(events []auditEvent, seq uint64) bool {
+	for i := len(events) - 1; i >= 0 && events[i].Seq > seq; i-- {
+		if events[i].Action == actionPassphrase && events[i].Result == resultAllowed {
+			return true
+		}
+	}
+	return false
+}
+
+// Rekeyed is closed when this session saw a passphrase change and zeroised
+// itself. A resident daemon locks on it; the human unlocks again.
+func (s *Session) Rekeyed() <-chan struct{} {
+	return s.rekeyCh()
+}
+
+func (s *Session) rekeyCh() chan struct{} {
+	s.rekeyOnce.Do(func() { s.rekeyed = make(chan struct{}) })
+	return s.rekeyed
+}
+
+// containsEvent reports whether a verified chain holds exactly this event at
+// this sequence. The chain is ordered, and the sequence looked for is the old
+// tip, so the scan starts at the end.
+func containsEvent(events []auditEvent, seq uint64, hash string) bool {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Seq == seq {
+			return events[i].Hash == hash
+		}
+		if events[i].Seq < seq {
+			return false
+		}
+	}
+	return false
+}
+
 func (s *Session) live() error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
@@ -786,6 +914,13 @@ func (s *Session) begin() error {
 		s.mu.Unlock()
 		return ErrUnauthenticated
 	}
+	// One guard for every entry point, so a new grant is usable and a revoked
+	// grant, agent or token is refused on the next call, without a restart and
+	// without any caller having to know a reload happened. See ADR 0024.
+	if err := s.adoptLocked(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.locked.Store(true)
 	return nil
 }
@@ -805,14 +940,9 @@ func (s *Session) duringCallback(fn func()) {
 		fn()
 		return
 	}
-	// Attribution belongs to this call, not to another operation admitted
-	// while its callback runs. Restore it only after owning the lock again.
-	actor := s.boundActor
-	s.boundActor = ""
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
-		s.boundActor = actor
 		s.locked.Store(true)
 	}()
 	fn()
@@ -897,19 +1027,24 @@ func (s *Session) commit(ev auditEvent, creds []credential) error {
 }
 
 func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentRecord, grants []grantRecord) error {
-	return s.commitBatch([]auditEvent{ev}, creds, agents, grants, true, nil, nil)
+	return s.commitBatch([]auditEvent{ev}, creds, agents, grants, true, nil)
 }
 
 // commitBatch seals creds and events in one transaction.
 // withResp lets one ordinary security event pick up its M5 response.
 // policy, when non-nil, becomes the durable health policy only after commit.
-func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, shared *sharedSnap) error {
-	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, shared, nil)
+func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy) error {
+	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil, nil)
 }
 
-// commitBatchWrap optionally replaces the passphrase wrap in the same transaction.
-// Neither the session header nor its audit cache changes before commit succeeds.
-func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, shared *sharedSnap, wrap *passphraseWrap) error {
+type dekRotation struct {
+	newDEK []byte
+}
+
+// commitBatchWrap optionally replaces the passphrase wrap and/or rotates the DEK
+// in the same transaction. Neither the session header nor its audit cache
+// changes before commit succeeds.
+func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap, rot *dekRotation) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
@@ -933,29 +1068,6 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 			}
 		}
 	}
-	if s.boundActor != "" && s.org != nil && safeID(s.boundActor) != "" {
-		partial := auditEvent{
-			Action: actionInventory, Result: resultAllowed, Decision: decisionInventory,
-			ActorID: s.boundActor, OrgID: s.org.ID,
-		}
-		for _, ev := range events {
-			if ev.Result == resultDenied {
-				partial.Result = resultDenied
-			}
-			if partial.CredID == "" && safeID(ev.CredID) != "" {
-				partial.CredID = ev.CredID
-				partial.CredType = ev.CredType
-			}
-			if partial.TargetID == "" && safeID(ev.AgentID) != "" {
-				partial.TargetID = ev.AgentID
-			}
-		}
-		ev, err := nextAudit(events, s.id, partial)
-		if err != nil {
-			return err
-		}
-		events = append(events, ev)
-	}
 	base := s.denials
 	if base == nil {
 		base = indexFromAudit(s.audit)
@@ -968,30 +1080,20 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	if err := validateDetection(det); err != nil {
 		return err
 	}
-	org, members, requests := s.org, s.members, s.requests
-	if shared != nil {
-		org, members, requests = shared.org, shared.members, shared.requests
-	}
-	if err := validateSharedState(org, members, requests, creds, agents, grants); err != nil {
-		return err
-	}
-	nextBind, err := s.bootstrap.extend(events)
-	if err != nil {
-		return err
-	}
-	if err := nextBind.check(org, members, requests, grants); err != nil {
-		return err
-	}
 	tip := events[len(events)-1]
 	plain, err := json.Marshal(document{
 		Credentials: creds, Agents: agents, Grants: grants, Detection: det, HealthPolicy: pol,
-		Organization: org, Memberships: members, Requests: requests,
+		DEKReloadPubKey: s.dekReloadPubKey,
 	})
 	if err != nil {
 		return ErrIO
 	}
 	defer wipe(plain)
-	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, tip.Hash, tip.Seq))
+	dekSeal := s.dek
+	if rot != nil {
+		dekSeal = rot.newDEK
+	}
+	nonce, ct, err := seal(dekSeal, plain, dataAAD(s.id, tip.Hash, tip.Seq))
 	if err != nil {
 		return err
 	}
@@ -999,6 +1101,8 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	if wrap != nil {
 		h.KDF, h.WrapNonce, h.WrappedDEK = wrap.kdf, wrap.nonce, wrap.ciphertext
 	}
+	h.DEKReloadPubKey = nil
+	h.DEKHandoffNonce, h.DEKHandoff = nil, nil
 	h.Version = formatVersion
 	h.ID = s.id
 	h.Root = rootPassphrase
@@ -1008,8 +1112,11 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	h.AuditSeq = tip.Seq
 	if err := writeTx(s.db, h, s.header.AuditSeq, events, len(s.audit) == 0, s.commitFault); err != nil {
 		if errors.Is(err, ErrCorrupt) {
-			// The durable sequence moved or the update was ignored. This
-			// cache must not approve, restore, or sign from its old view.
+			// The vault row no longer matches what this session can account
+			// for. The cache must not approve, restore, or sign from its old
+			// view. A commit that merely lost the compare-and-swap to another
+			// writer is ErrStale instead: nothing of this call was written,
+			// and the next entry point adopts that writer's commit.
 			s.defunct = true
 		}
 		if errors.Is(err, ErrIO) {
@@ -1017,7 +1124,16 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 		}
 		return err
 	}
+	if s.postCommitFault != nil {
+		if err := s.postCommitFault(); err != nil {
+			return ErrAudit
+		}
+	}
 	s.header = h
+	if rot != nil {
+		wipe(s.dek)
+		s.dek = append([]byte(nil), rot.newDEK...)
+	}
 	// Append only after the transaction succeeds. A failed commit leaves the
 	// prefix in place, and append grows the backing array instead of copying
 	// it on every row. The notice index follows the same commit: a failed
@@ -1035,10 +1151,6 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	s.detection = det
 	s.denials = nextDenials
 	s.hpolicy = pol
-	s.org = org
-	s.members = members
-	s.requests = requests
-	s.bootstrap = nextBind
 	for _, row := range events {
 		applyNotice(s.notices, row)
 		s.suspensions.apply(s.audit, row)
@@ -1223,6 +1335,22 @@ func cloneTime(t *time.Time) *time.Time {
 	return &u
 }
 
+func validateDocument(doc document) error {
+	if err := validateStored(doc.Credentials); err != nil {
+		return err
+	}
+	if err := validateAgentsAndGrants(doc); err != nil {
+		return err
+	}
+	if err := validateHealthPolicyStored(doc.HealthPolicy); err != nil {
+		return err
+	}
+	if len(doc.DEKReloadPubKey) != 0 && len(doc.DEKReloadPubKey) != 32 {
+		return ErrCorrupt
+	}
+	return validateDetection(doc.Detection)
+}
+
 func validateStored(creds []credential) error {
 	seen := make(map[string]struct{}, len(creds))
 	for _, c := range creds {
@@ -1281,6 +1409,15 @@ func validateHeader(h fileHeader) error {
 		return ErrCorrupt
 	}
 	if _, err := hex.DecodeString(h.AuditHead); err != nil {
+		return ErrCorrupt
+	}
+	if len(h.DEKHandoffNonce) != 0 {
+		return ErrCorrupt
+	}
+	if len(h.DEKReloadPubKey) != 0 && len(h.DEKReloadPubKey) != 32 {
+		return ErrCorrupt
+	}
+	if len(h.DEKHandoff) != 0 && len(h.DEKHandoff) < minDEKHandoffLen() {
 		return ErrCorrupt
 	}
 	return nil

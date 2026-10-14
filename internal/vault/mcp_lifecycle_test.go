@@ -22,7 +22,7 @@ import (
 // expose the writer's real delivery transitions without changing production code.
 func TestMCPOutputLifecycle(t *testing.T) {
 	t.Run("complete-frame-and-write-return", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		ep := lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID))
 		var writer *stagedMCPWriter
 		peer := startLifecyclePeer(t, ep, func(w io.WriteCloser) io.WriteCloser {
@@ -58,7 +58,7 @@ func TestMCPOutputLifecycle(t *testing.T) {
 	})
 
 	t.Run("first-busy-write-allows-cancellation", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		ep := lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID))
 		entered, cancelled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 		defer close(release)
@@ -120,7 +120,7 @@ func TestMCPOutputLifecycle(t *testing.T) {
 	})
 
 	t.Run("queued-response-overflow-closes", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		cap := bindCap(t, env.s, env.agent.ID)
 		list, _ := encodeCapList()
 		handle := capCall(t, cap, list).entries[0].handle
@@ -172,7 +172,7 @@ func TestMCPOutputLifecycle(t *testing.T) {
 	})
 
 	t.Run("idle-transition-does-not-strand-output", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		peer := startLifecyclePeer(t, lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID)), nil)
 		before := len(mcpAuditSnapshot(env.s))
 		for id := 1; id <= 100; id++ {
@@ -196,7 +196,7 @@ func TestMCPOutputLifecycle(t *testing.T) {
 
 func TestMCPTerminalOutputFailures(t *testing.T) {
 	t.Run("short-write", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		peer := startLifecyclePeer(t, lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID)), func(io.WriteCloser) io.WriteCloser { return shortMCPWriter{} })
 		peer.send(t, rpcFrame(t, 1, "tools/list", map[string]any{"_meta": mcpMeta()}))
 		awaitMCPSignal(t, peer.stopped)
@@ -205,7 +205,7 @@ func TestMCPTerminalOutputFailures(t *testing.T) {
 		}
 	})
 	t.Run("unmatched-cancellation-audit-failure", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		env.s.commitFault = func() error { return errors.New("test-only cancellation audit fault") }
 		peer := startLifecyclePeer(t, lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID)), nil)
 		before := len(mcpAuditSnapshot(env.s))
@@ -223,7 +223,7 @@ func TestMCPTerminalOutputFailures(t *testing.T) {
 		}
 	})
 	t.Run("input-closes-blocked-audit-error", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		env.s.commitFault = func() error { return errors.New("test-only audit fault") }
 		writer := &blockedMCPWriter{entered: make(chan struct{}), closed: make(chan struct{})}
 		peer := startLifecyclePeer(t, lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID)), func(io.WriteCloser) io.WriteCloser { return writer })
@@ -243,7 +243,7 @@ func (shortMCPWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
 func (shortMCPWriter) Close() error                { return nil }
 
 func TestMCPAuditSessionLifecycle(t *testing.T) {
-	env := approvedShared(t)
+	env := grantedAttestEnv(t)
 	ep := lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID))
 	auditErr := ErrAudit
 	env.s.commitFault = func() error { return errors.New("test-only audit storage failure") }
@@ -297,7 +297,7 @@ func TestMCPAuditSessionLifecycle(t *testing.T) {
 }
 
 func TestMCPNotificationEnvelopes(t *testing.T) {
-	env := approvedShared(t)
+	env := grantedAttestEnv(t)
 	raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 	for _, frame := range []string{
 		`{}`, `{"method":"notifications/cancelled"}`, `{"jsonrpc":"wrong","method":"notifications/cancelled"}`,
@@ -334,7 +334,7 @@ func TestMCPNotificationEnvelopes(t *testing.T) {
 }
 
 func TestMCPRejectedNotificationShapes(t *testing.T) {
-	env := approvedShared(t)
+	env := grantedAttestEnv(t)
 	raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 	for _, frame := range []string{
 		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9,"reason":[]}}`,
@@ -374,7 +374,7 @@ func TestMCPCancellationDecoderFailure(t *testing.T) {
 			name = "audit-failure"
 		}
 		t.Run(name, func(t *testing.T) {
-			env := approvedShared(t)
+			env := grantedAttestEnv(t)
 			if failAudit {
 				env.s.commitFault = func() error { return errors.New("test-only cancellation decode audit fault") }
 			}
@@ -421,7 +421,7 @@ func TestMCPCancellationDecoderFailure(t *testing.T) {
 }
 
 func TestMCPVersionProjection(t *testing.T) {
-	env := approvedShared(t)
+	env := grantedAttestEnv(t)
 	raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 	for _, tc := range []struct {
 		version string
@@ -470,7 +470,7 @@ func TestMCPVersionProjection(t *testing.T) {
 }
 
 func TestMCPOfficialClientBusyInterval(t *testing.T) {
-	env := approvedShared(t)
+	env := grantedAttestEnv(t)
 	ep := lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID))
 	var writer *stagedMCPWriter
 	peer := startLifecyclePeer(t, ep, func(w io.WriteCloser) io.WriteCloser {

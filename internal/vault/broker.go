@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -46,16 +47,29 @@ var (
 )
 
 // brokerAttempt is one authorized broker call. prepare may set broker-owned
-// headers. accept, when set, sees a retained HTTP 200 body before the
-// completed audit and must not keep that body. A nil accept is the status-only
-// path: any non-redirect 200–599 status is returned and the body is wiped.
+// headers. capture, when set, sees the capped response headers and body before
+// the completed audit and must not keep either. A nil capture is the
+// status-only path: any non-redirect 200–599 status is returned and the body
+// is wiped.
+//
+// origin, path, query, headers and body are the http_broker request shape.
+// malformed says the caller's own fields were already refused, so the refusal
+// is recorded without them.
 type brokerAttempt struct {
 	credentialID string
 	method       string
 	target       string
 	operation    string
+	origin       string
+	path         string
+	query        string
+	headers      map[string]string
+	body         []byte
+	malformed    bool
 	prepare      func(*http.Request)
-	accept       func([]byte) error
+	capture      func(grantInjection, []byte, http.Header, []byte, bool) error
+	// injection is resolved from the authorized grant, never a caller field.
+	injection grantInjection
 	// These are host-bound by the capability adapter, never caller fields.
 	bound *agentCapGrant
 	ctx   context.Context
@@ -100,7 +114,7 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		}
 		return s.failExchange(s.destinationEvent(agentID, call.credentialID, resultDeniedAgent, call.operation), method, ErrDeniedAgent)
 	}
-	if safeID(call.credentialID) == "" || !brokerMethod(call.method) {
+	if safeID(call.credentialID) == "" || !brokerMethod(call.method) || call.malformed {
 		return s.failExchange(auditEvent{Result: resultDenied}, "", ErrInvalid)
 	}
 	resource, host, port, class := classifyTarget(call.method, call.target)
@@ -116,13 +130,16 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 	}
 	var partial auditEvent
 	var cause error
-	if call.bound != nil {
+	switch {
+	case call.bound != nil:
 		partial, cause = s.judgeExactNetwork(agentID, *call.bound)
-	} else {
+	case call.operation == OpHTTPBroker:
+		partial, cause = s.judgeBroker(agentID, call.credentialID, call.origin, call.method, call.path)
+	default:
 		partial, cause = s.judge(agentID, call.credentialID, call.operation, resource)
 	}
 	if cause != nil {
-		if call.bound == nil && partial.Result == resultDeniedScope {
+		if call.bound == nil && call.operation != OpHTTPBroker && partial.Result == resultDeniedScope {
 			if class, id, ok := reclassifyScope(s.grants, agentID, partial.CredID, partial.CredType, call.method, call.target, call.operation); ok {
 				partial.Result = class
 				partial.GrantID = id
@@ -135,6 +152,22 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		partial.Result = resultDeniedDestructive
 		return s.failExchange(partial, call.method, ErrDeniedDestructive)
 	}
+	// The authorized grant names its own credential slot, so the grant has to
+	// be resolved before DNS and before any secret is copied. A request that
+	// would write that slot is refused, never overwritten.
+	if call.operation == OpHTTPBroker {
+		g, ok := s.grantByID(partial.GrantID)
+		if !ok || !brokerGrantShape(g) {
+			partial.Result = resultUpstreamError
+			return s.failExchange(partial, call.method, ErrBrokerUpstream)
+		}
+		call.injection = grantInjectionOf(g)
+		if injectionCollides(call.headers, call.query, call.injection) ||
+			queryParamNamed(call.query, "_method") || queryParamNamed(string(call.body), "_method") {
+			partial.Result = resultDeniedMalformed
+			return s.failExchange(partial, call.method, ErrDeniedMalformed)
+		}
+	}
 	base := call.ctx
 	if base == nil {
 		base = context.Background()
@@ -142,7 +175,45 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 	ctx, cancel := context.WithTimeout(base, brokerTimeout)
 	defer cancel()
 	call.ctx = ctx
-	ips, err := s.lookupBroker(ctx, host)
+	var ips []net.IP
+	var lookupErr error
+	s.duringCallback(func() {
+		ips, lookupErr = s.lookupBroker(ctx, host)
+	})
+	// The mutex was released for DNS. Everything decided before the lookup is
+	// decided again on the current state before any secret is copied: a Lock,
+	// revoke, expiry, suspension or destructive-policy change during the
+	// lookup holds.
+	if err := s.live(); err != nil {
+		return 0, err
+	}
+	if call.bound != nil {
+		if err := s.checkExactNetwork(agentID, call, false); err != nil {
+			return 0, err
+		}
+	} else if err := s.adoptLocked(); err != nil {
+		return 0, err
+	} else if s.defunct {
+		return 0, ErrStale
+	} else if s.agentExists(agentID) && !s.agentActive(agentID) {
+		return s.failExchange(s.destinationEvent(agentID, call.credentialID, resultDeniedAgent, call.operation), call.method, ErrDeniedAgent)
+	} else {
+		var again auditEvent
+		var cause error
+		if call.operation == OpHTTPBroker {
+			again, cause = s.judgeBroker(agentID, call.credentialID, call.origin, call.method, call.path)
+		} else {
+			again, cause = s.judge(agentID, call.credentialID, call.operation, resource)
+		}
+		if cause != nil {
+			return s.failExchange(again, call.method, cause)
+		}
+		if again.GrantID != partial.GrantID {
+			again.Result = resultDenied
+			return s.failExchange(again, call.method, ErrDenied)
+		}
+	}
+	err := lookupErr
 	if err != nil || len(ips) == 0 {
 		partial.Result = resultDeniedDestination
 		return s.failExchange(partial, call.method, ErrDeniedDestination)
@@ -159,7 +230,11 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		partial.Result = resultDeniedSSRF
 		return s.failExchange(partial, call.method, ErrDeniedSSRF)
 	}
-	upstream, err := http.NewRequestWithContext(ctx, call.method, call.target, nil)
+	var send io.Reader
+	if len(call.body) > 0 {
+		send = bytes.NewReader(call.body)
+	}
+	upstream, err := http.NewRequestWithContext(ctx, call.method, call.target, send)
 	if err != nil || upstream.URL == nil || upstream.URL.String() != call.target || upstream.URL.User != nil {
 		partial.Result = resultUpstreamError
 		return s.failExchange(partial, call.method, ErrBrokerUpstream)
@@ -167,7 +242,11 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 	if call.prepare != nil {
 		call.prepare(upstream)
 	}
-	if upstream.URL == nil || upstream.URL.String() != call.target || upstream.URL.User != nil || upstream.Host != upstream.URL.Host || upstream.Method != call.method || upstream.Body != nil {
+	// The body is broker-framed: one fixed Content-Length and no chunking, so
+	// an agent header cannot change how the upstream splits the request.
+	if upstream.URL == nil || upstream.URL.String() != call.target || upstream.URL.User != nil || upstream.Host != upstream.URL.Host ||
+		upstream.Method != call.method || (upstream.Body != nil) != (len(call.body) > 0) ||
+		upstream.ContentLength != int64(len(call.body)) || len(upstream.TransferEncoding) != 0 {
 		partial.Result = resultUpstreamError
 		return s.failExchange(partial, call.method, ErrBrokerUpstream)
 	}
@@ -190,6 +269,15 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 	} else if s.header.AuditSeq != seq || s.defunct {
 		return 0, ErrStale
 	}
+	// The hook and the DNS lookup both ran without the mutex, and a policy
+	// change does not move the audit sequence: read the policy last.
+	if err := s.live(); err != nil {
+		return 0, err
+	}
+	if call.method == http.MethodDelete && s.policy.Destructive == DestructiveDeny {
+		partial.Result = resultDeniedDestructive
+		return s.failExchange(partial, call.method, ErrDeniedDestructive)
+	}
 	secret, ok := s.copySecret(partial.CredID)
 	if !ok || !safeHeaderSecret(secret) {
 		wipe(secret)
@@ -200,15 +288,15 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 	if err := s.brokerCommit(partial, resultAllowed); err != nil {
 		return 0, err
 	}
-	// ponytail: bearer header only. Upgrade path: a typed credential adapter
-	// that still cannot accept a caller-supplied authorization header.
-	upstream.Header.Del("Authorization")
-	upstream.Header.Set("Authorization", "Bearer "+string(secret))
-	defer upstream.Header.Del("Authorization")
-	if call.accept == nil {
+	if err := injectCredential(upstream, call.injection, secret); err != nil {
+		partial.Result = resultUpstreamError
+		return s.failExchange(partial, call.method, ErrBrokerUpstream)
+	}
+	defer clearCredential(upstream, call.injection)
+	if call.capture == nil {
 		return s.finishStatus(partial, upstream, pin, port, call)
 	}
-	return s.finishAccepted(partial, upstream, pin, port, call)
+	return s.finishCaptured(partial, upstream, pin, port, call, secret)
 }
 
 func (s *Session) failExchange(ev auditEvent, method string, cause error) (int, error) {
@@ -245,8 +333,11 @@ func (s *Session) finishStatus(partial auditEvent, upstream *http.Request, pin n
 	return s.finishKind(partial, method, status, kind)
 }
 
-func (s *Session) finishAccepted(partial auditEvent, upstream *http.Request, pin net.IP, port string, call brokerAttempt) (int, error) {
-	method, accept := call.method, call.accept
+// finishCaptured projects the upstream headers and the capped body for the
+// caller. A redirect is refused before either is read, so a 3xx Location never
+// reaches the agent and the credential is not offered to the next hop.
+func (s *Session) finishCaptured(partial auditEvent, upstream *http.Request, pin net.IP, port string, call brokerAttempt, secret []byte) (int, error) {
+	method := call.method
 	resp, err := s.roundTrip(upstream, pin, port)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
@@ -254,21 +345,31 @@ func (s *Session) finishAccepted(partial auditEvent, upstream *http.Request, pin
 		}
 		return s.failTransport(partial, method, err)
 	}
-	var body []byte
-	var readErr error
-	if resp != nil && resp.Body != nil {
-		body, readErr = readCapped(resp.Body, githubIssueMaxBody)
-	}
-	defer wipe(body)
 	code := 0
 	if resp != nil {
 		code = resp.StatusCode
 	}
+	if status, kind := responseClass(code, nil); kind != brokerBodyOK {
+		if resp != nil && resp.Body != nil {
+			discardBody(resp.Body)
+		}
+		return s.finishKind(partial, method, status, kind)
+	}
+	// An undecoded coding or a byte-range fragment hides a credential from
+	// the literal scan, so it is withheld whole, like a surviving form.
+	if bodyNotRedactable(code, resp.Header) {
+		if resp.Body != nil {
+			discardBody(resp.Body)
+		}
+		return s.finishKind(partial, method, 0, brokerBodyBad)
+	}
+	body, truncated, readErr := readTruncating(resp.Body, maxAgentBody)
+	defer wipe(body)
 	status, kind := responseClass(code, readErr)
-	if kind == brokerBodyOK && status != http.StatusOK {
+	if kind == brokerBodyOK && bodyNotText(body, truncated) {
 		kind = brokerBodyBad
 	}
-	if kind == brokerBodyOK && accept(body) != nil {
+	if kind == brokerBodyOK && call.capture(call.injection, secret, resp.Header, body, truncated) != nil {
 		kind = brokerBodyBad
 	}
 	if err := s.checkExactNetwork(partial.AgentID, call, true); err != nil {
@@ -520,19 +621,6 @@ func responseClass(code int, readErr error) (int, int) {
 		return 0, brokerBodyBad
 	}
 	return code, brokerBodyOK
-}
-
-func readCapped(body io.ReadCloser, n int) ([]byte, error) {
-	if body == nil {
-		return nil, nil
-	}
-	buf, err := io.ReadAll(io.LimitReader(body, int64(n)+1))
-	_ = body.Close()
-	if err != nil || len(buf) > n {
-		wipe(buf)
-		return nil, errBrokerTransport
-	}
-	return buf, nil
 }
 
 func readLimited(body io.Reader) ([]byte, error) {

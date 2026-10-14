@@ -45,7 +45,7 @@ Early development may ship as one server binary plus a web UI and CLI. Logical b
 
 ## Initial data-store approach
 
-M1 uses one local SQLite database as the transactional store for encrypted credential state and the audit chain ([ADR 0003](docs/adr/0003-custody-audit-hash-chain.md)). M2 stores agent principals and capability grants in that same encrypted document, so a grant change and its audit event commit together ([ADR 0004](docs/adr/0004-agent-capability-grants.md)). Agents are not human users, and a grant does not authorize raw-secret retrieval. M3 brokers one authorized `http_request` through that grant ([ADR 0005](docs/adr/0005-http-credential-broker.md)): the agent names the credential and the target, and the broker holds the secret. M4 checks that request against an explicit origin, method, path, and action policy and refuses destination confusion before the credential is sent ([ADR 0006](docs/adr/0006-http-request-policy.md)). M5 classifies those rows, verifies the chain from a human audit view, and can notify or contain from the class without putting a secret in the alert ([ADR 0007](docs/adr/0007-audit-detection-notification.md)). M6 stores credential health in that same document and appends version-4 health rows in the same transaction ([ADR 0010](docs/adr/0010-credential-health.md)). Health is advisory: it does not rotate, revoke, or enlarge a grant. M7 brokers one GitHub issue-state read on a separate `github_issue_state` grant and returns four validated fields ([ADR 0011](docs/adr/0011-github-issue-state.md)). `BrokerHTTP` remains status-only. M8 signs one local artifact attestation with a vault-held Ed25519 key on a separate `local_artifact_attest` grant and returns a fixed signature plus public verification metadata ([ADR 0012](docs/adr/0012-local-ed25519-attestation.md)). The same milestone also serves a bounded SSH-agent subset on a separate `ssh_userauth` grant ([ADR 0013](docs/adr/0013-ssh-userauth.md)): one selected grant, one host-bound session, and one Ed25519 userauth signature. The private key stays in the vault. M9a adds one local shared-vault reference in that same document ([ADR 0015](docs/adr/0015-local-shared-vault-authorization.md)): a host-asserted member requests an exact local attestation, a different owner approves it, and the existing broker uses the resulting grant. It is not authentication, recovery, or production shared access. M9b copies that same file with the driver's online backup API and restores it only when the host supplies a matching checkpoint kept outside the artifact ([ADR 0016](docs/adr/0016-local-checkpoint-backup.md)). An old checkpoint is not detected as stale. M10a adds an in-process byte interface on an already-bound agent principal ([ADR 0017](docs/adr/0017-agent-capability-interface.md)). It discovers and invokes only that principal's `local_artifact_attest` grants by an exact handle. It is not a socket. M10b places that adapter behind one in-memory MCP peer for protocol `2026-07-28` ([ADR 0018](docs/adr/0018-local-mcp-capability.md)). That peer is not a network service, a distributed SDK, or remote authentication. M9 and M10 remain open. PostgreSQL support may follow for multi-user or clustered deployments.
+M1 uses one local SQLite database as the transactional store for encrypted credential state and the audit chain ([ADR 0003](docs/adr/0003-custody-audit-hash-chain.md)). M2 stores agent principals and capability grants in that same encrypted document, so a grant change and its audit event commit together ([ADR 0004](docs/adr/0004-agent-capability-grants.md)). Agents are not human users, and a grant does not authorize raw-secret retrieval. M3 brokers one authorized `http_request` through that grant ([ADR 0005](docs/adr/0005-http-credential-broker.md)): the agent names the credential and the target, and the broker holds the secret. M4 checks that request against an explicit origin, method, path, and action policy and refuses destination confusion before the credential is sent ([ADR 0006](docs/adr/0006-http-request-policy.md)). M5 classifies those rows, verifies the chain from a human audit view, and can notify or contain from the class without putting a secret in the alert ([ADR 0007](docs/adr/0007-audit-detection-notification.md)). M6 stores credential health in that same document and appends version-4 health rows in the same transaction ([ADR 0010](docs/adr/0010-credential-health.md)). Health is advisory: it does not rotate, revoke, or enlarge a grant. M7 brokered one GitHub issue-state read on a separate `github_issue_state` grant; V1 item 4 removed that special case and replaced it with a prefix-scoped broker on a separate `http_broker` grant ([ADR 0025](docs/adr/0025-http-broker-v1.md), superseding [ADR 0011](docs/adr/0011-github-issue-state.md)). That grant names an origin, an allowed method set, a path prefix and one credential-injection style, and its response carries the status, an allowlisted set of response headers and a capped body with every spelling of the credential redacted. `BrokerHTTP` remains status-only. M8 signs one local artifact attestation with a vault-held Ed25519 key on a separate `local_artifact_attest` grant and returns a fixed signature plus public verification metadata ([ADR 0012](docs/adr/0012-local-ed25519-attestation.md)). The same milestone also serves a bounded SSH-agent subset on a separate `ssh_userauth` grant ([ADR 0013](docs/adr/0013-ssh-userauth.md)): one selected grant, one host-bound session, and one Ed25519 userauth signature. The private key stays in the vault. M9b copies that same file with the driver's online backup API and restores it only when the host supplies a matching checkpoint kept outside the artifact ([ADR 0016](docs/adr/0016-local-checkpoint-backup.md)). An old checkpoint is not detected as stale. M10a adds an in-process byte interface on an already-bound agent principal ([ADR 0017](docs/adr/0017-agent-capability-interface.md)). It discovers and invokes only that principal's `local_artifact_attest` grants by an exact handle. It is not a socket. M10b places that adapter behind one in-memory MCP peer for protocol `2026-07-28` ([ADR 0018](docs/adr/0018-local-mcp-capability.md)). That peer is not a network service, a distributed SDK, or remote authentication. M10 remains open. Multiple humans, organizations and approvals are out of v1; the M9a reference that explored them was removed and ADR 0015 is superseded. PostgreSQL support may follow for multi-user or clustered deployments.
 
 ## Cryptography
 
@@ -75,7 +75,7 @@ adapter and both MCP profiles to existing HTTP and GitHub issue brokers. Network
 handles bind one agent, grant, operation, credential generation and canonical
 resource. Invocation carries only the handle; the host-derived grant supplies
 the request. Existing destination policy, fixed projections, audit and M5
-response controls remain in force. Shared vaults remain attestation-only. SSH's
+response controls remain in force. SSH's
 stateful host-proof contract is not represented by these one-shot invocations.
 
 ## Bounded SSH capability streams
@@ -86,3 +86,37 @@ Exact private bindings include credential generation, username and host key;
 public discovery omits SSH key identity. One private, bounded stream epoch belongs
 to each Serve, with cancellation retirement and joined wiping. Raw Exchange cannot
 borrow that state. This adds no listener, remote SSH connection or command runner.
+
+## Headless unlock
+
+[ADR 0024](docs/adr/0024-headless-unlock-daemon.md) adds `tremelay daemon`, the
+one resident process that holds an unlocked session for unattended agents. The
+human unlocks it once in a terminal; agents authenticate with per-agent bearer
+tokens whose SHA-256 the vault seals, over a user-only local endpoint whose
+peer is identified on every connection: a Unix socket with peer-uid enforcement
+on Linux and macOS, an owner-only named pipe with a client-SID check on
+Windows. It serves the same capability adapter and the same stdio MCP profile,
+adds `daemon_auth` audit rows, and exposes no human operation and no raw
+secret. The boundary becomes the owner's account rather than the owner's
+presence at a prompt. While it runs,
+the control plane stays usable: a commit from the human CLI is re-read and
+re-verified by the resident session with the key it already holds, so new
+grants and rotated or revoked agent tokens take effect on the next call, and
+only a file that fails that verification locks the daemon.
+
+## SSH agent socket
+
+[ADR 0026](docs/adr/0026-ssh-agent-socket.md) gives that daemon one more
+handshake verb and `tremelay ssh-agent`, a relay that publishes an
+ssh-agent-protocol socket under the same endpoint custody. The relay holds no
+vault state. Inside the daemon, one conversation owns one ADR 0013 stream per
+active `ssh_userauth` grant: identities are merged, a session binding is
+offered to each grant that may pin a different host key, and any other message
+stops at the first stream that does not refuse it. No grant check, audit row or
+dependency changes. The signed message set is
+`publickey-hostbound-v00@openssh.com` plus, since the ADR 0013 amendment of
+2026-10-14, the ordinary `publickey` preimage whose session identifier is the
+one a verified non-forwarded binding for that grant's pinned host key put on
+the same connection ([V1 item 5b](V1.md)). Servers that do not implement the
+host-bound method, github.com among them, therefore work; clients that send no
+binding still get nothing.

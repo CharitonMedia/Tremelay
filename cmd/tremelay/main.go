@@ -43,7 +43,13 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 	case "audit":
 		return cmdAudit(args[1:], getenv, stdin, stdout, stderr)
 	case "mcp":
-		return cmdMCP(args[1:], stdin, stdout, stderr)
+		return cmdMCP(args[1:], getenv, stdin, stdout, stderr)
+	case "daemon":
+		return cmdDaemon(args[1:], getenv, stdin, stdout, stderr)
+	case "ssh-agent":
+		return cmdSSHAgent(args[1:], getenv, stdout, stderr)
+	case "lock":
+		return cmdLock(args[1:], getenv, stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, "unknown command")
 		return 2
@@ -66,11 +72,18 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay credential health --path PATH [--id ID]
   tremelay credential refresh --path PATH [--id ID]
   tremelay credential policy --path PATH [--min-length N] [--pattern-run N] [--freshness DURATION] [--reminder-lead DURATION] [--compromise-opt-in true|false]
-  tremelay agent create --path PATH --label LABEL
-  tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339 [--ssh-user USER --ssh-host-key HEX]
+  tremelay agent create --path PATH --label LABEL [--token-file PATH]
+  tremelay agent token issue --path PATH --agent ID --token-file PATH
+  tremelay agent token rotate --path PATH --agent ID --token-file PATH
+  tremelay agent token revoke --path PATH --agent ID
+  tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339 [--ssh-user USER --ssh-host-key HEX] [--method M ... --inject STYLE [--inject-name NAME]]
   tremelay grant revoke --path PATH --id ID
   tremelay capability list --path PATH --agent ID
   tremelay capability authorize --path PATH --agent ID --credential ID --operation OP --resource SCOPE
+  tremelay daemon --vault PATH [--idle-timeout 1h]
+  tremelay mcp --daemon --token-file PATH
+  tremelay ssh-agent --token-file PATH [--socket /absolute/path]
+  tremelay lock
   tremelay mcp serve --path PATH --agent ID --pinentry /absolute/helper [--pinentry-tty /absolute/tty] [--unlock-timeout 2m]
   tremelay audit verify --path PATH
   tremelay audit list --path PATH [--credential ID] [--agent ID] [--action ACTION] [--class CLASS] [--since RFC3339] [--until RFC3339] [--after SEQ] [--limit N]
@@ -80,6 +93,9 @@ Types: %s
 Grant operations: %s
 Passphrase: TREMELAY_PASSPHRASE, or a no-echo terminal prompt.
 change-passphrase requires no-echo terminal entry of old, new, and confirmation; it ignores the environment.
+daemon unlocks once in your terminal and then serves agents on a user-only endpoint until lock, idle timeout, or exit.
+mcp --daemon is the stdio command an MCP client launches; it authenticates with one agent token file and relays MCP only.
+ssh-agent publishes an SSH_AUTH_SOCK backed by that agent's ssh_userauth grants; the key stays in the daemon.
 mcp serve uses a trusted pinentry helper over private pipes; it ignores the passphrase environment and keeps stdout MCP-only.
 The passphrase is not accepted as an argument. credential get writes the raw secret to stdout.
 Health is advisory. Refresh runs only while the vault is unlocked; a locked or stopped process does not evaluate credentials.
@@ -109,10 +125,9 @@ func cmdVault(args []string, getenv func(string) string, stdin io.Reader, stdout
 		usage(stderr)
 		return 2
 	}
-	fs := flag.NewFlagSet("vault create", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("vault create")
 	path := fs.String("path", "", "vault file")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := parseHumanFlags(fs, vaultCreateUsage, stderr, args[1:]); err != nil {
 		return 2
 	}
 	if *path == "" || fs.NArg() != 0 {
@@ -170,13 +185,12 @@ func cmdCredential(args []string, getenv func(string) string, stdin io.Reader, s
 }
 
 func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential put", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential put")
 	path := fs.String("path", "", "vault file")
 	label := fs.String("label", "", "label")
 	typ := fs.String("type", "", "credential type")
 	secretFile := fs.String("secret-file", "", "file containing the secret")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialPutUsage, stderr, args); err != nil {
 		// --path is applied before a later bad flag. That is an attempted put.
 		// A bad flag before --path leaves the path empty and cannot name a vault.
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
@@ -213,11 +227,10 @@ func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 }
 
 func cmdGet(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential get", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential get")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialGetUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectGet(vault.ErrInvalid)
 		})
@@ -248,10 +261,9 @@ func cmdGet(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 }
 
 func cmdList(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential list", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential list")
 	path := fs.String("path", "", "vault file")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialListUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectList(vault.ErrInvalid)
 		})
@@ -297,13 +309,12 @@ func cmdList(args []string, getenv func(string) string, stdin io.Reader, stdout,
 }
 
 func cmdReplace(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential replace", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential replace")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
 	secretFile := fs.String("secret-file", "", "file containing the secret")
 	opt, times := lifecycleFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialReplaceUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectReplace(vault.ErrInvalid)
 		})
@@ -337,12 +348,11 @@ func cmdReplace(args []string, getenv func(string) string, stdin io.Reader, stdo
 }
 
 func cmdLifecycle(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential lifecycle", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential lifecycle")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
 	opt, times := lifecycleFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialLifecycleUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectLifecycle(vault.ErrInvalid)
 		})
@@ -369,11 +379,10 @@ func cmdLifecycle(args []string, getenv func(string) string, stdin io.Reader, st
 }
 
 func cmdHealth(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential health", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential health")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialHealthUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectHealth(vault.ErrInvalid)
 		})
@@ -406,11 +415,10 @@ func cmdHealth(args []string, getenv func(string) string, stdin io.Reader, stdou
 }
 
 func cmdRefresh(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential refresh", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential refresh")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialRefreshUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectRefresh(vault.ErrInvalid)
 		})
@@ -432,15 +440,14 @@ func cmdRefresh(args []string, getenv func(string) string, stdin io.Reader, stdo
 }
 
 func cmdPolicy(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential policy", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential policy")
 	path := fs.String("path", "", "vault file")
 	minLen := fs.Int("min-length", 0, "minimum password length")
 	run := fs.Int("pattern-run", 0, "predictable-run length")
 	fresh := fs.String("freshness", "", "assessment freshness")
 	lead := fs.String("reminder-lead", "", "reminder lead")
 	optIn := fs.String("compromise-opt-in", "", "true or false")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialPolicyUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectHealthPolicy(vault.ErrInvalid)
 		})
@@ -599,10 +606,9 @@ func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout
 }
 
 func cmdAuditVerify(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("audit verify", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("audit verify")
 	path := fs.String("path", "", "vault file")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, auditVerifyUsage, stderr, args); err != nil {
 		return 2
 	}
 	if *path == "" || fs.NArg() != 0 {
@@ -630,8 +636,7 @@ func cmdAuditVerify(args []string, getenv func(string) string, stdin io.Reader, 
 }
 
 func cmdAuditList(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("audit list", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("audit list")
 	path := fs.String("path", "", "vault file")
 	cred := fs.String("credential", "", "credential id")
 	agent := fs.String("agent", "", "agent id")
@@ -641,7 +646,7 @@ func cmdAuditList(args []string, getenv func(string) string, stdin io.Reader, st
 	until := fs.String("until", "", "inclusive end (RFC3339)")
 	after := fs.Uint64("after", 0, "return rows after this sequence")
 	limit := fs.Int("limit", 0, "page size")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, auditListUsage, stderr, args); err != nil {
 		return 2
 	}
 	if *path == "" || fs.NArg() != 0 {
@@ -688,12 +693,11 @@ func cmdAuditList(args []string, getenv func(string) string, stdin io.Reader, st
 }
 
 func cmdAuditGet(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("audit get", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("audit get")
 	path := fs.String("path", "", "vault file")
 	seq := fs.Uint64("seq", 0, "audit sequence")
 	hash := fs.String("hash", "", "expected row hash")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, auditGetUsage, stderr, args); err != nil {
 		return 2
 	}
 	if *path == "" || *seq == 0 || fs.NArg() != 0 {
@@ -711,8 +715,7 @@ func cmdAuditGet(args []string, getenv func(string) string, stdin io.Reader, std
 }
 
 // denyKnownVault records a metadata-free denial when parsing fails after a
-// vault path is known. An empty path cannot name a vault; the flag package
-// has already described that error.
+// vault path is known. An empty path cannot name a vault.
 func denyKnownVault(path string, getenv func(string) string, stdin io.Reader, stderr io.Writer, deny func(*vault.Session) error) int {
 	if path == "" {
 		return 2
@@ -756,15 +759,18 @@ func withSession(path string, getenv func(string) string, stdin io.Reader, stder
 }
 
 func cmdAgent(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 1 && args[0] == "token" {
+		return cmdAgentToken(args[1], args[2:], getenv, stdin, stdout, stderr)
+	}
 	if len(args) == 0 || args[0] != "create" {
 		fmt.Fprintln(stderr, "unknown command")
 		return 2
 	}
-	fs := flag.NewFlagSet("agent create", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("agent create")
 	path := fs.String("path", "", "vault file")
 	label := fs.String("label", "", "agent label")
-	if err := fs.Parse(args[1:]); err != nil {
+	tokenFile := fs.String("token-file", "", "write this agent's daemon token here")
+	if err := parseHumanFlags(fs, agentCreateUsage, stderr, args[1:]); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectAgentCreate(vault.ErrInvalid)
 		})
@@ -781,7 +787,104 @@ func cmdAgent(args []string, getenv func(string) string, stdin io.Reader, stdout
 		if err != nil {
 			return err
 		}
-		_, err = fmt.Fprintln(stdout, agent.ID)
+		// The vault keeps only SHA-256 of this token. Without --token-file the
+		// only copy is wiped here, so the agent cannot reach a daemon: an
+		// agent gains that authority only when its owner asks for the file.
+		defer vault.Wipe(agent.Token)
+		if _, err := fmt.Fprintln(stdout, agent.ID); err != nil {
+			return err
+		}
+		if *tokenFile == "" {
+			return nil
+		}
+		if err := writeAgentToken(*tokenFile, agent.Token); err != nil {
+			return err
+		}
+		// The path, never the token. Nothing echoes the token bytes.
+		_, err = fmt.Fprintln(stdout, *tokenFile)
+		return err
+	})
+}
+
+// cmdAgentToken is agent token custody: give an agent that has none a token,
+// replace the one it has, or take it away. None of them touches the agent's
+// id, state or grants, so a client's MCP configuration never changes and an
+// agent never has to be recreated to get a working token.
+func cmdAgentToken(verb string, args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	var reject func(*vault.Session) error
+	switch verb {
+	case "issue":
+		reject = func(s *vault.Session) error { return s.RejectAgentTokenIssue(vault.ErrInvalid) }
+	case "rotate":
+		reject = func(s *vault.Session) error { return s.RejectAgentTokenRotate(vault.ErrInvalid) }
+	case "revoke":
+		reject = func(s *vault.Session) error { return s.RejectAgentTokenRevoke(vault.ErrInvalid) }
+	default:
+		fmt.Fprintln(stderr, "unknown command")
+		return 2
+	}
+	fs := newHumanFlagSet("agent token " + verb)
+	path := fs.String("path", "", "vault file")
+	agent := fs.String("agent", "", "agent id")
+	tokenFile := fs.String("token-file", "", "write this agent's daemon token here")
+	usageLine := agentTokenIssueUsage
+	switch verb {
+	case "rotate":
+		usageLine = agentTokenRotateUsage
+	case "revoke":
+		usageLine = agentTokenRevokeUsage
+	}
+	if err := parseHumanFlags(fs, usageLine, stderr, args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, reject)
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		// revoke writes no file and must not be handed one, so a mistyped
+		// command cannot leave a token on disk that authorizes nothing.
+		if fs.NArg() != 0 || *agent == "" || (*tokenFile == "") != (verb == "revoke") {
+			return reject(session)
+		}
+		if verb == "revoke" {
+			if err := session.RevokeAgentToken(*agent); err != nil {
+				return err
+			}
+			_, err := fmt.Fprintln(stdout, *agent)
+			return err
+		}
+		// rotate is the only verb that replaces a file, because the point of
+		// it is that a client's configured path never changes. What it
+		// replaces must already be a token file this tool could read: an
+		// existing path that is anything else is a mistyped argument. issue
+		// writes a path that is new, like agent create, so it cannot retire
+		// another agent's working token file. Either refusal happens before
+		// the vault commits.
+		if verb == "issue" {
+			if _, err := os.Lstat(*tokenFile); err == nil {
+				return reject(session)
+			}
+		} else if stale, err := readAgentToken(*tokenFile); err == nil {
+			vault.Wipe(stale)
+		} else if _, statErr := os.Lstat(*tokenFile); statErr == nil {
+			return reject(session)
+		}
+		mint, write := session.IssueAgentToken, writeAgentToken
+		if verb == "rotate" {
+			mint, write = session.RotateAgentToken, replaceAgentToken
+		}
+		minted, err := mint(*agent)
+		if err != nil {
+			return err
+		}
+		// The vault keeps only the digest, so this is the only copy. It is
+		// written to the file or wiped; it is never printed.
+		defer vault.Wipe(minted.Token)
+		if err := write(*tokenFile, minted.Token); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(stdout, *tokenFile)
 		return err
 	})
 }
@@ -803,8 +906,7 @@ func cmdGrant(args []string, getenv func(string) string, stdin io.Reader, stdout
 }
 
 func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("grant create", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("grant create")
 	path := fs.String("path", "", "vault file")
 	agent := fs.String("agent", "", "agent id")
 	cred := fs.String("credential", "", "credential id")
@@ -813,9 +915,13 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 	expires := fs.String("expires", "", "expiration time (RFC3339)")
 	sshUser := fs.String("ssh-user", "", "exact SSH username for ssh_userauth")
 	sshHost := fs.String("ssh-host-key", "", "hex ssh-ed25519 host public key blob for ssh_userauth")
+	inject := fs.String("inject", "", "http_broker credential placement: "+strings.Join(vault.InjectionStyles(), ", "))
+	injectName := fs.String("inject-name", "", "http_broker header name, basic user, or query parameter name")
 	var ops opsFlag
 	fs.Var(&ops, "operation", "permitted operation")
-	if err := fs.Parse(args); err != nil {
+	var methods opsFlag
+	fs.Var(&methods, "method", "http_broker allowed method (repeatable)")
+	if err := parseHumanFlags(fs, grantCreateUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectGrantCreate(vault.ErrInvalid)
 		})
@@ -849,6 +955,9 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 			ExpiresAt:       exp.UTC(),
 			SSHUsername:     *sshUser,
 			SSHHostKey:      hostKey,
+			HTTPMethods:     methods,
+			HTTPInject:      *inject,
+			HTTPInjectName:  *injectName,
 		})
 		if err != nil {
 			return err
@@ -859,11 +968,10 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 }
 
 func cmdGrantRevoke(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("grant revoke", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("grant revoke")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "grant id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, grantRevokeUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectGrantRevoke(vault.ErrInvalid)
 		})
@@ -901,11 +1009,10 @@ func cmdCapability(args []string, getenv func(string) string, stdin io.Reader, s
 }
 
 func cmdCapabilityList(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("capability list", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("capability list")
 	path := fs.String("path", "", "vault file")
 	agentID := fs.String("agent", "", "agent id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, capabilityListUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectCapabilityList(vault.ErrInvalid)
 		})
@@ -952,14 +1059,13 @@ func cmdCapabilityList(args []string, getenv func(string) string, stdin io.Reade
 }
 
 func cmdCapabilityAuthorize(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("capability authorize", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("capability authorize")
 	path := fs.String("path", "", "vault file")
 	agentID := fs.String("agent", "", "agent id")
 	cred := fs.String("credential", "", "credential id")
 	operation := fs.String("operation", "", "operation")
 	resource := fs.String("resource", "", "resource scope")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, capabilityAuthorizeUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectAuthorize(vault.ErrInvalid)
 		})

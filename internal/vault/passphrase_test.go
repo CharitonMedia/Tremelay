@@ -32,8 +32,8 @@ func TestChangePassphraseRewrapAndSnapshot(t *testing.T) {
 	if err := s.ChangePassphrase(oldPass, newPass); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(s.dek, dek) {
-		t.Fatal("passphrase change replaced DEK")
+	if bytes.Equal(s.dek, dek) {
+		t.Fatal("passphrase change did not rotate DEK")
 	}
 	if bytes.Equal(s.header.KDF.Salt, header.KDF.Salt) || bytes.Equal(s.header.WrapNonce, header.WrapNonce) || bytes.Equal(s.header.WrappedDEK, header.WrappedDEK) {
 		t.Fatal("wrap was not refreshed")
@@ -161,20 +161,15 @@ func TestChangePassphraseStaleSession(t *testing.T) {
 			if err := current.ChangePassphrase(oldPass, newPass); err != nil {
 				t.Fatal(err)
 			}
-			before := readAll(t, path)
+			// Since V1.md item 3g the session that lost this race locks: it
+			// never adopts the rotated DEK. The old passphrase is never
+			// revived and no write puts the old wrap back on the file.
 			if rewrap {
-				err = stale.ChangePassphrase(oldPass, []byte(randHex(t, 24)))
-			} else {
-				_, err = stale.CreateAgent("stale")
-			}
-			if !errors.Is(err, ErrCorrupt) {
+				if err := stale.ChangePassphrase(oldPass, []byte(randHex(t, 24))); !errors.Is(err, ErrStale) {
+					t.Fatalf("stale rewrap: %v", err)
+				}
+			} else if _, err := stale.CreateAgent("stale"); !errors.Is(err, ErrStale) {
 				t.Fatalf("stale write: %v", err)
-			}
-			if !bytes.Equal(before, readAll(t, path)) {
-				t.Fatal("stale session overwrote wrap")
-			}
-			if err := stale.ChangePassphrase(oldPass, newPass); !errors.Is(err, ErrStale) {
-				t.Fatal(err)
 			}
 			if _, err := VerifyAudit(path, newPass); err != nil {
 				t.Fatal(err)

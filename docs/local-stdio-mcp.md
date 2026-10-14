@@ -4,10 +4,10 @@
 The human chooses the vault, agent, and trusted pinentry executable before any
 protocol request. The client gets three tools: `list_capabilities`,
 `describe_capability`, and `invoke_capability`. Only existing exact
-`local_artifact_attest`, `http_request`, and `github_issue_state` grants are available.
+`local_artifact_attest`, `http_request`, and `http_broker` grants are available.
 Credentials never leave the broker through MCP; HTTP carries them only to the
 authorized service. Network capabilities require single-user, single-operation,
-exact credential-ID grants. Shared vaults still expose only approved attestation.
+exact credential-ID grants.
 This does not provision grants or finish the broader M10 authentication work.
 See [ADR 0020](adr/0020-local-stdio-mcp.md) for process custody and
 [ADR 0021](adr/0021-mcp-credential-brokers.md) for credential-use capabilities.
@@ -79,14 +79,16 @@ SIGINT handling in [Pinentry 1.3.x](https://dev.gnupg.org/T7046.html), following
 
 ## Using a protected service
 
-Create an exact `http_request` grant for `METHOD https://host/path` or an exact
-`github_issue_state` grant for `GET https://api.github.com/repos/OWNER/REPO/issues/NUMBER`
-using the existing human control plane. The same agent may hold separate grants
-for both operations, but one never authorizes the other's result.
+Create an exact `http_request` grant for `METHOD https://host/path`, or an
+`http_broker` grant for `https://host/prefix` with a method set and an injection
+style, using the existing human control plane. The same agent may hold separate
+grants for both operations, but one never authorizes the other's result.
 
 1. Call `list_capabilities` and select the desired operation/resource.
 2. Optionally call `describe_capability` with its opaque `handle`.
-3. Call `invoke_capability` with only `{"handle":"RETURNED_HANDLE"}`.
+3. Call `invoke_capability` with `{"handle":"RETURNED_HANDLE"}` for
+   `http_request`, or with the handle plus `method`, `path` and optional
+   `query`, `headers` and `body_base64` for `http_broker`.
 
 The HTTP result is only `{"status_code":200}` (the actual allowed status varies).
 GitHub returns only `number`, `state`, `locked`, and `comments`. No headers or

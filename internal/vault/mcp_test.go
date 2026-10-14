@@ -87,17 +87,9 @@ func TestMCPOutputGuard(t *testing.T) {
 
 func TestMCPSyntheticDemo(t *testing.T) {
 	var logs bytes.Buffer
-	env := newSharedEnvLog(t, &logs)
-	spec := env.requestSpec(time.Hour, 30*time.Minute)
-	req, err := env.bob.RequestAccess(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	grant, err := env.alice.Approve(req.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	beforeReq, beforeGrant := len(env.s.requests), len(env.s.grants)
+	env := newAttestEnvLog(t, &logs)
+	grant := env.grant(t, time.Hour)
+	beforeGrant := len(env.s.grants)
 	sess := startMCP(t, bindCap(t, env.s, env.agent.ID))
 	if sess.cs.InitializeResult() == nil || sess.cs.InitializeResult().ProtocolVersion != mcpProtocolRevision {
 		t.Fatalf("negotiated %+v", sess.cs.InitializeResult())
@@ -112,7 +104,7 @@ func TestMCPSyntheticDemo(t *testing.T) {
 	}
 	names := map[string]bool{}
 	rawTools, _ := json.Marshal(listed.Tools)
-	if bytes.Contains(rawTools, []byte(spec.Resource)) || bytes.Contains(rawTools, []byte(toolRequest)) || bytes.Contains(rawTools, []byte(env.label)) {
+	if bytes.Contains(rawTools, []byte(env.resource)) || bytes.Contains(rawTools, []byte(toolRequest)) || bytes.Contains(rawTools, []byte(env.label)) {
 		t.Fatal("tool list exposed a grant or request_capability")
 	}
 	for _, tool := range listed.Tools {
@@ -132,12 +124,12 @@ func TestMCPSyntheticDemo(t *testing.T) {
 		t.Fatalf("catalog %+v", cat)
 	}
 	entry := entries[0].(map[string]any)
-	if entry["operation"] != OpLocalArtifactAttest || entry["resource"] != spec.Resource || entry["key_id"] != grant.KeyID || entry["status"] != GrantActive {
+	if entry["operation"] != OpLocalArtifactAttest || entry["resource"] != env.resource || entry["key_id"] != grant.KeyID || entry["status"] != GrantActive {
 		t.Fatalf("entry %+v", entry)
 	}
 	handle, _ := entry["handle"].(string)
 	described := toolObject(t, mustCall(t, sess, toolDescribe, map[string]any{"handle": handle}))
-	if described["handle"] != handle || described["resource"] != spec.Resource || described["status"] != GrantActive {
+	if described["handle"] != handle || described["resource"] != env.resource || described["status"] != GrantActive {
 		t.Fatalf("describe %+v", described)
 	}
 	payload := []byte("demo-artifact")
@@ -147,16 +139,16 @@ func TestMCPSyntheticDemo(t *testing.T) {
 	}))
 	sig := mustB64(t, invoked["signature"].(string))
 	pub := mustB64(t, invoked["public_key"].(string))
-	if invoked["domain"] != AttestDomain || invoked["purpose"] != AttestPurpose || invoked["resource"] != spec.Resource {
+	if invoked["domain"] != AttestDomain || invoked["purpose"] != AttestPurpose || invoked["resource"] != env.resource {
 		t.Fatalf("projection %+v", invoked)
 	}
-	if !VerifyLocalAttestation(pub, spec.Resource, payload, sig) {
+	if !VerifyLocalAttestation(pub, env.resource, payload, sig) {
 		t.Fatal("signature did not verify")
 	}
 	if _, err := sess.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolRequest, Arguments: map[string]any{}}); err == nil || strings.Contains(err.Error(), toolRequest) {
 		t.Fatalf("request_capability %v", err)
 	}
-	if len(env.s.requests) != beforeReq || len(env.s.grants) != beforeGrant {
+	if len(env.s.grants) != beforeGrant {
 		t.Fatal("request_capability created authority")
 	}
 	rawInv, _ := json.Marshal(invoked)
@@ -189,7 +181,7 @@ func TestMCPSyntheticDemo(t *testing.T) {
 }
 
 func TestMCPWireAdmission(t *testing.T) {
-	env := approvedShared(t)
+	env := grantedAttestEnv(t)
 	cap := bindCap(t, env.s, env.agent.ID)
 	raw := startRaw(t, cap)
 	list := rpcFrame(t, 1, "tools/list", map[string]any{"_meta": mcpMeta()})
@@ -271,13 +263,13 @@ func TestMCPWireAdmission(t *testing.T) {
 	ask := rpcFrame(t, 11, "tools/call", map[string]any{
 		"name": toolRequest, "arguments": map[string]any{}, "_meta": mcpMeta(),
 	})
-	nReq, nGrant := len(env.s.requests), len(env.s.grants)
+	nGrant := len(env.s.grants)
 	before = len(mcpAuditSnapshot(env.s))
 	got = raw.round(t, ask)
 	if !bytes.Contains(got, []byte("invalid params")) || bytes.Contains(got, []byte(toolRequest)) {
 		t.Fatalf("request_capability %s", got)
 	}
-	if len(env.s.requests) != nReq || len(env.s.grants) != nGrant || mcpAuditSnapshot(env.s)[len(mcpAuditSnapshot(env.s))-1].Action != actionAgentCap || len(mcpAuditSnapshot(env.s)) != before+1 {
+	if len(env.s.grants) != nGrant || mcpAuditSnapshot(env.s)[len(mcpAuditSnapshot(env.s))-1].Action != actionAgentCap || len(mcpAuditSnapshot(env.s)) != before+1 {
 		t.Fatal("request_capability mutated authority or skipped the denial")
 	}
 
@@ -353,9 +345,9 @@ func TestMCPWireAdmission(t *testing.T) {
 }
 
 func TestMCPCallbackSerialization(t *testing.T) {
-	env := newSharedEnv(t)
-	first := approveExact(t, env, env.agent.ID, env.resource)
-	second := approveExact(t, env, env.agent.ID, env.resource)
+	env := newAttestEnv(t)
+	first := grantExact(t, env, env.agent.ID, env.resource)
+	second := grantExact(t, env, env.agent.ID, env.resource)
 	bound := bindCap(t, env.s, env.agent.ID)
 	sess := startMCP(t, bound)
 	if n := len(entriesOf(t, mustCall(t, sess, toolList, map[string]any{}))); n != 2 {
@@ -368,7 +360,7 @@ func TestMCPCallbackSerialization(t *testing.T) {
 		if err := sess.ep.denyOverlap(true); err != nil {
 			t.Errorf("overlap %v", err)
 		}
-		return env.alice.RevokeGrant(second.ID)
+		return env.s.RevokeGrant(second.ID)
 	}
 	res, err := sess.cs.CallTool(t.Context(), &mcp.CallToolParams{
 		Name: toolInvoke,
@@ -406,13 +398,13 @@ func TestMCPCallbackSerialization(t *testing.T) {
 
 func TestMCPAuthority(t *testing.T) {
 	t.Run("foreign", func(t *testing.T) {
-		env := newSharedEnv(t)
-		other, err := env.alice.CreateAgent("worker-2")
+		env := newAttestEnv(t)
+		other, err := env.s.CreateAgent("worker-2")
 		if err != nil {
 			t.Fatal(err)
 		}
-		approveExact(t, env, env.agent.ID, env.resource)
-		approveExact(t, env, other.ID, "artifact-"+randHex(t, 8))
+		grantExact(t, env, env.agent.ID, env.resource)
+		grantExact(t, env, other.ID, "artifact-"+randHex(t, 8))
 		a := startMCP(t, bindCap(t, env.s, env.agent.ID))
 		b := startMCP(t, bindCap(t, env.s, other.ID))
 		ah := entriesOf(t, mustCall(t, a, toolList, map[string]any{}))
@@ -432,10 +424,10 @@ func TestMCPAuthority(t *testing.T) {
 		}
 	})
 	t.Run("revoked-expired-suspended", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		sess := startMCP(t, bindCap(t, env.s, env.agent.ID))
 		handle := entriesOf(t, mustCall(t, sess, toolList, map[string]any{}))[0]["handle"]
-		if err := env.alice.RevokeGrant(env.s.grants[len(env.s.grants)-1].ID); err != nil {
+		if err := env.s.RevokeGrant(env.s.grants[len(env.s.grants)-1].ID); err != nil {
 			t.Fatal(err)
 		}
 		revoked := mustCall(t, sess, toolInvoke, invokeArgs(handle, []byte("revoked")))
@@ -445,8 +437,8 @@ func TestMCPAuthority(t *testing.T) {
 		if code := toolObject(t, revoked)["code"]; code != capDeniedRevoked {
 			t.Fatal(code)
 		}
-		exp := newSharedEnv(t)
-		approveExact(t, exp, exp.agent.ID, exp.resource)
+		exp := newAttestEnv(t)
+		grantExact(t, exp, exp.agent.ID, exp.resource)
 		expSess := startMCP(t, bindCap(t, exp.s, exp.agent.ID))
 		expHandle := entriesOf(t, mustCall(t, expSess, toolList, map[string]any{}))[0]["handle"]
 		exp.s.clock = func() time.Time { return time.Now().Add(2 * time.Hour) }
@@ -456,7 +448,7 @@ func TestMCPAuthority(t *testing.T) {
 		if code := toolObject(t, mustCall(t, expSess, toolInvoke, invokeArgs(expHandle, []byte("expired"))))["code"]; code != capDeniedExpired {
 			t.Fatal(code)
 		}
-		sus := approvedShared(t)
+		sus := grantedAttestEnv(t)
 		susSess := startMCP(t, bindCap(t, sus.s, sus.agent.ID))
 		susHandle := entriesOf(t, mustCall(t, susSess, toolList, map[string]any{}))[0]["handle"]
 		for i := range sus.s.agents {
@@ -471,19 +463,9 @@ func TestMCPAuthority(t *testing.T) {
 			t.Fatalf("suspended %s", raw)
 		}
 	})
-	t.Run("membership-key-stale-locked", func(t *testing.T) {
-		mem := approvedShared(t)
-		memSess := startMCP(t, bindCap(t, mem.s, mem.agent.ID))
-		memHandle := entriesOf(t, mustCall(t, memSess, toolList, map[string]any{}))[0]["handle"]
-		if err := mem.alice.Remove(mem.bobID); err != nil {
-			t.Fatal(err)
-		}
-		if code := toolObject(t, mustCall(t, memSess, toolInvoke, invokeArgs(memHandle, []byte("member"))))["code"]; code != capDeniedRevoked {
-			t.Fatal(code)
-		}
-
-		fresh := newSharedEnv(t)
-		old := approveExact(t, fresh, fresh.agent.ID, fresh.resource)
+	t.Run("key-stale-locked", func(t *testing.T) {
+		fresh := newAttestEnv(t)
+		old := grantExact(t, fresh, fresh.agent.ID, fresh.resource)
 		_, priv2, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			t.Fatal(err)
@@ -492,10 +474,10 @@ func TestMCPAuthority(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fresh.alice.Replace(fresh.cred.ID, der2, LifecycleOptions{}); err != nil {
+		if _, err := fresh.s.Replace(fresh.cred.ID, der2, LifecycleOptions{}); err != nil {
 			t.Fatal(err)
 		}
-		next := approveExact(t, fresh, fresh.agent.ID, fresh.resource)
+		next := grantExact(t, fresh, fresh.agent.ID, fresh.resource)
 		bound := startMCP(t, bindCap(t, fresh.s, fresh.agent.ID))
 		var oldHandle, newHandle string
 		for _, entry := range entriesOf(t, mustCall(t, bound, toolList, map[string]any{})) {
@@ -519,33 +501,47 @@ func TestMCPAuthority(t *testing.T) {
 			t.Fatal("new handle used the old key")
 		}
 
-		stale := approvedShared(t)
-		staleSess := startMCP(t, bindCap(t, stale.s, stale.agent.ID))
-		staleHandle := entriesOf(t, mustCall(t, staleSess, toolList, map[string]any{}))[0]["handle"]
-		other, err := Unlock(stale.path, stale.pass, nil)
+		// A second session's commit moves the durable audit tip past the view
+		// this bound capability holds. Since V1.md item 3d the session adopts
+		// that commit under Unlock's verification instead of refusing every
+		// later call, so a handle whose authority did not change keeps
+		// working, and a withdrawal has to be refused on the grant's own
+		// merits rather than by staleness.
+		adopted := newAttestEnv(t)
+		adoptedGrant := adopted.grant(t, time.Hour)
+		adoptedSess := startMCP(t, bindCap(t, adopted.s, adopted.agent.ID))
+		adoptedHandle := entriesOf(t, mustCall(t, adoptedSess, toolList, map[string]any{}))[0]["handle"]
+		other, err := Unlock(adopted.path, adopted.pass, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(other.Lock)
-		bob2, err := other.BindHuman(stale.bobID)
-		if err != nil {
+		if _, err := other.CreateAgent("worker-2"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := bob2.RequestAccess(stale.requestSpec(time.Hour, 10*time.Minute)); err != nil {
+		carried := mustCall(t, adoptedSess, toolInvoke, invokeArgs(adoptedHandle, []byte("adopted-artifact")))
+		if carried.IsError || toolObject(t, carried)["signature"] == nil {
+			t.Fatalf("an unrelated commit broke an unchanged handle: %+v", carried)
+		}
+		if err := other.RevokeGrant(adoptedGrant.ID); err != nil {
 			t.Fatal(err)
 		}
-		before := len(mcpAuditSnapshot(stale.s))
-		res, err := staleSess.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolInvoke, Arguments: invokeArgs(staleHandle, []byte("stale-artifact"))})
-		if err == nil || (res != nil && !res.IsError) || strings.Contains(err.Error(), "stale-artifact") || len(mcpAuditSnapshot(stale.s)) != before {
-			t.Fatalf("stale %v %+v rows %d", err, res, len(mcpAuditSnapshot(stale.s))-before)
+		before := len(mcpAuditSnapshot(adopted.s))
+		withdrawn := mustCall(t, adoptedSess, toolInvoke, invokeArgs(adoptedHandle, []byte("withdrawn-artifact")))
+		raw, _ := json.Marshal(toolObject(t, withdrawn))
+		if !withdrawn.IsError || toolObject(t, withdrawn)["code"] != capDeniedRevoked || bytes.Contains(raw, []byte("signature")) {
+			t.Fatalf("a grant revoked by another session still invoked: %s", raw)
+		}
+		if len(mcpAuditSnapshot(adopted.s)) == before {
+			t.Fatal("the withdrawn-authority refusal was not audited")
 		}
 
-		locked := approvedShared(t)
+		locked := grantedAttestEnv(t)
 		lockedSess := startMCP(t, bindCap(t, locked.s, locked.agent.ID))
 		lockedHandle := entriesOf(t, mustCall(t, lockedSess, toolList, map[string]any{}))[0]["handle"]
 		locked.s.Lock()
-		res, err = lockedSess.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolList, Arguments: map[string]any{}})
-		if err == nil || strings.Contains(err.Error(), lockedHandle.(string)) {
+		if _, err := lockedSess.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolList, Arguments: map[string]any{}}); err == nil ||
+			strings.Contains(err.Error(), lockedHandle.(string)) {
 			t.Fatalf("locked %v", err)
 		}
 	})
@@ -798,7 +794,7 @@ func signatureFrom(t *testing.T, frame []byte) []byte {
 
 func TestMCPReviewFixes(t *testing.T) {
 	t.Run("partial-invoke", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 		frame := rpcFrame(t, 4, "tools/call", map[string]any{
 			"name":      toolInvoke,
@@ -816,7 +812,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		assertSparse(t, env.s, before, actionAgentCap)
 	})
 	t.Run("partial-unparsed", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 		before := len(mcpAuditSnapshot(env.s))
 		if _, err := raw.w.Write([]byte("{")); err != nil {
@@ -829,7 +825,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		assertSparse(t, env.s, before, actionAgentCap)
 	})
 	t.Run("trailing-space", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 		handle := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
 		frame := append(rpcFrame(t, 5, "tools/call", map[string]any{
@@ -848,7 +844,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		assertSparse(t, env.s, before, actionAgentCap)
 	})
 	t.Run("recognized-invoke", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 		meta := string(mustJSON(t, mcpMeta()))
 		outer := []byte(`{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"invoke_capability","extra":true,"_meta":` + meta + `}}`)
@@ -867,7 +863,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		assertSparse(t, env.s, before, actionAgentCap)
 	})
 	t.Run("numeric-id", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 		meta := string(mustJSON(t, mcpMeta()))
 		unsafe := []byte(`{"jsonrpc":"2.0","id":9007199254740993,"method":"tools/list","params":{"_meta":` + meta + `}}`)
@@ -882,7 +878,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		}
 	})
 	t.Run("admission-held", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
 		if err != nil {
 			t.Fatal(err)
@@ -946,7 +942,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		}
 	})
 	t.Run("pre-handler-once", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
 		if err != nil {
 			t.Fatal(err)
@@ -994,7 +990,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		}
 	})
 	t.Run("close-unblocks", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
 		if err != nil {
 			t.Fatal(err)
@@ -1030,7 +1026,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		}
 	})
 	t.Run("notification-drop", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		raw := startRaw(t, bindCap(t, env.s, env.agent.ID))
 		before := len(mcpAuditSnapshot(env.s))
 		note := []byte("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
@@ -1061,7 +1057,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		}
 	})
 	t.Run("pre-handler-close", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
 		if err != nil {
 			t.Fatal(err)
@@ -1116,7 +1112,7 @@ func TestMCPReviewFixes(t *testing.T) {
 		assertSparse(t, env.s, before, actionAgentCap)
 	})
 	t.Run("audit-fault", func(t *testing.T) {
-		env := approvedShared(t)
+		env := grantedAttestEnv(t)
 		ep, err := BindMCPEndpoint(bindCap(t, env.s, env.agent.ID))
 		if err != nil {
 			t.Fatal(err)
@@ -1167,7 +1163,7 @@ func TestMCPReviewFixes(t *testing.T) {
 			{"audit-failure", lifecycleInvoke(t, 2), actionAgentCap, true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				env := approvedShared(t)
+				env := grantedAttestEnv(t)
 				ep := lifecycleEndpoint(t, bindCap(t, env.s, env.agent.ID))
 				var handled bool
 				ep.server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {

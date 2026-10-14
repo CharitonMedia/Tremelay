@@ -362,7 +362,7 @@ func TestMCPSSHResponseAndStateBounds(t *testing.T) {
 	h := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	for _, p := range []string{"Cw", "Cw==\n", "Cw== "} {
 		raw, _ := json.Marshal(map[string]any{"handle": h, "payload": p})
-		if _, _, err := toolInvokeArgs(raw); err == nil {
+		if _, _, _, err := toolInvokeArgs(raw); err == nil {
 			t.Fatal("noncanonical SSH payload accepted")
 		}
 	}
@@ -387,11 +387,14 @@ func TestMCPSSHDiscoveryRestrictions(t *testing.T) {
 			t.Fatal("noncanonical SSH grant discovered")
 		}
 	}
-	shared := newSharedEnv(t)
-	grant.AgentID = shared.agent.ID
-	grant.CredentialID = shared.cred.ID
-	if shared.s.capGrantSupported(grant) {
-		t.Fatal("shared SSH authority added")
+	absent, err := newID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := grant
+	foreign.CredentialID = absent
+	if env.session.capGrantSupported(foreign) {
+		t.Fatal("SSH grant for a credential this vault does not hold was discovered")
 	}
 }
 

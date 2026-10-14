@@ -1,6 +1,6 @@
 # ADR 0009: Claude checkpoint assessment through workload identity
 
-Status: Proposed; installation and activation remain separate
+Status: Superseded (removed in v1 cut; see tag pre-v1-cut)
 
 ## Context
 

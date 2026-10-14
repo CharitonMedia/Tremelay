@@ -227,14 +227,17 @@ func TestNoGetSecretMethod(t *testing.T) {
 	if _, ok := sessionType.MethodByName("BrokerHTTP"); ok {
 		t.Fatal("human session exports the broker")
 	}
-	if _, ok := sessionType.MethodByName("GitHubIssueState"); ok {
-		t.Fatal("human session exports the github issue read")
+	if _, ok := sessionType.MethodByName("BrokerRequest"); ok {
+		t.Fatal("human session exports the prefix-scoped broker")
 	}
 	if _, ok := sessionType.MethodByName("LocalAttest"); ok {
 		t.Fatal("human session exports local attestation")
 	}
 	if _, ok := sessionType.MethodByName("SSHUserAuth"); ok {
 		t.Fatal("human session exports the SSH userauth stream")
+	}
+	if _, ok := sessionType.MethodByName("SSHAgent"); ok {
+		t.Fatal("human session exports the SSH agent conversation")
 	}
 	for _, typ := range []reflect.Type{sessionType, reflect.TypeOf(&AgentPrincipal{})} {
 		for i := 0; i < typ.NumMethod(); i++ {
@@ -245,7 +248,7 @@ func TestNoGetSecretMethod(t *testing.T) {
 		}
 	}
 	typ := reflect.TypeOf(&AgentPrincipal{})
-	if typ.NumMethod() != 6 {
+	if typ.NumMethod() != 7 {
 		t.Fatalf("agent method count %d", typ.NumMethod())
 	}
 	for i := 0; i < typ.NumMethod(); i++ {
@@ -291,36 +294,37 @@ func TestNoGetSecretMethod(t *testing.T) {
 			if field.Name != "StatusCode" || field.Type.Kind() != reflect.Int {
 				t.Fatalf("broker response field %s", field.Name)
 			}
-		case "GitHubIssueState":
+		case "BrokerRequest":
 			if m.Type.NumIn() != 2 || m.Type.NumOut() != 2 {
-				t.Fatalf("GitHubIssueState signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
+				t.Fatalf("BrokerRequest signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
 			}
-			ghReq := m.Type.In(1)
-			if ghReq != reflect.TypeOf(GitHubIssueRequest{}) || ghReq.NumField() != 4 {
-				t.Fatalf("github request %s", ghReq)
+			req := m.Type.In(1)
+			if req != reflect.TypeOf(HTTPRequest{}) || req.NumField() != 7 {
+				t.Fatalf("broker request %s", req)
 			}
-			for j := 0; j < ghReq.NumField(); j++ {
-				f := ghReq.Field(j)
-				if f.Type.Kind() != reflect.String {
-					t.Fatal(f.Name)
+			// The request cannot name a credential value, an authorization
+			// header, a redirect policy, or a destination outside the grant.
+			wantReq := map[string]reflect.Kind{
+				"CredentialID": reflect.String, "Origin": reflect.String, "Method": reflect.String,
+				"Path": reflect.String, "Query": reflect.String, "Headers": reflect.Map, "Body": reflect.Slice,
+			}
+			for j := 0; j < req.NumField(); j++ {
+				f := req.Field(j)
+				if wantReq[f.Name] != f.Type.Kind() {
+					t.Fatalf("broker request field %s", f.Name)
 				}
-				switch f.Name {
-				case "CredentialID", "Owner", "Repository", "Number":
-				default:
-					t.Fatal(f.Name)
-				}
 			}
-			ghResp := m.Type.Out(0)
-			if ghResp != reflect.TypeOf(GitHubIssueState{}) || ghResp.NumField() != 4 {
-				t.Fatalf("github response %s", ghResp)
+			resp := m.Type.Out(0)
+			if resp != reflect.TypeOf(HTTPResponse{}) || resp.NumField() != 4 {
+				t.Fatalf("broker response %s", resp)
 			}
-			want := map[string]reflect.Kind{
-				"Number": reflect.Int64, "State": reflect.String, "Locked": reflect.Bool, "Comments": reflect.Int64,
+			wantResp := map[string]reflect.Kind{
+				"StatusCode": reflect.Int, "Headers": reflect.Map, "Body": reflect.Slice, "Truncated": reflect.Bool,
 			}
-			for j := 0; j < ghResp.NumField(); j++ {
-				f := ghResp.Field(j)
-				if want[f.Name] != f.Type.Kind() {
-					t.Fatalf("github field %s", f.Name)
+			for j := 0; j < resp.NumField(); j++ {
+				f := resp.Field(j)
+				if wantResp[f.Name] != f.Type.Kind() {
+					t.Fatalf("broker response field %s", f.Name)
 				}
 			}
 		case "LocalAttest":
@@ -379,6 +383,13 @@ func TestNoGetSecretMethod(t *testing.T) {
 			if m.Type.Out(0) != reflect.TypeOf(&SSHUserAuth{}) {
 				t.Fatal(m.Type.Out(0))
 			}
+		case "SSHAgent":
+			if m.Type.NumIn() != 1 || m.Type.NumOut() != 2 {
+				t.Fatalf("SSHAgent signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
+			}
+			if m.Type.Out(0) != reflect.TypeOf(&SSHAgent{}) {
+				t.Fatal(m.Type.Out(0))
+			}
 		default:
 			t.Fatal(m.Name)
 		}
@@ -395,18 +406,19 @@ func TestNoGetSecretMethod(t *testing.T) {
 			t.Fatal("AgentPrincipal holds *Session")
 		}
 	}
-	stream := reflect.TypeOf(&SSHUserAuth{})
-	for i := 0; i < stream.NumMethod(); i++ {
-		name := stream.Method(i).Name
-		switch name {
-		case "Serve", "Close":
-		default:
-			t.Fatal(name)
+	for _, stream := range []reflect.Type{reflect.TypeOf(&SSHUserAuth{}), reflect.TypeOf(&SSHAgent{})} {
+		for i := 0; i < stream.NumMethod(); i++ {
+			name := stream.Method(i).Name
+			switch name {
+			case "Serve", "Close":
+			default:
+				t.Fatal(name)
+			}
 		}
-	}
-	for i := 0; i < stream.Elem().NumField(); i++ {
-		if stream.Elem().Field(i).Type == reflect.TypeOf(&Session{}) {
-			t.Fatal("SSHUserAuth holds *Session")
+		for i := 0; i < stream.Elem().NumField(); i++ {
+			if stream.Elem().Field(i).Type == reflect.TypeOf(&Session{}) {
+				t.Fatalf("%s holds *Session", stream)
+			}
 		}
 	}
 }

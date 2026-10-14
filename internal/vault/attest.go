@@ -11,7 +11,7 @@ import (
 
 const (
 	// OpLocalArtifactAttest authorizes one local Ed25519 attestation.
-	// It does not authorize BrokerHTTP, GitHubIssueState, or the sign placeholder.
+	// It does not authorize BrokerHTTP, BrokerRequest, or the sign placeholder.
 	OpLocalArtifactAttest = "local_artifact_attest"
 
 	// CredTypeEd25519 is the only credential type this operation will sign with.
@@ -231,8 +231,8 @@ func (s *Session) releaseAttestation(partial auditEvent, priv ed25519.PrivateKey
 			return LocalAttestation{}, ErrSignFailed
 		}
 	}
-	// The callback, or another session, may have replaced the key, revoked the
-	// grant, or removed a member. Recheck this grant and this key. Do not
+	// The callback, or another session, may have replaced the key or revoked
+	// the grant. Recheck this grant and this key. Do not
 	// retarget onto a grant that appeared during the callback.
 	if err := s.attestStillBound(partial, priv, boundGen, resource); err != nil {
 		wipe(priv)
@@ -280,14 +280,11 @@ func (s *Session) releaseAttestation(partial auditEvent, priv ed25519.PrivateKey
 // still the credential that was authorized. A generation change, lifecycle
 // change, or different public key is a failure. Another grant is not selected.
 func (s *Session) attestStillBound(partial auditEvent, priv ed25519.PrivateKey, gen uint64, resource string) error {
-	if err := s.requireCurrent(); err != nil {
+	if err := s.adoptLocked(); err != nil {
 		return err
 	}
 	if !s.agentActive(partial.AgentID) {
 		return ErrDeniedAgent
-	}
-	if err := s.sharedGrantLive(partial.GrantID); err != nil {
-		return err
 	}
 	g, ok := s.grantByID(partial.GrantID)
 	if !ok || g.RevokedAt != nil {
@@ -386,7 +383,7 @@ func (s *Session) matchAttestKey(partial auditEvent) (ed25519.PrivateKey, auditE
 // retargetAttestGrant moves an allowed decision onto the grant bound to pub.
 // An empty match leaves partial unchanged.
 func (s *Session) retargetAttestGrant(partial auditEvent, resource string, pub ed25519.PublicKey) (auditEvent, error) {
-	matched := grantsForAttestKey(s.decisionGrants(), partial.AgentID, partial.CredID, resource, hex.EncodeToString(pub))
+	matched := grantsForAttestKey(s.grants, partial.AgentID, partial.CredID, resource, hex.EncodeToString(pub))
 	if len(matched) == 0 {
 		return partial, nil
 	}

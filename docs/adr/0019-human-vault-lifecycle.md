@@ -31,11 +31,12 @@ clean cancellations; a restore error fails closed.
 
 The host-only `Session.ChangePassphrase(old, new)` verifies both lengths (the
 existing 8–1024 byte bound), rejects an unchanged value, and reauthenticates the
-old value against the session wrap. It uses the existing Argon2id production
-parameters with a fresh random salt, and standard AES-256-GCM with a fresh nonce,
-to rewrap the existing DEK. No new recovery authority or cryptographic primitive
-is introduced. This does not claim strength or known-compromise checking for the
-vault passphrase beyond the existing length check.
+old value against the session wrap. It generates a fresh DEK, re-encrypts every
+credential under it, and uses the existing Argon2id production parameters with a
+fresh random salt and standard AES-256-GCM with a fresh nonce to wrap the new
+DEK. No new recovery authority or cryptographic primitive is introduced. This
+does not claim strength or known-compromise checking for the vault passphrase
+beyond the existing length check.
 
 The existing encrypted-document transaction writes the new KDF/wrap fields,
 resealed document, authenticated audit head, and fixed version-1
@@ -49,11 +50,13 @@ miss error and subsequent `ErrStale` behavior are retained.
 
 This operation is available on the trusted host's `Session`, including a shared
 vault, and is not exposed on `AgentPrincipal`, `AgentCapability`, MCP, or
-`HumanPrincipal`. It does not change credentials, grants, membership, or the DEK.
-A process already holding the DEK still knows it; changing the passphrase cannot
-recall that knowledge or stop a compromised host. Stop other instances first.
-Copies and snapshots retain their original passphrase. This is neither recovery
-nor a replacement for rotating exposed credentials or keys.
+`HumanPrincipal`. Grants and membership are unchanged; credential plaintext is
+preserved but re-sealed under the new DEK. An old snapshot plus
+its original passphrase and wrapped DEK cannot decrypt the current vault.
+Changing the passphrase cannot recall a DEK another process already discarded or
+stop a compromised host. Copies and snapshots retain their original passphrase
+and DEK. This is neither recovery nor a replacement for rotating exposed
+credentials or keys.
 
 ### Backup and restore CLI
 
@@ -100,10 +103,13 @@ transaction and cryptography is the smallest change satisfying atomic custody.
 
 ## Verification
 
-`TestChangePassphrase*` covers unchanged DEK, fresh salt/nonce, old/new authority,
+`TestChangePassphrase*` covers DEK rotation, fresh salt/nonce, old/new authority,
 credential retention, ordinary-write retention of the new wrap, original snapshot
-passphrase, invalid/wrong input, transaction rollback, stale sessions, and synthetic
-sentinel absence. `TestCLIChangePassphrase*` covers prompt order, confirmation,
+passphrase, invalid/wrong input, transaction rollback, stale sessions, crash
+recovery at each commit step, pre-change authority failing on post-change
+ciphertext, a resident session locking on rotation (item 3g), and synthetic sentinel
+absence.
+`TestCLIChangePassphrase*` covers prompt order, confirmation,
 cancellation, buffer wiping, terminal-only entry and fixed argument errors.
 `TestCLIBackup*` and `TestCLIRestore*` exercise CLI checkpoint and engine boundaries.
 Existing backup fault tests continue covering publication/rollback failures.
@@ -118,3 +124,71 @@ lifecycle commands and checks the committed-outcome warning and exit status.
 These process/PTY tests are Linux-only; Windows/macOS terminal and signal
 behavior has not been directly exercised. Shared state retention is source-
 reviewed; the new rewrap fixtures are single-user.
+
+## Amendment 2026-10-14: passphrase change rotates the DEK (V1.md item 3e)
+
+Status stays Accepted pending owner veto.
+
+`vault change-passphrase` now generates a fresh DEK and re-encrypts every
+stored credential under it in one SQLite transaction with the new passphrase
+wrap and the fixed `vault_passphrase_change / allowed` audit row. Crash or
+injected failure before commit leaves the prior wrap, DEK, and ciphertext;
+after commit the vault unlocks only with the new passphrase. A long-running daemon session publishes an ephemeral X25519 public key through
+the audited commit path when it unlocks; the matching private key lives only
+in that process until lock or exit. The reload public key is stored inside the
+encrypted credential document (authenticated by the DEK), not in a trusted
+plaintext column; a same-uid writer may still overwrite the legacy
+`dek_reload_pubkey` column, but `change-passphrase` and reload never read it.
+When a reload public key is present in the authenticated document,
+`change-passphrase` may leave a one-time `dek_handoff` blob: an inner
+AES-256-GCM seal of the new DEK under the **previous** DEK with AAD binding
+the vault id and the change commit's audit head and sequence, wrapped in an
+outer `nacl/box` anonymous seal to the reload public key
+(`inner nonce||inner ciphertext`). The outer box alone does not prove rotation
+authority; the inner layer requires the old DEK, so a same-uid writer cannot
+forge a handoff with an attacker-chosen DEK using only the public key. The
+handoff is not readable from an old backup and passphrase without the daemon's
+ephemeral private key. A resident session that still holds the reload key pair
+opens the outer box, opens the inner under its current DEK and binding,
+adopts the new DEK, and continues the existing verification path; any failure
+retires the session. Ordinary writes clear the handoff; if it is cleared before
+the daemon reloads, the session fails closed.
+
+**Known ceiling (review 2026-10-14, owner decision pending).** Someone who
+holds the pre-rotation passphrase (for example with an old backup) and can
+write the vault file as the same user can still *substitute* a chain-compatible
+document: re-seal the plaintext they already know under a DEK they choose and
+wrap it under a passphrase they choose, and, while a handoff is pending, forge
+the inner layer (it is keyed by the old DEK they hold) so a resident daemon
+adopts that document. They recover no credential added or replaced after their
+copy, which is what this item guarantees; they can lock the owner out and make
+the file and a resident daemon serve state they wrote. This is the same class
+as ADR 0003's unauthenticated tip: the wrap and document are not bound to
+anything the old-passphrase holder lacks. Closing the daemon half means not
+adopting rotations (the daemon locks on a passphrase change); closing the file
+half needs an external or keyed tip. Both are product decisions for the owner.
+
+## Amendment 2026-10-14: the daemon locks instead of adopting (V1.md item 3g)
+
+Owner decision N8: option (b) plus (a). The resident handoff described above is
+removed. A daemon that sees a passphrase change zeroises, records a
+`vault_unlock / denied` row and exits; the human unlocks again with the new
+passphrase (ADR 0024, 3g amendment). `change-passphrase` writes no handoff and
+the daemon publishes no reload key.
+
+Accepted ceiling: someone holding an old backup and the old passphrase who can
+also write the vault file as the same user can still substitute a forged vault.
+They learn nothing added after their backup. Two shapes:
+
+- A forgery under a passphrase they choose uses a DEK no session holds. It locks
+  the owner out of the file, and a resident daemon refuses it as corrupt and exits.
+- A forgery under the DEK their backup already yields is indistinguishable from
+  an authentic continuation to a session holding that same DEK. Omitting the
+  `vault_passphrase_change` row from the chain they write keeps this lock from
+  triggering, so a daemon unlocked before the rotation can be made to serve
+  credentials of their choosing until it is restarted. The lock closes the
+  honest rotation path, not a forger who already has the key.
+
+Nothing the daemon holds can tell the two apart: the chain is hashed, not keyed,
+so every input to that decision is something the old DEK already authenticates.
+Closing it needs a keyed or external audit tip (ADR 0003), which is outside v1.

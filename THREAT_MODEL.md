@@ -29,7 +29,7 @@ Tremelay MUST NOT rely on an agent following policy voluntarily.
 Attempts to obtain raw secrets through APIs, error messages, logs, environment variables, debug endpoints, process inspection, broker introspection, malformed requests, or response reflection.
 
 ### Scope escalation
-Attempts to use a valid capability for another credential, account, resource, organization, host, method, path, or action.
+Attempts to use a valid capability for another credential, account, resource, host, method, path, or action.
 
 ### Credential forwarding/exfiltration
 Redirects, SSRF, DNS rebinding, alternate hostnames, proxy chains, or malicious service definitions that cause credentials to be presented to an unintended destination.
@@ -53,27 +53,87 @@ Full host compromise may defeat software-only secrecy; the design SHOULD support
 
 The `ssh_userauth` adapter releases an Ed25519 signature for SSH account authentication. The trusted control plane pins one principal, one credential, that credential's public key, one opaque resource label, one username, and one Ed25519 server host public key. The resource label does not enforce a command, path, repository, SFTP session, shell, or forwarding channel. The enforceable destination is the host public key, not a DNS name, address, or port. Two destinations that share that host key and username are not distinguished. Pinning the host key is a control-plane action; the adapter does not discover hosts, trust on first use, edit known_hosts, or accept host certificates.
 
-The caller is treated as adversarial, including on a first hop. Signing requires `publickey-hostbound-v00@openssh.com` and a host signature over the session identifier with `is_forwarding` false. Ordinary publickey authentication is denied. The binding is checked cryptographically and can be replayed on a new in-memory stream. It is not evidence of a live local session, an honest forwarding path, server liveness, or global single use. A caller that relays bytes itself is outside what this stream can observe. Revocation and expiry stop later signatures. They do not invalidate a signature already released or close an SSH session that already authenticated. Each permitted request has its own audit rows.
+The caller is treated as adversarial, including on a first hop. Signing requires a host signature over the session identifier with `is_forwarding` false, verified under the pinned host key. The signed message is then either `publickey-hostbound-v00@openssh.com`, which names the pinned host key in its own bytes, or, since the ADR 0013 amendment of 2026-10-14, the ordinary `publickey` preimage whose session identifier is byte-equal to that of a binding the same stream already verified. An unbound plain request, a session identifier matching no verified binding, and a forwarded binding are denied. The binding is checked cryptographically and can be replayed on a new in-memory stream. It is not evidence of a live local session, an honest forwarding path, server liveness, or global single use. A caller that relays bytes itself is outside what this stream can observe. Revocation and expiry stop later signatures. They do not invalidate a signature already released or close an SSH session that already authenticated. Each permitted request has its own audit rows.
 
 Wire messages cannot choose the principal, grant, credential, clock, or host key. One stream is tied to the grant selected at construction and is not retargeted when the vault key changes or another grant would match. The private key does not leave the broker. Username, host key, session identifier, preimage, and signature stay out of plaintext audit, notifications, logs, and errors. This is synthetic in-memory compatibility with a protocol subset, not a deployable general SSH agent and not a completed login.
 
-## Shared-vault reference limits
+## SSH agent socket limits
 
-M9a is one local approval path for `local_artifact_attest`. The host that holds the process and the vault passphrase asserts synthetic human identities. Two records do not prove two people and do not confine that host. Bound humans cannot retrieve plaintext, switch actor, or mint assertions. Agents still cannot retrieve a raw secret.
+[ADR 0026](docs/adr/0026-ssh-agent-socket.md) puts the ADR 0013 subset on a
+local ssh-agent socket served by the ADR 0024 daemon. Reach widens, authority
+does not: anything running as the owner that can reach the socket can ask, and
+what it can obtain is still one authentication signature for the pinned
+username on a connection whose session binding proves the grant's host key.
+Other preimages, key insertion, removal, locking and other extensions stay
+refused, and identities stay hidden until that binding. An ordinary `publickey`
+request is signed only for the session identifier of a binding that connection
+already verified, which is what lets servers without the host-bound method,
+github.com among them, be used at all; the requirement moves to the client,
+which must be OpenSSH 8.9 or later to send a binding.
+The relay process holds only a bearer token and copies bytes; it parses
+nothing and holds no vault state. A caller that replays a genuine binding on a
+fresh connection is outside what this process can observe, as in ADR 0013. A
+released signature cannot be recalled and an authenticated SSH session is not
+closed by later revocation. Each connection adds `daemon_auth` and `cap_list`
+rows beside the existing `ssh_userauth` rows. Real-client evidence is one
+unprivileged OpenSSH server and one in-process server without the host-bound
+method, both on Linux with a real `ssh` client, not a claim about any
+particular hosted forge's deployment.
 
-A shared grant is usable only while the requester and the approving owner remain active at the generations stored on the grant. Removal, demotion, re-enrollment, and re-promotion invalidate that authority. They do not recall a signature already released. Legacy single-user grants are not given approval provenance and are not accepted in a shared vault. An older reader fails closed on shared storage instead of treating it as an unrestricted single-user vault.
+## Resident session reload limits
 
-This does not decide production enrollment, recovery, offboarding, or independent custody. Those remain open under M9.
+An unlocked session re-reads the vault file when another holder of the same
+passphrase commits to it, so the daemon serves grant and token changes made
+from the control plane without a restart
+([ADR 0024](docs/adr/0024-headless-unlock-daemon.md), amendment of
+2026-10-13). What it adopts is bounded by verification, not by trust in the
+file: the header, the hash chain, the locked-denial suffix and the sealed
+document are checked with the same code an unlock runs, under the key the
+session already holds. An attacker who can write the file but does not hold that
+key cannot make a resident session adopt a forged document, a broken chain, a
+rolled-back audit head or another vault's identity; each of those locks the
+session and the daemon exits. An attacker who does hold it — an old backup plus
+the old passphrase, after a passphrase change — is the accepted ceiling in
+[ADR 0019](docs/adr/0019-human-vault-lifecycle.md). A higher sequence is not taken for a continuation either: the
+re-read chain must contain the event the session last served, so an older
+authentic copy restored under the daemon and then pushed past that sequence
+by the owner's own commands is refused rather than adopted, and the
+revocations and retired tokens the session had already seen cannot be
+reinstated that way. Rollback is detected only while a session is live and
+remembers the tip it served — an older authentic copy opened fresh still
+verifies on its own terms, as in the snapshot limits below. A token retired
+while a connection is open is refused on that connection's next call, because
+the authenticated principal is bound to the agent's token generation and not
+only to its identity. A reload appends no audit
+row; the commit it adopts is already in the chain under the identity that
+wrote it. Commits remain optimistic, so a writer that loses the
+compare-and-swap writes nothing and reports a stale session rather than
+corruption.
+
+## Single-human custody
+
+One human holds the passphrase; many agents hold grants. Tremelay has no second
+human principal, no organization, no role separation and no approval workflow.
+Multi-user custody is out of v1 ([V1.md](V1.md)). The M9a reference that explored
+it was removed and ADR 0015 is superseded.
+
+A vault that still carries the retired M9a organization, membership, approval or
+grant-provenance state fails closed: the encrypted document is decoded strictly,
+and so is every audit row, so such a vault does not unlock and is not silently
+downgraded to an unrestricted single-user vault.
+
+Production enrollment, recovery, offboarding, and independent custody remain
+undecided and out of scope.
 
 ## Local snapshot reference limits
 
-M9b copies one local SQLite vault with the driver's online backup API and restores that copy only when the host presents the existing passphrase and a checkpoint kept outside the file. The checkpoint binds vault identity, organization identity when the snapshot is shared, the audit tip including a valid locked-denial suffix, and the artifact digest. A filename, a sibling manifest, or a successful decrypt does not establish that the snapshot is current.
+M9b copies one local SQLite vault with the driver's online backup API and restores that copy only when the host presents the existing passphrase and a checkpoint kept outside the file. The checkpoint binds vault identity, the audit tip including a valid locked-denial suffix, and the artifact digest. A filename, a sibling manifest, or a successful decrypt does not establish that the snapshot is current.
 
-The host is trusted to supply the current checkpoint, quiesce the source, and run one active instance. This reference does not enforce those duties across other processes or machines. An old authentic snapshot and the checkpoint issued for it still match. That pair is not detected as stale. A checkpoint the host treats as newer rejects every older artifact. Restore does not merge stale state, reset membership, reissue authority, or fail over. It does not recover a lost passphrase, a lost owner, or a compromised host. Backup and restore are not agent or member operations and do not append an audit row. A later unlock of a restored file remains an ordinary open.
+The host is trusted to supply the current checkpoint, quiesce the source, and run one active instance. This reference does not enforce those duties across other processes or machines. An old authentic snapshot and the checkpoint issued for it still match. That pair is not detected as stale. A checkpoint the host treats as newer rejects every older artifact. Restore does not merge stale state, reissue authority, or fail over. It does not recover a lost passphrase or a compromised host. Backup and restore are not agent operations and do not append an audit row. A later unlock of a restored file remains an ordinary open.
 
 ## Passphrase-change limits
 
-The human host can rewrap the existing DEK after reauthenticating the old passphrase ([ADR 0019](docs/adr/0019-human-vault-lifecycle.md)). The new wrap and audit event commit together. Cached sessions cannot overwrite a newer wrap, but a process already holding the DEK still knows it. This is not key revocation against a compromised host. Existing snapshots and copies retain their original passphrase. Agents and bound shared members do not receive this operation.
+The human host can generate a fresh DEK, re-encrypt every stored credential under it, and rewrap under the new passphrase after reauthenticating the old one ([ADR 0019](docs/adr/0019-human-vault-lifecycle.md)). The new wrap and audit event commit together. Cached sessions cannot overwrite a newer wrap, but a process already holding the DEK still knows it. This is not key revocation against a compromised host. Existing snapshots and copies retain their original passphrase. Agents do not receive this operation.
 
 ## Agent capability interface limits
 
@@ -142,11 +202,16 @@ open, and real production credentials are outside the demonstrated evidence.
 ## MCP network capability limits
 
 [ADR 0021](docs/adr/0021-mcp-credential-brokers.md) exposes only grant-derived
-HTTP or GitHub issue requests, with the existing status-only or four-field
-response projection. Handles are not bearer authentication. Host identity,
+HTTP requests. An `http_request` grant keeps the status-only projection. An
+`http_broker` grant ([ADR 0025](docs/adr/0025-http-broker-v1.md)) returns the
+status, a closed allowlist of response headers, and the body up to a fixed cap
+with every spelling of the credential redacted and the call failed closed if any
+spelling survives. Response content is not validated and may be hostile text;
+only the credential's absence and the response shape are guaranteed. Handles are
+not bearer authentication. Host identity,
 credential custody and public destination controls remain unchanged. A handle
 pins one grant and credential generation; an active duplicate cannot rescue a
-revoked/expired/replaced binding. Shared network approval is not added.
+revoked/expired/replaced binding.
 
 Cancellation can interrupt DNS and network I/O but cannot recall an external
 operation or invalidate a credential already used. No automatic replay is
@@ -167,4 +232,4 @@ retires the resolved handle for that epoch and wipes its binding after active
 work joins; a later Serve requires fresh binding. No automatic retry is permitted
 after ambiguous output. Existing host-key/username enforcement and replay limits
 remain unchanged. This proves neither remote login nor command/channel policy.
-Shared authority and remote principal authentication are not added.
+Remote principal authentication is not added.

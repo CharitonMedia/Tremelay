@@ -34,8 +34,9 @@ var restorePublishFault func() error
 var ioFault func(step string) error
 
 // ErrPublished means Restore linked the destination and left that name in
-// place. A later directory sync or staging cleanup failed, and the
-// destination was not removed. The destination is the restored vault.
+// place. Post-link validation, directory sync, or staging cleanup failed,
+// and the destination was not removed. If validation failed, the
+// destination does not match the checkpoint and must not be used.
 // Its directory durability or staging cleanup may be incomplete. Do not
 // blindly retry Restore after this result.
 var ErrPublished = errors.New("vault restore destination remains")
@@ -56,7 +57,6 @@ var ErrPublicationUncertain = errors.New("vault restore publication uncertain")
 // match an older artifact, and Restore then refuses.
 type Checkpoint struct {
 	VaultID  string
-	OrgID    string
 	AuditSeq uint64
 	AuditTip string
 	Digest   string
@@ -67,10 +67,9 @@ type Checkpoint struct {
 //
 // The copy uses the pinned SQLite driver's online backup API. The checkpoint
 // is taken from the finished artifact, after that API returns and before any
-// later audit event on the source: vault id, organization id when the
-// snapshot is shared, the audit tip sequence and hash (including a valid
-// locked-denial suffix), and the SHA-256 of the artifact bytes. Backup does
-// not append an audit event and does not write a manifest.
+// later audit event on the source: vault id, the audit tip sequence and hash
+// (including a valid locked-denial suffix), and the SHA-256 of the artifact
+// bytes. Backup does not append an audit event and does not write a manifest.
 //
 // The host keeps the checkpoint. This call does not freeze other processes
 // or machines. The host quiesces writers when the checkpoint must describe
@@ -117,7 +116,7 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 	if err = requireFreshSQLiteName(dst); err != nil {
 		return Checkpoint{}, err
 	}
-	f, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := openExclusiveOwnerOnly(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return Checkpoint{}, ErrInvalid
@@ -164,7 +163,7 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 	if again != sum {
 		return Checkpoint{}, ErrIO
 	}
-	cp = Checkpoint{VaultID: view.id, OrgID: view.org, AuditSeq: view.seq, AuditTip: view.tip, Digest: sum}
+	cp = Checkpoint{VaultID: view.id, AuditSeq: view.seq, AuditTip: view.tip, Digest: sum}
 	if err = cp.canonical(); err != nil {
 		return Checkpoint{}, ErrCorrupt
 	}
@@ -188,9 +187,10 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 // read, not written. Validation, mode 0600, and the sidecar check run before
 // the destination name is published.
 //
-// The link is the commit. ErrPublished means destPath remains after a later
-// directory sync or staging cleanup failed. ErrPublicationUncertain means
-// a linked destination was removed but rollback durability is unconfirmed.
+// The link is the commit. ErrPublished means destPath remains after later
+// validation, directory sync, or staging cleanup failed.
+// ErrPublicationUncertain means a linked destination was removed but
+// rollback durability is unconfirmed.
 // Neither outcome is safe to retry blindly. Other errors mean this call did
 // not leave a newly restored destination; pre-existing collisions stay intact.
 // A failure before the link removes private staging data. Restore does not
@@ -198,8 +198,8 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 // Unlock of destPath is an ordinary open, including trusted-time expiry.
 //
 // want is the host's current checkpoint, supplied independently of the
-// artifact. A snapshot from before revocation, membership change, request
-// consumption, key replacement, or containment does not match a later
+// artifact. A snapshot from before revocation, grant issuance, key
+// replacement, or containment does not match a later
 // checkpoint. The checkpoint issued for that older snapshot still matches
 // it; Restore cannot detect that older pair as stale.
 func Restore(artifactPath, destPath string, passphrase []byte, want Checkpoint, logger *log.Logger) (err error) {
@@ -248,7 +248,7 @@ func Restore(artifactPath, destPath string, passphrase []byte, want Checkpoint, 
 }
 
 func (c Checkpoint) canonical() error {
-	if !canonicalID(c.VaultID) || (c.OrgID != "" && !canonicalID(c.OrgID)) {
+	if !canonicalID(c.VaultID) {
 		return ErrInvalid
 	}
 	if c.AuditSeq == 0 || !canonicalHexN(c.AuditTip, 64) || !canonicalHexN(c.Digest, 64) {
@@ -258,7 +258,7 @@ func (c Checkpoint) canonical() error {
 }
 
 func (c Checkpoint) matches(v snapshotView) error {
-	if c.VaultID != v.id || c.OrgID != v.org || c.AuditSeq != v.seq || c.AuditTip != v.tip {
+	if c.VaultID != v.id || c.AuditSeq != v.seq || c.AuditTip != v.tip {
 		return ErrCheckpoint
 	}
 	return nil
@@ -270,14 +270,9 @@ func (c Checkpoint) MarshalText() ([]byte, error) {
 	if err := c.canonical(); err != nil {
 		return nil, err
 	}
-	org := c.OrgID
-	if org == "" {
-		org = "-"
-	}
 	text := strings.Join([]string{
 		checkpointVersion,
 		"vault " + c.VaultID,
-		"org " + org,
 		"seq " + strconv.FormatUint(c.AuditSeq, 10),
 		"tip " + c.AuditTip,
 		"sha256 " + c.Digest,
@@ -299,10 +294,10 @@ func (c *Checkpoint) UnmarshalText(text []byte) error {
 	}
 	body := strings.TrimSuffix(string(text), "\n")
 	lines := strings.Split(body, "\n")
-	if len(lines) != 6 || lines[0] != checkpointVersion {
+	if len(lines) != 5 || lines[0] != checkpointVersion {
 		return ErrInvalid
 	}
-	fields := []string{"vault", "org", "seq", "tip", "sha256"}
+	fields := []string{"vault", "seq", "tip", "sha256"}
 	got := map[string]string{}
 	for i, key := range fields {
 		name, value, ok := strings.Cut(lines[i+1], " ")
@@ -311,10 +306,6 @@ func (c *Checkpoint) UnmarshalText(text []byte) error {
 		}
 		got[key] = value
 	}
-	org := got["org"]
-	if org == "-" {
-		org = ""
-	}
 	seqText := got["seq"]
 	seq, err := strconv.ParseUint(seqText, 10, 64)
 	if err != nil || strconv.FormatUint(seq, 10) != seqText {
@@ -322,7 +313,6 @@ func (c *Checkpoint) UnmarshalText(text []byte) error {
 	}
 	parsed := Checkpoint{
 		VaultID:  got["vault"],
-		OrgID:    org,
 		AuditSeq: seq,
 		AuditTip: got["tip"],
 		Digest:   got["sha256"],
@@ -336,7 +326,6 @@ func (c *Checkpoint) UnmarshalText(text []byte) error {
 
 type snapshotView struct {
 	id  string
-	org string
 	seq uint64
 	tip string
 }
@@ -383,21 +372,11 @@ func readSnapshot(path string, passphrase []byte) (snapshotView, error) {
 	if err := validateDocument(doc); err != nil {
 		return snapshotView{}, err
 	}
-	if err := sharedMatchesVault(doc, header.ID); err != nil {
-		return snapshotView{}, err
-	}
-	if err := sharedHistoryBound(events, doc.Organization, doc.Memberships, doc.Requests, doc.Grants); err != nil {
-		return snapshotView{}, err
-	}
-	org := ""
-	if doc.Organization != nil {
-		org = doc.Organization.ID
-	}
 	tip := events[len(events)-1]
 	if tip.Seq == 0 || tip.VaultID != header.ID || !canonicalHexN(tip.Hash, 64) {
 		return snapshotView{}, ErrAudit
 	}
-	return snapshotView{id: header.ID, org: org, seq: tip.Seq, tip: tip.Hash}, nil
+	return snapshotView{id: header.ID, seq: tip.Seq, tip: tip.Hash}, nil
 }
 
 type sqliteBackuper interface {
@@ -504,10 +483,11 @@ func sqliteFileURI(path string) (string, error) {
 }
 
 func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
-	staging, err := createStaging(filepath.Dir(dest))
+	stagingFile, staging, err := createStaging(filepath.Dir(dest))
 	if err != nil {
 		return err
 	}
+	defer stagingFile.Close()
 	published := false
 	defer func() {
 		if !published {
@@ -515,17 +495,20 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 			removeSidecars(staging)
 		}
 	}()
-	if err := streamCopy(artifact, staging); err != nil {
+	if err := streamCopyToFile(artifact, stagingFile); err != nil {
 		return err
 	}
-	sum, err := fileSHA256(staging)
+	if err := verifyRegularSameFile(staging, stagingFile); err != nil {
+		return err
+	}
+	sum, err := fileSHA256File(stagingFile)
 	if err != nil {
 		return err
 	}
 	if sum != want.Digest {
 		return ErrIO
 	}
-	view, err := readSnapshot(staging, passphrase)
+	view, err := readSnapshotFile(stagingFile, passphrase)
 	if err != nil {
 		return err
 	}
@@ -537,12 +520,18 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 			return ErrIO
 		}
 	}
+	if err := verifyRegularSameFile(staging, stagingFile); err != nil {
+		return err
+	}
 	// Mode is on the inode the link will share. A failure here is still
 	// before the destination name exists.
-	if ioFaultStep("chmod") != nil || os.Chmod(staging, 0o600) != nil {
+	if ioFaultStep("chmod") != nil || stagingFile.Chmod(0o600) != nil {
 		return ErrIO
 	}
 	if err := requireFreshSQLiteName(dest); err != nil {
+		return err
+	}
+	if err := verifyRegularSameFile(staging, stagingFile); err != nil {
 		return err
 	}
 	if err := os.Link(staging, dest); err != nil {
@@ -554,6 +543,22 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 	// The destination name is committed. Later steps must not report
 	// absence while this name remains.
 	published = true
+	if err := verifyRegularSameFile(dest, stagingFile); err != nil {
+		return rollbackPublish(staging, dest, err)
+	}
+	sum, err = fileSHA256File(stagingFile)
+	if err == nil && sum == want.Digest {
+		view, err = readSnapshotFile(stagingFile, passphrase)
+		if err == nil {
+			err = want.matches(view)
+		}
+	}
+	if err != nil || sum != want.Digest {
+		return rollbackPublish(staging, dest, ErrCheckpoint)
+	}
+	// ponytail: an owner-equivalent process can still mutate the destination
+	// after this check. Upgrade path: isolate publication under a principal
+	// that alone can write the destination directory and file.
 	return finishPublish(staging, dest)
 }
 
@@ -564,19 +569,7 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 // it was removed but the rollback directory sync failed.
 func finishPublish(staging, dest string) error {
 	if err := syncDir(filepath.Dir(dest)); err != nil || ioFaultStep("sync") != nil {
-		if ioFaultStep("rollback") != nil || os.Remove(dest) != nil {
-			// The destination name is still there. Dropping the staging
-			// link is cleanup; it does not make this absence.
-			os.Remove(staging)
-			removeSidecars(staging)
-			return ErrPublished
-		}
-		os.Remove(staging)
-		removeSidecars(staging)
-		if err := syncDirStrict(filepath.Dir(dest)); err != nil || ioFaultStep("rollback-sync") != nil {
-			return ErrPublicationUncertain
-		}
-		return ErrIO
+		return rollbackPublish(staging, dest, ErrIO)
 	}
 	if ioFaultStep("unlink") != nil || os.Remove(staging) != nil {
 		return ErrPublished
@@ -584,42 +577,45 @@ func finishPublish(staging, dest string) error {
 	return nil
 }
 
-func createStaging(dir string) (string, error) {
+func rollbackPublish(staging, dest string, result error) error {
+	if ioFaultStep("rollback") != nil || os.Remove(dest) != nil {
+		// The destination name is still there. Dropping the staging
+		// link is cleanup; it does not make this absence.
+		os.Remove(staging)
+		removeSidecars(staging)
+		return ErrPublished
+	}
+	os.Remove(staging)
+	removeSidecars(staging)
+	if err := syncDirStrict(filepath.Dir(dest)); err != nil || ioFaultStep("rollback-sync") != nil {
+		return ErrPublicationUncertain
+	}
+	return result
+}
+
+func createStaging(dir string) (*os.File, string, error) {
 	id, err := newID()
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 	// ponytail: O_EXCL refuses a final symlink, and cleanPath refuses a
 	// symlink component beforehand. A parent swapped for a symlink after
 	// that walk can still redirect the create. Upgrade path: openat with
 	// O_NOFOLLOW on each component.
 	path := filepath.Join(dir, "."+id+".restore-incomplete")
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := openExclusiveOwnerOnly(path, os.O_RDWR|os.O_CREATE|os.O_EXCL)
 	if err != nil {
-		return "", ErrIO
+		return nil, "", ErrIO
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(path)
-		return "", ErrIO
-	}
-	return path, nil
+	return f, path, nil
 }
 
-func streamCopy(src, dst string) (err error) {
+func streamCopyToFile(src string, out *os.File) (err error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return ErrIO
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY, 0o600)
-	if err != nil {
-		return ErrIO
-	}
-	defer func() {
-		if closeErr := out.Close(); err == nil && closeErr != nil {
-			err = ErrIO
-		}
-	}()
 	buf := make([]byte, copyBuf)
 	if _, err := io.CopyBuffer(out, in, buf); err != nil {
 		return ErrIO
@@ -628,6 +624,46 @@ func streamCopy(src, dst string) (err error) {
 		return ErrIO
 	}
 	return nil
+}
+
+// verifyRegularSameFile requires path to name the same regular file as f.
+// A symlink at path is rejected so publication cannot commit an alias.
+func verifyRegularSameFile(path string, f *os.File) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return ErrIO
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+		return ErrCheckpoint
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return ErrIO
+	}
+	if !os.SameFile(fi, st) {
+		return ErrCheckpoint
+	}
+	return nil
+}
+
+func readSnapshotFile(f *os.File, passphrase []byte) (snapshotView, error) {
+	path, err := sqlitePathForOpenFile(f)
+	if err != nil {
+		return snapshotView{}, err
+	}
+	return readSnapshot(path, passphrase)
+}
+
+func fileSHA256File(f *os.File) (string, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", ErrIO
+	}
+	h := sha256.New()
+	buf := make([]byte, copyBuf)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
+		return "", ErrIO
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func syncFile(path string) error {

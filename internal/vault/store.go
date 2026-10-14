@@ -8,9 +8,80 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
-	_ "modernc.org/sqlite" // pure-Go SQLite; no cgo so Windows CI matches Linux.
+	"modernc.org/sqlite" // pure-Go SQLite; no cgo so Windows CI matches Linux.
+	sqlite3 "modernc.org/sqlite/lib"
 )
+
+// vaultWriteMu serializes every write transaction in this process so one
+// goroutine cannot commit back to back and starve peers on the same file past
+// busy_timeout. Cross-process contention still hits SQLite; vaultWriteRun
+// retries that case with a bounded backoff.
+var vaultWriteMu sync.Mutex
+
+var errSQLiteBusy = errors.New("sqlite busy")
+
+const sqliteWriteMaxAttempts = 12
+
+func sqliteWriteBackoff(attempt int) time.Duration {
+	d := time.Duration(10*(1<<attempt)) * time.Millisecond
+	const cap = 250 * time.Millisecond
+	if d > cap {
+		return cap
+	}
+	return d
+}
+
+func sqliteBusy(err error) bool {
+	var driverErr *sqlite.Error
+	if !errors.As(err, &driverErr) {
+		return false
+	}
+	return driverErr.Code()&0xff == sqlite3.SQLITE_BUSY
+}
+
+func vaultWriteRun(fn func() error) error {
+	vaultWriteMu.Lock()
+	defer vaultWriteMu.Unlock()
+	for attempt := 0; attempt < sqliteWriteMaxAttempts; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, errSQLiteBusy) {
+			if attempt+1 < sqliteWriteMaxAttempts {
+				time.Sleep(sqliteWriteBackoff(attempt))
+				continue
+			}
+			return ErrIO
+		}
+		return err
+	}
+	return ErrIO
+}
+
+func beginWriteTx(db *sql.DB) (*sql.Tx, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		if sqliteBusy(err) {
+			return nil, errSQLiteBusy
+		}
+		return nil, ErrIO
+	}
+	return tx, nil
+}
+
+func commitWriteTx(tx *sql.Tx) error {
+	if err := tx.Commit(); err != nil {
+		if sqliteBusy(err) {
+			return errSQLiteBusy
+		}
+		return ErrIO
+	}
+	return nil
+}
 
 const schemaSQL = `
 CREATE TABLE vault (
@@ -28,7 +99,10 @@ CREATE TABLE vault (
   data_nonce BLOB NOT NULL,
   encrypted_document BLOB NOT NULL,
   audit_head TEXT NOT NULL,
-  audit_seq INTEGER NOT NULL
+  audit_seq INTEGER NOT NULL,
+  dek_reload_pubkey BLOB,
+  dek_handoff_nonce BLOB NOT NULL DEFAULT '',
+  dek_handoff BLOB NOT NULL DEFAULT ''
 );
 CREATE TABLE audit (
   seq INTEGER PRIMARY KEY,
@@ -86,7 +160,7 @@ func createDB(path string) (*sql.DB, error) {
 	if path == "" {
 		return nil, ErrInvalid
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := openExclusiveOwnerOnly(path, os.O_RDWR|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return nil, ErrInvalid
@@ -220,6 +294,13 @@ func assertDurable(db *sql.DB) error {
 	return nil
 }
 
+// queryer is the read subset of *sql.DB and *sql.Tx. A reload takes its header
+// and its chain from one transaction so both describe the same commit.
+type queryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 func loadVault(path string) (*sql.DB, fileHeader, []auditEvent, error) {
 	return loadVaultMode(path, false, false)
 }
@@ -243,14 +324,18 @@ func loadVaultMode(path string, readonly, legacyAudit bool) (*sql.DB, fileHeader
 	if err != nil {
 		return nil, fileHeader{}, nil, err
 	}
-	header, err := readVaultRow(db)
-	if err != nil {
+	fail := func(err error) (*sql.DB, fileHeader, []auditEvent, error) {
 		db.Close()
 		return nil, fileHeader{}, nil, err
 	}
-	if err := validateHeader(header); err != nil {
-		db.Close()
-		return nil, fileHeader{}, nil, err
+	// Gate migration on a header that is a vault at all: a file this package
+	// will reject must not have its audit schema altered on the way out.
+	header, err := readVaultRow(db)
+	if err == nil {
+		err = validateHeader(header)
+	}
+	if err != nil {
+		return fail(err)
 	}
 	// Verification projects legacy columns without migrating. Backup artifact
 	// reads remain strict; ordinary unlock still performs its existing migration.
@@ -262,22 +347,70 @@ func loadVaultMode(path string, readonly, legacyAudit bool) (*sql.DB, fileHeader
 		err = migrateAudit(db)
 	}
 	if err != nil {
-		db.Close()
-		return nil, fileHeader{}, nil, err
+		return fail(err)
 	}
-	events, err := readAuditRowsMode(db, legacyAudit)
+	if !readonly {
+		if err = migrateVault(db); err != nil {
+			return fail(err)
+		}
+	}
+	header, events, err := readVaultSnapshot(db, legacyAudit)
 	if err != nil {
-		db.Close()
-		return nil, fileHeader{}, nil, err
-	}
-	if len(events) == 0 || verifyChain(events) != nil || suffixAllows(events, header) != nil {
-		db.Close()
-		return nil, fileHeader{}, nil, ErrAudit
+		return fail(err)
 	}
 	return db, header, events, nil
 }
 
-func readVaultRow(db *sql.DB) (fileHeader, error) {
+// readVaultSnapshot reads the state inside one transaction. Another process
+// may commit between any two statements now that the daemon and the human
+// control plane share a live vault, and a header taken on one side of such a
+// commit with a chain taken on the other describes no state that ever
+// existed. That must not be reported as tampering.
+//
+// _txlock=immediate makes this BEGIN take the reserved lock like a writer, so
+// it queues with the writers; outside the queue a back-to-back writer starves it.
+func readVaultSnapshot(db *sql.DB, legacyAudit bool) (header fileHeader, events []auditEvent, err error) {
+	err = vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
+			return err
+		}
+		header, events, err = readVaultState(tx, legacyAudit)
+		if rollback := tx.Rollback(); rollback != nil && err == nil {
+			return ErrIO
+		}
+		return err
+	})
+	if err != nil {
+		return fileHeader{}, nil, err
+	}
+	return header, events, nil
+}
+
+// readVaultState reads and verifies the durable state of an open vault: the
+// header shape, the hash chain from its first row, and the locked-denial
+// suffix the header's audit head must sit on. Unlock reaches it through
+// loadVaultMode; Session.reloadLocked calls it on a snapshot of the handle it
+// already holds. There is one verifier, not one per caller.
+func readVaultState(q queryer, legacyAudit bool) (fileHeader, []auditEvent, error) {
+	header, err := readVaultRow(q)
+	if err != nil {
+		return fileHeader{}, nil, err
+	}
+	if err := validateHeader(header); err != nil {
+		return fileHeader{}, nil, err
+	}
+	events, err := readAuditRowsMode(q, legacyAudit)
+	if err != nil {
+		return fileHeader{}, nil, err
+	}
+	if len(events) == 0 || verifyChain(events) != nil || suffixAllows(events, header) != nil {
+		return fileHeader{}, nil, ErrAudit
+	}
+	return header, events, nil
+}
+
+func readVaultRow(db queryer) (fileHeader, error) {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM vault`).Scan(&n); err != nil {
 		return fileHeader{}, ErrCorrupt
@@ -285,11 +418,25 @@ func readVaultRow(db *sql.DB) (fileHeader, error) {
 	if n != 1 {
 		return fileHeader{}, ErrCorrupt
 	}
+	// Vaults written before V1 item 3e have no handoff columns. They read as
+	// empty (no handoff pending); Unlock adds them, read-only paths never do.
+	cols, err := vaultColumnSet(db)
+	if err != nil {
+		return fileHeader{}, err
+	}
+	handoff := make([]string, 0, 3)
+	for _, name := range []string{"dek_reload_pubkey", "dek_handoff_nonce", "dek_handoff"} {
+		if cols[name] {
+			handoff = append(handoff, name)
+		} else {
+			handoff = append(handoff, "X''")
+		}
+	}
 	var h fileHeader
 	var timeCost, memory, threads, keyLen, seq int64
-	err := db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq FROM vault`).Scan(
+	err = db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, `+strings.Join(handoff, ", ")+` FROM vault`).Scan(
 		&h.ID, &h.Version, &h.Root, &h.KDF.Algorithm, &h.KDF.Salt, &timeCost, &memory, &threads, &keyLen,
-		&h.WrapNonce, &h.WrappedDEK, &h.DataNonce, &h.Data, &h.AuditHead, &seq,
+		&h.WrapNonce, &h.WrappedDEK, &h.DataNonce, &h.Data, &h.AuditHead, &seq, &h.DEKReloadPubKey, &h.DEKHandoffNonce, &h.DEKHandoff,
 	)
 	if err != nil {
 		return fileHeader{}, ErrCorrupt
@@ -305,7 +452,7 @@ func readVaultRow(db *sql.DB) (fileHeader, error) {
 	return h, nil
 }
 
-func auditColumnSet(db *sql.DB) (map[string]bool, error) {
+func auditColumnSet(db queryer) (map[string]bool, error) {
 	rows, err := db.Query(`PRAGMA table_info(audit)`)
 	if err != nil {
 		return nil, ErrCorrupt
@@ -384,34 +531,123 @@ func migrateAudit(db *sql.DB) error {
 	if !missing {
 		return nil
 	}
-	tx, err := db.Begin()
+	return vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
+			return err
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		for _, col := range adds {
+			if cols[col.name] {
+				continue
+			}
+			if _, err := tx.Exec(col.ddl); err != nil {
+				return ErrCorrupt
+			}
+		}
+		if !cols["v"] {
+			if err := backfillAuditVersion(tx); err != nil {
+				return err
+			}
+		}
+		if err := commitWriteTx(tx); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	})
+}
+
+func vaultColumnSet(db queryer) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(vault)`)
 	if err != nil {
-		return ErrIO
+		return nil, ErrCorrupt
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return nil, ErrCorrupt
 		}
-	}()
-	for _, col := range adds {
-		if cols[col.name] {
-			continue
-		}
-		if _, err := tx.Exec(col.ddl); err != nil {
+		cols[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, ErrCorrupt
+	}
+	return cols, nil
+}
+
+func vaultHandoffReady(db *sql.DB) error {
+	cols, err := vaultColumnSet(db)
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"dek_reload_pubkey", "dek_handoff_nonce", "dek_handoff"} {
+		if !cols[name] {
 			return ErrCorrupt
 		}
 	}
-	if !cols["v"] {
-		if err := backfillAuditVersion(tx); err != nil {
-			return err
+	return nil
+}
+
+// migrateVault adds DEK-rotation handoff columns for resident sessions that
+// reload after a passphrase change committed elsewhere.
+func migrateVault(db *sql.DB) error {
+	cols, err := vaultColumnSet(db)
+	if err != nil {
+		return err
+	}
+	adds := []struct {
+		name string
+		ddl  string
+	}{
+		{"dek_reload_pubkey", `ALTER TABLE vault ADD COLUMN dek_reload_pubkey BLOB`},
+		{"dek_handoff_nonce", `ALTER TABLE vault ADD COLUMN dek_handoff_nonce BLOB NOT NULL DEFAULT ''`},
+		{"dek_handoff", `ALTER TABLE vault ADD COLUMN dek_handoff BLOB NOT NULL DEFAULT ''`},
+	}
+	missing := false
+	for _, col := range adds {
+		if !cols[col.name] {
+			missing = true
+			break
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return ErrIO
+	if !missing {
+		return nil
 	}
-	committed = true
-	return nil
+	return vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
+			return err
+		}
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		for _, col := range adds {
+			if cols[col.name] {
+				continue
+			}
+			if _, err := tx.Exec(col.ddl); err != nil {
+				return ErrCorrupt
+			}
+		}
+		if err := commitWriteTx(tx); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	})
 }
 
 func backfillAuditVersion(tx *sql.Tx) error {
@@ -448,11 +684,11 @@ func backfillAuditVersion(tx *sql.Tx) error {
 	return nil
 }
 
-func readAuditRows(db *sql.DB) ([]auditEvent, error) {
+func readAuditRows(db queryer) ([]auditEvent, error) {
 	return readAuditRowsMode(db, false)
 }
 
-func readAuditRowsMode(db *sql.DB, legacy bool) ([]auditEvent, error) {
+func readAuditRowsMode(db queryer, legacy bool) ([]auditEvent, error) {
 	columns := strings.Split("seq,time,action,vault_id,credential_id,credential_type,result,prev_hash,hash,agent_id,grant_id,operation,v,class,ref_seq,reasons,cred_gen,actor_id,org_id,target_id,request_id,decision", ",")
 	inferVersion := false
 	if legacy {
@@ -518,47 +754,63 @@ func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fres
 	if len(events) == 0 {
 		return ErrAudit
 	}
-	tx, err := db.Begin()
-	if err != nil {
-		return ErrIO
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	if fresh {
-		if err := insertVault(tx, h); err != nil {
+	return vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
 			return err
 		}
-	} else if err := updateVault(tx, h, prevSeq); err != nil {
-		return err
-	}
-	for _, ev := range events {
-		if err := insertAudit(tx, ev); err != nil {
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		if fresh {
+			if err := insertVault(tx, h); err != nil {
+				return err
+			}
+		} else if err := updateVault(tx, h, prevSeq); err != nil {
 			return err
 		}
-	}
-	if fault != nil {
-		if err := fault(); err != nil {
-			return ErrAudit
+		for _, ev := range events {
+			if err := insertAudit(tx, ev); err != nil {
+				return err
+			}
 		}
+		if fault != nil {
+			if err := fault(); err != nil {
+				return ErrAudit
+			}
+		}
+		if err := commitWriteTx(tx); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	})
+}
+
+func blobOrEmpty(b []byte) []byte {
+	if b == nil {
+		return []byte{}
 	}
-	if err := tx.Commit(); err != nil {
-		return ErrIO
+	return b
+}
+
+func blobOrNil(b []byte) interface{} {
+	if len(b) == 0 {
+		return nil
 	}
-	committed = true
-	return nil
+	return b
 }
 
 func insertVault(tx *sql.Tx, h fileHeader) error {
 	_, err := tx.Exec(`INSERT INTO vault (
 		id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len,
-		wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, dek_reload_pubkey, dek_handoff_nonce, dek_handoff
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		h.ID, h.Version, h.Root, h.KDF.Algorithm, h.KDF.Salt, h.KDF.Time, h.KDF.Memory, h.KDF.Threads, h.KDF.KeyLen,
-		h.WrapNonce, h.WrappedDEK, h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq),
+		h.WrapNonce, h.WrappedDEK, h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), blobOrNil(h.DEKReloadPubKey), blobOrEmpty(h.DEKHandoffNonce), blobOrEmpty(h.DEKHandoff),
 	)
 	if err != nil {
 		return ErrIO
@@ -567,9 +819,9 @@ func insertVault(tx *sql.Tx, h fileHeader) error {
 }
 
 func updateVault(tx *sql.Tx, h fileHeader, prevSeq uint64) error {
-	res, err := tx.Exec(`UPDATE vault SET kdf_algorithm=?, kdf_salt=?, kdf_time=?, kdf_memory=?, kdf_threads=?, kdf_key_len=?, wrap_nonce=?, wrapped_dek=?, data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=? WHERE id=? AND audit_seq=?`,
+	res, err := tx.Exec(`UPDATE vault SET kdf_algorithm=?, kdf_salt=?, kdf_time=?, kdf_memory=?, kdf_threads=?, kdf_key_len=?, wrap_nonce=?, wrapped_dek=?, data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=?, dek_reload_pubkey=?, dek_handoff_nonce=?, dek_handoff=? WHERE id=? AND audit_seq=?`,
 		h.KDF.Algorithm, h.KDF.Salt, h.KDF.Time, h.KDF.Memory, h.KDF.Threads, h.KDF.KeyLen, h.WrapNonce, h.WrappedDEK,
-		h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), h.ID, int64(prevSeq))
+		h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), blobOrNil(h.DEKReloadPubKey), blobOrEmpty(h.DEKHandoffNonce), blobOrEmpty(h.DEKHandoff), h.ID, int64(prevSeq))
 	if err != nil {
 		return ErrIO
 	}
@@ -579,7 +831,31 @@ func updateVault(tx *sql.Tx, h fileHeader, prevSeq uint64) error {
 	}
 	if n != 1 {
 		// A compare-and-swap miss, including a trigger that ignores the
-		// update, leaves the previous document in place.
+		// update, leaves the previous document in place. Another writer
+		// moving the sequence forward is the ordinary case now that the
+		// daemon and the human control plane share a live vault, and the
+		// read below is inside this transaction, so it cannot race the
+		// verdict: that writer is stale, not corrupt, and the caller may
+		// reopen and repeat the command. Anything else is a vault row this
+		// session can no longer account for.
+		//
+		// ponytail: optimistic concurrency, so a caller under sustained
+		// competing writes can lose repeatedly. The whole call, not only
+		// this statement, sits outside the write transaction, and SQLite's
+		// busy backoff makes a writer that commits every few milliseconds
+		// win most races. Measured ceiling: a human command loses outright
+		// against roughly a hundred agent calls per second, and is
+		// unaffected at a working agent's rate. Upgrade path: take the
+		// write transaction first and re-run the caller's mutation against
+		// the state read inside it, which needs every mutating method
+		// expressed as a redoable closure.
+		var seq int64
+		if err := tx.QueryRow(`SELECT audit_seq FROM vault WHERE id=?`, h.ID).Scan(&seq); err != nil {
+			return ErrCorrupt
+		}
+		if seq >= 0 && uint64(seq) > prevSeq {
+			return ErrStale
+		}
 		return ErrCorrupt
 	}
 	return nil
@@ -593,6 +869,10 @@ func insertAudit(tx *sql.Tx, ev auditEvent) error {
 		int64(ev.Seq), ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Prev, ev.Hash, ev.AgentID, ev.GrantID, ev.Operation, ev.V, ev.Class, int64(ev.RefSeq), ev.Reasons, int64(ev.CredGen),
 		ev.ActorID, ev.OrgID, ev.TargetID, ev.RequestID, ev.Decision)
 	if err != nil {
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY {
+			return ErrAudit
+		}
 		return ErrIO
 	}
 	return nil
@@ -607,35 +887,37 @@ func insertAudit(tx *sql.Tx, ev auditEvent) error {
 // tip read and the insert. A concurrent denial waits, then observes the
 // committed sequence instead of reusing it.
 func appendDenial(db *sql.DB, vaultID string) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return ErrIO
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
+			return err
 		}
-	}()
-	tip, err := readAuditTip(tx)
-	if err != nil {
-		return err
-	}
-	if tip.VaultID != vaultID {
-		return ErrAudit
-	}
-	ev, err := nextEvent([]auditEvent{tip}, actionUnlock, vaultID, "", "", resultDenied)
-	if err != nil {
-		return err
-	}
-	if err := insertAudit(tx, ev); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return ErrIO
-	}
-	committed = true
-	return nil
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		tip, err := readAuditTip(tx)
+		if err != nil {
+			return err
+		}
+		if tip.VaultID != vaultID {
+			return ErrAudit
+		}
+		ev, err := nextEvent([]auditEvent{tip}, actionUnlock, vaultID, "", "", resultDenied)
+		if err != nil {
+			return err
+		}
+		if err := insertAudit(tx, ev); err != nil {
+			return err
+		}
+		if err := commitWriteTx(tx); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	})
 }
 
 func readAuditTip(tx *sql.Tx) (auditEvent, error) {

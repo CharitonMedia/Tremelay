@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	// OpSSHUserAuth authorizes one host-bound SSH user authentication signature.
-	// It is not an alias of sign, local_artifact_attest, http_request, or github_issue_state.
+	// OpSSHUserAuth authorizes one SSH user authentication signature bound to a
+	// session this stream verified against the grant's pinned host key.
+	// It is not an alias of sign, local_artifact_attest, http_request, or http_broker.
 	OpSSHUserAuth = "ssh_userauth"
 
 	// SSH userauth limits. The frame cap is the SSH agent length field, not
@@ -28,6 +29,7 @@ const (
 	sshAlgoEd25519        = "ssh-ed25519"
 	sshServiceConnection  = "ssh-connection"
 	sshUserAuthMethod     = "publickey-hostbound-v00@openssh.com"
+	sshUserAuthPlain      = "publickey"
 	sshExtSessionBind     = "session-bind@openssh.com"
 	sshMsgUserAuthRequest = 50
 
@@ -70,9 +72,15 @@ type SSHUserAuth struct {
 	mu         sync.Mutex
 	closed     bool
 	hasBinding bool
-	hostKey    []byte
-	sessionID  []byte
-	hostSig    []byte
+	// forwarded is set for good by any session-bind that claims forwarding.
+	// OpenSSH sends that bind first on a forwarded agent channel, so the far
+	// host can never follow it with a non-forwarding bind of its own choosing:
+	// is_forwarding is outside the host signature, and a plain publickey
+	// preimage names no host key, so such a signature could log in elsewhere.
+	forwarded bool
+	hostKey   []byte
+	sessionID []byte
+	hostSig   []byte
 }
 
 // sshBroker is the in-process session surface used by one stream.
@@ -82,6 +90,7 @@ type sshBroker interface {
 	sshJudge(agentID string, bound agentCapGrant) (auditEvent, []byte, error)
 	sshRecord(ev auditEvent) error
 	sshDeny(agentID string, bound agentCapGrant) error
+	sshDenyNoGrant(agentID string) error
 	sshShowKey(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig []byte) ([]byte, error)
 	sshRelease(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error)
 }
@@ -228,7 +237,7 @@ func (a *SSHUserAuth) identities(body []byte, ev auditEvent) ([]byte, error) {
 	if len(body) != 1 {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
-	if !a.hasBinding {
+	if !a.hasBinding || a.forwarded {
 		return a.record(ev, resultDenied, sshEmptyIdentities())
 	}
 	blob, err := a.broker.sshShowKey(a.agentID, a.bound, a.hostKey, a.sessionID, a.hostSig)
@@ -242,7 +251,7 @@ func (a *SSHUserAuth) identities(body []byte, ev auditEvent) ([]byte, error) {
 }
 
 func (a *SSHUserAuth) sign(body []byte, ev auditEvent) ([]byte, error) {
-	if !a.hasBinding {
+	if !a.hasBinding || a.forwarded {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
 	sig, err := a.broker.sshRelease(a.agentID, a.bound, a.hostKey, a.sessionID, a.hostSig, body)
@@ -267,7 +276,10 @@ func (a *SSHUserAuth) extension(body []byte, ev auditEvent, pinned []byte) ([]by
 	if name != sshExtSessionBind {
 		return a.record(ev, resultDenied, []byte{sshAgentExtensionFailure})
 	}
-	if a.hasBinding {
+	if bindClaimsForwarding(rest) {
+		a.forwarded = true
+	}
+	if a.hasBinding || a.forwarded {
 		return a.record(ev, resultDenied, []byte{sshAgentFailure})
 	}
 	host, sid, sig, ok := parseSessionBind(rest)
@@ -339,15 +351,15 @@ func fixedStreamErr(err error) error {
 }
 
 func (b agentBinder) sshConstruct(agentID, grantID string) (agentCapGrant, error) {
-	if b.s == nil {
-		return agentCapGrant{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return agentCapGrant{}, err
 	}
 	return b.s.sshConstruct(agentID, grantID)
 }
 
 func (b agentBinder) sshJudge(agentID string, bound agentCapGrant) (auditEvent, []byte, error) {
-	if b.s == nil {
-		return auditEvent{}, nil, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return auditEvent{}, nil, err
 	}
 	return b.s.sshJudge(agentID, bound)
 }
@@ -360,22 +372,29 @@ func (b agentBinder) sshRecord(ev auditEvent) error {
 }
 
 func (b agentBinder) sshDeny(agentID string, bound agentCapGrant) error {
-	if b.s == nil {
-		return ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return err
 	}
 	return b.s.sshDeny(agentID, bound)
 }
 
+func (b agentBinder) sshDenyNoGrant(agentID string) error {
+	if err := b.bound(agentID); err != nil {
+		return err
+	}
+	return b.s.sshDenyNoGrant(agentID)
+}
+
 func (b agentBinder) sshShowKey(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig []byte) ([]byte, error) {
-	if b.s == nil {
-		return nil, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return nil, err
 	}
 	return b.s.sshShowKey(agentID, bound, hostKey, sessionID, hostSig)
 }
 
 func (b agentBinder) sshRelease(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
-	if b.s == nil {
-		return nil, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return nil, err
 	}
 	return b.s.sshRelease(agentID, bound, hostKey, sessionID, hostSig, signBody)
 }
@@ -405,7 +424,7 @@ func (s *Session) sshConstructUnlocked(agentID, grantID string) (agentCapGrant, 
 	if g.AgentID != agentID {
 		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrDeniedAgent)
 	}
-	if s.shared() || !sshGrantShape(g) || validateResource(g.Resource) != nil {
+	if !sshGrantShape(g) || validateResource(g.Resource) != nil {
 		return agentCapGrant{}, s.denySSHConstruct(agentID, ErrDeniedOperation)
 	}
 	c, ok := s.credByID(g.CredentialID)
@@ -417,6 +436,24 @@ func (s *Session) sshConstructUnlocked(agentID, grantID string) (agentCapGrant, 
 		resource: g.Resource, operation: OpSSHUserAuth, credGen: c.Gen,
 		sshUser: g.SSHUsername, sshHost: string(g.SSHHostKey),
 	}, nil
+}
+
+// sshDenyNoGrant audits an SSH attempt from a principal that holds no usable
+// ssh_userauth authority at all, so no selected grant exists to judge. The row
+// carries the same fields a rejected construction writes: a verified principal
+// ID, the operation, and nothing of the caller's frame.
+func (s *Session) sshDenyNoGrant(agentID string) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	if err := s.live(); err != nil {
+		return err
+	}
+	if err := s.adoptLocked(); err != nil {
+		return err
+	}
+	return s.denySSHConstruct(agentID, nil)
 }
 
 func (s *Session) denySSHConstruct(agentID string, cause error) error {
@@ -441,7 +478,7 @@ func (s *Session) sshJudgeUnlocked(agentID string, bound agentCapGrant) (auditEv
 	if err := s.live(); err != nil {
 		return auditEvent{}, nil, err
 	}
-	if err := s.requireCurrent(); err != nil {
+	if err := s.adoptLocked(); err != nil {
 		return auditEvent{}, nil, err
 	}
 	ev := auditEvent{Action: actionSSHUserAuth, AgentID: agentID, GrantID: bound.grantID, Operation: OpSSHUserAuth}
@@ -461,7 +498,7 @@ func (s *Session) sshJudgeUnlocked(agentID string, bound agentCapGrant) (auditEv
 		ev.Result = resultDeniedAgent
 		return ev, nil, ErrDeniedAgent
 	}
-	if !ok || s.shared() || g.AgentID != agentID || !sshGrantShape(g) ||
+	if !ok || g.AgentID != agentID || !sshGrantShape(g) ||
 		bound.operation != OpSSHUserAuth || g.CredentialID != bound.credID || g.KeyID != bound.keyID ||
 		g.Resource != bound.resource || validateResource(g.Resource) != nil ||
 		g.SSHUsername != bound.sshUser || string(g.SSHHostKey) != bound.sshHost {
@@ -507,7 +544,7 @@ func (s *Session) sshRecordUnlocked(ev auditEvent) error {
 	if err := s.live(); err != nil {
 		return err
 	}
-	if err := s.requireCurrent(); err != nil {
+	if err := s.adoptLocked(); err != nil {
 		return err
 	}
 	ev.Action = actionSSHUserAuth
@@ -908,7 +945,18 @@ func sshSignBody(pinned, sessionID, body []byte, user string, userBlob []byte) b
 	if !ok || !validSSHUsername(parts.user) || parts.user != user {
 		return false
 	}
-	return sshBytesEq(parts.sessionID, sessionID) && sshBytesEq(parts.hostKey, pinned) && sshBytesEq(parts.userKey, userBlob)
+	if !sshBytesEq(parts.sessionID, sessionID) || !sshBytesEq(parts.userKey, userBlob) {
+		return false
+	}
+	if !parts.hostBound {
+		// A plain publickey request carries no host key. Its session
+		// identifier is the whole destination evidence, and it is only
+		// reached when the caller matched the session identifier of a
+		// non-forwarding bind this stream already verified against the
+		// grant's pinned host key.
+		return true
+	}
+	return sshBytesEq(parts.hostKey, pinned)
 }
 
 // sshSignData returns the exact bytes to sign: the data string inside the
@@ -926,6 +974,7 @@ type userauthParts struct {
 	user      string
 	userKey   []byte
 	hostKey   []byte
+	hostBound bool
 }
 
 func parseUserauth(data []byte) (userauthParts, bool) {
@@ -950,7 +999,11 @@ func parseUserauth(data []byte) (userauthParts, bool) {
 		return zero, false
 	}
 	method, rest, ok := takeSSHBytes(rest, len(sshUserAuthMethod))
-	if !ok || string(method) != sshUserAuthMethod {
+	if !ok {
+		return zero, false
+	}
+	hostBound := string(method) == sshUserAuthMethod
+	if !hostBound && string(method) != sshUserAuthPlain {
 		return zero, false
 	}
 	if len(rest) < 1 || rest[0] != 1 {
@@ -965,11 +1018,19 @@ func parseUserauth(data []byte) (userauthParts, bool) {
 	if !ok || len(userKey) != sshEd25519BlobLen {
 		return zero, false
 	}
+	parts := userauthParts{sessionID: sid, user: string(user), userKey: userKey, hostBound: hostBound}
+	if !hostBound {
+		if len(rest) != 0 {
+			return zero, false
+		}
+		return parts, true
+	}
 	hostKey, rest, ok := takeSSHBytes(rest, sshEd25519BlobLen)
 	if !ok || len(hostKey) != sshEd25519BlobLen || len(rest) != 0 {
 		return zero, false
 	}
-	return userauthParts{sessionID: sid, user: string(user), userKey: userKey, hostKey: hostKey}, true
+	parts.hostKey = hostKey
+	return parts, true
 }
 
 func parseSignBody(body []byte) (key, data []byte, flags uint32, ok bool) {
@@ -989,6 +1050,24 @@ func parseSignBody(body []byte) (key, data []byte, flags uint32, ok bool) {
 		return nil, nil, 0, false
 	}
 	return key, data, binary.BigEndian.Uint32(rest), true
+}
+
+// bindClaimsForwarding reports whether a session-bind body could mean
+// is_forwarding to any reader: OpenSSH takes the byte right after the three
+// strings and ignores what follows, so that byte counts, and so does a non-zero
+// final byte when the strings do not parse.
+func bindClaimsForwarding(rest []byte) bool {
+	if len(rest) > 0 && rest[len(rest)-1] != 0 {
+		return true
+	}
+	b := rest
+	for range 3 {
+		var ok bool
+		if _, b, ok = takeSSHBytes(b, len(rest)); !ok {
+			return false
+		}
+	}
+	return len(b) > 0 && b[0] != 0
 }
 
 func parseSessionBind(rest []byte) (host, sid, sig []byte, ok bool) {
@@ -1075,11 +1154,7 @@ func sshEmptyIdentities() []byte {
 }
 
 func sshIdentities(blob []byte) []byte {
-	body := []byte{sshAgentIdentitiesAnswer}
-	body = appendU32(body, 1)
-	body = appendSSHString(body, blob)
-	body = appendSSHString(body, nil)
-	return body
+	return sshIdentityList([][]byte{blob})
 }
 
 func sshSignResponse(sigBlob []byte) []byte {
