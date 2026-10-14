@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -735,6 +736,7 @@ func TestBrokerRedactsEquivalentCredentialEncodings(t *testing.T) {
 		{"base64-standard-raw", []byte(base64.RawStdEncoding.EncodeToString(secret))},
 		{"base64-url-padded", []byte(base64.URLEncoding.EncodeToString(secret))},
 		{"base64-url-raw", []byte(base64.RawURLEncoding.EncodeToString(secret))},
+		{"mixed-case-hex", mixedCaseHexEncoding(secret)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -742,6 +744,73 @@ func TestBrokerRedactsEquivalentCredentialEncodings(t *testing.T) {
 				t.Fatal("equivalent credential encoding survived redaction")
 			}
 		})
+	}
+}
+
+func mixedCaseHexEncoding(secret []byte) []byte {
+	lower := hex.EncodeToString(secret)
+	out := []byte(lower)
+	for i := range out {
+		if out[i] >= 'a' && out[i] <= 'f' {
+			out[i] -= 'a' - 'A'
+			return out
+		}
+	}
+	return out
+}
+
+func TestBrokerRedactsJSONSolidusEscape(t *testing.T) {
+	secret := []byte("ab/cd+EF9kLm")
+	forms := credentialForms(grantInjection{style: InjectBearer}, secret)
+	defer wipeForms(forms)
+	body := []byte(`ab\/cd+EF9kLm`)
+	if got := redactForms(append([]byte(nil), body...), forms, false); string(got) != redacted {
+		t.Fatalf("JSON solidus escape survived redaction: %q", got)
+	}
+}
+
+func TestBrokerWithholdsMCPJSONEncodingLeak(t *testing.T) {
+	// Credential bytes are a JSON escape spelling; the upstream echoes the preimage.
+	secret := []byte(`Q7m\u003ckL2p9`)
+	body := []byte(`Q7m<kL2p9`)
+	forms := credentialForms(grantInjection{style: InjectBearer}, secret)
+	defer wipeForms(forms)
+	for _, form := range forms {
+		if bytes.Contains(body, form) {
+			t.Fatal("fixture body already held a credential form")
+		}
+	}
+	resp, err := projectResponse(grantInjection{style: InjectBearer}, secret, http.Header{}, body, false)
+	if err == nil {
+		mcpJSON, _ := json.Marshal(brokerBody(resp))
+		if containsCredentialForm(mcpJSON, forms) {
+			t.Fatal("fixture did not reproduce the MCP JSON encoding leak")
+		}
+		t.Fatal("MCP JSON credential form was not withheld")
+	}
+	if !errors.Is(err, ErrBrokerUpstream) || resp.Body != nil {
+		t.Fatal("MCP JSON credential form did not fail closed")
+	}
+}
+
+func TestBrokerOrdinaryResponseUnchanged(t *testing.T) {
+	secret := []byte("Sk" + randHex(t, 20) + `/\"&=`)
+	body := []byte("upstream ok: no reflection")
+	resp, err := projectResponse(grantInjection{style: InjectBearer}, secret, http.Header{
+		"Content-Type": []string{"text/plain"},
+	}, body, false)
+	if err != nil {
+		t.Fatalf("ordinary response withheld: %v", err)
+	}
+	if string(resp.Body) != string(body) {
+		t.Fatalf("body %q, want %q", resp.Body, body)
+	}
+	mcpJSON, err := json.Marshal(brokerBody(resp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(mcpJSON), "upstream ok") {
+		t.Fatalf("MCP projection changed ordinary body: %s", mcpJSON)
 	}
 }
 
