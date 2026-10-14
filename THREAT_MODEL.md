@@ -133,7 +133,7 @@ The host is trusted to supply the current checkpoint, quiesce the source, and ru
 
 ## Passphrase-change limits
 
-The human host can rewrap the existing DEK after reauthenticating the old passphrase ([ADR 0019](docs/adr/0019-human-vault-lifecycle.md)). The new wrap and audit event commit together. Cached sessions cannot overwrite a newer wrap, but a process already holding the DEK still knows it. This is not key revocation against a compromised host. Existing snapshots and copies retain their original passphrase. Agents do not receive this operation.
+The human host can generate a fresh DEK, re-encrypt every stored credential under it, and rewrap under the new passphrase after reauthenticating the old one ([ADR 0019](docs/adr/0019-human-vault-lifecycle.md)). The new wrap and audit event commit together. Cached sessions cannot overwrite a newer wrap, but a process already holding the DEK still knows it. This is not key revocation against a compromised host. Existing snapshots and copies retain their original passphrase. Agents do not receive this operation.
 
 ## Agent capability interface limits
 

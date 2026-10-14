@@ -73,7 +73,7 @@ The pattern is:
 2) create a Claude-specific agent token file,
 3) create scoped grants (origin + methods + path prefix + injection style +
    expiry),
-4) run `tremelay daemon`,
+4) run `tremelay daemon --vault PATH`,
 5) register `tremelay mcp --daemon --token-file ...` as the local MCP server.
 
 Claude then uses list_capabilities / describe_capability / invoke_capability.
