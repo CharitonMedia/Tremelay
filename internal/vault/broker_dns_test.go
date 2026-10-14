@@ -145,3 +145,31 @@ func TestBrokerDNSRevokedDuringLookupRefused(t *testing.T) {
 		t.Fatal("revoked grant reached the upstream after DNS")
 	}
 }
+
+// TestBrokerRequestRevokedDuringLookupRefused covers the AgentPrincipal path,
+// which has no bound handle: the decision is taken again after DNS.
+func TestBrokerRequestRevokedDuringLookupRefused(t *testing.T) {
+	e := newHTTPBrokerEnv(t, InjectBearer, "")
+	entered, release := make(chan struct{}), make(chan struct{})
+	e.s.resolve = func(context.Context, string) ([]net.IP, error) {
+		close(entered)
+		<-release
+		return []net.IP{net.ParseIP("1.1.1.1")}, nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
+		done <- err
+	}()
+	<-entered
+	if err := e.s.RevokeGrant(e.grant.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err == nil {
+		t.Fatal("grant revoked during DNS was still used")
+	}
+	if e.requests != 0 {
+		t.Fatalf("upstream saw %d requests after revoke", e.requests)
+	}
+}

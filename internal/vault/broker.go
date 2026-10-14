@@ -187,6 +187,23 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		return 0, err
 	} else if s.defunct {
 		return 0, ErrStale
+	} else {
+		// The mutex was released for DNS: decide again on the adopted state
+		// before any secret is copied, so a revoke during the lookup holds.
+		var again auditEvent
+		var cause error
+		if call.operation == OpHTTPBroker {
+			again, cause = s.judgeBroker(agentID, call.credentialID, call.origin, call.method, call.path)
+		} else {
+			again, cause = s.judge(agentID, call.credentialID, call.operation, resource)
+		}
+		if cause != nil {
+			return s.failExchange(again, call.method, cause)
+		}
+		if again.GrantID != partial.GrantID {
+			again.Result = resultDenied
+			return s.failExchange(again, call.method, ErrDenied)
+		}
 	}
 	err := lookupErr
 	if err != nil || len(ips) == 0 {
