@@ -1,4 +1,4 @@
-.PHONY: test vet race build candidate
+.PHONY: test vet race build candidate release-dry
 
 test:
 	go test ./...
@@ -18,3 +18,8 @@ build:
 # The helper is verified and compiled by tools/bootstrap-candidate.sh.
 candidate:
 	sh tools/bootstrap-candidate.sh
+
+# Six-platform binaries, archives, SBOMs and checksums in dist/release.
+# Dry run only: it does not sign or publish. See docs/adr/0027-release-artifacts.md.
+release-dry:
+	sh tools/release-dry.sh
