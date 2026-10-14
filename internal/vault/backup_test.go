@@ -149,6 +149,42 @@ func TestBackupRestoreNegative(t *testing.T) {
 	env.grant(t, time.Hour)
 	artGranted, cpGranted := mustBackup(t, env.path, dir, env.pass, nil)
 	mustReject(t, artUngranted, env.pass, cpGranted, ErrCheckpoint)
+	t.Run("staging symlink before publish", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink swap proof is Unix-specific")
+		}
+		decoy := filepath.Join(dir, "symlink-decoy.db")
+		if err := os.WriteFile(decoy, readAll(t, artUngranted), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		restorePublishFault = func() error {
+			names := incompleteNames(t, dir)
+			if len(names) != 1 {
+				return errors.New("staging-count-sentinel")
+			}
+			staging := filepath.Join(dir, names[0])
+			if err := os.Remove(staging); err != nil {
+				return err
+			}
+			return os.Symlink(decoy, staging)
+		}
+		t.Cleanup(func() { restorePublishFault = nil })
+		dest := filepath.Join(dir, "symlink-race.db")
+		if err := Restore(artGranted, dest, env.pass, cpGranted, nil); !errors.Is(err, ErrCheckpoint) {
+			t.Fatalf("symlink staging publication: %v", err)
+		}
+		fi, statErr := os.Lstat(dest)
+		if statErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			t.Fatal("symlink staging publication left a symlink destination")
+		}
+		if statErr == nil {
+			t.Fatal("symlink staging publication left a destination")
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("destination stat: %v", statErr)
+		}
+		assertNoIncomplete(t, dir)
+	})
 	t.Run("staging overwritten before publish", func(t *testing.T) {
 		restorePublishFault = func() error {
 			names := incompleteNames(t, dir)

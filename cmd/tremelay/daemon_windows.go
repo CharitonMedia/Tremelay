@@ -10,6 +10,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/CharitonMedia/Tremelay/internal/vault"
 	"golang.org/x/sys/windows"
 )
 
@@ -27,64 +28,23 @@ const (
 	pipeBusyInterval   = 20 * time.Millisecond
 	pipeBusyAttempts   = 50
 
-	// A descriptor this program wrote holds one entry. The bound only stops an
-	// unbounded walk of a descriptor some other writer produced.
-	maxDescriptorACEs = 64
-
 	// GENERIC_READ|GENERIC_WRITE lets the owner open the pipe and create the
 	// further instances the accept loop needs (FILE_CREATE_PIPE_INSTANCE is
 	// part of the generic write mapping). Nothing else is granted.
 	pipeRights = "GRGW"
-	// A token file must also be deletable and re-securable by its owner.
-	fileRights = "GA"
 )
 
-// currentUserSID returns this process's token user: the whole identity
-// boundary on Windows. The pipe descriptor names it, every client checks it,
-// and every accepted connection must match it.
 func currentUserSID() (*windows.SID, error) {
-	user, err := windows.GetCurrentProcessToken().GetTokenUser()
-	if err != nil {
-		return nil, err
-	}
-	return user.User.Sid.Copy() // The native buffer is not retained.
+	return vault.CurrentUserSID()
 }
 
-// userOnlyDescriptor grants the named rights to this user and to nobody else,
-// in a protected DACL that inherits nothing, owned by the same SID. Everyone,
-// Authenticated Users, Administrators and SYSTEM appear nowhere; only this
-// user's own SID can match the one entry. Windows parses the descriptor, so
-// no ACL layout is invented here.
 func userOnlyDescriptor(rights string) (*windows.SECURITY_DESCRIPTOR, error) {
-	sid, err := currentUserSID()
-	if err != nil {
-		return nil, err
-	}
-	self := sid.String()
-	return windows.SecurityDescriptorFromString("O:" + self + "G:" + self + "D:P(A;;" + rights + ";;;" + self + ")")
+	return vault.OwnerOnlySecurityDescriptor(rights)
 }
 
-// descriptorIsUserOnly requires this user to own the object and every DACL
-// entry to name this user. A missing DACL, a NULL DACL (which grants
-// everyone), or any entry for another principal is refused.
 func descriptorIsUserOnly(sd *windows.SECURITY_DESCRIPTOR, self *windows.SID) error {
-	owner, _, err := sd.Owner()
-	if err != nil || owner == nil || !owner.Equals(self) {
+	if err := vault.DescriptorIsUserOnly(sd, self); err != nil {
 		return errDaemonEndpoint
-	}
-	dacl, _, err := sd.DACL()
-	if err != nil || dacl == nil || dacl.AceCount == 0 || dacl.AceCount > maxDescriptorACEs {
-		return errDaemonEndpoint
-	}
-	for index := range uint32(dacl.AceCount) {
-		var ace *windows.ACCESS_ALLOWED_ACE
-		if err := windows.GetAce(dacl, index, &ace); err != nil {
-			return errDaemonEndpoint
-		}
-		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-		if !sid.IsValid() || !sid.Equals(self) {
-			return errDaemonEndpoint
-		}
 	}
 	return nil
 }
@@ -401,72 +361,22 @@ func newPipeConn(handle windows.Handle, name string) *pipeConn {
 // a normal profile also admits SYSTEM and Administrators, so the descriptor
 // is set explicitly at creation rather than taken from the directory.
 func createUserOnlyFile(path string) (*os.File, error) {
-	sd, err := userOnlyDescriptor(fileRights)
-	if err != nil {
-		return nil, err
+	f, err := vault.OpenExclusiveOwnerOnly(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	if errors.Is(err, vault.ErrSecureCreateACL) {
+		return nil, errTokenFileACL
 	}
-	wide, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return nil, err
-	}
-	sa := windows.SecurityAttributes{SecurityDescriptor: sd}
-	sa.Length = uint32(unsafe.Sizeof(sa))
-	// CREATE_NEW refuses an existing file, as O_EXCL does on Unix.
-	// READ_CONTROL is what the read-back below needs; the generic write
-	// mapping already carries it, and naming it keeps that from being
-	// accidental.
-	handle, err := windows.CreateFile(wide, windows.GENERIC_WRITE|windows.READ_CONTROL, 0, &sa,
-		windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
-	if err != nil {
-		return nil, err
-	}
-	// A volume with no ACL support — FAT, exFAT, some network redirectors —
-	// accepts the SECURITY_ATTRIBUTES and silently ignores them, which would
-	// leave the bearer token readable by every user of the machine. So the
-	// descriptor the object actually carries is read back from the open
-	// handle before a single token byte is written, and a file that does not
-	// carry it leaves with us while it is still empty.
-	if err := handleIsUserOnly(handle); err != nil {
-		windows.CloseHandle(handle)
-		os.Remove(path)
-		return nil, err
-	}
-	file := os.NewFile(uintptr(handle), path)
-	if file == nil {
-		windows.CloseHandle(handle)
-		return nil, errAgentToken
-	}
-	return file, nil
+	return f, err
 }
 
-// handleIsUserOnly applies the same check userOnlyFile makes by path to the
-// object behind an open handle, so a creator can verify its own result
-// without a second lookup that could resolve to a different file.
 func handleIsUserOnly(handle windows.Handle) error {
-	self, err := currentUserSID()
-	if err != nil {
-		return errTokenFileACL
-	}
-	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-	if err != nil || sd == nil || descriptorIsUserOnly(sd, self) != nil {
+	if err := vault.VerifyOwnerOnlyHandle(handle); err != nil {
 		return errTokenFileACL
 	}
 	return nil
 }
 
-// userOnlyFile refuses a token file any other principal can read.
 func userOnlyFile(path string) error {
-	self, err := currentUserSID()
-	if err != nil {
-		return errAgentToken
-	}
-	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-	if err != nil || sd == nil {
-		return errAgentToken
-	}
-	if descriptorIsUserOnly(sd, self) != nil {
+	if err := vault.VerifyOwnerOnlyPath(path); err != nil {
 		return errAgentToken
 	}
 	return nil
