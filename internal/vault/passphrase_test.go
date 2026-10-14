@@ -161,20 +161,19 @@ func TestChangePassphraseStaleSession(t *testing.T) {
 			if err := current.ChangePassphrase(oldPass, newPass); err != nil {
 				t.Fatal(err)
 			}
-			before := readAll(t, path)
+			// Since V1.md item 3d the session that lost this race adopts the
+			// newer wrap at its next entry point instead of refusing every
+			// later call. The property that matters is unchanged and is what
+			// the checks below assert: the old passphrase is never revived,
+			// and no write puts the old wrap back on the file.
 			if rewrap {
-				err = stale.ChangePassphrase(oldPass, []byte(randHex(t, 24)))
-			} else {
-				_, err = stale.CreateAgent("stale")
-			}
-			if !errors.Is(err, ErrCorrupt) {
-				t.Fatalf("stale write: %v", err)
-			}
-			if !bytes.Equal(before, readAll(t, path)) {
-				t.Fatal("stale session overwrote wrap")
-			}
-			if err := stale.ChangePassphrase(oldPass, newPass); !errors.Is(err, ErrStale) {
-				t.Fatal(err)
+				// The adopted wrap is the new one, so the old passphrase no
+				// longer authenticates a further change.
+				if err := stale.ChangePassphrase(oldPass, []byte(randHex(t, 24))); !errors.Is(err, ErrUnauthenticated) {
+					t.Fatalf("stale rewrap: %v", err)
+				}
+			} else if _, err := stale.CreateAgent("stale"); err != nil {
+				t.Fatalf("adopted write: %v", err)
 			}
 			if _, err := VerifyAudit(path, newPass); err != nil {
 				t.Fatal(err)

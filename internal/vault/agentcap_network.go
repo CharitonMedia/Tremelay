@@ -66,8 +66,8 @@ func (s *Session) capGrantSupported(g grantRecord) bool {
 }
 
 func (b agentBinder) agentCapNetwork(ctx context.Context, agentID string, bound agentCapGrant, req HTTPRequest) (capNetworkResult, error) {
-	if b.s == nil {
-		return capNetworkResult{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return capNetworkResult{}, err
 	}
 	return b.s.agentCapNetwork(ctx, agentID, bound, req)
 }
@@ -77,9 +77,6 @@ func (s *Session) agentCapNetwork(ctx context.Context, agentID string, bound age
 		return capNetworkResult{}, err
 	}
 	defer s.end()
-	if err := s.requireCurrent(); err != nil {
-		return capNetworkResult{}, err
-	}
 	partial, err := s.judgeExactNetwork(agentID, bound)
 	if err != nil {
 		if capHost(err) {
@@ -153,7 +150,7 @@ func (s *Session) judgeExactNetwork(agentID string, bound agentCapGrant) (auditE
 	if err := s.live(); err != nil {
 		return auditEvent{}, err
 	}
-	if err := s.requireCurrent(); err != nil {
+	if err := s.adoptLocked(); err != nil {
 		return auditEvent{}, err
 	}
 	bare := s.boundAgentDenial(agentID)

@@ -8,6 +8,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/x509"
+	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +52,7 @@ type daemonFixture struct {
 	t              *testing.T
 	env            map[string]string
 	path, pass     string
+	credID         string
 	agents         []daemonAgent
 	endpoint       string
 	stdout, stderr *daemonOutput
@@ -70,6 +74,18 @@ func (f *daemonFixture) wait(t *testing.T, timeout time.Duration) int {
 		}
 	})
 	return f.code
+}
+
+// exited reports whether the daemon has already stopped. A test that requires
+// the daemon to keep serving asserts this rather than waiting for a timeout.
+func (f *daemonFixture) exited() bool {
+	select {
+	case code := <-f.exit:
+		f.once.Do(func() { f.code = code })
+		return true
+	default:
+		return false
+	}
 }
 
 // startDaemon builds a synthetic vault through the human CLI, then unlocks it
@@ -106,6 +122,7 @@ func startDaemon(t *testing.T, idle time.Duration) *daemonFixture {
 
 	f.cli(t, "vault", "create", "--path", f.path)
 	credID := f.cli(t, "credential", "put", "--path", f.path, "--label", "daemon key", "--type", "ed25519", "--secret-file", secretPath)
+	f.credID = credID
 	// Two agents share one credential through separate grants, so a call can
 	// be checked for the resource it holds and for the one it must not see.
 	for i := range 2 {
@@ -157,6 +174,25 @@ func (f *daemonFixture) cli(t *testing.T, args ...string) string {
 	return strings.TrimSpace(stdout.String())
 }
 
+// cliRetryStale runs a control-plane command that may lose its compare-and-swap
+// to a daemon committing audit rows at the same moment. Nothing of a lost
+// attempt is written, and re-running it is what an operator does by hand.
+func (f *daemonFixture) cliRetryStale(t *testing.T, args ...string) string {
+	t.Helper()
+	for range 50 {
+		var stdout, stderr bytes.Buffer
+		code := run(args, envGet(f.env), strings.NewReader(""), &stdout, &stderr)
+		if code == 0 {
+			return strings.TrimSpace(stdout.String())
+		}
+		if !strings.Contains(stderr.String(), vault.ErrStale.Error()) {
+			t.Fatalf("%v exited %d: %s", args, code, stderr.String())
+		}
+	}
+	t.Fatalf("%v never won its race with the daemon", args)
+	return ""
+}
+
 func (f *daemonFixture) token(t *testing.T, a daemonAgent) string {
 	t.Helper()
 	raw, err := os.ReadFile(a.tokenFile)
@@ -187,6 +223,28 @@ func (f *daemonFixture) relay(t *testing.T, tokenFile string) *agentRelay {
 	}()
 	t.Cleanup(func() { stdinW.Close(); stdoutR.Close() })
 	return r
+}
+
+// relayToken connects with a token that is no longer at the agent's path,
+// which is how a client holding a superseded token is simulated.
+func (f *daemonFixture) relayToken(t *testing.T, token string) *agentRelay {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "held.token")
+	// The platform's owner-only creator: on Windows a plain 0600 write keeps
+	// the inherited ACL, and the client would refuse the file before the
+	// daemon ever saw the token.
+	file, err := createUserOnlyFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.WriteString(token + "\n")
+	if cerr := file.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f.relay(t, path)
 }
 
 func (r *agentRelay) send(t *testing.T, frame string) {
@@ -234,8 +292,55 @@ func (r *agentRelay) finish(t *testing.T) int {
 const (
 	initializeFrame  = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"synthetic-daemon-client","version":"1"}}}`
 	initializedFrame = `{"jsonrpc":"2.0","method":"notifications/initialized"}`
-	listFrame        = `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_capabilities","arguments":{}}}`
 )
+
+// daemonCapEntry is the part of one list_capabilities entry these tests read.
+type daemonCapEntry struct {
+	Handle   string `json:"handle"`
+	Resource string `json:"resource"`
+	Status   string `json:"status"`
+}
+
+// capabilityEntries parses the entries out of a list_capabilities response.
+func capabilityEntries(t *testing.T, frame string) []daemonCapEntry {
+	t.Helper()
+	var resp struct {
+		Result struct {
+			Structured struct {
+				Entries []daemonCapEntry `json:"entries"`
+			} `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(frame), &resp); err != nil {
+		t.Fatalf("capability frame %q: %v", frame, err)
+	}
+	return resp.Result.Structured.Entries
+}
+
+// callList asks an already-initialized relay to list capabilities again, which
+// is how a long-lived agent connection observes a control-plane change.
+func (r *agentRelay) callList(t *testing.T, id int) string {
+	t.Helper()
+	r.send(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"list_capabilities","arguments":{}}}`, id))
+	listed := r.receive(t)
+	if !strings.Contains(listed, fmt.Sprintf(`"id":%d`, id)) {
+		t.Fatalf("capability call response %q", listed)
+	}
+	return listed
+}
+
+// attest invokes one local_artifact_attest capability and returns the raw
+// response frame together with whether a signature was released.
+func (r *agentRelay) attest(t *testing.T, id int, handle string) (string, bool) {
+	t.Helper()
+	payload := base64.StdEncoding.EncodeToString([]byte("item-3d-reload-probe"))
+	r.send(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"invoke_capability","arguments":{"handle":%q,"payload":%q}}}`, id, handle, payload))
+	got := r.receive(t)
+	if !strings.Contains(got, fmt.Sprintf(`"id":%d`, id)) {
+		t.Fatalf("invoke response %q", got)
+	}
+	return got, strings.Contains(got, `"signature"`)
+}
 
 // TestDaemonUnlockedAgentCall is the ADR 0024 acceptance path: one unlock, then
 // an agent capability call with no prompt, then lock-and-exit, after which the
@@ -343,12 +448,7 @@ func (r *agentRelay) capabilities(t *testing.T) string {
 		t.Fatalf("initialize response %q", got)
 	}
 	r.send(t, initializedFrame)
-	r.send(t, listFrame)
-	listed := r.receive(t)
-	if !strings.Contains(listed, `"id":2`) {
-		t.Fatalf("capability call response %q", listed)
-	}
-	return listed
+	return r.callList(t, 2)
 }
 
 // TestDaemonConcurrentAgentsStayIsolated holds two agent sessions open on the
@@ -403,42 +503,509 @@ func TestDaemonIdleTimeoutFailsClosed(t *testing.T) {
 	f.assertAudit(t, nil, 0)
 }
 
-// TestDaemonFailsClosedAfterGrantRevoke revokes an agent's only grant through
-// the human control plane while the daemon is unlocked. The control-plane
-// commit makes the daemon's cached session stale, so the daemon refuses the
-// next call, zeroises, and exits instead of serving stale authority.
-func TestDaemonFailsClosedAfterGrantRevoke(t *testing.T) {
+// grantIDFor returns the grant id the human control plane reports for one of
+// this agent's resources.
+func (f *daemonFixture) grantIDFor(t *testing.T, agentID, resource string) string {
+	t.Helper()
+	listed := f.cli(t, "capability", "list", "--path", f.path, "--agent", agentID)
+	for _, line := range strings.Split(listed, "\n") {
+		var entry struct {
+			GrantID  string `json:"grant_id"`
+			Resource string `json:"resource"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("capability line %q: %v", line, err)
+		}
+		if entry.Resource == resource {
+			return entry.GrantID
+		}
+	}
+	t.Fatalf("no grant for %q in %q", resource, listed)
+	return ""
+}
+
+// TestDaemonReloadsOnControlPlaneChange is the V1.md item 3d acceptance path.
+// With the daemon unlocked, `grant create` makes a capability usable and
+// `grant revoke` makes it refused, on the agent connection that is already
+// open, with no restart and no second passphrase entry.
+func TestDaemonReloadsOnControlPlaneChange(t *testing.T) {
 	f := startDaemon(t, time.Hour)
 	worker := f.agents[0]
-	first := f.relay(t, worker.tokenFile)
-	if listed := first.capabilities(t); !strings.Contains(listed, worker.resource) {
-		t.Fatalf("capability call before revocation: %q", listed)
+	agent := f.relay(t, worker.tokenFile)
+	before := capabilityEntries(t, agent.capabilities(t))
+	if len(before) != 1 || before[0].Resource != worker.resource || before[0].Status != vault.GrantActive {
+		t.Fatalf("capabilities before the control-plane change: %+v", before)
 	}
-	first.finish(t)
 
-	// This agent holds exactly one grant, so the listing is one JSON line.
-	var entry struct {
-		GrantID string `json:"grant_id"`
+	// A grant issued while the daemon serves is usable on the next call.
+	added := "synthetic-reload-" + randHex(t, 6)
+	f.cli(t, "grant", "create", "--path", f.path, "--agent", worker.id, "--credential", f.credID,
+		"--operation", vault.OpLocalArtifactAttest, "--resource", added,
+		"--expires", time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	grown := capabilityEntries(t, agent.callList(t, 3))
+	addedHandle := ""
+	for _, entry := range grown {
+		if entry.Resource == added && entry.Status == vault.GrantActive {
+			addedHandle = entry.Handle
+		}
 	}
-	grants := f.cli(t, "capability", "list", "--path", f.path, "--agent", worker.id)
-	if err := json.Unmarshal([]byte(grants), &entry); err != nil || entry.GrantID == "" {
-		t.Fatalf("no grant id in %q: %v", grants, err)
+	if len(grown) != 2 || addedHandle == "" {
+		t.Fatalf("grant created while the daemon served is not usable: %+v", grown)
 	}
-	f.cli(t, "grant", "revoke", "--path", f.path, "--id", entry.GrantID)
+	if frame, signed := agent.attest(t, 4, addedHandle); !signed {
+		t.Fatalf("new grant did not release a signature: %q", frame)
+	}
 
-	after := f.relay(t, worker.tokenFile)
-	if code := after.finish(t); code != 1 {
-		t.Fatalf("call against a stale daemon exited %d: %q", code, after.stderr.String())
+	// Revoking the original grant refuses it on the next call, through the
+	// handle the agent already holds.
+	f.cli(t, "grant", "revoke", "--path", f.path, "--id", f.grantIDFor(t, worker.id, worker.resource))
+	frame, signed := agent.attest(t, 5, before[0].Handle)
+	if signed || !strings.Contains(frame, vault.GrantRevoked) {
+		t.Fatalf("revoked grant was not refused: %q", frame)
 	}
-	if code := f.wait(t, 15*time.Second); code != 0 {
-		t.Fatalf("stale daemon exited %d", code)
+	// The other grant is untouched, so the refusal came from the revocation
+	// and not from a daemon that stopped serving.
+	if frame, signed := agent.attest(t, 6, addedHandle); !signed {
+		t.Fatalf("surviving grant stopped working: %q", frame)
 	}
-	if !strings.Contains(f.stderr.String(), errDaemonTerminal.Error()) {
-		t.Fatalf("stale daemon diagnostic: %q", f.stderr.String())
+	if f.exited() {
+		t.Fatalf("daemon exited on an ordinary control-plane change: %q", f.stderr.String())
 	}
+	if strings.Contains(f.stderr.String(), errDaemonTerminal.Error()) {
+		t.Fatalf("daemon reported a terminal session: %q", f.stderr.String())
+	}
+
+	agent.finish(t)
+	f.cancel()
+	f.wait(t, 15*time.Second)
 	if _, err := vault.VerifyAudit(f.path, []byte(f.pass)); err != nil {
 		t.Fatalf("audit chain invalid: %v", err)
 	}
+}
+
+// TestDaemonLocksOnUnverifiableVault is the fail-closed half of item 3d. A
+// reload that cannot be verified is never adopted: the daemon zeroises and
+// exits rather than serve a document, a chain, or an audit head it cannot
+// authenticate with the key it holds.
+func TestDaemonLocksOnUnverifiableVault(t *testing.T) {
+	for name, tamper := range map[string]func(*testing.T, *daemonFixture){
+		// Each case first advances the durable sequence through an ordinary
+		// command, which is what brings the daemon back to the file at all.
+		"tampered document": func(t *testing.T, f *daemonFixture) {
+			f.cli(t, "agent", "create", "--path", f.path, "--label", "tamper probe")
+			f.execSQL(t, `UPDATE vault SET encrypted_document = randomblob(length(encrypted_document))`)
+		},
+		"broken chain": func(t *testing.T, f *daemonFixture) {
+			f.cli(t, "agent", "create", "--path", f.path, "--label", "tamper probe")
+			f.execSQL(t, `UPDATE audit SET result = 'denied' WHERE seq = 2`)
+		},
+		"rolled back audit head": func(t *testing.T, f *daemonFixture) {
+			f.execSQL(t, `UPDATE vault SET audit_seq = audit_seq - 1`)
+		},
+		// A forked chain: an older authentic copy of the file, pushed past
+		// the sequence the daemon has already served by the owner's own
+		// ordinary commands. Everything a reload verifies passes on the
+		// fork's own terms, so what refuses it is the session's memory of
+		// the tip it served.
+		"forked chain": func(t *testing.T, f *daemonFixture) {
+			var nonce, doc []byte
+			var head string
+			var seq int64
+			f.withDB(t, func(db *sql.DB) {
+				if err := db.QueryRow(`SELECT data_nonce, encrypted_document, audit_head, audit_seq FROM vault`).Scan(&nonce, &doc, &head, &seq); err != nil {
+					t.Fatal(err)
+				}
+			})
+			f.cli(t, "agent", "create", "--path", f.path, "--label", "fork probe")
+			// One agent call makes the daemon adopt that commit, so the tip
+			// it remembers is past the copy taken above.
+			probe := f.relay(t, f.agents[0].tokenFile)
+			probe.capabilities(t)
+			probe.finish(t)
+			tip := f.auditSeq(t)
+			f.execSQL(t, `DELETE FROM audit WHERE seq > ?`, seq)
+			f.execSQL(t, `UPDATE vault SET data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=?`, nonce, doc, head, seq)
+			for f.auditSeq(t) <= tip {
+				f.cli(t, "agent", "create", "--path", f.path, "--label", "fork push")
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := startDaemon(t, time.Hour)
+			tamper(t, f)
+			// Any agent call reaches the vault, so authentication is enough.
+			refused := f.relay(t, f.agents[0].tokenFile)
+			if code := refused.finish(t); code != 1 {
+				t.Fatalf("call against an unverifiable vault exited %d: %q", code, refused.stderr.String())
+			}
+			if code := f.wait(t, 15*time.Second); code != 0 {
+				t.Fatalf("daemon exited %d: %q", code, f.stderr.String())
+			}
+			if !strings.Contains(f.stderr.String(), errDaemonTerminal.Error()) {
+				t.Fatalf("missing fail-closed diagnostic: %q", f.stderr.String())
+			}
+			if _, err := os.Lstat(f.endpoint); err == nil {
+				t.Fatal("locked daemon left its endpoint in place")
+			}
+		})
+	}
+}
+
+// withDB opens the vault file directly, which is the only way to produce the
+// tampering an attacker with filesystem access would.
+func (f *daemonFixture) withDB(t *testing.T, fn func(*sql.DB)) {
+	t.Helper()
+	db, err := sql.Open("sqlite", f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	fn(db)
+}
+
+func (f *daemonFixture) execSQL(t *testing.T, stmt string, args ...any) {
+	t.Helper()
+	f.withDB(t, func(db *sql.DB) {
+		if _, err := db.Exec(stmt, args...); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// auditSeq is the durable audit sequence, which is what a fork has to pass to
+// be taken for a continuation.
+func (f *daemonFixture) auditSeq(t *testing.T) int64 {
+	t.Helper()
+	var seq int64
+	f.withDB(t, func(db *sql.DB) {
+		if err := db.QueryRow(`SELECT audit_seq FROM vault`).Scan(&seq); err != nil {
+			t.Fatal(err)
+		}
+	})
+	return seq
+}
+
+// TestDaemonConcurrentCallsDuringReload keeps both agents calling the daemon
+// across a run of control-plane commits, so each reload swap is taken by
+// several connections at once. Under -race this is the check that the session
+// mutex keeps every one of them off half-swapped state.
+func TestDaemonConcurrentCallsDuringReload(t *testing.T) {
+	f := startDaemon(t, time.Hour)
+	relays := make([]*agentRelay, len(f.agents))
+	for i, a := range f.agents {
+		relays[i] = f.relay(t, a.tokenFile)
+		relays[i].capabilities(t)
+	}
+	stop := make(chan struct{})
+	var callers sync.WaitGroup
+	// A caller goroutine must be joined before this test can fail, or its
+	// next frame goes to a closed pipe and panics the run.
+	halt := sync.OnceFunc(func() { close(stop); callers.Wait() })
+	defer halt()
+	// Every agent call commits an audit row of its own, and a commit is
+	// optimistic, so a human command racing a continuous stream of them can
+	// lose indefinitely; see the ceiling noted on updateVault. The gate gives
+	// the control plane the writes that are in flight, not the agents that
+	// follow it: callers resume together and reach the reload at once.
+	var gate sync.RWMutex
+	for i, r := range relays {
+		callers.Add(1)
+		go func() {
+			defer callers.Done()
+			for id := 100; ; id++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				gate.RLock()
+				// Each agent must keep seeing its own grant and only its own,
+				// whichever side of a reload the call lands on.
+				listed := r.callList(t, id)
+				gate.RUnlock()
+				if !strings.Contains(listed, f.agents[i].resource) ||
+					strings.Contains(listed, f.agents[(i+1)%len(f.agents)].resource) {
+					t.Errorf("agent %d saw the wrong grants during a reload: %q", i, listed)
+					return
+				}
+			}
+		}()
+	}
+	for range 3 {
+		gate.Lock()
+		f.cliRetryStale(t, "grant", "create", "--path", f.path, "--agent", f.agents[0].id, "--credential", f.credID,
+			"--operation", vault.OpLocalArtifactAttest, "--resource", "churn-"+randHex(t, 6),
+			"--expires", time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+		gate.Unlock()
+		// Let the callers back in long enough to cross the reload together.
+		time.Sleep(50 * time.Millisecond)
+	}
+	halt()
+	if f.exited() {
+		t.Fatalf("daemon exited while serving concurrent calls: %q", f.stderr.String())
+	}
+	for _, r := range relays {
+		r.finish(t)
+	}
+	f.cancel()
+	f.wait(t, 15*time.Second)
+	if _, err := vault.VerifyAudit(f.path, []byte(f.pass)); err != nil {
+		t.Fatalf("audit chain invalid: %v", err)
+	}
+}
+
+// auditRows returns the result and agent of every row with this action, in
+// chain order, straight from the file.
+func (f *daemonFixture) auditRows(t *testing.T, action string) [][2]string {
+	t.Helper()
+	db, err := sql.Open("sqlite", f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT result, agent_id FROM audit WHERE action = ? ORDER BY seq`, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out [][2]string
+	for rows.Next() {
+		var result, agent string
+		if err := rows.Scan(&result, &agent); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, [2]string{result, agent})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestDaemonAgentTokenCustody is the V1.md item 3c acceptance path over the
+// real CLI and a live daemon: a token is rotated and revoked and reissued at
+// the path the client is already configured with, the agent keeps its id and
+// its grants throughout, and the daemon honours each change on the next call
+// with no restart.
+func TestDaemonAgentTokenCustody(t *testing.T) {
+	f := startDaemon(t, time.Hour)
+	worker := f.agents[0]
+	stale := f.token(t, worker)
+	// These connections stay open across the rotation. A daemon connection
+	// authenticates once, so the token it authenticated with has to be
+	// refused on its next call and not merely on its next connection: one
+	// connection proves that for a listing, the other for an invocation on
+	// the handle it already holds.
+	lister := f.relay(t, worker.tokenFile)
+	if listed := lister.capabilities(t); !strings.Contains(listed, worker.resource) {
+		t.Fatalf("capability call before rotation: %q", listed)
+	}
+	signer := f.relay(t, worker.tokenFile)
+	held := capabilityEntries(t, signer.capabilities(t))
+	if len(held) != 1 || held[0].Resource != worker.resource {
+		t.Fatalf("capability call before rotation: %+v", held)
+	}
+
+	// Attributed daemon_auth denials are how a refusal on an open connection
+	// is audited: the digest resolved an agent, the token is no longer its.
+	refusals := func() int {
+		n := 0
+		for _, row := range f.auditRows(t, "daemon_auth") {
+			if row[0] == "denied_agent" && row[1] == worker.id {
+				n++
+			}
+		}
+		return n
+	}
+	if out := f.cli(t, "agent", "token", "rotate", "--path", f.path, "--agent", worker.id,
+		"--token-file", worker.tokenFile); out != worker.tokenFile {
+		t.Fatalf("rotate reported %q, want the same path", out)
+	}
+	rotated := f.token(t, worker)
+	if rotated == stale {
+		t.Fatal("rotate left the same token at the path")
+	}
+	audited := refusals()
+	if frame := lister.callList(t, 7); !strings.Contains(frame, `"error"`) || strings.Contains(frame, worker.resource) {
+		t.Fatalf("a connection opened before the rotation still listed: %q", frame)
+	}
+	if refusals() <= audited {
+		t.Fatal("the refused listing was not audited")
+	}
+	audited = refusals()
+	if frame, signed := signer.attest(t, 8, held[0].Handle); signed || !strings.Contains(frame, `"error"`) {
+		t.Fatalf("a connection opened before the rotation still signed: %q", frame)
+	}
+	if refusals() <= audited {
+		t.Fatal("the refused invocation was not audited")
+	}
+	lister.finish(t)
+	signer.finish(t)
+	// The daemon re-reads the vault, so the superseded token is refused by
+	// the process that was serving it a moment ago.
+	if code := f.relayToken(t, stale).finish(t); code != 1 {
+		t.Fatal("the superseded token still authenticated")
+	}
+	after := f.relay(t, worker.tokenFile)
+	if listed := after.capabilities(t); !strings.Contains(listed, worker.resource) {
+		t.Fatalf("the rotated token lost the agent's grants: %q", listed)
+	}
+
+	// Revoking the token takes daemon access away and leaves everything else
+	// in place; reissuing to the same path restores it.
+	f.cli(t, "agent", "token", "revoke", "--path", f.path, "--agent", worker.id)
+	audited = refusals()
+	if frame := after.callList(t, 9); !strings.Contains(frame, `"error"`) || strings.Contains(frame, worker.resource) {
+		t.Fatalf("a connection open across the revocation still listed: %q", frame)
+	}
+	if refusals() <= audited {
+		t.Fatal("the refused listing after revocation was not audited")
+	}
+	after.finish(t)
+	if code := f.relay(t, worker.tokenFile).finish(t); code != 1 {
+		t.Fatal("a revoked token still authenticated")
+	}
+	// issue writes a new path, so the file the revoked token left behind goes
+	// first. The path itself does not change, which is what the client is
+	// configured with.
+	if err := os.Remove(worker.tokenFile); err != nil {
+		t.Fatal(err)
+	}
+	f.cli(t, "agent", "token", "issue", "--path", f.path, "--agent", worker.id, "--token-file", worker.tokenFile)
+	reissued := f.relay(t, worker.tokenFile)
+	entries := capabilityEntries(t, reissued.capabilities(t))
+	if len(entries) != 1 || entries[0].Resource != worker.resource || entries[0].Status != vault.GrantActive {
+		t.Fatalf("the reissued token does not hold the agent's grants: %+v", entries)
+	}
+	if frame, signed := reissued.attest(t, 3, entries[0].Handle); !signed {
+		t.Fatalf("the reissued token could not use the grant: %q", frame)
+	}
+	reissued.finish(t)
+	if f.exited() {
+		t.Fatalf("daemon exited during token custody: %q", f.stderr.String())
+	}
+
+	// Each attempt is audited, and the refused ones are daemon_auth denials
+	// with no attribution, since a retired token resolves to no agent.
+	custody := map[string][][2]string{
+		"agent_token_rotate": {{"allowed", worker.id}},
+		"agent_token_revoke": {{"allowed", worker.id}},
+		"agent_token_issue":  {{"allowed", worker.id}},
+	}
+	for action, want := range custody {
+		if got := f.auditRows(t, action); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s rows %v, want %v", action, got, want)
+		}
+	}
+	denied := 0
+	for _, row := range f.auditRows(t, "daemon_auth") {
+		if row[0] == "denied" && row[1] == "" {
+			denied++
+		}
+	}
+	if denied != 2 {
+		t.Fatalf("retired tokens produced %d unattributed denials", denied)
+	}
+	// Nothing printed the token, and the file still holds only the digest.
+	if strings.Contains(f.stdout.String()+f.stderr.String(), rotated) {
+		t.Fatal("a token reached daemon output")
+	}
+	sealed, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{stale, rotated, f.token(t, worker)} {
+		raw, err := hex.DecodeString(token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(sealed, raw) {
+			t.Fatal("the vault file contains a raw token")
+		}
+	}
+
+	f.cancel()
+	f.wait(t, 15*time.Second)
+	if _, err := vault.VerifyAudit(f.path, []byte(f.pass)); err != nil {
+		t.Fatalf("audit chain invalid: %v", err)
+	}
+}
+
+// TestAgentTokenCustodyCLIRefusals covers the control-plane refusals, which
+// happen with no daemon in the picture at all.
+func TestAgentTokenCustodyCLIRefusals(t *testing.T) {
+	f := startDaemon(t, time.Hour)
+	worker := f.agents[0]
+	spare := filepath.Join(filepath.Dir(worker.tokenFile), "spare.token")
+	cases := map[string]struct {
+		args []string
+		code int
+	}{
+		// issue refuses an agent that still holds a token, rather than
+		// retiring a client that is working right now.
+		"issue over a live token": {[]string{"agent", "token", "issue", "--path", f.path, "--agent", worker.id, "--token-file", spare}, 1},
+		"unknown agent":           {[]string{"agent", "token", "rotate", "--path", f.path, "--agent", randHex(t, 16), "--token-file", spare}, 1},
+		"rotate with no path":     {[]string{"agent", "token", "rotate", "--path", f.path, "--agent", worker.id}, 1},
+		"revoke with a path":      {[]string{"agent", "token", "revoke", "--path", f.path, "--agent", worker.id, "--token-file", spare}, 1},
+		"no agent":                {[]string{"agent", "token", "rotate", "--path", f.path, "--token-file", spare}, 1},
+		"unknown verb":            {[]string{"agent", "token", "renew", "--path", f.path, "--agent", worker.id}, 2},
+		"unknown flag":            {[]string{"agent", "token", "rotate", "--path", f.path, "--agent", worker.id, "--force"}, 1},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(tc.args, envGet(f.env), strings.NewReader(""), &stdout, &stderr); code != tc.code {
+				t.Fatalf("exited %d, want %d: %q", code, tc.code, stderr.String())
+			}
+			if _, err := os.Lstat(spare); err == nil {
+				t.Fatal("a refused command wrote a token file")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("a refused command printed %q", stdout.String())
+			}
+		})
+	}
+	// A path that is not a token file is a mistyped argument, and the vault
+	// must not commit before saying so.
+	other := filepath.Join(filepath.Dir(worker.tokenFile), "notes.txt")
+	if err := os.WriteFile(other, []byte("not a token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := run([]string{"agent", "token", "rotate", "--path", f.path, "--agent", worker.id, "--token-file", other},
+		envGet(f.env), strings.NewReader(""), io.Discard, &stderr); code != 1 {
+		t.Fatalf("rotate overwrote a file that was not a token: %q", stderr.String())
+	}
+	if raw, err := os.ReadFile(other); err != nil || string(raw) != "not a token\n" {
+		t.Fatalf("a refused rotate changed the file: %q %v", raw, err)
+	}
+	// issue writes a path that is new, like agent create: an existing file
+	// may be another agent's live token, and replacing it would retire a
+	// client that is working. Replacing in place is rotate's job alone.
+	held := f.token(t, worker)
+	fresh := f.cli(t, "agent", "create", "--path", f.path, "--label", "no token yet")
+	// agent create always seals a digest, so this is how the CLI produces an
+	// agent that holds no token: the refusal below must be about the file.
+	f.cli(t, "agent", "token", "revoke", "--path", f.path, "--agent", fresh)
+	if code := run([]string{"agent", "token", "issue", "--path", f.path, "--agent", fresh, "--token-file", worker.tokenFile},
+		envGet(f.env), strings.NewReader(""), io.Discard, &stderr); code != 1 {
+		t.Fatalf("issue overwrote an existing token file: %q", stderr.String())
+	}
+	if f.token(t, worker) != held {
+		t.Fatal("a refused issue replaced another agent's token")
+	}
+	// The refusal happened before the vault committed, so the agent that has
+	// no token can still be given one at a path of its own.
+	f.cli(t, "agent", "token", "issue", "--path", f.path, "--agent", fresh, "--token-file", spare)
+	// The token the agent is using is untouched by every refusal above.
+	if _, err := vault.VerifyAudit(f.path, []byte(f.pass)); err != nil {
+		t.Fatalf("audit chain invalid: %v", err)
+	}
+	live := f.relay(t, worker.tokenFile)
+	if listed := live.capabilities(t); !strings.Contains(listed, worker.resource) {
+		t.Fatalf("a refused command disturbed a live token: %q", listed)
+	}
+	live.finish(t)
 }
 
 func TestAgentTokenFile(t *testing.T) {
@@ -457,6 +1024,29 @@ func TestAgentTokenFile(t *testing.T) {
 	got, err := readAgentToken(path)
 	if err != nil || !bytes.Equal(got, token) {
 		t.Fatalf("token round trip: %v", err)
+	}
+	// A rotated token is written through the same owner-only creator as a new
+	// one. A temporary file created any other way keeps the directory's
+	// inherited ACL on Windows, and the token is then refused on read with
+	// the vault already committed, which leaves the agent with no way in.
+	rotated := randBytes(t, vault.AgentTokenLen)
+	if err := replaceAgentToken(path, rotated); err != nil {
+		t.Fatal(err)
+	}
+	if err := userOnlyFile(path); err != nil {
+		t.Fatalf("a rotated token file is not user-only: %v", err)
+	}
+	if got, err = readAgentToken(path); err != nil || !bytes.Equal(got, rotated) {
+		t.Fatalf("rotated token round trip: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".tremelay-token-") {
+			t.Fatalf("rotation left a token behind at %q", entry.Name())
+		}
 	}
 	for name, content := range map[string]string{
 		"empty":        "",

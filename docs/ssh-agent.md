@@ -119,11 +119,10 @@ granted key, and the signature is produced inside the daemon.
 tremelay grant revoke --path /absolute/vault.db --id GRANT_ID
 ```
 
-The next signature is refused. Because any control-plane command commits to
-the same vault, revoking also makes the running daemon's session stale, so it
-zeroises and exits — which is the same outcome from the client's side: the
-next `git push` fails. `tremelay lock`, the idle timeout, losing the daemon,
-or stopping `tremelay ssh-agent` each stop it as well.
+The next signature is refused, and the key stops being listed, on the
+connection the client already has: the running daemon re-reads the vault and
+picks the revocation up without a restart. `tremelay lock`, the idle timeout,
+losing the daemon, or stopping `tremelay ssh-agent` each stop it as well.
 
 ## What is audited
 

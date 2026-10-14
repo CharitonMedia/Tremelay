@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -270,13 +272,16 @@ func (d *daemon) serveSSHAgent(conn net.Conn, principal *vault.AgentPrincipal) {
 	}
 }
 
-// checkTerminal locks and exits when this session can never serve again. A
-// human control-plane command run against the same vault advances the durable
-// audit sequence, which makes the daemon's cached session stale: it then
-// refuses every operation. Holding an unusable DEK serves nobody, so the
-// daemon zeroises it and says so instead of refusing calls indefinitely.
+// checkTerminal locks and exits when this session can never serve again.
+// Neither an ordinary control-plane commit nor a write that lost the race to
+// one is such a case any more: the session re-reads and re-verifies the vault
+// and keeps serving, so a human can create and revoke grants while agents
+// work. What reaches here is a failed verification — a tampered document, a
+// broken chain, or a rolled-back audit head. Holding a DEK that can never be
+// trusted again serves nobody, so the daemon zeroises it and says so instead
+// of refusing calls indefinitely.
 func (d *daemon) checkTerminal(err error) {
-	if errors.Is(err, vault.ErrStale) || errors.Is(err, vault.ErrCorrupt) || errors.Is(err, vault.ErrAudit) {
+	if errors.Is(err, vault.ErrCorrupt) || errors.Is(err, vault.ErrAudit) {
 		fmt.Fprintln(d.stderr, errDaemonTerminal.Error())
 		d.requestLock()
 	}
@@ -464,8 +469,7 @@ func writeAgentToken(path string, token []byte) error {
 	if err != nil {
 		return errAgentToken
 	}
-	encoded := hex.AppendEncode(make([]byte, 0, hex.EncodedLen(len(token))+1), token)
-	encoded = append(encoded, '\n')
+	encoded := encodeAgentToken(token)
 	defer vault.Wipe(encoded)
 	_, err = f.Write(encoded)
 	if closeErr := f.Close(); err == nil {
@@ -476,4 +480,63 @@ func writeAgentToken(path string, token []byte) error {
 		return errAgentToken
 	}
 	return nil
+}
+
+// replaceAgentToken puts a rotated token at the path the client is already
+// configured with. The new token is written and flushed to a user-only
+// temporary file beside it and then renamed over it, so a reader either gets
+// the whole old token or the whole new one, never a truncated file and never
+// a file the daemon has already stopped accepting while the old one is gone.
+func replaceAgentToken(path string, token []byte) error {
+	// os.CreateTemp is not the creator here: its 0600 is a Unix mode, and on
+	// Windows the file would keep the directory's inherited ACL, which
+	// readAgentToken then refuses after the vault has already committed. The
+	// platform creator is the same one agent create uses, so the temporary
+	// file and the final file have one custody rule.
+	f, err := createUserOnlyFile(filepath.Join(filepath.Dir(path), tempTokenName()))
+	if err != nil {
+		return errAgentToken
+	}
+	encoded := encodeAgentToken(token)
+	defer vault.Wipe(encoded)
+	fail := func() error {
+		f.Close()
+		os.Remove(f.Name())
+		return errAgentToken
+	}
+	if _, err := f.Write(encoded); err != nil {
+		return fail()
+	}
+	// ponytail: the file is flushed, the directory entry is not, so a crash
+	// between the rename and the directory's own writeback can leave the old
+	// token in place. That is the recoverable direction — the operator sees
+	// the old token still working and rotates again — and os.File cannot
+	// fsync a directory portably. Upgrade path: a build-tagged directory
+	// sync on Unix.
+	if err := f.Sync(); err != nil {
+		return fail()
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return errAgentToken
+	}
+	// os.Rename replaces an existing target on both platforms: rename(2) on
+	// Unix, MoveFileEx with MOVEFILE_REPLACE_EXISTING on Windows.
+	if err := os.Rename(f.Name(), path); err != nil {
+		os.Remove(f.Name())
+		return errAgentToken
+	}
+	return nil
+}
+
+// tempTokenName is a name nothing else holds, because the owner-only creator
+// refuses an existing file on both platforms. A collision is not retried: the
+// vault has already committed, so the operator rotates again.
+func tempTokenName() string {
+	return ".tremelay-token-" + rand.Text()
+}
+
+func encodeAgentToken(token []byte) []byte {
+	encoded := hex.AppendEncode(make([]byte, 0, hex.EncodedLen(len(token))+1), token)
+	return append(encoded, '\n')
 }

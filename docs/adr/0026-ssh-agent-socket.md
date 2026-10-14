@@ -174,10 +174,10 @@ signatures, tokens and private keys stay out of rows, logs and errors.
   `key_id` from `tremelay capability list`; [the guide](../ssh-agent.md) gives
   the one-line conversion to an `authorized_keys` entry. `ssh-add -L` lists
   nothing before a binding, by design.
-- Changing grants while the daemon runs still makes the session stale, so the
-  daemon zeroises and exits (ADR 0024). Revocation consequently stops signing
-  immediately, which is the V1 item 5 acceptance behavior, but it also means
-  grant changes are made against a locked vault.
+- Changing grants while the daemon runs is served by the daemon re-reading the
+  vault (ADR 0024, amendment of 2026-10-13). Revocation stops signing on the
+  client's existing connection, which is the V1 item 5 acceptance behavior,
+  and the daemon keeps running.
 - Each SSH connection adds three audit rows beyond the signing rows. A busy
   repository produces a visible, but bounded, audit volume.
 - `tremelay ssh-agent` is one process per agent token. Two agents need two

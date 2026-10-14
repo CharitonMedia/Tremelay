@@ -14,32 +14,39 @@ const (
 	auditNoticeVersion     = 3
 	auditHealthVersion     = 4
 
-	actionCreate       = "vault_create"
-	actionUnlock       = "vault_unlock"
-	actionPassphrase   = "vault_passphrase_change"
-	actionPut          = "credential_put"
-	actionGet          = "credential_get"
-	actionList         = "credential_list"
-	actionAgentCreate  = "agent_create"
-	actionDaemonAuth   = "daemon_auth"
-	actionGrantCreate  = "grant_create"
-	actionGrantRevoke  = "grant_revoke"
-	actionAuthorize    = "capability_authorize"
-	actionCapList      = "capability_list"
-	actionBroker       = "broker_http"
-	actionLocalAttest  = "local_attest"
-	actionSSHUserAuth  = "ssh_userauth"
-	actionAgentCap     = "agent_capability"
-	actionNotify       = "notify"
-	actionContain      = "contain"
-	actionRespond      = "respond"
-	actionReplace      = "credential_replace"
-	actionLifecycle    = "credential_lifecycle"
-	actionHealth       = "health_assess"
-	actionRefresh      = "health_refresh"
-	actionHealthPolicy = "health_policy"
-	actionHealthGet    = "health_get"
-	actionHealthList   = "health_list"
+	actionCreate      = "vault_create"
+	actionUnlock      = "vault_unlock"
+	actionPassphrase  = "vault_passphrase_change"
+	actionPut         = "credential_put"
+	actionGet         = "credential_get"
+	actionList        = "credential_list"
+	actionAgentCreate = "agent_create"
+	// The three token actions record custody of an agent's bearer token.
+	// They never carry the token, its digest, its length or its generation:
+	// an audit row is readable by anyone who can read the chain, and any of
+	// those is a verifier for a guessed token.
+	actionAgentTokenIssue  = "agent_token_issue"
+	actionAgentTokenRotate = "agent_token_rotate"
+	actionAgentTokenRevoke = "agent_token_revoke"
+	actionDaemonAuth       = "daemon_auth"
+	actionGrantCreate      = "grant_create"
+	actionGrantRevoke      = "grant_revoke"
+	actionAuthorize        = "capability_authorize"
+	actionCapList          = "capability_list"
+	actionBroker           = "broker_http"
+	actionLocalAttest      = "local_attest"
+	actionSSHUserAuth      = "ssh_userauth"
+	actionAgentCap         = "agent_capability"
+	actionNotify           = "notify"
+	actionContain          = "contain"
+	actionRespond          = "respond"
+	actionReplace          = "credential_replace"
+	actionLifecycle        = "credential_lifecycle"
+	actionHealth           = "health_assess"
+	actionRefresh          = "health_refresh"
+	actionHealthPolicy     = "health_policy"
+	actionHealthGet        = "health_get"
+	actionHealthList       = "health_list"
 
 	resultAllowed           = "allowed"
 	resultDenied            = "denied"
@@ -129,31 +136,15 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 		return "", ErrUnauthenticated
 	}
 	defer wipe(dek)
-	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
+	// openDocument authenticates the sealed document under the plaintext audit
+	// head, checks the detection mirror and health against the chain, and
+	// wipes anything it rejects. Every one of those failures is a failed
+	// verification here, not a clean tip.
+	doc, _, err := openDocument(dek, header, events)
 	if err != nil {
 		return "", ErrAudit
 	}
-	defer wipe(plain)
-	var doc document
-	// The closure reads doc after unmarshal. A deferred wipeCredentials(doc.Credentials)
-	// would capture the nil slice header from before the decode.
-	defer func() { wipeCredentials(doc.Credentials) }()
-	if err := unmarshalStrict(plain, &doc); err != nil {
-		return "", ErrAudit
-	}
-	// The detection mirror is inside the authenticated document. A pre-M5
-	// document has no member; the chain supplies it. A stored member that
-	// does not match the chain is a failed verification, not a clean tip.
-	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
-	if err != nil || matchDetection(indexFromAudit(events).state(), doc.Detection) != nil {
-		return "", ErrAudit
-	}
-	if matchHealth(events, doc.Credentials) != nil {
-		return "", ErrAudit
-	}
-	if validateDocument(doc) != nil {
-		return "", ErrAudit
-	}
+	defer wipeCredentials(doc.Credentials)
 	return events[len(events)-1].Hash, nil
 }
 
@@ -362,7 +353,8 @@ func verifyLinked(events []auditEvent) error {
 func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPassphrase, actionPut, actionGet, actionList,
-		actionAgentCreate, actionDaemonAuth, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
+		actionAgentCreate, actionAgentTokenIssue, actionAgentTokenRotate, actionAgentTokenRevoke,
+		actionDaemonAuth, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
 		actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
 		actionHealthGet, actionHealthList:
@@ -378,7 +370,8 @@ func noticeAction(action string) bool {
 
 func capabilityAction(action string) bool {
 	switch action {
-	case actionAgentCreate, actionDaemonAuth, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap:
+	case actionAgentCreate, actionAgentTokenIssue, actionAgentTokenRotate, actionAgentTokenRevoke,
+		actionDaemonAuth, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap:
 		return true
 	default:
 		return false
@@ -447,6 +440,28 @@ func validAuditShape(ev auditEvent) error {
 			return ErrAudit
 		}
 		if ev.Result != resultAllowed && ev.Result != resultDenied {
+			return ErrAudit
+		}
+	case actionAgentTokenIssue, actionAgentTokenRotate, actionAgentTokenRevoke:
+		// Token custody names the agent and nothing else. No credential, no
+		// grant, no operation, and nothing derived from the token: not the
+		// digest, not the generation, not a length.
+		if ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
+			return ErrAudit
+		}
+		switch ev.Result {
+		case resultAllowed, resultDeniedAgent:
+			// A refusal that names the agent is one the caller identified:
+			// a token already held, or none to replace.
+			if ev.AgentID == "" {
+				return ErrAudit
+			}
+		case resultDenied:
+			// An unknown or malformed agent id has nothing to attribute.
+			if ev.AgentID != "" {
+				return ErrAudit
+			}
+		default:
 			return ErrAudit
 		}
 	case actionGrantCreate:

@@ -73,6 +73,9 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay credential refresh --path PATH [--id ID]
   tremelay credential policy --path PATH [--min-length N] [--pattern-run N] [--freshness DURATION] [--reminder-lead DURATION] [--compromise-opt-in true|false]
   tremelay agent create --path PATH --label LABEL [--token-file PATH]
+  tremelay agent token issue --path PATH --agent ID --token-file PATH
+  tremelay agent token rotate --path PATH --agent ID --token-file PATH
+  tremelay agent token revoke --path PATH --agent ID
   tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339 [--ssh-user USER --ssh-host-key HEX] [--method M ... --inject STYLE [--inject-name NAME]]
   tremelay grant revoke --path PATH --id ID
   tremelay capability list --path PATH --agent ID
@@ -769,6 +772,9 @@ func withSession(path string, getenv func(string) string, stdin io.Reader, stder
 }
 
 func cmdAgent(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 1 && args[0] == "token" {
+		return cmdAgentToken(args[1], args[2:], getenv, stdin, stdout, stderr)
+	}
 	if len(args) == 0 || args[0] != "create" {
 		fmt.Fprintln(stderr, "unknown command")
 		return 2
@@ -809,6 +815,83 @@ func cmdAgent(args []string, getenv func(string) string, stdin io.Reader, stdout
 			return err
 		}
 		// The path, never the token. Nothing echoes the token bytes.
+		_, err = fmt.Fprintln(stdout, *tokenFile)
+		return err
+	})
+}
+
+// cmdAgentToken is agent token custody: give an agent that has none a token,
+// replace the one it has, or take it away. None of them touches the agent's
+// id, state or grants, so a client's MCP configuration never changes and an
+// agent never has to be recreated to get a working token.
+func cmdAgentToken(verb string, args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	var reject func(*vault.Session) error
+	switch verb {
+	case "issue":
+		reject = func(s *vault.Session) error { return s.RejectAgentTokenIssue(vault.ErrInvalid) }
+	case "rotate":
+		reject = func(s *vault.Session) error { return s.RejectAgentTokenRotate(vault.ErrInvalid) }
+	case "revoke":
+		reject = func(s *vault.Session) error { return s.RejectAgentTokenRevoke(vault.ErrInvalid) }
+	default:
+		fmt.Fprintln(stderr, "unknown command")
+		return 2
+	}
+	fs := flag.NewFlagSet("agent token "+verb, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	path := fs.String("path", "", "vault file")
+	agent := fs.String("agent", "", "agent id")
+	tokenFile := fs.String("token-file", "", "write this agent's daemon token here")
+	if err := fs.Parse(args); err != nil {
+		return denyKnownVault(*path, getenv, stdin, stderr, reject)
+	}
+	if *path == "" {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		// revoke writes no file and must not be handed one, so a mistyped
+		// command cannot leave a token on disk that authorizes nothing.
+		if fs.NArg() != 0 || *agent == "" || (*tokenFile == "") != (verb == "revoke") {
+			return reject(session)
+		}
+		if verb == "revoke" {
+			if err := session.RevokeAgentToken(*agent); err != nil {
+				return err
+			}
+			_, err := fmt.Fprintln(stdout, *agent)
+			return err
+		}
+		// rotate is the only verb that replaces a file, because the point of
+		// it is that a client's configured path never changes. What it
+		// replaces must already be a token file this tool could read: an
+		// existing path that is anything else is a mistyped argument. issue
+		// writes a path that is new, like agent create, so it cannot retire
+		// another agent's working token file. Either refusal happens before
+		// the vault commits.
+		if verb == "issue" {
+			if _, err := os.Lstat(*tokenFile); err == nil {
+				return reject(session)
+			}
+		} else if stale, err := readAgentToken(*tokenFile); err == nil {
+			vault.Wipe(stale)
+		} else if _, statErr := os.Lstat(*tokenFile); statErr == nil {
+			return reject(session)
+		}
+		mint, write := session.IssueAgentToken, writeAgentToken
+		if verb == "rotate" {
+			mint, write = session.RotateAgentToken, replaceAgentToken
+		}
+		minted, err := mint(*agent)
+		if err != nil {
+			return err
+		}
+		// The vault keeps only the digest, so this is the only copy. It is
+		// written to the file or wiped; it is never printed.
+		defer vault.Wipe(minted.Token)
+		if err := write(*tokenFile, minted.Token); err != nil {
+			return err
+		}
 		_, err = fmt.Fprintln(stdout, *tokenFile)
 		return err
 	})

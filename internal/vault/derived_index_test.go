@@ -330,29 +330,29 @@ func TestDeliverPendingIndexesRoutineHistoryOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := len(session.audit)
-	noticeScanVisits = 0
-	noticeApplyVisits = 0
+	noticeScanVisits.Store(0)
+	noticeApplyVisits.Store(0)
 	if err := session.DeliverPending(); err != nil {
 		t.Fatal(err)
 	}
-	if noticeScanVisits != 0 {
-		t.Fatalf("pending delivery scanned %d rows", noticeScanVisits)
+	if noticeScanVisits.Load() != 0 {
+		t.Fatalf("pending delivery scanned %d rows", noticeScanVisits.Load())
 	}
 	wrote := len(session.audit) - before
-	if noticeApplyVisits != wrote {
-		t.Fatalf("pending delivery applied %d rows, wrote %d", noticeApplyVisits, wrote)
+	if noticeApplyVisits.Load() != int64(wrote) {
+		t.Fatalf("pending delivery applied %d rows, wrote %d", noticeApplyVisits.Load(), wrote)
 	}
 	got := sink.Snapshot()
 	if len(got) != 1 || got[0].Result != resultDeniedOrigin {
 		t.Fatalf("delivered %+v", got)
 	}
-	noticeScanVisits = 0
-	noticeApplyVisits = 0
+	noticeScanVisits.Store(0)
+	noticeApplyVisits.Store(0)
 	if err := session.DeliverPending(); err != nil {
 		t.Fatal(err)
 	}
-	if noticeScanVisits != 0 || noticeApplyVisits != 0 {
-		t.Fatalf("second pass scanned %d applied %d", noticeScanVisits, noticeApplyVisits)
+	if noticeScanVisits.Load() != 0 || noticeApplyVisits.Load() != 0 {
+		t.Fatalf("second pass scanned %d applied %d", noticeScanVisits.Load(), noticeApplyVisits.Load())
 	}
 	if len(sink.Snapshot()) != 1 {
 		t.Fatal("second pass sent another alert")
@@ -375,16 +375,16 @@ func TestSustainedHighRiskSkipsNoticeScan(t *testing.T) {
 	}
 	check := func() int {
 		t.Helper()
-		noticeScanVisits = 0
-		noticeApplyVisits = 0
+		noticeScanVisits.Store(0)
+		noticeApplyVisits.Store(0)
 		before := len(session.audit)
 		writeSSRF()
 		wrote := len(session.audit) - before
-		if noticeScanVisits != 0 {
-			t.Fatalf("scanned %d rows after %d history", noticeScanVisits, before)
+		if noticeScanVisits.Load() != 0 {
+			t.Fatalf("scanned %d rows after %d history", noticeScanVisits.Load(), before)
 		}
-		if noticeApplyVisits != wrote || wrote > 4 {
-			t.Fatalf("applied %d rows, wrote %d", noticeApplyVisits, wrote)
+		if noticeApplyVisits.Load() != int64(wrote) || wrote > 4 {
+			t.Fatalf("applied %d rows, wrote %d", noticeApplyVisits.Load(), wrote)
 		}
 		return wrote
 	}
@@ -442,14 +442,14 @@ func TestNoticeIndexRollbackAndReopen(t *testing.T) {
 		t.Fatal("index diverged from the chain")
 	}
 	session.Lock()
-	noticeApplyVisits = 0
+	noticeApplyVisits.Store(0)
 	opened, err := Unlock(path, pass, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(opened.Lock)
-	if noticeApplyVisits != len(opened.audit) {
-		t.Fatalf("rebuild visited %d rows for %d audit rows", noticeApplyVisits, len(opened.audit))
+	if noticeApplyVisits.Load() != int64(len(opened.audit)) {
+		t.Fatalf("rebuild visited %d rows for %d audit rows", noticeApplyVisits.Load(), len(opened.audit))
 	}
 	if !reflect.DeepEqual(opened.notices, noticeIndex(opened.audit)) {
 		t.Fatal("reopen index does not match the chain")
@@ -458,12 +458,12 @@ func TestNoticeIndexRollbackAndReopen(t *testing.T) {
 	if err := opened.SetNotifier(sink); err != nil {
 		t.Fatal(err)
 	}
-	noticeScanVisits = 0
+	noticeScanVisits.Store(0)
 	if err := opened.DeliverPending(); err != nil {
 		t.Fatal(err)
 	}
-	if noticeScanVisits != 0 {
-		t.Fatalf("reopen delivery scanned %d rows", noticeScanVisits)
+	if noticeScanVisits.Load() != 0 {
+		t.Fatalf("reopen delivery scanned %d rows", noticeScanVisits.Load())
 	}
 	var origin, redirect, ssrf int
 	for _, n := range sink.Snapshot() {

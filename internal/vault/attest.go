@@ -280,7 +280,7 @@ func (s *Session) releaseAttestation(partial auditEvent, priv ed25519.PrivateKey
 // still the credential that was authorized. A generation change, lifecycle
 // change, or different public key is a failure. Another grant is not selected.
 func (s *Session) attestStillBound(partial auditEvent, priv ed25519.PrivateKey, gen uint64, resource string) error {
-	if err := s.requireCurrent(); err != nil {
+	if err := s.adoptLocked(); err != nil {
 		return err
 	}
 	if !s.agentActive(partial.AgentID) {

@@ -74,6 +74,34 @@ closed by later revocation. Each connection adds `daemon_auth` and `cap_list`
 rows beside the existing `ssh_userauth` rows. Real-client evidence is one
 unprivileged OpenSSH server on Linux, not a claim about hosted forges.
 
+## Resident session reload limits
+
+An unlocked session re-reads the vault file when another holder of the same
+passphrase commits to it, so the daemon serves grant and token changes made
+from the control plane without a restart
+([ADR 0024](docs/adr/0024-headless-unlock-daemon.md), amendment of
+2026-10-13). What it adopts is bounded by verification, not by trust in the
+file: the header, the hash chain, the locked-denial suffix and the sealed
+document are checked with the same code an unlock runs, under the key the
+session already holds. An attacker who can write the file cannot make a
+resident session adopt a forged document, a broken chain, a rolled-back audit
+head or another vault's identity; each of those locks the session and the
+daemon exits. A higher sequence is not taken for a continuation either: the
+re-read chain must contain the event the session last served, so an older
+authentic copy restored under the daemon and then pushed past that sequence
+by the owner's own commands is refused rather than adopted, and the
+revocations and retired tokens the session had already seen cannot be
+reinstated that way. Rollback is detected only while a session is live and
+remembers the tip it served — an older authentic copy opened fresh still
+verifies on its own terms, as in the snapshot limits below. A token retired
+while a connection is open is refused on that connection's next call, because
+the authenticated principal is bound to the agent's token generation and not
+only to its identity. A reload appends no audit
+row; the commit it adopts is already in the chain under the identity that
+wrote it. Commits remain optimistic, so a writer that loses the
+compare-and-swap writes nothing and reports a stale session rather than
+corruption.
+
 ## Single-human custody
 
 One human holds the passphrase; many agents hold grants. Tremelay has no second

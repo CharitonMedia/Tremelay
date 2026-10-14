@@ -108,6 +108,12 @@ var (
 	ErrAgentNotFound = errors.New("agent not found")
 	// ErrGrantNotFound means the grant id is not in this vault.
 	ErrGrantNotFound = errors.New("grant not found")
+	// ErrAgentTokenPresent means this agent already holds a token. Issuing a
+	// second one would retire a working client silently; rotate instead.
+	ErrAgentTokenPresent = errors.New("agent already holds a token; rotate it instead")
+	// ErrAgentTokenAbsent means this agent holds no token to replace or
+	// revoke. Issuing one gives it daemon access without touching its grants.
+	ErrAgentTokenAbsent = errors.New("agent holds no token; issue one instead")
 	// ErrDeniedAgent means authorization failed because the principal does not hold the grant.
 	ErrDeniedAgent = errors.New("denied_agent")
 	// ErrDeniedCredential means authorization failed because the credential does not match.
@@ -330,7 +336,8 @@ type Session struct {
 	// mu; its commit must match the durable audit sequence or it fails closed.
 	mu     sync.Mutex
 	locked atomic.Bool
-	// defunct is set when a commit loses a race. Later calls return ErrStale.
+	// defunct is set when a commit loses a race it cannot recover from.
+	// Later calls return ErrStale.
 	defunct bool
 }
 
@@ -410,6 +417,52 @@ var unlockDecoded func([]credential)
 // is zeroed. Tests hold that buffer. Production leaves it nil.
 var wipedSecret func([]byte)
 
+// openDocument authenticates the sealed document under the plaintext audit
+// head and checks every invariant that document must satisfy: strict decoding,
+// the detection mirror against the chain, health against the chain, and the
+// stored credential, agent and grant shapes. It is the whole verification
+// Unlock performs once the DEK is in hand, and the whole verification
+// Session.reloadLocked performs with the DEK it already holds. A rejected document
+// is wiped here, so no caller receives decoded credential bytes to leak.
+func openDocument(dek []byte, header fileHeader, events []auditEvent) (document, *detectionIndex, error) {
+	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
+	if err != nil {
+		return document{}, nil, ErrCorrupt
+	}
+	defer wipe(plain)
+	var doc document
+	// retained is set only when the caller keeps these buffers. Every
+	// rejection, including a partial decode, zeroes them before returning.
+	retained := false
+	defer func() {
+		if !retained {
+			wipeCredentials(doc.Credentials)
+		}
+	}()
+	if err := unmarshalStrict(plain, &doc); err != nil {
+		return document{}, nil, ErrCorrupt
+	}
+	if unlockDecoded != nil {
+		unlockDecoded(doc.Credentials)
+	}
+	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
+	if err != nil {
+		return document{}, nil, err
+	}
+	if err := validateDocument(doc); err != nil {
+		return document{}, nil, err
+	}
+	idx := indexFromAudit(events)
+	if err := matchDetection(idx.state(), doc.Detection); err != nil {
+		return document{}, nil, ErrCorrupt
+	}
+	if err := matchHealth(events, doc.Credentials); err != nil {
+		return document{}, nil, ErrCorrupt
+	}
+	retained = true
+	return doc, idx, nil
+}
+
 // Unlock opens path with passphrase. A rejected unlock appends a denial and
 // does not update encrypted credential state. The denial has no passphrase
 // bytes. A later valid unlock checks that denial suffix and links its own
@@ -442,46 +495,17 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	if err != nil {
 		return nil, deny(ErrUnauthenticated)
 	}
-	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
+	doc, idx, err := openDocument(dek, header, events)
 	if err != nil {
 		wipe(dek)
-		return nil, deny(ErrCorrupt)
+		return nil, deny(err)
 	}
-	defer wipe(plain)
-	var doc document
-	// retained is set only when the session keeps these buffers. Every earlier
-	// return, including a partial decode, zeroes them. VerifyAudit does the same.
 	retained := false
 	defer func() {
 		if !retained {
 			wipeCredentials(doc.Credentials)
 		}
 	}()
-	if err := unmarshalStrict(plain, &doc); err != nil {
-		wipe(dek)
-		return nil, deny(ErrCorrupt)
-	}
-	if unlockDecoded != nil {
-		unlockDecoded(doc.Credentials)
-	}
-	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
-	if err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
-	if err := validateDocument(doc); err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
-	idx := indexFromAudit(events)
-	if err := matchDetection(idx.state(), doc.Detection); err != nil {
-		wipe(dek)
-		return nil, deny(ErrCorrupt)
-	}
-	if err := matchHealth(events, doc.Credentials); err != nil {
-		wipe(dek)
-		return nil, deny(ErrCorrupt)
-	}
 	red := &Redactor{}
 	// A logger cannot be attached later. A logger-free host (including stdio)
 	// must not retain an unnecessary passphrase copy for the session lifetime.
@@ -690,21 +714,117 @@ func (c credential) public() Credential {
 	}
 }
 
-// requireCurrent fails closed when this cached session is no longer the
-// durable audit tip. A commit from another session makes it defunct.
-func (s *Session) requireCurrent() error {
+// adoptLocked brings this session up to the durable audit tip. The caller
+// holds s.mu, so an in-flight call can never observe a half-swapped session.
+// A sequence that has not moved needs no work; one that moved forward is
+// re-read and re-verified; one that moved backwards is a vault file replaced
+// by an older copy, which verifies on its own terms and can only be caught by
+// this process's memory of the tip.
+//
+// Before item 3d a session that lost this race refused every later call, which
+// cost `tremelay daemon` its vault on any control-plane command. Adopting is
+// the stronger of the two: refusing leaves the caller with no current view,
+// while this gives it the one the owner just committed, under the whole of
+// Unlock's verification.
+//
+// ponytail: one indexed single-row read per session entry, and re-verification
+// only when the sequence moved. A document rewritten under an unchanged
+// sequence is not detected, which is the same reach this process had before
+// reloading existed. Upgrade path: a cheap per-commit document tag to compare
+// without decrypting.
+func (s *Session) adoptLocked() error {
 	if s == nil || s.defunct {
 		return ErrStale
 	}
 	var seq int64
-	if err := s.db.QueryRow(`SELECT audit_seq FROM vault WHERE id=?`, s.id).Scan(&seq); err != nil || seq < 0 {
+	if err := s.db.QueryRow(`SELECT audit_seq FROM vault WHERE id=?`, s.id).Scan(&seq); err != nil {
+		// A read that cannot happen is an IO failure, not a verdict about the
+		// chain, and it does not retire the session.
+		return ErrIO
+	}
+	if seq < 0 {
 		return ErrAudit
 	}
-	if uint64(seq) != s.header.AuditSeq {
+	switch {
+	case uint64(seq) == s.header.AuditSeq:
+		return nil
+	case uint64(seq) < s.header.AuditSeq:
 		s.defunct = true
-		return ErrStale
+		return ErrCorrupt
 	}
+	return s.reloadLocked()
+}
+
+// reloadLocked replaces this session's cached authority with the durable state
+// under the DEK it already holds. No passphrase is involved: the KEK was
+// consumed at unlock and the DEK has not changed. Verification is Unlock's,
+// through readVaultState and openDocument, so a tampered document, a broken
+// chain, a forged denial suffix or a foreign vault id all fail here. Nothing
+// is swapped until every check passes, and a failure makes the session
+// permanently unusable rather than leaving it serving unverified state.
+func (s *Session) reloadLocked() error {
+	fail := func(err error) error {
+		s.defunct = true
+		return err
+	}
+	header, events, err := readVaultSnapshot(s.db, false)
+	// A failed verification is terminal; a database that is merely busy or
+	// unwritable is not, so the transient error does not retire the session.
+	if errors.Is(err, ErrIO) {
+		return err
+	}
+	if err != nil {
+		return fail(err)
+	}
+	if header.ID != s.id {
+		// A different vault at this handle is not a newer commit of this one.
+		return fail(ErrCorrupt)
+	}
+	if !containsEvent(events, s.header.AuditSeq, s.header.AuditHead) {
+		// A higher sequence is not by itself a continuation. An older
+		// authentic copy of this vault verifies on its own terms, so an
+		// attacker who restores one and lets ordinary commands push it past
+		// this session's tip would otherwise have the revocations, rotations
+		// and suspensions this session already served quietly undone. The
+		// chain being adopted must extend the history this session verified.
+		return fail(ErrCorrupt)
+	}
+	doc, idx, err := openDocument(s.dek, header, events)
+	if err != nil {
+		return fail(err)
+	}
+	for i := range doc.Credentials {
+		s.redactor.Add(doc.Credentials[i].Secret)
+	}
+	// Zeroing the superseded secrets matches Lock, which an entrant holding
+	// this mutex can already call between a callback and its continuation.
+	wipeCredentials(s.creds)
+	s.header = header
+	s.creds = doc.Credentials
+	s.agents = doc.Agents
+	s.grants = doc.Grants
+	s.audit = events
+	s.detection = doc.Detection
+	s.denials = idx
+	s.notices = noticeIndex(events)
+	s.suspensions = suspensionFromAudit(events)
+	s.hpolicy = doc.HealthPolicy
 	return nil
+}
+
+// containsEvent reports whether a verified chain holds exactly this event at
+// this sequence. The chain is ordered, and the sequence looked for is the old
+// tip, so the scan starts at the end.
+func containsEvent(events []auditEvent, seq uint64, hash string) bool {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Seq == seq {
+			return events[i].Hash == hash
+		}
+		if events[i].Seq < seq {
+			return false
+		}
+	}
+	return false
 }
 
 func (s *Session) live() error {
@@ -730,6 +850,13 @@ func (s *Session) begin() error {
 	if s.db == nil || len(s.dek) != keyLen {
 		s.mu.Unlock()
 		return ErrUnauthenticated
+	}
+	// One guard for every entry point, so a new grant is usable and a revoked
+	// grant, agent or token is refused on the next call, without a restart and
+	// without any caller having to know a reload happened. See ADR 0024.
+	if err := s.adoptLocked(); err != nil {
+		s.mu.Unlock()
+		return err
 	}
 	s.locked.Store(true)
 	return nil
@@ -910,8 +1037,11 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	h.AuditSeq = tip.Seq
 	if err := writeTx(s.db, h, s.header.AuditSeq, events, len(s.audit) == 0, s.commitFault); err != nil {
 		if errors.Is(err, ErrCorrupt) {
-			// The durable sequence moved or the update was ignored. This
-			// cache must not approve, restore, or sign from its old view.
+			// The vault row no longer matches what this session can account
+			// for. The cache must not approve, restore, or sign from its old
+			// view. A commit that merely lost the compare-and-swap to another
+			// writer is ErrStale instead: nothing of this call was written,
+			// and the next entry point adopts that writer's commit.
 			s.defunct = true
 		}
 		if errors.Is(err, ErrIO) {

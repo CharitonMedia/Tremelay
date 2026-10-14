@@ -35,9 +35,38 @@ read is refused when it is used. It is a bearer secret: anything that can read
 it can use that agent's grants while the daemon is unlocked. Without `--token-file` no token
 copy survives the command, and that agent can only be used through pinentry.
 
-An agent created before this feature has no token digest and cannot
-authenticate to the daemon. Create a new agent for it. There is no
-`agent token rotate` yet; revoke the agent and create another.
+## Give an existing agent a token, or replace one
+
+No agent ever has to be recreated to get a working token, and no client
+configuration has to change: the three commands below keep the agent's id,
+its state and every grant it holds.
+
+```sh
+# An agent that has no token: one created before this feature, or one whose
+# token was revoked. The token file must not exist yet; delete the file a
+# revoked token left behind and reuse its path.
+tremelay agent token issue --path /absolute/vault.db --agent AGENT_ID --token-file ~/.tremelay/claude-code.token
+
+# Replace a live token at the path the client already points at.
+tremelay agent token rotate --path /absolute/vault.db --agent AGENT_ID --token-file ~/.tremelay/claude-code.token
+
+# Take daemon access away and leave the agent and its grants in place.
+tremelay agent token revoke --path /absolute/vault.db --agent AGENT_ID
+```
+
+Each command prints the token path, or the agent id for `revoke`, and never
+the token. `issue` refuses an agent that still holds a token and refuses a
+token file that already exists, so it cannot retire a working client by
+accident; `rotate` is the command that replaces one in place. Rotation writes
+a user-only temporary file beside the target and renames it over it, so a
+reader gets the whole old token or the whole new one. A `rotate` path that is
+not already a token file is refused before the vault commits, so a mistyped
+`--token-file` cannot overwrite something else.
+
+The replaced or revoked token stops authenticating at once, including in a
+daemon that is already serving and including on a connection that agent
+already has open: its next call is refused and audited, and it does not have
+to reconnect for that to happen.
 
 ## Unlock
 
@@ -51,10 +80,18 @@ counts only time with no agent connected. Keep this terminal, a `tmux` window,
 or a user service running — the key lives nowhere else, so closing the process
 or rebooting locks the vault.
 
-Leave the control plane alone while it runs. Creating an agent or changing a
-grant commits to the same vault, which makes the daemon's session stale; it
-then zeroises and exits with a fixed diagnostic rather than serving. Lock
-first, make the change, unlock again.
+The control plane stays usable while it runs. Creating an agent, issuing a
+grant or revoking one commits to the same vault; the daemon re-reads and
+re-verifies the file with the key it already holds, and the change takes
+effect on the agent's next call. Nothing re-prompts, and open client
+connections stay up. If a command reports a stale session, an agent call
+committed at the same moment and nothing of your command was written: run it
+again.
+
+The daemon still locks and exits when it cannot verify the file — a tampered
+document, a broken audit chain, a rolled-back audit head, or a chain that no
+longer contains the audit event the daemon last served, which is what an
+older copy of the vault restored underneath it looks like.
 
 ## Register the stdio command with a client
 
@@ -124,6 +161,10 @@ line, or an error. Capability use is audited exactly as before.
 ```sh
 tremelay audit list --path /absolute/vault.db --action daemon_auth
 ```
+
+Token custody is audited the same way, as `agent_token_issue`,
+`agent_token_rotate` and `agent_token_revoke`. Each row names the agent and
+nothing else: no credential, no grant, and nothing derived from the token.
 
 ## Endpoint custody
 
