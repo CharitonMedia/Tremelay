@@ -583,6 +583,37 @@ func TestDaemonReloadsOnControlPlaneChange(t *testing.T) {
 	}
 }
 
+func TestDaemonAdoptsLockedDenialSuffix(t *testing.T) {
+	f := startDaemon(t, time.Hour)
+	var stdout, stderr bytes.Buffer
+	wrong := randHex(t, 16)
+	if code := run([]string{"credential", "list", "--path", f.path},
+		envGet(map[string]string{"TREMELAY_PASSPHRASE": wrong}), strings.NewReader(""), &stdout, &stderr); code == 0 {
+		t.Fatal("wrong passphrase succeeded")
+	}
+	if strings.Contains(stdout.String()+stderr.String(), wrong) {
+		t.Fatal("failed unlock disclosed the passphrase")
+	}
+
+	agent := f.relay(t, f.agents[0].tokenFile)
+	listed := agent.capabilities(t)
+	if !strings.Contains(listed, f.agents[0].resource) {
+		t.Fatalf("locked denial wedged the resident agent session: %q", listed)
+	}
+	if got := f.cli(t, "credential", "list", "--path", f.path); !strings.Contains(got, f.credID) {
+		t.Fatalf("human operation after locked denial returned %q", got)
+	}
+	if listed = agent.callList(t, 3); !strings.Contains(listed, f.agents[0].resource) {
+		t.Fatalf("resident session stopped after the human operation: %q", listed)
+	}
+	agent.finish(t)
+	f.cancel()
+	f.wait(t, 15*time.Second)
+	if _, err := vault.VerifyAudit(f.path, []byte(f.pass)); err != nil {
+		t.Fatalf("audit chain invalid: %v", err)
+	}
+}
+
 // TestDaemonLocksOnUnverifiableVault is the fail-closed half of item 3d. A
 // reload that cannot be verified is never adopted: the daemon zeroises and
 // exits rather than serve a document, a chain, or an audit head it cannot
@@ -601,6 +632,18 @@ func TestDaemonLocksOnUnverifiableVault(t *testing.T) {
 		},
 		"rolled back audit head": func(t *testing.T, f *daemonFixture) {
 			f.execSQL(t, `UPDATE vault SET audit_seq = audit_seq - 1`)
+		},
+		"forged locked suffix": func(t *testing.T, f *daemonFixture) {
+			var nonce, doc []byte
+			var head string
+			var seq int64
+			f.withDB(t, func(db *sql.DB) {
+				if err := db.QueryRow(`SELECT data_nonce, encrypted_document, audit_head, audit_seq FROM vault`).Scan(&nonce, &doc, &head, &seq); err != nil {
+					t.Fatal(err)
+				}
+			})
+			f.cli(t, "agent", "create", "--path", f.path, "--label", "forged suffix")
+			f.execSQL(t, `UPDATE vault SET data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=?`, nonce, doc, head, seq)
 		},
 		// A forked chain: an older authentic copy of the file, pushed past
 		// the sequence the daemon has already served by the owner's own

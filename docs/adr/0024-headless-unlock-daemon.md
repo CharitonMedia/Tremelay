@@ -369,15 +369,18 @@ item 3 exists to deliver.
 
 An unlocked session now adopts the vault it is already holding the key to. At
 every `Session` entry point, under the same mutex the dispatch discipline
-above describes, the session compares the durable audit sequence with its own.
-When the file has moved forward it re-reads the header and the whole chain in
-one transaction and re-verifies them with `Unlock`'s own code — one verifier,
-not a second one: `readVaultState` checks the header shape, the hash chain and
-the locked-denial suffix, and `openDocument` authenticates the sealed document
-under the plaintext audit head and checks the detection mirror, the health
-mirror and the stored credential, agent and grant shapes. Only a document that
-passes all of it is swapped in, and the swap happens with the mutex held, so
-no in-flight call sees half of it.
+above describes, the session compares the durable authenticated sequence and
+the audit table's actual tip with its own. A locked-state denial suffix
+therefore takes the same reload path: a valid suffix is incorporated before
+the resident operation appends after it, while a forged suffix retires the
+session. When the file has moved forward it re-reads the header and the whole
+chain in one transaction and re-verifies them with `Unlock`'s own code — one
+verifier, not a second one: `readVaultState` checks the header shape, the hash
+chain and the locked-denial suffix, and `openDocument` authenticates the sealed
+document under the plaintext audit head and checks the detection mirror, the
+health mirror and the stored credential, agent and grant shapes. Only a
+document that passes all of it is swapped in, and the swap happens with the
+mutex held, so no in-flight call sees half of it.
 
 What this changes for an operator: grants created while the daemon serves are
 usable on the agent's next call, and revoked grants, suspended agents and

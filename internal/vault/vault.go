@@ -728,32 +728,29 @@ func (c credential) public() Credential {
 // Unlock's verification.
 //
 // ponytail: one indexed single-row read per session entry, and re-verification
-// only when the audit tip moved. A document rewritten under an unchanged tip
-// is not detected, which is the same reach this process had before reloading
-// existed. Upgrade path: a cheap per-commit document tag to compare without
-// decrypting.
+// only when the authenticated head or audit tip moved. A document rewritten
+// under an unchanged tip is not detected, which is the same reach this process
+// had before reloading existed. Upgrade path: a cheap per-commit document tag
+// to compare without decrypting.
 func (s *Session) adoptLocked() error {
 	if s == nil || s.defunct {
 		return ErrStale
 	}
-	var seq int64
+	var seq, tip int64
 	var head string
-	if err := s.db.QueryRow(`SELECT audit_seq, audit_head FROM vault WHERE id=?`, s.id).Scan(&seq, &head); err != nil {
+	if err := s.db.QueryRow(`SELECT audit_seq, audit_head, COALESCE((SELECT seq FROM audit ORDER BY seq DESC LIMIT 1), 0) FROM vault WHERE id=?`, s.id).Scan(&seq, &head, &tip); err != nil {
 		// A read that cannot happen is an IO failure, not a verdict about the
 		// chain, and it does not retire the session.
 		return ErrIO
 	}
-	if seq < 0 {
+	if seq < 0 || tip < 0 {
+		s.defunct = true
 		return ErrAudit
 	}
 	switch {
-	case uint64(seq) == s.header.AuditSeq:
-		if head != s.header.AuditHead {
-			s.defunct = true
-			return ErrCorrupt
-		}
+	case uint64(seq) == s.header.AuditSeq && head == s.header.AuditHead && uint64(tip) == s.header.AuditSeq:
 		return nil
-	case uint64(seq) < s.header.AuditSeq:
+	case uint64(seq) < s.header.AuditSeq || uint64(tip) < s.header.AuditSeq:
 		s.defunct = true
 		return ErrCorrupt
 	}

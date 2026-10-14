@@ -9,7 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	_ "modernc.org/sqlite" // pure-Go SQLite; no cgo so Windows CI matches Linux.
+	"modernc.org/sqlite" // pure-Go SQLite; no cgo so Windows CI matches Linux.
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const schemaSQL = `
@@ -662,6 +663,10 @@ func insertAudit(tx *sql.Tx, ev auditEvent) error {
 		int64(ev.Seq), ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Prev, ev.Hash, ev.AgentID, ev.GrantID, ev.Operation, ev.V, ev.Class, int64(ev.RefSeq), ev.Reasons, int64(ev.CredGen),
 		ev.ActorID, ev.OrgID, ev.TargetID, ev.RequestID, ev.Decision)
 	if err != nil {
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY {
+			return ErrAudit
+		}
 		return ErrIO
 	}
 	return nil
