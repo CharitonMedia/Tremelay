@@ -43,7 +43,11 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 	case "audit":
 		return cmdAudit(args[1:], getenv, stdin, stdout, stderr)
 	case "mcp":
-		return cmdMCP(args[1:], stdin, stdout, stderr)
+		return cmdMCP(args[1:], getenv, stdin, stdout, stderr)
+	case "daemon":
+		return cmdDaemon(args[1:], getenv, stdin, stdout, stderr)
+	case "lock":
+		return cmdLock(args[1:], getenv, stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, "unknown command")
 		return 2
@@ -66,11 +70,14 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay credential health --path PATH [--id ID]
   tremelay credential refresh --path PATH [--id ID]
   tremelay credential policy --path PATH [--min-length N] [--pattern-run N] [--freshness DURATION] [--reminder-lead DURATION] [--compromise-opt-in true|false]
-  tremelay agent create --path PATH --label LABEL
+  tremelay agent create --path PATH --label LABEL [--token-file PATH]
   tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339 [--ssh-user USER --ssh-host-key HEX]
   tremelay grant revoke --path PATH --id ID
   tremelay capability list --path PATH --agent ID
   tremelay capability authorize --path PATH --agent ID --credential ID --operation OP --resource SCOPE
+  tremelay daemon --vault PATH [--idle-timeout 1h]
+  tremelay mcp --daemon --token-file PATH
+  tremelay lock
   tremelay mcp serve --path PATH --agent ID --pinentry /absolute/helper [--pinentry-tty /absolute/tty] [--unlock-timeout 2m]
   tremelay audit verify --path PATH
   tremelay audit list --path PATH [--credential ID] [--agent ID] [--action ACTION] [--class CLASS] [--since RFC3339] [--until RFC3339] [--after SEQ] [--limit N]
@@ -80,6 +87,8 @@ Types: %s
 Grant operations: %s
 Passphrase: TREMELAY_PASSPHRASE, or a no-echo terminal prompt.
 change-passphrase requires no-echo terminal entry of old, new, and confirmation; it ignores the environment.
+daemon unlocks once in your terminal and then serves agents on a user-only endpoint until lock, idle timeout, or exit.
+mcp --daemon is the stdio command an MCP client launches; it authenticates with one agent token file and relays MCP only.
 mcp serve uses a trusted pinentry helper over private pipes; it ignores the passphrase environment and keeps stdout MCP-only.
 The passphrase is not accepted as an argument. credential get writes the raw secret to stdout.
 Health is advisory. Refresh runs only while the vault is unlocked; a locked or stopped process does not evaluate credentials.
@@ -764,6 +773,7 @@ func cmdAgent(args []string, getenv func(string) string, stdin io.Reader, stdout
 	fs.SetOutput(stderr)
 	path := fs.String("path", "", "vault file")
 	label := fs.String("label", "", "agent label")
+	tokenFile := fs.String("token-file", "", "write this agent's daemon token here")
 	if err := fs.Parse(args[1:]); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectAgentCreate(vault.ErrInvalid)
@@ -781,7 +791,21 @@ func cmdAgent(args []string, getenv func(string) string, stdin io.Reader, stdout
 		if err != nil {
 			return err
 		}
-		_, err = fmt.Fprintln(stdout, agent.ID)
+		// The vault keeps only SHA-256 of this token. Without --token-file the
+		// only copy is wiped here, so the agent cannot reach a daemon: an
+		// agent gains that authority only when its owner asks for the file.
+		defer vault.Wipe(agent.Token)
+		if _, err := fmt.Fprintln(stdout, agent.ID); err != nil {
+			return err
+		}
+		if *tokenFile == "" {
+			return nil
+		}
+		if err := writeAgentToken(*tokenFile, agent.Token); err != nil {
+			return err
+		}
+		// The path, never the token. Nothing echoes the token bytes.
+		_, err = fmt.Fprintln(stdout, *tokenFile)
 		return err
 	})
 }

@@ -1,6 +1,8 @@
 package vault
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"slices"
 	"strings"
 	"time"
@@ -23,6 +25,9 @@ const (
 	// authorize this response projection.
 	OpGitHubIssueState = "github_issue_state"
 
+	// AgentTokenLen is the size of a per-agent bearer token from crypto/rand.
+	AgentTokenLen = 32
+
 	// GrantActive, GrantRevoked, and GrantExpired are capability lifecycle states.
 	GrantActive  = "active"
 	GrantRevoked = "revoked"
@@ -39,10 +44,14 @@ func GrantOperations() []string {
 }
 
 // Agent is a software principal. It is not a human user.
+// Token is the one-time bearer token minted by CreateAgent. Only its SHA-256
+// is stored. The human control plane writes it to a user-only file and wipes
+// this copy; it is never recoverable from the vault.
 type Agent struct {
 	ID        string
 	Label     string
 	CreatedAt time.Time
+	Token     []byte
 }
 
 // GrantSpec is a human request to issue one capability.
@@ -108,6 +117,10 @@ type agentRecord struct {
 	Kind      string    `json:"kind"`
 	CreatedAt time.Time `json:"created_at"`
 	State     string    `json:"state"`
+	// TokenHash is SHA-256 of this agent's bearer token. The token itself is
+	// never stored. It is absent on agents sealed before ADR 0024, which
+	// cannot authenticate to the daemon.
+	TokenHash []byte `json:"token_hash,omitempty"`
 }
 
 type grantRecord struct {
@@ -243,7 +256,8 @@ func (a *AgentPrincipal) LocalAttest(req LocalAttestRequest) (LocalAttestation, 
 	return a.view.localAttest(a.id, req)
 }
 
-// CreateAgent persists a new agent principal.
+// CreateAgent persists a new agent principal and mints its bearer token.
+// The returned Agent.Token is the only copy; the vault seals only its SHA-256.
 func (s *Session) CreateAgent(label string) (Agent, error) {
 	if err := s.begin(); err != nil {
 		return Agent{}, err
@@ -256,19 +270,71 @@ func (s *Session) CreateAgent(label string) (Agent, error) {
 	if err != nil {
 		return Agent{}, err
 	}
+	token, err := randBytes(AgentTokenLen)
+	if err != nil {
+		return Agent{}, err
+	}
+	sum := sha256.Sum256(token)
 	rec := agentRecord{
 		ID:        id,
 		Label:     label,
 		Kind:      principalAgent,
 		CreatedAt: time.Now().UTC(),
 		State:     agentStateActive,
+		TokenHash: sum[:],
 	}
 	next := append(append([]agentRecord{}, s.agents...), rec)
 	partial := auditEvent{Action: actionAgentCreate, Result: resultAllowed, AgentID: id}
 	if err := s.writeAudit(partial, s.creds, next, s.grants); err != nil {
+		wipe(token)
 		return Agent{}, err
 	}
-	return rec.public(), nil
+	out := rec.public()
+	out.Token = token
+	return out, nil
+}
+
+// AuthenticateAgentToken resolves one active agent principal from a bearer
+// token and nothing else. The caller cannot name an agent, a human, the
+// session, the vault, or the clock. The vault holds only SHA-256(token) and
+// the comparison is constant time. Every attempt appends one daemon_auth row:
+// the verified agent on success, the verified agent on a suspended principal,
+// and no attribution at all for an unknown token. The token, its hash, and
+// its length are never audit fields, log text, or error text.
+//
+// ponytail: a linear constant-time scan over the agent list, and repeated
+// failures are ordinary expected denials rather than a detection class. The
+// endpoint already restricts callers to the vault owner's uid. Upgrade path:
+// a keyed index plus a daemon_auth failure class in the M5 lookback.
+func (s *Session) AuthenticateAgentToken(token []byte) (*AgentPrincipal, error) {
+	if err := s.begin(); err != nil {
+		return nil, err
+	}
+	defer s.end()
+	sum := sha256.Sum256(token)
+	defer wipe(sum[:])
+	matched, active := "", false
+	if len(token) == AgentTokenLen {
+		for i := range s.agents {
+			if len(s.agents[i].TokenHash) != sha256.Size {
+				continue
+			}
+			if subtle.ConstantTimeCompare(s.agents[i].TokenHash, sum[:]) == 1 {
+				matched, active = s.agents[i].ID, s.agents[i].State == agentStateActive
+				break
+			}
+		}
+	}
+	if matched == "" {
+		return nil, s.finish(auditEvent{Action: actionDaemonAuth, Result: resultDenied}, ErrUnauthenticated)
+	}
+	if !active {
+		return nil, s.finish(auditEvent{Action: actionDaemonAuth, Result: resultDeniedAgent, AgentID: matched}, ErrDeniedAgent)
+	}
+	if err := s.finish(auditEvent{Action: actionDaemonAuth, Result: resultAllowed, AgentID: matched}, nil); err != nil {
+		return nil, err
+	}
+	return &AgentPrincipal{view: agentBinder{s: s}, id: matched}, nil
 }
 
 // IssueGrant persists a revocable, expiring capability for one agent.
@@ -899,6 +965,11 @@ func validateAgentsAndGrants(doc document) error {
 			return ErrCorrupt
 		}
 		if _, err := requireTime(a.CreatedAt); err != nil {
+			return ErrCorrupt
+		}
+		// Absent is a pre-ADR-0024 agent that cannot authenticate. Any other
+		// length is not a SHA-256 digest and is not silently accepted.
+		if a.TokenHash != nil && len(a.TokenHash) != sha256.Size {
 			return ErrCorrupt
 		}
 		if _, ok := agents[a.ID]; ok {

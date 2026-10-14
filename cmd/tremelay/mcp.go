@@ -15,14 +15,17 @@ import (
 	"github.com/CharitonMedia/Tremelay/internal/vault"
 )
 
-const mcpServeUsage = "usage: tremelay mcp serve --path PATH --agent ID --pinentry /absolute/helper [--pinentry-tty /absolute/tty] [--unlock-timeout 2m]"
+const mcpServeUsage = "usage: tremelay mcp --daemon --token-file PATH\n   or: tremelay mcp serve --path PATH --agent ID --pinentry /absolute/helper [--pinentry-tty /absolute/tty] [--unlock-timeout 2m]"
 
 var errMCPStdio = errors.New("mcp serve requires supported, close-interruptible stdin and stdout pipes")
 
-func cmdMCP(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] != "serve" {
+func cmdMCP(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
 		fmt.Fprintln(stderr, mcpServeUsage)
 		return 2
+	}
+	if args[0] != "serve" {
+		return cmdMCPDaemon(args, getenv, stdin, stdout, stderr)
 	}
 	fs := flag.NewFlagSet("mcp serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // Never reflect flag values or helper diagnostics.
@@ -41,6 +44,23 @@ func cmdMCP(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return serveMCP(ctx, *path, *agentID, pinentryOptions{path: *helper, tty: *tty}, *timeout, stdin, stdout, stderr)
+}
+
+// cmdMCPDaemon is the default agent path: an already-unlocked daemon holds the
+// vault, and this process only authenticates and relays. Pinentry stays
+// available as `tremelay mcp serve`, the non-default option.
+func cmdMCPDaemon(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	fs.SetOutput(io.Discard) // Never reflect flag values or token bytes.
+	useDaemon := fs.Bool("daemon", false, "connect to the running tremelay daemon")
+	tokenFile := fs.String("token-file", "", "this agent's token file")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !*useDaemon || *tokenFile == "" {
+		fmt.Fprintln(stderr, mcpServeUsage)
+		return 2
+	}
+	stopPipe := lifecyclePipeErrors()
+	defer stopPipe()
+	return relayDaemonMCP(getenv, *tokenFile, stdin, stdout, stderr)
 }
 
 func serveMCP(ctx context.Context, path, agentID string, options pinentryOptions, timeout time.Duration, stdin io.Reader, stdout, stderr io.Writer) int {
