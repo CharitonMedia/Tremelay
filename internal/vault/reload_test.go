@@ -77,6 +77,86 @@ func TestSessionAdoptsControlPlaneCommits(t *testing.T) {
 	}
 }
 
+func TestSessionAdoptsLockedDenialSuffix(t *testing.T) {
+	for _, name := range []string{"human", "agent"} {
+		t.Run(name, func(t *testing.T) {
+			env := newAttestEnv(t)
+			use := func() {
+				if _, err := env.s.List(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if name == "agent" {
+				cap := bindCap(t, env.s, env.agent.ID)
+				use = func() {
+					if got := capCall(t, cap, okBytes(t)(encodeCapList())); got.code != "" {
+						t.Fatalf("capability list failed: %q", got.code)
+					}
+				}
+			}
+			before := len(mustAudit(t, env.path))
+			if unlocked, err := Unlock(env.path, []byte(randHex(t, 24)), nil); unlocked != nil || !errors.Is(err, ErrUnauthenticated) {
+				t.Fatalf("wrong passphrase unlocked: %v", err)
+			}
+
+			use()
+
+			events := mustAudit(t, env.path)
+			if len(events) < before+2 || events[before].Action != actionUnlock || events[before].Result != resultDenied {
+				t.Fatalf("locked denial was not incorporated before the resident operation: %+v", events[before:])
+			}
+			if env.s.header.AuditSeq != events[len(events)-1].Seq {
+				t.Fatalf("resident head %d, audit tip %d", env.s.header.AuditSeq, events[len(events)-1].Seq)
+			}
+			if _, err := VerifyAudit(env.path, env.pass); err != nil {
+				t.Fatalf("audit chain invalid: %v", err)
+			}
+		})
+	}
+}
+
+func TestSessionRefusesForgedLockedSuffix(t *testing.T) {
+	env := newAttestEnv(t)
+	events := mustAudit(t, env.path)
+	forged, err := nextEvent(events, actionList, env.s.id, "", "", resultAllowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutateDB(t, env.path, func(db *sql.DB) {
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := insertAudit(tx, forged); err != nil {
+			tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if _, err := env.s.List(); !errors.Is(err, ErrAudit) {
+		t.Fatalf("forged suffix did not fail closed: %v", err)
+	}
+	if _, err := env.s.List(); !errors.Is(err, ErrStale) {
+		t.Fatalf("retired session still served: %v", err)
+	}
+}
+
+func TestAuditSequenceCollisionIsAuditFailure(t *testing.T) {
+	env := newAttestEnv(t)
+	events := mustAudit(t, env.path)
+	tx, err := env.s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := insertAudit(tx, events[len(events)-1]); !errors.Is(err, ErrAudit) {
+		t.Fatalf("sequence collision: %v", err)
+	}
+}
+
 // TestSessionReloadFailsClosed covers the other half: a reload is adopted only
 // when it verifies exactly as Unlock does. Each case moves the durable
 // sequence with a legitimate commit and then corrupts what the session must
