@@ -583,6 +583,42 @@ func TestDaemonReloadsOnControlPlaneChange(t *testing.T) {
 	}
 }
 
+// TestDaemonReloadsAfterPassphraseChange is the V1.md item 3e daemon half: a
+// running daemon keeps serving after another holder rotates the DEK.
+func TestDaemonReloadsAfterPassphraseChange(t *testing.T) {
+	f := startDaemon(t, time.Hour)
+	agent := f.relay(t, f.agents[0].tokenFile)
+	before := capabilityEntries(t, agent.capabilities(t))
+	if len(before) != 1 || before[0].Status != vault.GrantActive {
+		t.Fatalf("capabilities before passphrase change: %+v", before)
+	}
+	control, err := vault.Unlock(f.path, []byte(f.pass), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPass := []byte(randHex(t, 16))
+	if err := control.ChangePassphrase([]byte(f.pass), newPass); err != nil {
+		t.Fatal(err)
+	}
+	control.Lock()
+	f.pass = string(newPass)
+	if frame, signed := agent.attest(t, 4, before[0].Handle); !signed {
+		t.Fatalf("daemon broke after passphrase rotation: %q", frame)
+	}
+	if f.exited() {
+		t.Fatalf("daemon exited on passphrase rotation: %q", f.stderr.String())
+	}
+	if strings.Contains(f.stderr.String(), errDaemonTerminal.Error()) {
+		t.Fatalf("daemon reported a terminal session: %q", f.stderr.String())
+	}
+	agent.finish(t)
+	f.cancel()
+	f.wait(t, 15*time.Second)
+	if _, err := vault.VerifyAudit(f.path, newPass); err != nil {
+		t.Fatalf("audit chain invalid: %v", err)
+	}
+}
+
 func TestDaemonAdoptsLockedDenialSuffix(t *testing.T) {
 	f := startDaemon(t, time.Hour)
 	var stdout, stderr bytes.Buffer

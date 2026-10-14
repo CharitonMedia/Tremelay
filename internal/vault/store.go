@@ -29,7 +29,9 @@ CREATE TABLE vault (
   data_nonce BLOB NOT NULL,
   encrypted_document BLOB NOT NULL,
   audit_head TEXT NOT NULL,
-  audit_seq INTEGER NOT NULL
+  audit_seq INTEGER NOT NULL,
+  dek_handoff_nonce BLOB NOT NULL DEFAULT '',
+  dek_handoff BLOB NOT NULL DEFAULT ''
 );
 CREATE TABLE audit (
   seq INTEGER PRIMARY KEY,
@@ -276,6 +278,13 @@ func loadVaultMode(path string, readonly, legacyAudit bool) (*sql.DB, fileHeader
 	if err != nil {
 		return fail(err)
 	}
+	if !readonly {
+		if err = migrateVault(db); err != nil {
+			return fail(err)
+		}
+	} else if err = vaultHandoffReady(db); err != nil {
+		return fail(err)
+	}
 	header, events, err := readVaultSnapshot(db, legacyAudit)
 	if err != nil {
 		return fail(err)
@@ -333,9 +342,9 @@ func readVaultRow(db queryer) (fileHeader, error) {
 	}
 	var h fileHeader
 	var timeCost, memory, threads, keyLen, seq int64
-	err := db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq FROM vault`).Scan(
+	err := db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, dek_handoff_nonce, dek_handoff FROM vault`).Scan(
 		&h.ID, &h.Version, &h.Root, &h.KDF.Algorithm, &h.KDF.Salt, &timeCost, &memory, &threads, &keyLen,
-		&h.WrapNonce, &h.WrappedDEK, &h.DataNonce, &h.Data, &h.AuditHead, &seq,
+		&h.WrapNonce, &h.WrappedDEK, &h.DataNonce, &h.Data, &h.AuditHead, &seq, &h.DEKHandoffNonce, &h.DEKHandoff,
 	)
 	if err != nil {
 		return fileHeader{}, ErrCorrupt
@@ -451,6 +460,90 @@ func migrateAudit(db *sql.DB) error {
 	if !cols["v"] {
 		if err := backfillAuditVersion(tx); err != nil {
 			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return ErrIO
+	}
+	committed = true
+	return nil
+}
+
+func vaultColumnSet(db queryer) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(vault)`)
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return nil, ErrCorrupt
+		}
+		cols[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, ErrCorrupt
+	}
+	return cols, nil
+}
+
+func vaultHandoffReady(db *sql.DB) error {
+	cols, err := vaultColumnSet(db)
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"dek_handoff_nonce", "dek_handoff"} {
+		if !cols[name] {
+			return ErrCorrupt
+		}
+	}
+	return nil
+}
+
+// migrateVault adds DEK-rotation handoff columns for resident sessions that
+// reload after a passphrase change committed elsewhere.
+func migrateVault(db *sql.DB) error {
+	cols, err := vaultColumnSet(db)
+	if err != nil {
+		return err
+	}
+	adds := []struct {
+		name string
+		ddl  string
+	}{
+		{"dek_handoff_nonce", `ALTER TABLE vault ADD COLUMN dek_handoff_nonce BLOB NOT NULL DEFAULT ''`},
+		{"dek_handoff", `ALTER TABLE vault ADD COLUMN dek_handoff BLOB NOT NULL DEFAULT ''`},
+	}
+	missing := false
+	for _, col := range adds {
+		if !cols[col.name] {
+			missing = true
+			break
+		}
+	}
+	if !missing {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return ErrIO
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, col := range adds {
+		if cols[col.name] {
+			continue
+		}
+		if _, err := tx.Exec(col.ddl); err != nil {
+			return ErrCorrupt
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -598,13 +691,20 @@ func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fres
 	return nil
 }
 
+func blobOrEmpty(b []byte) []byte {
+	if b == nil {
+		return []byte{}
+	}
+	return b
+}
+
 func insertVault(tx *sql.Tx, h fileHeader) error {
 	_, err := tx.Exec(`INSERT INTO vault (
 		id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len,
-		wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, dek_handoff_nonce, dek_handoff
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		h.ID, h.Version, h.Root, h.KDF.Algorithm, h.KDF.Salt, h.KDF.Time, h.KDF.Memory, h.KDF.Threads, h.KDF.KeyLen,
-		h.WrapNonce, h.WrappedDEK, h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq),
+		h.WrapNonce, h.WrappedDEK, h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), blobOrEmpty(h.DEKHandoffNonce), blobOrEmpty(h.DEKHandoff),
 	)
 	if err != nil {
 		return ErrIO
@@ -613,9 +713,9 @@ func insertVault(tx *sql.Tx, h fileHeader) error {
 }
 
 func updateVault(tx *sql.Tx, h fileHeader, prevSeq uint64) error {
-	res, err := tx.Exec(`UPDATE vault SET kdf_algorithm=?, kdf_salt=?, kdf_time=?, kdf_memory=?, kdf_threads=?, kdf_key_len=?, wrap_nonce=?, wrapped_dek=?, data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=? WHERE id=? AND audit_seq=?`,
+	res, err := tx.Exec(`UPDATE vault SET kdf_algorithm=?, kdf_salt=?, kdf_time=?, kdf_memory=?, kdf_threads=?, kdf_key_len=?, wrap_nonce=?, wrapped_dek=?, data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=?, dek_handoff_nonce=?, dek_handoff=? WHERE id=? AND audit_seq=?`,
 		h.KDF.Algorithm, h.KDF.Salt, h.KDF.Time, h.KDF.Memory, h.KDF.Threads, h.KDF.KeyLen, h.WrapNonce, h.WrappedDEK,
-		h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), h.ID, int64(prevSeq))
+		h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), blobOrEmpty(h.DEKHandoffNonce), blobOrEmpty(h.DEKHandoff), h.ID, int64(prevSeq))
 	if err != nil {
 		return ErrIO
 	}

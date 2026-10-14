@@ -31,11 +31,12 @@ clean cancellations; a restore error fails closed.
 
 The host-only `Session.ChangePassphrase(old, new)` verifies both lengths (the
 existing 8–1024 byte bound), rejects an unchanged value, and reauthenticates the
-old value against the session wrap. It uses the existing Argon2id production
-parameters with a fresh random salt, and standard AES-256-GCM with a fresh nonce,
-to rewrap the existing DEK. No new recovery authority or cryptographic primitive
-is introduced. This does not claim strength or known-compromise checking for the
-vault passphrase beyond the existing length check.
+old value against the session wrap. It generates a fresh DEK, re-encrypts every
+credential under it, and uses the existing Argon2id production parameters with a
+fresh random salt and standard AES-256-GCM with a fresh nonce to wrap the new
+DEK. No new recovery authority or cryptographic primitive is introduced. This
+does not claim strength or known-compromise checking for the vault passphrase
+beyond the existing length check.
 
 The existing encrypted-document transaction writes the new KDF/wrap fields,
 resealed document, authenticated audit head, and fixed version-1
@@ -49,11 +50,15 @@ miss error and subsequent `ErrStale` behavior are retained.
 
 This operation is available on the trusted host's `Session`, including a shared
 vault, and is not exposed on `AgentPrincipal`, `AgentCapability`, MCP, or
-`HumanPrincipal`. It does not change credentials, grants, membership, or the DEK.
-A process already holding the DEK still knows it; changing the passphrase cannot
-recall that knowledge or stop a compromised host. Stop other instances first.
-Copies and snapshots retain their original passphrase. This is neither recovery
-nor a replacement for rotating exposed credentials or keys.
+`HumanPrincipal`. Grants and membership are unchanged; credential plaintext is
+preserved but re-sealed under the new DEK. A one-time handoff sealed under the
+previous DEK lets a resident session reload after the change without
+re-prompting; it is cleared on the next ordinary commit. An old snapshot plus
+its original passphrase and wrapped DEK cannot decrypt the current vault.
+Changing the passphrase cannot recall a DEK another process already discarded or
+stop a compromised host. Copies and snapshots retain their original passphrase
+and DEK. This is neither recovery nor a replacement for rotating exposed
+credentials or keys.
 
 ### Backup and restore CLI
 
@@ -100,10 +105,12 @@ transaction and cryptography is the smallest change satisfying atomic custody.
 
 ## Verification
 
-`TestChangePassphrase*` covers unchanged DEK, fresh salt/nonce, old/new authority,
+`TestChangePassphrase*` covers DEK rotation, fresh salt/nonce, old/new authority,
 credential retention, ordinary-write retention of the new wrap, original snapshot
-passphrase, invalid/wrong input, transaction rollback, stale sessions, and synthetic
-sentinel absence. `TestCLIChangePassphrase*` covers prompt order, confirmation,
+passphrase, invalid/wrong input, transaction rollback, stale sessions, crash
+recovery at each commit step, pre-change authority failing on post-change
+ciphertext, resident-session reload, and synthetic sentinel absence.
+`TestCLIChangePassphrase*` covers prompt order, confirmation,
 cancellation, buffer wiping, terminal-only entry and fixed argument errors.
 `TestCLIBackup*` and `TestCLIRestore*` exercise CLI checkpoint and engine boundaries.
 Existing backup fault tests continue covering publication/rollback failures.
@@ -118,3 +125,17 @@ lifecycle commands and checks the committed-outcome warning and exit status.
 These process/PTY tests are Linux-only; Windows/macOS terminal and signal
 behavior has not been directly exercised. Shared state retention is source-
 reviewed; the new rewrap fixtures are single-user.
+
+## Amendment 2026-10-14: passphrase change rotates the DEK (V1.md item 3e)
+
+Status stays Accepted pending owner veto.
+
+`vault change-passphrase` now generates a fresh DEK and re-encrypts every
+stored credential under it in one SQLite transaction with the new passphrase
+wrap and the fixed `vault_passphrase_change / allowed` audit row. Crash or
+injected failure before commit leaves the prior wrap, DEK, and ciphertext;
+after commit the vault unlocks only with the new passphrase. A one-time DEK
+handoff column pair, sealed under the previous DEK and bound to the change
+commit, lets a running daemon adopt the rotation through the existing reload
+path without re-prompting; ordinary writes clear the handoff. An old backup
+plus the old passphrase and wrapped DEK cannot decrypt the current document.

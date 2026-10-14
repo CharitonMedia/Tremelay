@@ -243,11 +243,13 @@ type fileHeader struct {
 	Root       string
 	KDF        kdfParams
 	WrapNonce  []byte
-	WrappedDEK []byte
-	DataNonce  []byte
-	Data       []byte
-	AuditHead  string
-	AuditSeq   uint64
+	WrappedDEK       []byte
+	DataNonce        []byte
+	Data             []byte
+	AuditHead        string
+	AuditSeq         uint64
+	DEKHandoffNonce  []byte
+	DEKHandoff       []byte
 }
 
 // document is the plaintext inside the encrypted blob. Audit history lives
@@ -281,6 +283,11 @@ type Session struct {
 	// commitFault, when set, fails a credential-state transaction before commit.
 	// Tests use it to prove rollback. Production leaves it nil.
 	commitFault func() error
+	// rotateFault, when set, fails ChangePassphrase at named steps. Tests only.
+	rotateFault func(step string) error
+	// postCommitFault, when set, fails after a successful durable commit before
+	// the session cache is updated. Tests only.
+	postCommitFault func() error
 	// attestFault, when set, runs after the local-attestation allowed row
 	// commits and before Ed25519 signing. A non-nil error withholds the
 	// signature. Tests use it. Production leaves it nil.
@@ -759,11 +766,13 @@ func (s *Session) adoptLocked() error {
 
 // reloadLocked replaces this session's cached authority with the durable state
 // under the DEK it already holds. No passphrase is involved: the KEK was
-// consumed at unlock and the DEK has not changed. Verification is Unlock's,
-// through readVaultState and openDocument, so a tampered document, a broken
-// chain, a forged denial suffix or a foreign vault id all fail here. Nothing
-// is swapped until every check passes, and a failure makes the session
-// permanently unusable rather than leaving it serving unverified state.
+// consumed at unlock. A passphrase change may have rotated the DEK; a one-time
+// handoff sealed under the previous DEK lets a resident session adopt the new
+// key without re-prompting. Verification is Unlock's, through readVaultState
+// and openDocument, so a tampered document, a broken chain, a forged denial
+// suffix or a foreign vault id all fail here. Nothing is swapped until every
+// check passes, and a failure makes the session permanently unusable rather
+// than leaving it serving unverified state.
 func (s *Session) reloadLocked() error {
 	fail := func(err error) error {
 		s.defunct = true
@@ -792,6 +801,15 @@ func (s *Session) reloadLocked() error {
 		return fail(ErrCorrupt)
 	}
 	doc, idx, err := openDocument(s.dek, header, events)
+	if err != nil && len(header.DEKHandoff) > 0 {
+		next, herr := openDEKHandoff(s.dek, header)
+		if herr != nil {
+			return fail(herr)
+		}
+		wipe(s.dek)
+		s.dek = next
+		doc, idx, err = openDocument(s.dek, header, events)
+	}
 	if err != nil {
 		return fail(err)
 	}
@@ -973,12 +991,19 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 // withResp lets one ordinary security event pick up its M5 response.
 // policy, when non-nil, becomes the durable health policy only after commit.
 func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy) error {
-	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil)
+	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil, nil)
 }
 
-// commitBatchWrap optionally replaces the passphrase wrap in the same transaction.
-// Neither the session header nor its audit cache changes before commit succeeds.
-func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap) error {
+type dekRotation struct {
+	newDEK        []byte
+	handoffNonce  []byte
+	handoffCipher []byte
+}
+
+// commitBatchWrap optionally replaces the passphrase wrap and/or rotates the DEK
+// in the same transaction. Neither the session header nor its audit cache
+// changes before commit succeeds.
+func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap, rot *dekRotation) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
@@ -1022,13 +1047,22 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 		return ErrIO
 	}
 	defer wipe(plain)
-	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, tip.Hash, tip.Seq))
+	dekSeal := s.dek
+	if rot != nil {
+		dekSeal = rot.newDEK
+	}
+	nonce, ct, err := seal(dekSeal, plain, dataAAD(s.id, tip.Hash, tip.Seq))
 	if err != nil {
 		return err
 	}
 	h := s.header
 	if wrap != nil {
 		h.KDF, h.WrapNonce, h.WrappedDEK = wrap.kdf, wrap.nonce, wrap.ciphertext
+	}
+	if rot != nil {
+		h.DEKHandoffNonce, h.DEKHandoff = rot.handoffNonce, rot.handoffCipher
+	} else {
+		h.DEKHandoffNonce, h.DEKHandoff = nil, nil
 	}
 	h.Version = formatVersion
 	h.ID = s.id
@@ -1051,7 +1085,16 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 		}
 		return err
 	}
+	if s.postCommitFault != nil {
+		if err := s.postCommitFault(); err != nil {
+			return ErrAudit
+		}
+	}
 	s.header = h
+	if rot != nil {
+		wipe(s.dek)
+		s.dek = append([]byte(nil), rot.newDEK...)
+	}
 	// Append only after the transaction succeeds. A failed commit leaves the
 	// prefix in place, and append grows the backing array instead of copying
 	// it on every row. The notice index follows the same commit: a failed
@@ -1121,6 +1164,27 @@ func deriveKEK(passphrase []byte, p kdfParams) []byte {
 
 func dekAAD(vaultID string) []byte {
 	return []byte("tremelay/v1/dek\x00" + vaultID)
+}
+
+func dekHandoffAAD(vaultID, auditHead string, auditSeq uint64) []byte {
+	var seq [8]byte
+	binary.BigEndian.PutUint64(seq[:], auditSeq)
+	return append([]byte("tremelay/v1/dek-handoff\x00"+vaultID+"\x00"+auditHead+"\x00"), seq[:]...)
+}
+
+func openDEKHandoff(oldDEK []byte, header fileHeader) ([]byte, error) {
+	if len(header.DEKHandoffNonce) != nonceLen || len(header.DEKHandoff) < keyLen+16 {
+		return nil, ErrCorrupt
+	}
+	dek, err := openAEAD(oldDEK, header.DEKHandoffNonce, header.DEKHandoff, dekHandoffAAD(header.ID, header.AuditHead, header.AuditSeq))
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	if len(dek) != keyLen {
+		wipe(dek)
+		return nil, ErrCorrupt
+	}
+	return dek, nil
 }
 
 func dataAAD(vaultID, auditHead string, auditSeq uint64) []byte {
@@ -1324,6 +1388,13 @@ func validateHeader(h fileHeader) error {
 		return ErrCorrupt
 	}
 	if _, err := hex.DecodeString(h.AuditHead); err != nil {
+		return ErrCorrupt
+	}
+	if len(h.DEKHandoffNonce) == 0 {
+		if len(h.DEKHandoff) != 0 {
+			return ErrCorrupt
+		}
+	} else if len(h.DEKHandoffNonce) != nonceLen || len(h.DEKHandoff) < keyLen+16 {
 		return ErrCorrupt
 	}
 	return nil
