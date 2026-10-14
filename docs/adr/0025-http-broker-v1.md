@@ -169,7 +169,13 @@ the same `brokerExchange`: target classification before DNS, special-use and
 private-address refusal, one DNS lookup with a first-public-address pin, a
 transport that ignores `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` and dials only the
 pinned address, total refusal of redirects including chains, the destructive-
-method policy, and the abuse-guard hook. A 3xx is refused before its headers or
+method policy, and the abuse-guard hook.
+
+`2026-10-14`: DNS resolution runs outside the session mutex via `duringCallback`,
+matching the existing HTTP transport path. After re-acquiring the lock, bound
+grants are rechecked with `checkExactNetwork` before the pinned address is used;
+the validated address set is unchanged and there is still no second lookup before
+dial. A 3xx is refused before its headers or
 body are read, so `Location` never reaches the agent and the credential is never
 offered to the next hop.
 
