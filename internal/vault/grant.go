@@ -240,7 +240,7 @@ func (b agentBinder) localAttest(agentID string, req LocalAttestRequest) (LocalA
 
 // AgentPrincipal is the agent-facing handle for one identity.
 // Its method set is capability listing, authorization, the HTTP broker, the
-// GitHub issue read, local attestation, and one host-bound SSH userauth stream.
+// GitHub issue read, local attestation, and one session-bound SSH userauth stream.
 // It has no credential retrieval, grant issuance, clock, or way to select a different principal.
 type AgentPrincipal struct {
 	view capabilityView
