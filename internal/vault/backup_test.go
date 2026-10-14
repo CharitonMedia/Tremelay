@@ -149,6 +149,30 @@ func TestBackupRestoreNegative(t *testing.T) {
 	env.grant(t, time.Hour)
 	artGranted, cpGranted := mustBackup(t, env.path, dir, env.pass, nil)
 	mustReject(t, artUngranted, env.pass, cpGranted, ErrCheckpoint)
+	t.Run("staging overwritten before publish", func(t *testing.T) {
+		restorePublishFault = func() error {
+			names := incompleteNames(t, dir)
+			if len(names) != 1 {
+				return errors.New("staging-count-sentinel")
+			}
+			return os.WriteFile(filepath.Join(dir, names[0]), readAll(t, artUngranted), 0o600)
+		}
+		t.Cleanup(func() { restorePublishFault = nil })
+		dest := filepath.Join(dir, "stale-race.db")
+		want := ErrCheckpoint
+		if runtime.GOOS == "windows" {
+			// As in "sync rollback": Windows cannot confirm the rollback's
+			// directory flush, so a removed name is reported as uncertain.
+			want = ErrPublicationUncertain
+		}
+		if err := Restore(artGranted, dest, env.pass, cpGranted, nil); !errors.Is(err, want) {
+			t.Fatalf("stale staging publication: %v", err)
+		}
+		if _, err := os.Lstat(dest); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("stale staging publication left a destination")
+		}
+		assertNoIncomplete(t, dir)
+	})
 	// The pre-grant artifact still matches the checkpoint issued for it.
 	// That pair is stale against the granted source, and this reference cannot tell.
 	ungrantedDest := filepath.Join(canonicalTemp(t), "ungranted.db")
