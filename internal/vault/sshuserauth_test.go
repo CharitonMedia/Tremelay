@@ -994,14 +994,20 @@ func TestSSHUserAuthDirectRelease(t *testing.T) {
 // preimage names no host key, so the signature would log in to another server.
 func TestSSHUserAuthForwardedStreamStaysRefused(t *testing.T) {
 	for _, flag := range []byte{1, 2} {
-		forwardedStreamStaysRefused(t, flag)
+		forwardedStreamStaysRefused(t, flag, false)
+		// OpenSSH reads the byte after the signature and ignores the rest.
+		forwardedStreamStaysRefused(t, flag, true)
 	}
 }
 
-func forwardedStreamStaysRefused(t *testing.T, flag byte) {
+func forwardedStreamStaysRefused(t *testing.T, flag byte, trailingZero bool) {
 	env := newSSHEnv(t)
 	sid := env.sessionID(32)
-	if resp, err := env.stream.roundTrip(env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, sid), flag)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+	bind := env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, sid), flag)
+	if trailingZero {
+		bind = append(bind, 0)
+	}
+	if resp, err := env.stream.roundTrip(bind); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
 		t.Fatalf("forwarding bind %x %v", resp, err)
 	}
 	other := env.sessionID(32)

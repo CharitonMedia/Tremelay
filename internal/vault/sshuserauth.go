@@ -276,7 +276,7 @@ func (a *SSHUserAuth) extension(body []byte, ev auditEvent, pinned []byte) ([]by
 	if name != sshExtSessionBind {
 		return a.record(ev, resultDenied, []byte{sshAgentExtensionFailure})
 	}
-	if len(rest) > 0 && rest[len(rest)-1] != 0 {
+	if bindClaimsForwarding(rest) {
 		a.forwarded = true
 	}
 	if a.hasBinding || a.forwarded {
@@ -1050,6 +1050,24 @@ func parseSignBody(body []byte) (key, data []byte, flags uint32, ok bool) {
 		return nil, nil, 0, false
 	}
 	return key, data, binary.BigEndian.Uint32(rest), true
+}
+
+// bindClaimsForwarding reports whether a session-bind body could mean
+// is_forwarding to any reader: OpenSSH takes the byte right after the three
+// strings and ignores what follows, so that byte counts, and so does a non-zero
+// final byte when the strings do not parse.
+func bindClaimsForwarding(rest []byte) bool {
+	if len(rest) > 0 && rest[len(rest)-1] != 0 {
+		return true
+	}
+	b := rest
+	for range 3 {
+		var ok bool
+		if _, b, ok = takeSSHBytes(b, len(rest)); !ok {
+			return false
+		}
+	}
+	return len(b) > 0 && b[0] != 0
 }
 
 func parseSessionBind(rest []byte) (host, sid, sig []byte, ok bool) {
