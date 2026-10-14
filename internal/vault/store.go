@@ -8,10 +8,80 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"modernc.org/sqlite" // pure-Go SQLite; no cgo so Windows CI matches Linux.
 	sqlite3 "modernc.org/sqlite/lib"
 )
+
+// vaultWriteMu serializes every write transaction in this process so one
+// goroutine cannot commit back to back and starve peers on the same file past
+// busy_timeout. Cross-process contention still hits SQLite; vaultWriteRun
+// retries that case with a bounded backoff.
+var vaultWriteMu sync.Mutex
+
+var errSQLiteBusy = errors.New("sqlite busy")
+
+const sqliteWriteMaxAttempts = 12
+
+func sqliteWriteBackoff(attempt int) time.Duration {
+	d := time.Duration(10*(1<<attempt)) * time.Millisecond
+	const cap = 250 * time.Millisecond
+	if d > cap {
+		return cap
+	}
+	return d
+}
+
+func sqliteBusy(err error) bool {
+	var driverErr *sqlite.Error
+	if !errors.As(err, &driverErr) {
+		return false
+	}
+	return driverErr.Code()&0xff == sqlite3.SQLITE_BUSY
+}
+
+func vaultWriteRun(fn func() error) error {
+	vaultWriteMu.Lock()
+	defer vaultWriteMu.Unlock()
+	for attempt := 0; attempt < sqliteWriteMaxAttempts; attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, errSQLiteBusy) {
+			if attempt+1 < sqliteWriteMaxAttempts {
+				time.Sleep(sqliteWriteBackoff(attempt))
+				continue
+			}
+			return ErrIO
+		}
+		return err
+	}
+	return ErrIO
+}
+
+func beginWriteTx(db *sql.DB) (*sql.Tx, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		if sqliteBusy(err) {
+			return nil, errSQLiteBusy
+		}
+		return nil, ErrIO
+	}
+	return tx, nil
+}
+
+func commitWriteTx(tx *sql.Tx) error {
+	if err := tx.Commit(); err != nil {
+		if sqliteBusy(err) {
+			return errSQLiteBusy
+		}
+		return ErrIO
+	}
+	return nil
+}
 
 const schemaSQL = `
 CREATE TABLE vault (
@@ -430,34 +500,36 @@ func migrateAudit(db *sql.DB) error {
 	if !missing {
 		return nil
 	}
-	tx, err := db.Begin()
-	if err != nil {
-		return ErrIO
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	for _, col := range adds {
-		if cols[col.name] {
-			continue
-		}
-		if _, err := tx.Exec(col.ddl); err != nil {
-			return ErrCorrupt
-		}
-	}
-	if !cols["v"] {
-		if err := backfillAuditVersion(tx); err != nil {
+	return vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
 			return err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return ErrIO
-	}
-	committed = true
-	return nil
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		for _, col := range adds {
+			if cols[col.name] {
+				continue
+			}
+			if _, err := tx.Exec(col.ddl); err != nil {
+				return ErrCorrupt
+			}
+		}
+		if !cols["v"] {
+			if err := backfillAuditVersion(tx); err != nil {
+				return err
+			}
+		}
+		if err := commitWriteTx(tx); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	})
 }
 
 func backfillAuditVersion(tx *sql.Tx) error {
@@ -564,38 +636,40 @@ func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fres
 	if len(events) == 0 {
 		return ErrAudit
 	}
-	tx, err := db.Begin()
-	if err != nil {
-		return ErrIO
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	if fresh {
-		if err := insertVault(tx, h); err != nil {
+	return vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
 			return err
 		}
-	} else if err := updateVault(tx, h, prevSeq); err != nil {
-		return err
-	}
-	for _, ev := range events {
-		if err := insertAudit(tx, ev); err != nil {
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		if fresh {
+			if err := insertVault(tx, h); err != nil {
+				return err
+			}
+		} else if err := updateVault(tx, h, prevSeq); err != nil {
 			return err
 		}
-	}
-	if fault != nil {
-		if err := fault(); err != nil {
-			return ErrAudit
+		for _, ev := range events {
+			if err := insertAudit(tx, ev); err != nil {
+				return err
+			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return ErrIO
-	}
-	committed = true
-	return nil
+		if fault != nil {
+			if err := fault(); err != nil {
+				return ErrAudit
+			}
+		}
+		if err := commitWriteTx(tx); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	})
 }
 
 func insertVault(tx *sql.Tx, h fileHeader) error {
@@ -681,35 +755,37 @@ func insertAudit(tx *sql.Tx, ev auditEvent) error {
 // tip read and the insert. A concurrent denial waits, then observes the
 // committed sequence instead of reusing it.
 func appendDenial(db *sql.DB, vaultID string) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return ErrIO
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
+			return err
 		}
-	}()
-	tip, err := readAuditTip(tx)
-	if err != nil {
-		return err
-	}
-	if tip.VaultID != vaultID {
-		return ErrAudit
-	}
-	ev, err := nextEvent([]auditEvent{tip}, actionUnlock, vaultID, "", "", resultDenied)
-	if err != nil {
-		return err
-	}
-	if err := insertAudit(tx, ev); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return ErrIO
-	}
-	committed = true
-	return nil
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		tip, err := readAuditTip(tx)
+		if err != nil {
+			return err
+		}
+		if tip.VaultID != vaultID {
+			return ErrAudit
+		}
+		ev, err := nextEvent([]auditEvent{tip}, actionUnlock, vaultID, "", "", resultDenied)
+		if err != nil {
+			return err
+		}
+		if err := insertAudit(tx, ev); err != nil {
+			return err
+		}
+		if err := commitWriteTx(tx); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	})
 }
 
 func readAuditTip(tx *sql.Tx) (auditEvent, error) {

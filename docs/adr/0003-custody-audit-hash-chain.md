@@ -144,3 +144,13 @@ These mechanisms should be deleted rather than preserved as dormant compatibilit
 `audit verify` opens SQLite with `mode=ro` and `query_only(ON)`, without a journal-mode setter, migration, or audit append, even when authentication or verification fails. For legacy audit tables it projects only the columns that the existing migration would add: empty strings and zero numeric defaults, and the existing action-derived version when `v` is absent. Present values and all chain, suffix, encrypted-document, detection, health, and shared-history checks are unchanged. Original M1 columns remain required. This preserves synthetic M1, M2–M4, and M5 schema compatibility without modifying the input.
 
 The strict read-only backup-artifact reader remains strict. Ordinary `Unlock` keeps its migration and failed-authentication denial behavior; changing that ordering is outside this correction. `TestCLIAuditVerifyReadOnly` verifies unchanged file bytes and no new sidecars for success, wrong/invalid passphrases, and tampered rows. `TestVerifyAuditReadOnlyCompatibility` checks the write-disabled connection, legacy version projection, strict artifact reader, and ordinary unlock denial. These are synthetic compatibility fixtures, not historical-binary interoperability claims.
+
+## Amendment 2026-10-14: fair SQLite writers (V1.md item 3f)
+
+Status stays Accepted pending owner veto.
+
+Concurrent holders of the same vault file (daemon plus control plane, or many goroutines each with its own connection) could starve one another past the 5 s `busy_timeout` because SQLite's busy wait is not fair. A writer that commits back to back could make another connection fail with `ErrIO` even though no credential state changed and neither side should lock.
+
+Every mutating store path (`writeTx`, `appendDenial`, and audit migration) now runs under a process-wide write mutex so only one write transaction is prepared at a time in that process, still using `BEGIN IMMEDIATE` via `_txlock=immediate` so the reserved lock is taken at transaction start. When `BEGIN` or `COMMIT` returns `SQLITE_BUSY` after the connection's busy wait, the store retries the whole write with bounded exponential backoff; exhaustion still returns `ErrIO` and callers remain fail-closed. Read snapshots (`readVaultSnapshot`, read-only verify) do not take the write mutex and are not queued behind unrelated writers except for ordinary SQLite reader/writer blocking.
+
+Required tests include concurrent denial and session-commit stress that assert no `ErrIO` from lock starvation, plus unit checks that audit faults are not retried and busy exhaustion maps to `ErrIO`.
