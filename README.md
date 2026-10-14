@@ -127,10 +127,11 @@ Read this before you trust it with anything.
   macOS only and fails closed on Windows.
 - **The agent still reads broker responses.** An `http_broker` grant returns the
   status code, an allowlisted set of response headers, and up to 32 KiB of the
-  body with every spelling of the credential redacted. The agent never sees the
-  credential, but it does see the data that credential unlocks — and anything in
-  that body can be prompt injection. Tremelay guarantees the secret is not in the
-  response, not that the response is trustworthy.
+  body with the credential redacted in its common encodings (raw, URL, base64,
+  hex, JSON-escaped). The agent never sees the credential, but it does see the
+  data that credential unlocks — and anything in that body can be prompt
+  injection (H1). A hostile upstream that deliberately re-encodes or splits the
+  credential is not caught; grant only origins you trust with the credential.
 - **An unlocked daemon trusts your uid.** While it is unlocked, any code running
   as you can use your agents' granted capabilities. It still cannot read a
   credential, change a grant, or learn your passphrase, and everything it does is
@@ -142,6 +143,9 @@ Read this before you trust it with anything.
   yet. The audit chain is tamper-evident to *you*; nobody else checkpoints it.
 - **`credential get` prints the raw secret.** That is the human control plane, by
   design — it is not reachable from any agent interface.
+- **Legacy GitHub issue grants block unlock (H2).** A vault that still holds a
+  pre-v1 `github_issue_state` grant will not unlock until that grant is revoked
+  with the pre-v1 binary.
 - **Pre-release.** Do not put production credentials in it yet.
 
 ## Security
