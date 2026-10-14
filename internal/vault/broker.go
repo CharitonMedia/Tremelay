@@ -179,6 +179,13 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 	s.duringCallback(func() {
 		ips, lookupErr = s.lookupBroker(ctx, host)
 	})
+	// The mutex was released for DNS. Everything decided before the lookup is
+	// decided again on the current state before any secret is copied: a Lock,
+	// revoke, expiry, suspension or destructive-policy change during the
+	// lookup holds.
+	if err := s.live(); err != nil {
+		return 0, err
+	}
 	if call.bound != nil {
 		if err := s.checkExactNetwork(agentID, call, false); err != nil {
 			return 0, err
@@ -187,9 +194,9 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		return 0, err
 	} else if s.defunct {
 		return 0, ErrStale
+	} else if s.agentExists(agentID) && !s.agentActive(agentID) {
+		return s.failExchange(s.destinationEvent(agentID, call.credentialID, resultDeniedAgent, call.operation), call.method, ErrDeniedAgent)
 	} else {
-		// The mutex was released for DNS: decide again on the adopted state
-		// before any secret is copied, so a revoke during the lookup holds.
 		var again auditEvent
 		var cause error
 		if call.operation == OpHTTPBroker {
@@ -260,6 +267,15 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		}
 	} else if s.header.AuditSeq != seq || s.defunct {
 		return 0, ErrStale
+	}
+	// The hook and the DNS lookup both ran without the mutex, and a policy
+	// change does not move the audit sequence: read the policy last.
+	if err := s.live(); err != nil {
+		return 0, err
+	}
+	if call.method == http.MethodDelete && s.policy.Destructive == DestructiveDeny {
+		partial.Result = resultDeniedDestructive
+		return s.failExchange(partial, call.method, ErrDeniedDestructive)
 	}
 	secret, ok := s.copySecret(partial.CredID)
 	if !ok || !safeHeaderSecret(secret) {
