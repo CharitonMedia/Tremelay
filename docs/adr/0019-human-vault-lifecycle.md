@@ -51,9 +51,7 @@ miss error and subsequent `ErrStale` behavior are retained.
 This operation is available on the trusted host's `Session`, including a shared
 vault, and is not exposed on `AgentPrincipal`, `AgentCapability`, MCP, or
 `HumanPrincipal`. Grants and membership are unchanged; credential plaintext is
-preserved but re-sealed under the new DEK. A one-time handoff sealed under the
-previous DEK lets a resident session reload after the change without
-re-prompting; it is cleared on the next ordinary commit. An old snapshot plus
+preserved but re-sealed under the new DEK. An old snapshot plus
 its original passphrase and wrapped DEK cannot decrypt the current vault.
 Changing the passphrase cannot recall a DEK another process already discarded or
 stop a compromised host. Copies and snapshots retain their original passphrase
@@ -109,7 +107,8 @@ transaction and cryptography is the smallest change satisfying atomic custody.
 credential retention, ordinary-write retention of the new wrap, original snapshot
 passphrase, invalid/wrong input, transaction rollback, stale sessions, crash
 recovery at each commit step, pre-change authority failing on post-change
-ciphertext, resident-session reload, and synthetic sentinel absence.
+ciphertext, resident-session reload with ephemeral reload keys, handoff
+adversarial cases, and synthetic sentinel absence.
 `TestCLIChangePassphrase*` covers prompt order, confirmation,
 cancellation, buffer wiping, terminal-only entry and fixed argument errors.
 `TestCLIBackup*` and `TestCLIRestore*` exercise CLI checkpoint and engine boundaries.
@@ -134,8 +133,18 @@ Status stays Accepted pending owner veto.
 stored credential under it in one SQLite transaction with the new passphrase
 wrap and the fixed `vault_passphrase_change / allowed` audit row. Crash or
 injected failure before commit leaves the prior wrap, DEK, and ciphertext;
-after commit the vault unlocks only with the new passphrase. A one-time DEK
-handoff column pair, sealed under the previous DEK and bound to the change
-commit, lets a running daemon adopt the rotation through the existing reload
-path without re-prompting; ordinary writes clear the handoff. An old backup
-plus the old passphrase and wrapped DEK cannot decrypt the current document.
+after commit the vault unlocks only with the new passphrase. A long-running
+daemon session publishes an ephemeral X25519 public key (`dek_reload_pubkey`)
+through the audited commit path when it unlocks; the matching private key
+lives only in that process until lock or exit. When a reload public key is
+recorded, `change-passphrase` may leave a one-time `dek_handoff` blob:
+`nacl/box` anonymous seal of the new DEK plus a binding to the vault id and
+the change commit's audit head and sequence. The handoff is never sealed
+under the previous DEK or anything derivable from the old passphrase or an
+old backup. A resident session that still holds the reload private key opens
+the handoff on reload, verifies the binding, adopts the new DEK, and
+continues the existing verification path; any failure retires the session.
+Ordinary writes clear the handoff; if it is cleared before the daemon reloads,
+the session fails closed. An old backup plus the old passphrase and wrapped
+DEK cannot decrypt the current document or recover the new DEK from the
+handoff without the daemon's ephemeral private key.

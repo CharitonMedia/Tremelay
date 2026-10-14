@@ -37,6 +37,7 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
+	"golang.org/x/crypto/nacl/box"
 )
 
 const (
@@ -248,6 +249,7 @@ type fileHeader struct {
 	Data             []byte
 	AuditHead        string
 	AuditSeq         uint64
+	DEKReloadPubKey  []byte
 	DEKHandoffNonce  []byte
 	DEKHandoff       []byte
 }
@@ -346,6 +348,11 @@ type Session struct {
 	// defunct is set when a commit loses a race it cannot recover from.
 	// Later calls return ErrStale.
 	defunct bool
+	// reloadPriv, when set, opens a DEK handoff left by a passphrase rotation.
+	// It is wiped on Lock and is never written to disk.
+	reloadPriv *[32]byte
+	// pendingReloadPub is written into the vault row on the next commit only.
+	pendingReloadPub []byte
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -580,6 +587,8 @@ func (s *Session) lockLocked() {
 	s.responding = false
 	s.checker = nil
 	s.hpolicy = healthPolicy{}
+	s.reloadPriv = nil
+	s.pendingReloadPub = nil
 	s.locked.Store(false)
 	if s.redactor != nil {
 		s.redactor.Wipe()
@@ -767,8 +776,8 @@ func (s *Session) adoptLocked() error {
 // reloadLocked replaces this session's cached authority with the durable state
 // under the DEK it already holds. No passphrase is involved: the KEK was
 // consumed at unlock. A passphrase change may have rotated the DEK; a one-time
-// handoff sealed under the previous DEK lets a resident session adopt the new
-// key without re-prompting. Verification is Unlock's, through readVaultState
+// handoff sealed to this session's ephemeral reload public key lets a resident
+// session adopt the new key without re-prompting. Verification is Unlock's, through readVaultState
 // and openDocument, so a tampered document, a broken chain, a forged denial
 // suffix or a foreign vault id all fail here. Nothing is swapped until every
 // check passes, and a failure makes the session permanently unusable rather
@@ -802,7 +811,7 @@ func (s *Session) reloadLocked() error {
 	}
 	doc, idx, err := openDocument(s.dek, header, events)
 	if err != nil && len(header.DEKHandoff) > 0 {
-		next, herr := openDEKHandoff(s.dek, header)
+		next, herr := openDEKHandoffReload(s.reloadPriv, header)
 		if herr != nil {
 			return fail(herr)
 		}
@@ -996,7 +1005,6 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 
 type dekRotation struct {
 	newDEK        []byte
-	handoffNonce  []byte
 	handoffCipher []byte
 }
 
@@ -1059,8 +1067,11 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	if wrap != nil {
 		h.KDF, h.WrapNonce, h.WrappedDEK = wrap.kdf, wrap.nonce, wrap.ciphertext
 	}
+	if s.pendingReloadPub != nil {
+		h.DEKReloadPubKey = append([]byte(nil), s.pendingReloadPub...)
+	}
 	if rot != nil {
-		h.DEKHandoffNonce, h.DEKHandoff = rot.handoffNonce, rot.handoffCipher
+		h.DEKHandoffNonce, h.DEKHandoff = nil, rot.handoffCipher
 	} else {
 		h.DEKHandoffNonce, h.DEKHandoff = nil, nil
 	}
@@ -1164,27 +1175,6 @@ func deriveKEK(passphrase []byte, p kdfParams) []byte {
 
 func dekAAD(vaultID string) []byte {
 	return []byte("tremelay/v1/dek\x00" + vaultID)
-}
-
-func dekHandoffAAD(vaultID, auditHead string, auditSeq uint64) []byte {
-	var seq [8]byte
-	binary.BigEndian.PutUint64(seq[:], auditSeq)
-	return append([]byte("tremelay/v1/dek-handoff\x00"+vaultID+"\x00"+auditHead+"\x00"), seq[:]...)
-}
-
-func openDEKHandoff(oldDEK []byte, header fileHeader) ([]byte, error) {
-	if len(header.DEKHandoffNonce) != nonceLen || len(header.DEKHandoff) < keyLen+16 {
-		return nil, ErrCorrupt
-	}
-	dek, err := openAEAD(oldDEK, header.DEKHandoffNonce, header.DEKHandoff, dekHandoffAAD(header.ID, header.AuditHead, header.AuditSeq))
-	if err != nil {
-		return nil, ErrCorrupt
-	}
-	if len(dek) != keyLen {
-		wipe(dek)
-		return nil, ErrCorrupt
-	}
-	return dek, nil
 }
 
 func dataAAD(vaultID, auditHead string, auditSeq uint64) []byte {
@@ -1390,12 +1380,16 @@ func validateHeader(h fileHeader) error {
 	if _, err := hex.DecodeString(h.AuditHead); err != nil {
 		return ErrCorrupt
 	}
-	if len(h.DEKHandoffNonce) == 0 {
-		if len(h.DEKHandoff) != 0 {
+	if len(h.DEKHandoffNonce) != 0 {
+		return ErrCorrupt
+	}
+	if len(h.DEKReloadPubKey) != 0 && len(h.DEKReloadPubKey) != 32 {
+		return ErrCorrupt
+	}
+	if len(h.DEKHandoff) != 0 {
+		if len(h.DEKReloadPubKey) != 32 || len(h.DEKHandoff) < keyLen+box.AnonymousOverhead {
 			return ErrCorrupt
 		}
-	} else if len(h.DEKHandoffNonce) != nonceLen || len(h.DEKHandoff) < keyLen+16 {
-		return ErrCorrupt
 	}
 	return nil
 }

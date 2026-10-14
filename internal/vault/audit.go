@@ -28,7 +28,8 @@ const (
 	actionAgentTokenIssue  = "agent_token_issue"
 	actionAgentTokenRotate = "agent_token_rotate"
 	actionAgentTokenRevoke = "agent_token_revoke"
-	actionDaemonAuth       = "daemon_auth"
+	actionDaemonAuth         = "daemon_auth"
+	actionDaemonReloadPubkey = "daemon_reload_pubkey"
 	actionGrantCreate      = "grant_create"
 	actionGrantRevoke      = "grant_revoke"
 	actionAuthorize        = "capability_authorize"
@@ -354,7 +355,7 @@ func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPassphrase, actionPut, actionGet, actionList,
 		actionAgentCreate, actionAgentTokenIssue, actionAgentTokenRotate, actionAgentTokenRevoke,
-		actionDaemonAuth, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
+		actionDaemonAuth, actionDaemonReloadPubkey, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
 		actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
 		actionHealthGet, actionHealthList:

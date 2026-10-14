@@ -2,9 +2,12 @@ package vault
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"reflect"
 	"testing"
+
+	"golang.org/x/crypto/nacl/box"
 )
 
 func TestChangePassphraseOldWrappedDEKCannotDecryptPostChange(t *testing.T) {
@@ -12,6 +15,9 @@ func TestChangePassphraseOldWrappedDEKCannotDecryptPostChange(t *testing.T) {
 	defer s.Lock()
 	secret := randBytesT(t, 32)
 	if _, err := s.Put("rotate-target", "generic", secret, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PublishDaemonReloadPubKey(); err != nil {
 		t.Fatal(err)
 	}
 	beforeWrap := passphraseWrap{
@@ -41,6 +47,22 @@ func TestChangePassphraseOldWrappedDEKCannotDecryptPostChange(t *testing.T) {
 	}
 	if _, err := openAEAD(staleDEK, after.DataNonce, after.Data, dataAAD(after.ID, after.AuditHead, after.AuditSeq)); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("old DEK decrypted post-change ciphertext: %v", err)
+	}
+	if len(after.DEKHandoff) != 0 {
+		attackerPub, attackerPriv, err := box.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pub [32]byte
+		copy(pub[:], after.DEKReloadPubKey)
+		if plain, ok := box.OpenAnonymous(nil, after.DEKHandoff, &pub, attackerPriv); ok {
+			wipe(plain)
+			t.Fatal("foreign private key opened DEK handoff")
+		}
+		if _, err := openDEKHandoffReload(attackerPriv, after); err == nil {
+			t.Fatal("wrong reload key recovered DEK handoff")
+		}
+		_ = attackerPub
 	}
 	opened, err := Unlock(path, newPass, nil)
 	if err != nil {
@@ -163,6 +185,9 @@ func TestSessionReloadAdoptsPassphraseRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := resident.PublishDaemonReloadPubKey(); err != nil {
+		t.Fatal(err)
+	}
 	oldDEK := append([]byte(nil), resident.dek...)
 	defer wipe(oldDEK)
 	control, err := Unlock(path, oldPass, nil)
@@ -184,6 +209,109 @@ func TestSessionReloadAdoptsPassphraseRotation(t *testing.T) {
 	}
 	if _, err := VerifyAudit(path, newPass); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestChangePassphraseNoReloadKeyWritesNoHandoff(t *testing.T) {
+	path, oldPass, s := mustCreate(t, nil)
+	defer s.Lock()
+	if _, err := s.Put("nohandoff", "generic", randBytesT(t, 16), PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	newPass := []byte(randHex(t, 24))
+	if err := s.ChangePassphrase(oldPass, newPass); err != nil {
+		t.Fatal(err)
+	}
+	after, err := readHeaderFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.DEKHandoff) != 0 || len(after.DEKReloadPubKey) != 0 {
+		t.Fatal("passphrase change without reload key wrote handoff or pubkey")
+	}
+}
+
+func TestSessionReloadRejectsForeignReloadPubKey(t *testing.T) {
+	path, oldPass, resident := mustCreate(t, nil)
+	defer resident.Lock()
+	secret := randBytesT(t, 32)
+	cred, err := resident.Put("foreign-pub", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resident.PublishDaemonReloadPubKey(); err != nil {
+		t.Fatal(err)
+	}
+	control, err := Unlock(path, oldPass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Lock()
+	newPass := []byte(randHex(t, 24))
+	if err := control.ChangePassphrase(oldPass, newPass); err != nil {
+		t.Fatal(err)
+	}
+	foreign, _, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := vaultHandoffReady(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE vault SET dek_reload_pubkey = ?`, foreign[:]); err != nil {
+		t.Fatal(err)
+	}
+	_, err = resident.Get(cred.ID)
+	if !errors.Is(err, ErrStale) && !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("foreign reload pubkey: %v", err)
+	}
+	if !resident.defunct {
+		t.Fatal("foreign reload pubkey did not retire session")
+	}
+}
+
+func TestSessionReloadRejectsBadDEKHandoff(t *testing.T) {
+	path, oldPass, resident := mustCreate(t, nil)
+	defer resident.Lock()
+	secret := randBytesT(t, 32)
+	cred, err := resident.Put("tamper", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resident.PublishDaemonReloadPubKey(); err != nil {
+		t.Fatal(err)
+	}
+	control, err := Unlock(path, oldPass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Lock()
+	newPass := []byte(randHex(t, 24))
+	if err := control.ChangePassphrase(oldPass, newPass); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := vaultHandoffReady(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE vault SET dek_handoff = randomblob(length(dek_handoff))`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = resident.Get(cred.ID)
+	if !errors.Is(err, ErrStale) && !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("tampered handoff: %v", err)
+	}
+	if !resident.defunct {
+		t.Fatal("tampered handoff did not retire session")
 	}
 }
 

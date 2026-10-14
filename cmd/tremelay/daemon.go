@@ -96,6 +96,10 @@ func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv fu
 	if err != nil {
 		return fail("vault unlock failed")
 	}
+	if err := session.PublishDaemonReloadPubKey(); err != nil {
+		session.Lock()
+		return fail("vault reload registration failed")
+	}
 	connCtx, cancelConns := context.WithCancel(ctx)
 	d := &daemon{
 		session: session,

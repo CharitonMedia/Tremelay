@@ -157,6 +157,9 @@ func TestChangePassphraseStaleSession(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer current.Lock()
+			if err := stale.PublishDaemonReloadPubKey(); err != nil {
+				t.Fatal(err)
+			}
 			newPass := []byte(randHex(t, 24))
 			if err := current.ChangePassphrase(oldPass, newPass); err != nil {
 				t.Fatal(err)

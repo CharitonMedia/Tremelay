@@ -559,3 +559,28 @@ invocation with each refusal audited and attributed, a rotated token file
 still owner-only with no temporary file left beside it, `issue` refusing to
 overwrite another agent's token file without committing, and the daemon
 locking on a forked chain. These are security controls under invariant 13.
+
+## Amendment 2026-10-14: DEK rotation handoff for resident reload (V1.md item 3e)
+
+Status stays Accepted pending owner veto.
+
+Passphrase change now rotates the vault DEK in one transaction (ADR 0019,
+amendment of 2026-10-14). A running daemon must adopt that rotation through
+the reload path without re-prompting, but the handoff must not be readable
+with an old backup and passphrase: sealing the new DEK under the previous DEK
+would let anyone who derived the old DEK from a snapshot read the handoff
+while it remains on disk.
+
+On unlock, before serving connections, the daemon generates an ephemeral
+X25519 key pair (`golang.org/x/crypto/nacl/box`), commits only the public key
+to `dek_reload_pubkey` with a fixed `daemon_reload_pubkey / allowed` audit
+row, and keeps the private key in memory until lock or exit. When another
+holder runs `change-passphrase` and a reload public key is present, the
+change commit may store `dek_handoff` as an anonymous box of the new DEK and
+a binding to the vault id and that commit's audit head and sequence. If no
+reload key is recorded, no handoff is written. Reload adoption opens the
+handoff with the in-memory private key, verifies the binding, swaps in the new
+DEK, and runs the same `openDocument` verification as any other reload; failure
+retires the session and the daemon locks. Ordinary commits clear the handoff;
+if it is cleared before reload, the resident session fails closed, which is
+acceptable. The handoff is never sealed under the old DEK or the old wrap.

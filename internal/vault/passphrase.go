@@ -14,8 +14,9 @@ type passphraseWrap struct {
 // ChangePassphrase reauthenticates the current passphrase, generates a fresh
 // DEK, re-encrypts every credential under it, and commits the new wrap, the
 // resealed document, and the vault_passphrase_change audit row atomically. A
-// one-time handoff sealed under the previous DEK lets a resident session reload
-// without re-prompting. A stale session cannot replace a newer wrap. This is
+// one-time handoff sealed to a recorded daemon reload public key lets a resident
+// session reload without re-prompting when that key was published before the
+// change. A stale session cannot replace a newer wrap. This is
 // host custody, not an agent operation. Snapshots keep their original
 // passphrase and DEK. This does not revoke a DEK that another process already
 // holds or defend against a compromised host.
@@ -64,16 +65,19 @@ func (s *Session) ChangePassphrase(oldPassphrase, newPassphrase []byte) error {
 	if err != nil {
 		return err
 	}
-	handoffNonce, handoffCipher, err := seal(s.dek, newDEK, dekHandoffAAD(s.id, ev.Hash, ev.Seq))
-	if err != nil {
-		return err
+	var handoffCipher []byte
+	if len(s.header.DEKReloadPubKey) == 32 {
+		handoffCipher, err = sealDEKHandoff(s.header.DEKReloadPubKey, newDEK, s.id, ev.Hash, ev.Seq)
+		if err != nil {
+			return err
+		}
 	}
 	if s.rotateFault != nil {
 		if err := s.rotateFault("reseal"); err != nil {
 			return err
 		}
 	}
-	rot := &dekRotation{newDEK: newDEK, handoffNonce: handoffNonce, handoffCipher: handoffCipher}
+	rot := &dekRotation{newDEK: newDEK, handoffCipher: handoffCipher}
 	// newDEK is adopted by commitBatchWrap on success; do not wipe it here.
 	newDEK = nil
 	if err := s.commitBatchWrap([]auditEvent{ev}, s.creds, s.agents, s.grants, true, nil,

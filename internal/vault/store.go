@@ -30,6 +30,7 @@ CREATE TABLE vault (
   encrypted_document BLOB NOT NULL,
   audit_head TEXT NOT NULL,
   audit_seq INTEGER NOT NULL,
+  dek_reload_pubkey BLOB,
   dek_handoff_nonce BLOB NOT NULL DEFAULT '',
   dek_handoff BLOB NOT NULL DEFAULT ''
 );
@@ -342,9 +343,9 @@ func readVaultRow(db queryer) (fileHeader, error) {
 	}
 	var h fileHeader
 	var timeCost, memory, threads, keyLen, seq int64
-	err := db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, dek_handoff_nonce, dek_handoff FROM vault`).Scan(
+	err := db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, dek_reload_pubkey, dek_handoff_nonce, dek_handoff FROM vault`).Scan(
 		&h.ID, &h.Version, &h.Root, &h.KDF.Algorithm, &h.KDF.Salt, &timeCost, &memory, &threads, &keyLen,
-		&h.WrapNonce, &h.WrappedDEK, &h.DataNonce, &h.Data, &h.AuditHead, &seq, &h.DEKHandoffNonce, &h.DEKHandoff,
+		&h.WrapNonce, &h.WrappedDEK, &h.DataNonce, &h.Data, &h.AuditHead, &seq, &h.DEKReloadPubKey, &h.DEKHandoffNonce, &h.DEKHandoff,
 	)
 	if err != nil {
 		return fileHeader{}, ErrCorrupt
@@ -496,7 +497,7 @@ func vaultHandoffReady(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	for _, name := range []string{"dek_handoff_nonce", "dek_handoff"} {
+	for _, name := range []string{"dek_reload_pubkey", "dek_handoff_nonce", "dek_handoff"} {
 		if !cols[name] {
 			return ErrCorrupt
 		}
@@ -515,6 +516,7 @@ func migrateVault(db *sql.DB) error {
 		name string
 		ddl  string
 	}{
+		{"dek_reload_pubkey", `ALTER TABLE vault ADD COLUMN dek_reload_pubkey BLOB`},
 		{"dek_handoff_nonce", `ALTER TABLE vault ADD COLUMN dek_handoff_nonce BLOB NOT NULL DEFAULT ''`},
 		{"dek_handoff", `ALTER TABLE vault ADD COLUMN dek_handoff BLOB NOT NULL DEFAULT ''`},
 	}
@@ -698,13 +700,20 @@ func blobOrEmpty(b []byte) []byte {
 	return b
 }
 
+func blobOrNil(b []byte) interface{} {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
+}
+
 func insertVault(tx *sql.Tx, h fileHeader) error {
 	_, err := tx.Exec(`INSERT INTO vault (
 		id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len,
-		wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, dek_handoff_nonce, dek_handoff
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, dek_reload_pubkey, dek_handoff_nonce, dek_handoff
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		h.ID, h.Version, h.Root, h.KDF.Algorithm, h.KDF.Salt, h.KDF.Time, h.KDF.Memory, h.KDF.Threads, h.KDF.KeyLen,
-		h.WrapNonce, h.WrappedDEK, h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), blobOrEmpty(h.DEKHandoffNonce), blobOrEmpty(h.DEKHandoff),
+		h.WrapNonce, h.WrappedDEK, h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), blobOrNil(h.DEKReloadPubKey), blobOrEmpty(h.DEKHandoffNonce), blobOrEmpty(h.DEKHandoff),
 	)
 	if err != nil {
 		return ErrIO
@@ -713,9 +722,9 @@ func insertVault(tx *sql.Tx, h fileHeader) error {
 }
 
 func updateVault(tx *sql.Tx, h fileHeader, prevSeq uint64) error {
-	res, err := tx.Exec(`UPDATE vault SET kdf_algorithm=?, kdf_salt=?, kdf_time=?, kdf_memory=?, kdf_threads=?, kdf_key_len=?, wrap_nonce=?, wrapped_dek=?, data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=?, dek_handoff_nonce=?, dek_handoff=? WHERE id=? AND audit_seq=?`,
+	res, err := tx.Exec(`UPDATE vault SET kdf_algorithm=?, kdf_salt=?, kdf_time=?, kdf_memory=?, kdf_threads=?, kdf_key_len=?, wrap_nonce=?, wrapped_dek=?, data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=?, dek_reload_pubkey=?, dek_handoff_nonce=?, dek_handoff=? WHERE id=? AND audit_seq=?`,
 		h.KDF.Algorithm, h.KDF.Salt, h.KDF.Time, h.KDF.Memory, h.KDF.Threads, h.KDF.KeyLen, h.WrapNonce, h.WrappedDEK,
-		h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), blobOrEmpty(h.DEKHandoffNonce), blobOrEmpty(h.DEKHandoff), h.ID, int64(prevSeq))
+		h.DataNonce, h.Data, h.AuditHead, int64(h.AuditSeq), blobOrNil(h.DEKReloadPubKey), blobOrEmpty(h.DEKHandoffNonce), blobOrEmpty(h.DEKHandoff), h.ID, int64(prevSeq))
 	if err != nil {
 		return ErrIO
 	}
