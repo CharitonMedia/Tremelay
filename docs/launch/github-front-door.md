@@ -1,8 +1,8 @@
 # GitHub front door — for Patrick to apply by hand
 
-Drafts for the GitHub-side half of [V1.md](../../V1.md) item 8. Nothing here has
-been applied: no `gh` command, no API call, no issue, no label, no settings
-change. Everything below is text to paste.
+Drafts for the GitHub-side half of [V1.md](../../V1.md) item 8. Applied on
+2026-10-14 from Patrick's account (not by the orchestrator): description and topics
+set, Discussions enabled, roadmap issues #55–#63 opened with these labels.
 
 ## Repo description
 
