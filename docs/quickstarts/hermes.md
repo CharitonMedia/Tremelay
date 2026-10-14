@@ -65,7 +65,7 @@ real grant has the same shape — only the resource changes:
 ```
 
 Either way the grant allows `GET` under that one prefix and nothing else: no
-other repo, host or method. See [the broker guide](../m7-github-issue.md).
+other repo, host or method. See [ADR 0025](../adr/0025-http-broker-v1.md).
 
 ## 3. Unlock once, in its own terminal
 

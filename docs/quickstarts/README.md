@@ -58,7 +58,7 @@ tremelay audit list --path /home/you/.tremelay/vault.db --action daemon_auth
 ## Background
 
 [Headless daemon](../headless-daemon.md) ·
-[HTTP broker](../m7-github-issue.md) ·
+[HTTP broker](../adr/0025-http-broker-v1.md) ·
 [SSH signing](../ssh-agent.md) ·
 [ADR 0024](../adr/0024-headless-unlock-daemon.md) ·
 [ADR 0025](../adr/0025-http-broker-v1.md)
