@@ -230,8 +230,10 @@ the credential has left scope.
   broker guarantees the credential is not in it, not that it is trustworthy.
 - Redaction is a closed list of literal spellings, not an encoding-aware scan.
   An upstream that re-encodes the credential some other way (a custom cipher,
-  a chunked JSON string built from pieces) would defeat it; the containment
-  re-check cannot see that either. Marked `ponytail:` in `credentialForms`
+  a chunked JSON string built from pieces, or partial spellings placed
+  mid-body or stacked at the truncation edge) would defeat it; the containment
+  re-check cannot see that either. The trailing-prefix cut protects an honest
+  echo cut by the cap, not against an upstream splitting the credential. Marked `ponytail:` in `credentialForms`
   with the upgrade path. Transport content codings and byte ranges are the two
   re-encodings an agent could *choose*, so those are closed by refusal on the
   request and by withholding on the response rather than by teaching the scan
