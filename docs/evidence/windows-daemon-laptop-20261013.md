@@ -1,4 +1,4 @@
-# Windows daemon acceptance on Patrick's laptop, 2026-10-13 (partial)
+# Windows daemon acceptance on Patrick's laptop, 2026-10-13 and 2026-10-14
 
 Commit under test: 9305cf2 (branch `v1-windows-daemon`), cross-built `GOOS=windows GOARCH=amd64`
 on render-1. Machine: LAPTOP-T09K3E6A, Windows, AMD64, user `patri`, reached over `ssh laptop`
@@ -22,10 +22,29 @@ Throwaway vault in `%TEMP%`, random passphrase held only in process env, dummy `
 6. `audit list --action daemon_auth`: allowed rows name the agent, one denied row; `audit verify`
    passed. `dummy-demo-secret` appeared in no output file and not in the vault.
 
-NOT YET DONE: the Claude Code step. `claude -p` on the laptop failed with
-`Failed to authenticate: OAuth session expired and could not be refreshed`, so no model turn ran.
-Desk's MCP bridge runs as `NT AUTHORITY\SYSTEM`, which is not a user session and cannot stand in.
-Re-run the script after `claude` is logged in on the laptop; item 3b stays unticked until then.
+On 2026-10-13 the Claude Code step could not run (`claude -p` on the laptop failed with
+`OAuth session expired`). Desk's MCP bridge runs as `NT AUTHORITY\SYSTEM` and cannot stand in.
+
+## Re-run with Claude Code, 2026-10-14
+
+Commit under test: d70c0c7 (v1 head), cross-built `GOOS=windows GOARCH=amd64` on render-1; same
+script, same laptop, Claude Code 2.1.296 logged in by Patrick. Every step above repeated with the
+same results (owner-only token DACL `LAPTOP-T09K3E6A\patri FullControl Allow`; pipe
+`\\.\pipe\tremelay-S-1-5-21-…-1001-accept3b`; raw MCP client 200 with `Bearer [redacted]`; random
+token refused, exit 1, audit `daemon_auth result=denied`; `lock` exited the daemon and the next
+connection got `no unlocked daemon is reachable`, exit 1; `audit verify` passed;
+`dummy-demo-secret` in no output file and not in the vault; temp dir removed). New:
+
+7. Claude Code, started as `claude -p --strict-mcp-config --mcp-config mcp.json` with only the
+   three tremelay MCP tools allowed and `TREMELAY_PASSPHRASE` cleared from its environment, whose
+   server command is `tremelay mcp --daemon --token-file cc.token`, replied:
+
+   ```
+   HTTP status: 200
+   URL httpbin echoed: `https://httpbin.org/anything/windows-check`
+   Authorization header httpbin echoed: `Bearer [redacted]`
+   ```
+   `claude exit=0`. Its call shows up as the first `daemon_auth result=allowed` row (seq 10).
 
 Observed: a named pipe has no half-close, so `mcp --daemon` ends the session when its stdin
 closes. A client that writes requests and closes stdin before reading loses the replies; MCP
