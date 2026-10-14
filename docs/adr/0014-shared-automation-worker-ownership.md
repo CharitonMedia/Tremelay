@@ -1,6 +1,6 @@
 # ADR 0014: Shared worker ownership across goal lifecycle changes
 
-Status: Proposed
+Status: Superseded (removed in v1 cut; see tag pre-v1-cut)
 
 ## Context
 

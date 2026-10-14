@@ -59,15 +59,9 @@ jobs:
       - name: Reproducible unsigned Linux CLI evidence
         run: make candidate
 
-  automation:
+  ponytail:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Verify pinned Ponytail rule
         run: python3 scripts/verify_ponytail.py
-      - name: Compile automation helpers
-        run: python3 -m py_compile scripts/*.py
-      - name: Test review ownership and fixed cycle budget
-        run: python3 scripts/goal_agent_request.py self-check
-      - name: Test automatic checkpoint supervisor
-        run: python3 -m unittest discover -s automation_tests -p 'test_*.py'
