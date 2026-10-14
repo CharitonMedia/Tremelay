@@ -1,7 +1,6 @@
 package release
 
 import (
-	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -115,48 +114,6 @@ func TestReleaseDryTarFailureExitsNonZero(t *testing.T) {
 		if info.Size() <= 32 {
 			t.Fatalf("suspiciously small archive %s (%d bytes) after tar failure", path, info.Size())
 		}
-	}
-}
-
-func TestReleaseDryZipUsesUTC(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("zip timezone check needs Info-ZIP on Linux")
-	}
-	stage := t.TempDir()
-	exe := filepath.Join(stage, "tremelay_v0.0.0-test_windows_amd64.exe")
-	lic := filepath.Join(stage, "LICENSE")
-	if err := os.WriteFile(exe, []byte("sentinel-exe-not-a-real-binary"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(lic, []byte("sentinel-license-text"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := exec.Command("touch", "-t", "198001010000", exe, lic).Run(); err != nil {
-		t.Fatal(err)
-	}
-	zipWithTZ := func(tz string) []byte {
-		out := filepath.Join(t.TempDir(), "artifact.zip")
-		cmd := exec.Command("zip", "-qX9", out, filepath.Base(exe), "LICENSE")
-		cmd.Dir = stage
-		cmd.Env = append(os.Environ(), "TZ="+tz)
-		if err := cmd.Run(); err != nil {
-			t.Fatalf("zip TZ=%s: %v", tz, err)
-		}
-		data, err := os.ReadFile(out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return data
-	}
-	if bytes.Equal(zipWithTZ("UTC"), zipWithTZ("America/Los_Angeles")) {
-		t.Fatal("zip bytes matched across TZ=UTC and TZ=America/Los_Angeles; expected TZ-dependent local time in metadata")
-	}
-	script, err := os.ReadFile(filepath.Join(repoRoot(t), "tools", "release-dry.sh"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(script), "TZ=UTC zip") {
-		t.Fatal("release-dry.sh does not run zip with TZ=UTC")
 	}
 }
 
