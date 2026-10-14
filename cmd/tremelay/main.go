@@ -125,10 +125,9 @@ func cmdVault(args []string, getenv func(string) string, stdin io.Reader, stdout
 		usage(stderr)
 		return 2
 	}
-	fs := flag.NewFlagSet("vault create", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("vault create")
 	path := fs.String("path", "", "vault file")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := parseHumanFlags(fs, vaultCreateUsage, stderr, args[1:]); err != nil {
 		return 2
 	}
 	if *path == "" || fs.NArg() != 0 {
@@ -186,13 +185,12 @@ func cmdCredential(args []string, getenv func(string) string, stdin io.Reader, s
 }
 
 func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential put", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential put")
 	path := fs.String("path", "", "vault file")
 	label := fs.String("label", "", "label")
 	typ := fs.String("type", "", "credential type")
 	secretFile := fs.String("secret-file", "", "file containing the secret")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialPutUsage, stderr, args); err != nil {
 		// --path is applied before a later bad flag. That is an attempted put.
 		// A bad flag before --path leaves the path empty and cannot name a vault.
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
@@ -229,11 +227,10 @@ func cmdPut(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 }
 
 func cmdGet(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential get", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential get")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialGetUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectGet(vault.ErrInvalid)
 		})
@@ -264,10 +261,9 @@ func cmdGet(args []string, getenv func(string) string, stdin io.Reader, stdout, 
 }
 
 func cmdList(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential list", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential list")
 	path := fs.String("path", "", "vault file")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialListUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectList(vault.ErrInvalid)
 		})
@@ -313,13 +309,12 @@ func cmdList(args []string, getenv func(string) string, stdin io.Reader, stdout,
 }
 
 func cmdReplace(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential replace", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential replace")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
 	secretFile := fs.String("secret-file", "", "file containing the secret")
 	opt, times := lifecycleFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialReplaceUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectReplace(vault.ErrInvalid)
 		})
@@ -353,12 +348,11 @@ func cmdReplace(args []string, getenv func(string) string, stdin io.Reader, stdo
 }
 
 func cmdLifecycle(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential lifecycle", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential lifecycle")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
 	opt, times := lifecycleFlags(fs)
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialLifecycleUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectLifecycle(vault.ErrInvalid)
 		})
@@ -385,11 +379,10 @@ func cmdLifecycle(args []string, getenv func(string) string, stdin io.Reader, st
 }
 
 func cmdHealth(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential health", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential health")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialHealthUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectHealth(vault.ErrInvalid)
 		})
@@ -422,11 +415,10 @@ func cmdHealth(args []string, getenv func(string) string, stdin io.Reader, stdou
 }
 
 func cmdRefresh(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential refresh", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential refresh")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "credential id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialRefreshUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectRefresh(vault.ErrInvalid)
 		})
@@ -448,15 +440,14 @@ func cmdRefresh(args []string, getenv func(string) string, stdin io.Reader, stdo
 }
 
 func cmdPolicy(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("credential policy", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("credential policy")
 	path := fs.String("path", "", "vault file")
 	minLen := fs.Int("min-length", 0, "minimum password length")
 	run := fs.Int("pattern-run", 0, "predictable-run length")
 	fresh := fs.String("freshness", "", "assessment freshness")
 	lead := fs.String("reminder-lead", "", "reminder lead")
 	optIn := fs.String("compromise-opt-in", "", "true or false")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, credentialPolicyUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectHealthPolicy(vault.ErrInvalid)
 		})
@@ -615,10 +606,9 @@ func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout
 }
 
 func cmdAuditVerify(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("audit verify", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("audit verify")
 	path := fs.String("path", "", "vault file")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, auditVerifyUsage, stderr, args); err != nil {
 		return 2
 	}
 	if *path == "" || fs.NArg() != 0 {
@@ -646,8 +636,7 @@ func cmdAuditVerify(args []string, getenv func(string) string, stdin io.Reader, 
 }
 
 func cmdAuditList(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("audit list", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("audit list")
 	path := fs.String("path", "", "vault file")
 	cred := fs.String("credential", "", "credential id")
 	agent := fs.String("agent", "", "agent id")
@@ -657,7 +646,7 @@ func cmdAuditList(args []string, getenv func(string) string, stdin io.Reader, st
 	until := fs.String("until", "", "inclusive end (RFC3339)")
 	after := fs.Uint64("after", 0, "return rows after this sequence")
 	limit := fs.Int("limit", 0, "page size")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, auditListUsage, stderr, args); err != nil {
 		return 2
 	}
 	if *path == "" || fs.NArg() != 0 {
@@ -704,12 +693,11 @@ func cmdAuditList(args []string, getenv func(string) string, stdin io.Reader, st
 }
 
 func cmdAuditGet(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("audit get", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("audit get")
 	path := fs.String("path", "", "vault file")
 	seq := fs.Uint64("seq", 0, "audit sequence")
 	hash := fs.String("hash", "", "expected row hash")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, auditGetUsage, stderr, args); err != nil {
 		return 2
 	}
 	if *path == "" || *seq == 0 || fs.NArg() != 0 {
@@ -727,8 +715,7 @@ func cmdAuditGet(args []string, getenv func(string) string, stdin io.Reader, std
 }
 
 // denyKnownVault records a metadata-free denial when parsing fails after a
-// vault path is known. An empty path cannot name a vault; the flag package
-// has already described that error.
+// vault path is known. An empty path cannot name a vault.
 func denyKnownVault(path string, getenv func(string) string, stdin io.Reader, stderr io.Writer, deny func(*vault.Session) error) int {
 	if path == "" {
 		return 2
@@ -779,12 +766,11 @@ func cmdAgent(args []string, getenv func(string) string, stdin io.Reader, stdout
 		fmt.Fprintln(stderr, "unknown command")
 		return 2
 	}
-	fs := flag.NewFlagSet("agent create", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("agent create")
 	path := fs.String("path", "", "vault file")
 	label := fs.String("label", "", "agent label")
 	tokenFile := fs.String("token-file", "", "write this agent's daemon token here")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := parseHumanFlags(fs, agentCreateUsage, stderr, args[1:]); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectAgentCreate(vault.ErrInvalid)
 		})
@@ -837,12 +823,18 @@ func cmdAgentToken(verb string, args []string, getenv func(string) string, stdin
 		fmt.Fprintln(stderr, "unknown command")
 		return 2
 	}
-	fs := flag.NewFlagSet("agent token "+verb, flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("agent token " + verb)
 	path := fs.String("path", "", "vault file")
 	agent := fs.String("agent", "", "agent id")
 	tokenFile := fs.String("token-file", "", "write this agent's daemon token here")
-	if err := fs.Parse(args); err != nil {
+	usageLine := agentTokenIssueUsage
+	switch verb {
+	case "rotate":
+		usageLine = agentTokenRotateUsage
+	case "revoke":
+		usageLine = agentTokenRevokeUsage
+	}
+	if err := parseHumanFlags(fs, usageLine, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, reject)
 	}
 	if *path == "" {
@@ -914,8 +906,7 @@ func cmdGrant(args []string, getenv func(string) string, stdin io.Reader, stdout
 }
 
 func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("grant create", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("grant create")
 	path := fs.String("path", "", "vault file")
 	agent := fs.String("agent", "", "agent id")
 	cred := fs.String("credential", "", "credential id")
@@ -930,7 +921,7 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 	fs.Var(&ops, "operation", "permitted operation")
 	var methods opsFlag
 	fs.Var(&methods, "method", "http_broker allowed method (repeatable)")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, grantCreateUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectGrantCreate(vault.ErrInvalid)
 		})
@@ -977,11 +968,10 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 }
 
 func cmdGrantRevoke(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("grant revoke", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("grant revoke")
 	path := fs.String("path", "", "vault file")
 	id := fs.String("id", "", "grant id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, grantRevokeUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectGrantRevoke(vault.ErrInvalid)
 		})
@@ -1019,11 +1009,10 @@ func cmdCapability(args []string, getenv func(string) string, stdin io.Reader, s
 }
 
 func cmdCapabilityList(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("capability list", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("capability list")
 	path := fs.String("path", "", "vault file")
 	agentID := fs.String("agent", "", "agent id")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, capabilityListUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectCapabilityList(vault.ErrInvalid)
 		})
@@ -1070,14 +1059,13 @@ func cmdCapabilityList(args []string, getenv func(string) string, stdin io.Reade
 }
 
 func cmdCapabilityAuthorize(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("capability authorize", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newHumanFlagSet("capability authorize")
 	path := fs.String("path", "", "vault file")
 	agentID := fs.String("agent", "", "agent id")
 	cred := fs.String("credential", "", "credential id")
 	operation := fs.String("operation", "", "operation")
 	resource := fs.String("resource", "", "resource scope")
-	if err := fs.Parse(args); err != nil {
+	if err := parseHumanFlags(fs, capabilityAuthorizeUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectAuthorize(vault.ErrInvalid)
 		})
