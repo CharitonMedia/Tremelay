@@ -193,8 +193,8 @@ func TestSSHUserAuthContextDenials(t *testing.T) {
 		env.bindBody(sessionID, env.hostBlob, env.hostSig(otherHostPriv, sessionID), 0),
 		env.bindBody(sessionID, otherHost, env.hostSig(otherHostPriv, sessionID), 0),
 		env.bindBody(sessionID, env.hostBlob, env.hostSig(env.hostPriv, otherID), 0),
-		env.bindBody(sessionID, env.hostBlob, env.hostSig(env.hostPriv, sessionID), 1),
-		env.bindBody(sessionID, env.hostBlob, env.hostSig(env.hostPriv, sessionID), 2),
+		// Non-zero is_forwarding values poison the stream for good; see
+		// TestSSHUserAuthForwardedStreamStaysRefused.
 		append(env.bindBody(sessionID, env.hostBlob, env.hostSig(env.hostPriv, sessionID), 0), 0),
 	}
 	for i, body := range badBinds {
@@ -987,6 +987,45 @@ func TestSSHUserAuthDirectRelease(t *testing.T) {
 // session-bind for this grant's pinned host key already put on this same
 // stream. Servers that do not implement publickey-hostbound-v00@openssh.com,
 // github.com among them, ask for exactly this request.
+// TestSSHUserAuthForwardedStreamStaysRefused: on a forwarded agent channel
+// OpenSSH binds with is_forwarding set before any forwarded byte. The far host
+// holds the pinned host key and could then bind its own session with the flag
+// cleared; that flag is outside the host signature and a plain publickey
+// preimage names no host key, so the signature would log in to another server.
+func TestSSHUserAuthForwardedStreamStaysRefused(t *testing.T) {
+	for _, flag := range []byte{1, 2} {
+		forwardedStreamStaysRefused(t, flag, false)
+		// OpenSSH reads the byte after the signature and ignores the rest.
+		forwardedStreamStaysRefused(t, flag, true)
+	}
+}
+
+func forwardedStreamStaysRefused(t *testing.T, flag byte, trailingZero bool) {
+	env := newSSHEnv(t)
+	sid := env.sessionID(32)
+	bind := env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, sid), flag)
+	if trailingZero {
+		bind = append(bind, 0)
+	}
+	if resp, err := env.stream.roundTrip(bind); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+		t.Fatalf("forwarding bind %x %v", resp, err)
+	}
+	other := env.sessionID(32)
+	if resp, err := env.stream.roundTrip(env.bindBody(other, env.hostBlob, env.hostSig(env.hostPriv, other), 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) || env.stream.hasBinding {
+		t.Fatalf("non-forwarding bind accepted after a forwarding bind: %x %v", resp, err)
+	}
+	for _, data := range [][]byte{plainPreimage(other, env.user, env.userBlob), env.preimage(other, env.user, env.userBlob, env.hostBlob)} {
+		if resp, err := env.stream.roundTrip(env.signBody(env.userBlob, data, 0)); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+			t.Fatalf("forwarded stream signed: %x %v", resp, err)
+		}
+	}
+	// A fresh local stream is unaffected.
+	fresh := env.secondStream(t)
+	env.stream = fresh
+	env.mustBind(t, other)
+	env.mustSign(t, other)
+}
+
 func TestSSHUserAuthPlainPublickey(t *testing.T) {
 	logs := &bytes.Buffer{}
 	env := newSSHEnvLog(t, logs)
@@ -1015,7 +1054,6 @@ func TestSSHUserAuthPlainPublickey(t *testing.T) {
 		"another host key":                 env.bindBody(sid, otherHost, env.hostSig(otherHostPriv, sid), 0),
 		"an invalid host signature":        env.bindBody(sid, env.hostBlob, env.hostSig(otherHostPriv, sid), 0),
 		"a signature over another session": env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, otherID), 0),
-		"forwarding":                       env.bindBody(sid, env.hostBlob, env.hostSig(env.hostPriv, sid), 1),
 	}
 	for name, body := range badBinds {
 		if resp, err := env.stream.roundTrip(body); err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) || env.stream.hasBinding {
