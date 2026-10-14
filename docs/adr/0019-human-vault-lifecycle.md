@@ -153,3 +153,17 @@ opens the outer box, opens the inner under its current DEK and binding,
 adopts the new DEK, and continues the existing verification path; any failure
 retires the session. Ordinary writes clear the handoff; if it is cleared before
 the daemon reloads, the session fails closed.
+
+**Known ceiling (review 2026-10-14, owner decision pending).** Someone who
+holds the pre-rotation passphrase (for example with an old backup) and can
+write the vault file as the same user can still *substitute* a chain-compatible
+document: re-seal the plaintext they already know under a DEK they choose and
+wrap it under a passphrase they choose, and, while a handoff is pending, forge
+the inner layer (it is keyed by the old DEK they hold) so a resident daemon
+adopts that document. They recover no credential added or replaced after their
+copy, which is what this item guarantees; they can lock the owner out and make
+the file and a resident daemon serve state they wrote. This is the same class
+as ADR 0003's unauthenticated tip: the wrap and document are not bound to
+anything the old-passphrase holder lacks. Closing the daemon half means not
+adopting rotations (the daemon locks on a passphrase change); closing the file
+half needs an external or keyed tip. Both are product decisions for the owner.
