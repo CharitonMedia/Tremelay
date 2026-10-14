@@ -174,7 +174,21 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 	ctx, cancel := context.WithTimeout(base, brokerTimeout)
 	defer cancel()
 	call.ctx = ctx
-	ips, err := s.lookupBroker(ctx, host)
+	var ips []net.IP
+	var lookupErr error
+	s.duringCallback(func() {
+		ips, lookupErr = s.lookupBroker(ctx, host)
+	})
+	if call.bound != nil {
+		if err := s.checkExactNetwork(agentID, call, false); err != nil {
+			return 0, err
+		}
+	} else if err := s.adoptLocked(); err != nil {
+		return 0, err
+	} else if s.defunct {
+		return 0, ErrStale
+	}
+	err := lookupErr
 	if err != nil || len(ips) == 0 {
 		partial.Result = resultDeniedDestination
 		return s.failExchange(partial, call.method, ErrDeniedDestination)
