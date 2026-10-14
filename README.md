@@ -155,7 +155,7 @@ Read this before you trust it with anything.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) · [VISION.md](VISION.md) ·
 [ADRs](docs/adr/) · [vault lifecycle](docs/vault-lifecycle.md) ·
-[HTTP broker](docs/m7-github-issue.md) · [SSH signing](docs/ssh-agent.md) ·
+[HTTP broker](docs/adr/0025-http-broker-v1.md) · [SSH signing](docs/ssh-agent.md) ·
 [measured client integrations](docs/named-client-mcp-tests.md) ·
 [what is in v1](V1.md) · [milestone history](MILESTONES.md)
 
