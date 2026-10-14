@@ -828,9 +828,10 @@ func TestCLIAgentTokenCustody(t *testing.T) {
 	if rotated == minted || len(rotated) != len(minted) {
 		t.Fatalf("rotate wrote %q", rotated)
 	}
-	info, err := os.Lstat(tokenFile)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		t.Fatalf("rotated token file is %v (%v)", info.Mode(), err)
+	// The platform's own owner-only rule: mode bits on Unix, the DACL on
+	// Windows, where Mode().Perm() reports 0666 for every file.
+	if err := userOnlyFile(tokenFile); err != nil {
+		t.Fatalf("rotated token file is not user-only: %v", err)
 	}
 	if entries, err := os.ReadDir(dir); err != nil {
 		t.Fatal(err)
