@@ -212,10 +212,6 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 			return s.failExchange(again, call.method, ErrDenied)
 		}
 	}
-	if call.method == http.MethodDelete && s.policy.Destructive == DestructiveDeny {
-		partial.Result = resultDeniedDestructive
-		return s.failExchange(partial, call.method, ErrDeniedDestructive)
-	}
 	err := lookupErr
 	if err != nil || len(ips) == 0 {
 		partial.Result = resultDeniedDestination
@@ -271,6 +267,15 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		}
 	} else if s.header.AuditSeq != seq || s.defunct {
 		return 0, ErrStale
+	}
+	// The hook and the DNS lookup both ran without the mutex, and a policy
+	// change does not move the audit sequence: read the policy last.
+	if err := s.live(); err != nil {
+		return 0, err
+	}
+	if call.method == http.MethodDelete && s.policy.Destructive == DestructiveDeny {
+		partial.Result = resultDeniedDestructive
+		return s.failExchange(partial, call.method, ErrDeniedDestructive)
 	}
 	secret, ok := s.copySecret(partial.CredID)
 	if !ok || !safeHeaderSecret(secret) {

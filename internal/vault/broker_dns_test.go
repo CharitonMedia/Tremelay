@@ -209,3 +209,20 @@ func TestBrokerRequestRecheckAfterDNS(t *testing.T) {
 		})
 	}
 }
+
+// TestBrokerDestructiveDenyFromAbuseGuard: the abuse guard also runs without
+// the session mutex, after the lookup; a DestructiveDeny it sets still holds.
+func TestBrokerDestructiveDenyFromAbuseGuard(t *testing.T) {
+	e := newHTTPBrokerEnv(t, InjectBearer, "", http.MethodDelete)
+	_ = e.s.SetAbuseGuard(func(AbuseDecision) error {
+		return e.s.SetResponsePolicy(ResponsePolicy{Destructive: DestructiveDeny})
+	})
+	req := e.request(brokerTestPrefix)
+	req.Method = http.MethodDelete
+	if _, err := e.principal.BrokerRequest(req); err == nil {
+		t.Fatal("DELETE completed after the guard set DestructiveDeny")
+	}
+	if e.requests != 0 {
+		t.Fatalf("upstream saw %d requests", e.requests)
+	}
+}
