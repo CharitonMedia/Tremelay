@@ -123,9 +123,6 @@ type grantRecord struct {
 	KeyID           string     `json:"key_id,omitempty"`
 	SSHUsername     string     `json:"ssh_username,omitempty"`
 	SSHHostKey      []byte     `json:"ssh_host_key,omitempty"`
-	// Provenance is set only on a grant issued by shared-mode approval.
-	// Legacy grants leave it empty. A legacy grant cannot gain it later.
-	Provenance *grantProvenance `json:"provenance,omitempty"`
 }
 
 // capabilityView is the slice of the vault an agent principal can call.
@@ -252,16 +249,6 @@ func (s *Session) CreateAgent(label string) (Agent, error) {
 		return Agent{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.finish(auditEvent{Action: actionAgentCreate, Result: resultDenied}, ErrDenied); err != nil {
-			return Agent{}, err
-		}
-		return Agent{}, ErrDenied
-	}
-	return s.createAgentUnlocked(label)
-}
-
-func (s *Session) createAgentUnlocked(label string) (Agent, error) {
 	if err := validateLabel(label); err != nil {
 		return Agent{}, s.denyAction(actionAgentCreate, err)
 	}
@@ -291,21 +278,6 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 		return Grant{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		return s.issueDenied(ErrDenied)
-	}
-	return s.issueGrantUnlocked(spec)
-}
-
-func (s *Session) issueDenied(cause error) (Grant, error) {
-	partial := auditEvent{Action: actionGrantCreate, Result: resultDenied}
-	if err := s.writeAudit(partial, s.creds, s.agents, s.grants); err != nil {
-		return Grant{}, err
-	}
-	return Grant{}, cause
-}
-
-func (s *Session) issueGrantUnlocked(spec GrantSpec) (Grant, error) {
 	now := time.Now().UTC()
 	agentID := ""
 	if safeID(spec.AgentID) != "" && s.agentExists(spec.AgentID) {
@@ -399,13 +371,6 @@ func (s *Session) RevokeGrant(id string) error {
 		return err
 	}
 	defer s.end()
-	if s.shared() {
-		return s.finish(auditEvent{Action: actionGrantRevoke, Result: resultDenied}, ErrDenied)
-	}
-	return s.revokeGrantUnlocked(id)
-}
-
-func (s *Session) revokeGrantUnlocked(id string) error {
 	if safeID(id) == "" {
 		return s.finish(auditEvent{Action: actionGrantRevoke, Result: resultDenied}, ErrInvalid)
 	}
@@ -510,7 +475,7 @@ func (s *Session) listCapabilities(agentID string) ([]Capability, error) {
 		}
 		return nil, ErrAgentNotFound
 	}
-	caps := capabilitiesFor(s.decisionGrants(), agentID, now)
+	caps := capabilitiesFor(s.grants, agentID, now)
 	if err := s.finish(auditEvent{Action: actionCapList, Result: resultAllowed, AgentID: agentID}, nil); err != nil {
 		return nil, err
 	}
@@ -574,7 +539,7 @@ func (s *Session) judge(agentID, credentialID, operation, resource string) (audi
 	}
 	agentOK := s.agentExists(agentID)
 	credID, credType, credOK := s.lookupCred(credentialID)
-	result, grantID := decideAccess(s.decisionGrants(), agentOK, agentID, credID, credType, credOK, operation, resource, now)
+	result, grantID := decideAccess(s.grants, agentOK, agentID, credID, credType, credOK, operation, resource, now)
 	partial := auditEvent{Result: result, Operation: operation, GrantID: grantID}
 	if agentOK {
 		partial.AgentID = agentID
@@ -582,14 +547,6 @@ func (s *Session) judge(agentID, credentialID, operation, resource string) (audi
 	if agentOK && credOK && result != resultDeniedAgent {
 		partial.CredID = credID
 		partial.CredType = credType
-	}
-	if result == resultAllowed && s.shared() {
-		g, ok := s.grantByID(grantID)
-		if !ok || !s.provenanceLive(g.Provenance) {
-			partial.Result = resultDeniedRevoked
-			partial.GrantID = grantID
-			return partial, ErrDeniedRevoked
-		}
 	}
 	if result != resultAllowed {
 		return partial, denialError(result)

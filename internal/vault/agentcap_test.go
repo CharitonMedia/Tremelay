@@ -14,23 +14,15 @@ import (
 
 func TestAgentCapSyntheticDemo(t *testing.T) {
 	var logs bytes.Buffer
-	env := newSharedEnvLog(t, &logs)
-	spec := env.requestSpec(time.Hour, 30*time.Minute)
-	req, err := env.bob.RequestAccess(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	grant, err := env.alice.Approve(req.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	env := newAttestEnvLog(t, &logs)
+	grant := env.grant(t, time.Hour)
 	cap := bindCap(t, env.s, env.agent.ID)
 	listed := capCall(t, cap, okBytes(t)(encodeCapList()))
 	if listed.method != capMethodList || len(listed.entries) != 1 {
 		t.Fatalf("catalog %+v", listed)
 	}
 	entry := listed.entries[0]
-	if entry.operation != OpLocalArtifactAttest || entry.resource != spec.Resource || entry.keyID != grant.KeyID || entry.status != GrantActive {
+	if entry.operation != OpLocalArtifactAttest || entry.resource != env.resource || entry.keyID != grant.KeyID || entry.status != GrantActive {
 		t.Fatalf("entry %+v", entry)
 	}
 	if _, ok := canonicalAuditTime(entry.expires.Format(time.RFC3339Nano)); !ok {
@@ -47,10 +39,10 @@ func TestAgentCapSyntheticDemo(t *testing.T) {
 	}
 	payload := []byte("demo-artifact")
 	invoked := capCall(t, cap, okBytes(t)(encodeCapInvoke(entry.handle, payload)))
-	if invoked.method != capMethodInvoke || !VerifyLocalAttestation(invoked.att.PublicKey[:], spec.Resource, payload, invoked.att.Signature[:]) {
+	if invoked.method != capMethodInvoke || !VerifyLocalAttestation(invoked.att.PublicKey[:], env.resource, payload, invoked.att.Signature[:]) {
 		t.Fatal("signature did not verify")
 	}
-	if invoked.att.Domain != AttestDomain || invoked.att.Purpose != AttestPurpose || invoked.att.Resource != spec.Resource {
+	if invoked.att.Domain != AttestDomain || invoked.att.Purpose != AttestPurpose || invoked.att.Resource != env.resource {
 		t.Fatalf("projection %+v", invoked.att)
 	}
 	rawInv, err := cap.Exchange(okBytes(t)(encodeCapInvoke(entry.handle, payload)))
@@ -58,12 +50,12 @@ func TestAgentCapSyntheticDemo(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoCapLeak(t, rawInv, env, grant, payload)
-	beforeReq, beforeGrant := len(env.s.requests), len(env.s.grants)
+	beforeGrant := len(env.s.grants)
 	unsupported := capCall(t, cap, okBytes(t)(encodeCapRequest()))
 	if unsupported.code != capUnsupported || unsupported.message != "method is not supported" {
 		t.Fatalf("request %+v", unsupported)
 	}
-	if len(env.s.requests) != beforeReq || len(env.s.grants) != beforeGrant {
+	if len(env.s.grants) != beforeGrant {
 		t.Fatal("unsupported request created authority")
 	}
 	if _, err := VerifyAudit(env.path, env.pass); err != nil {
@@ -164,13 +156,13 @@ func TestAgentCapSchemaAndFixedErrors(t *testing.T) {
 }
 
 func TestAgentCapIsolationAndCatalog(t *testing.T) {
-	env := newSharedEnv(t)
-	other, err := env.alice.CreateAgent("worker-2")
+	env := newAttestEnv(t)
+	other, err := env.s.CreateAgent("worker-2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mine := approveExact(t, env, env.agent.ID, env.resource)
-	theirs := approveExact(t, env, other.ID, "artifact-"+randHex(t, 8))
+	mine := grantExact(t, env, env.agent.ID, env.resource)
+	theirs := grantExact(t, env, other.ID, "artifact-"+randHex(t, 8))
 	a := bindCap(t, env.s, env.agent.ID)
 	b := bindCap(t, env.s, other.ID)
 	alist := capCall(t, a, okBytes(t)(encodeCapList()))
@@ -256,9 +248,9 @@ func TestAgentCapIsolationAndCatalog(t *testing.T) {
 }
 
 func TestAgentCapExactGrantDoesNotRetarget(t *testing.T) {
-	env := newSharedEnv(t)
-	first := approveExact(t, env, env.agent.ID, env.resource)
-	second := approveExact(t, env, env.agent.ID, env.resource)
+	env := newAttestEnv(t)
+	first := grantExact(t, env, env.agent.ID, env.resource)
+	second := grantExact(t, env, env.agent.ID, env.resource)
 	cap := bindCap(t, env.s, env.agent.ID)
 	listed := capCall(t, cap, okBytes(t)(encodeCapList()))
 	if len(listed.entries) != 2 {
@@ -268,7 +260,7 @@ func TestAgentCapExactGrantDoesNotRetarget(t *testing.T) {
 	if listed.entries[0].status != GrantActive || listed.entries[1].status != GrantActive {
 		t.Fatal("status")
 	}
-	if err := env.alice.RevokeGrant(first.ID); err != nil {
+	if err := env.s.RevokeGrant(first.ID); err != nil {
 		t.Fatal(err)
 	}
 	denied := capCall(t, cap, okBytes(t)(encodeCapInvoke(oldH, []byte("revoked-grant"))))
@@ -286,8 +278,8 @@ func TestAgentCapExactGrantDoesNotRetarget(t *testing.T) {
 		t.Fatal("the other grant was blamed")
 	}
 
-	fresh := newSharedEnv(t)
-	old := approveExact(t, fresh, fresh.agent.ID, fresh.resource)
+	fresh := newAttestEnv(t)
+	old := grantExact(t, fresh, fresh.agent.ID, fresh.resource)
 	_, priv2, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -296,10 +288,10 @@ func TestAgentCapExactGrantDoesNotRetarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fresh.alice.Replace(fresh.cred.ID, der2, LifecycleOptions{}); err != nil {
+	if _, err := fresh.s.Replace(fresh.cred.ID, der2, LifecycleOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	next := approveExact(t, fresh, fresh.agent.ID, fresh.resource)
+	next := grantExact(t, fresh, fresh.agent.ID, fresh.resource)
 	if next.KeyID == old.KeyID {
 		t.Fatal("replacement kept the old key id")
 	}
@@ -338,7 +330,7 @@ func TestAgentCapExactGrantDoesNotRetarget(t *testing.T) {
 	}
 
 	fresh.s.attestFault = func() error {
-		return fresh.alice.RevokeGrant(next.ID)
+		return fresh.s.RevokeGrant(next.ID)
 	}
 	during, err := bound.Exchange(okBytes(t)(encodeCapInvoke(newHandle, []byte("during-callback"))))
 	fresh.s.attestFault = nil
@@ -361,11 +353,11 @@ func TestAgentCapExactGrantDoesNotRetarget(t *testing.T) {
 }
 
 func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
-	env := approvedShared(t)
+	env := grantedAttestEnv(t)
 	cap := bindCap(t, env.s, env.agent.ID)
 	entry := capCall(t, cap, okBytes(t)(encodeCapList())).entries[0]
 	payload := []byte("authority-artifact")
-	if err := env.alice.RevokeGrant(env.s.grants[len(env.s.grants)-1].ID); err != nil {
+	if err := env.s.RevokeGrant(env.s.grants[len(env.s.grants)-1].ID); err != nil {
 		t.Fatal(err)
 	}
 	if got := capCall(t, cap, okBytes(t)(encodeCapInvoke(entry.handle, payload))); got.code != capDeniedRevoked {
@@ -376,8 +368,8 @@ func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
 		t.Fatalf("describe status %s", described.entry.status)
 	}
 
-	exp := newSharedEnv(t)
-	approveExact(t, exp, exp.agent.ID, exp.resource)
+	exp := newAttestEnv(t)
+	grantExact(t, exp, exp.agent.ID, exp.resource)
 	expCap := bindCap(t, exp.s, exp.agent.ID)
 	expHandle := capCall(t, expCap, okBytes(t)(encodeCapList())).entries[0].handle
 	exp.s.clock = func() time.Time { return time.Now().Add(2 * time.Hour) }
@@ -388,7 +380,7 @@ func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
 		t.Fatalf("expiry %+v", got)
 	}
 
-	sus := approvedShared(t)
+	sus := grantedAttestEnv(t)
 	susCap := bindCap(t, sus.s, sus.agent.ID)
 	susHandle := capCall(t, susCap, okBytes(t)(encodeCapList())).entries[0].handle
 	for i := range sus.s.agents {
@@ -409,17 +401,7 @@ func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
 		t.Fatal("suspended payload was stored")
 	}
 
-	mem := approvedShared(t)
-	memCap := bindCap(t, mem.s, mem.agent.ID)
-	memHandle := capCall(t, memCap, okBytes(t)(encodeCapList())).entries[0].handle
-	if err := mem.alice.Remove(mem.bobID); err != nil {
-		t.Fatal(err)
-	}
-	if got := capCall(t, memCap, okBytes(t)(encodeCapInvoke(memHandle, payload))); got.code != capDeniedRevoked {
-		t.Fatalf("membership %+v", got)
-	}
-
-	stale := approvedShared(t)
+	stale := grantedAttestEnv(t)
 	staleCap := bindCap(t, stale.s, stale.agent.ID)
 	staleHandle := capCall(t, staleCap, okBytes(t)(encodeCapList())).entries[0].handle
 	other, err := Unlock(stale.path, stale.pass, nil)
@@ -427,11 +409,9 @@ func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(other.Lock)
-	bob2, err := other.BindHuman(stale.bobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := bob2.RequestAccess(stale.requestSpec(time.Hour, 10*time.Minute)); err != nil {
+	// A commit from the second session moves the durable audit tip past the
+	// view the bound capability still holds.
+	if _, err := other.CreateAgent("worker-2"); err != nil {
 		t.Fatal(err)
 	}
 	before := len(stale.s.audit)
@@ -440,7 +420,7 @@ func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
 		t.Fatalf("stale %x %v rows %d", raw, err, len(stale.s.audit)-before)
 	}
 
-	fault := approvedShared(t)
+	fault := grantedAttestEnv(t)
 	faultCap := bindCap(t, fault.s, fault.agent.ID)
 	faultHandle := capCall(t, faultCap, okBytes(t)(encodeCapList())).entries[0].handle
 	before = len(fault.s.audit)
@@ -462,7 +442,7 @@ func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
 		t.Fatalf("malformed audit fault %x %v", raw, err)
 	}
 
-	cut := approvedShared(t)
+	cut := grantedAttestEnv(t)
 	cutCap := bindCap(t, cut.s, cut.agent.ID)
 	cutHandle := capCall(t, cutCap, okBytes(t)(encodeCapList())).entries[0].handle
 	var writes int
@@ -490,7 +470,7 @@ func TestAgentCapAuthorityAndAuditFailures(t *testing.T) {
 	if !allowed || completed {
 		t.Fatalf("allowed %v completed %v", allowed, completed)
 	}
-	for _, s := range []*Session{env.s, exp.s, sus.s, mem.s, fault.s, cut.s} {
+	for _, s := range []*Session{env.s, exp.s, sus.s, stale.s, fault.s, cut.s} {
 		if err := verifyChain(s.audit); err != nil {
 			t.Fatal(err)
 		}
@@ -583,16 +563,12 @@ func newSingleAttestCap(t *testing.T) (*Session, *AgentCapability, Grant, ed2551
 	return session, bindCap(t, session, agent.ID), grant, pub, resource
 }
 
-func approveExact(t *testing.T, env *sharedEnv, agentID, resource string) Grant {
+func grantExact(t *testing.T, env *attestEnv, agentID, resource string) Grant {
 	t.Helper()
-	spec := env.requestSpec(time.Hour, 20*time.Minute)
+	spec := env.grantSpec(time.Hour)
 	spec.AgentID = agentID
 	spec.Resource = resource
-	req, err := env.bob.RequestAccess(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	grant, err := env.alice.Approve(req.ID)
+	grant, err := env.s.IssueGrant(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,9 +664,9 @@ func auditHasGrant(s *Session, action, result, grantID string) bool {
 	return false
 }
 
-func assertNoCapLeak(t *testing.T, raw []byte, env *sharedEnv, grant Grant, payload []byte) {
+func assertNoCapLeak(t *testing.T, raw []byte, env *attestEnv, grant Grant, payload []byte) {
 	t.Helper()
-	for _, hidden := range []string{env.label, env.aliceID, env.bobID, grant.ID, grant.CredentialID, env.sentinel} {
+	for _, hidden := range []string{env.label, grant.ID, grant.CredentialID, env.sentinel} {
 		if hidden != "" && bytes.Contains(raw, []byte(hidden)) {
 			t.Fatalf("response exposed %s", hidden)
 		}

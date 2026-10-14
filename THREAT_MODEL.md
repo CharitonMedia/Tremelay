@@ -29,7 +29,7 @@ Tremelay MUST NOT rely on an agent following policy voluntarily.
 Attempts to obtain raw secrets through APIs, error messages, logs, environment variables, debug endpoints, process inspection, broker introspection, malformed requests, or response reflection.
 
 ### Scope escalation
-Attempts to use a valid capability for another credential, account, resource, organization, host, method, path, or action.
+Attempts to use a valid capability for another credential, account, resource, host, method, path, or action.
 
 ### Credential forwarding/exfiltration
 Redirects, SSRF, DNS rebinding, alternate hostnames, proxy chains, or malicious service definitions that cause credentials to be presented to an unintended destination.
@@ -57,23 +57,30 @@ The caller is treated as adversarial, including on a first hop. Signing requires
 
 Wire messages cannot choose the principal, grant, credential, clock, or host key. One stream is tied to the grant selected at construction and is not retargeted when the vault key changes or another grant would match. The private key does not leave the broker. Username, host key, session identifier, preimage, and signature stay out of plaintext audit, notifications, logs, and errors. This is synthetic in-memory compatibility with a protocol subset, not a deployable general SSH agent and not a completed login.
 
-## Shared-vault reference limits
+## Single-human custody
 
-M9a is one local approval path for `local_artifact_attest`. The host that holds the process and the vault passphrase asserts synthetic human identities. Two records do not prove two people and do not confine that host. Bound humans cannot retrieve plaintext, switch actor, or mint assertions. Agents still cannot retrieve a raw secret.
+One human holds the passphrase; many agents hold grants. Tremelay has no second
+human principal, no organization, no role separation and no approval workflow.
+Multi-user custody is out of v1 ([V1.md](V1.md)). The M9a reference that explored
+it was removed and ADR 0015 is superseded.
 
-A shared grant is usable only while the requester and the approving owner remain active at the generations stored on the grant. Removal, demotion, re-enrollment, and re-promotion invalidate that authority. They do not recall a signature already released. Legacy single-user grants are not given approval provenance and are not accepted in a shared vault. An older reader fails closed on shared storage instead of treating it as an unrestricted single-user vault.
+A vault that still carries the retired M9a organization, membership, approval or
+grant-provenance state fails closed: the encrypted document is decoded strictly,
+and so is every audit row, so such a vault does not unlock and is not silently
+downgraded to an unrestricted single-user vault.
 
-This does not decide production enrollment, recovery, offboarding, or independent custody. Those remain open under M9.
+Production enrollment, recovery, offboarding, and independent custody remain
+undecided and out of scope.
 
 ## Local snapshot reference limits
 
-M9b copies one local SQLite vault with the driver's online backup API and restores that copy only when the host presents the existing passphrase and a checkpoint kept outside the file. The checkpoint binds vault identity, organization identity when the snapshot is shared, the audit tip including a valid locked-denial suffix, and the artifact digest. A filename, a sibling manifest, or a successful decrypt does not establish that the snapshot is current.
+M9b copies one local SQLite vault with the driver's online backup API and restores that copy only when the host presents the existing passphrase and a checkpoint kept outside the file. The checkpoint binds vault identity, the audit tip including a valid locked-denial suffix, and the artifact digest. A filename, a sibling manifest, or a successful decrypt does not establish that the snapshot is current.
 
-The host is trusted to supply the current checkpoint, quiesce the source, and run one active instance. This reference does not enforce those duties across other processes or machines. An old authentic snapshot and the checkpoint issued for it still match. That pair is not detected as stale. A checkpoint the host treats as newer rejects every older artifact. Restore does not merge stale state, reset membership, reissue authority, or fail over. It does not recover a lost passphrase, a lost owner, or a compromised host. Backup and restore are not agent or member operations and do not append an audit row. A later unlock of a restored file remains an ordinary open.
+The host is trusted to supply the current checkpoint, quiesce the source, and run one active instance. This reference does not enforce those duties across other processes or machines. An old authentic snapshot and the checkpoint issued for it still match. That pair is not detected as stale. A checkpoint the host treats as newer rejects every older artifact. Restore does not merge stale state, reissue authority, or fail over. It does not recover a lost passphrase or a compromised host. Backup and restore are not agent operations and do not append an audit row. A later unlock of a restored file remains an ordinary open.
 
 ## Passphrase-change limits
 
-The human host can rewrap the existing DEK after reauthenticating the old passphrase ([ADR 0019](docs/adr/0019-human-vault-lifecycle.md)). The new wrap and audit event commit together. Cached sessions cannot overwrite a newer wrap, but a process already holding the DEK still knows it. This is not key revocation against a compromised host. Existing snapshots and copies retain their original passphrase. Agents and bound shared members do not receive this operation.
+The human host can rewrap the existing DEK after reauthenticating the old passphrase ([ADR 0019](docs/adr/0019-human-vault-lifecycle.md)). The new wrap and audit event commit together. Cached sessions cannot overwrite a newer wrap, but a process already holding the DEK still knows it. This is not key revocation against a compromised host. Existing snapshots and copies retain their original passphrase. Agents do not receive this operation.
 
 ## Agent capability interface limits
 
@@ -146,7 +153,7 @@ HTTP or GitHub issue requests, with the existing status-only or four-field
 response projection. Handles are not bearer authentication. Host identity,
 credential custody and public destination controls remain unchanged. A handle
 pins one grant and credential generation; an active duplicate cannot rescue a
-revoked/expired/replaced binding. Shared network approval is not added.
+revoked/expired/replaced binding.
 
 Cancellation can interrupt DNS and network I/O but cannot recall an external
 operation or invalidate a credential already used. No automatic replay is
@@ -167,4 +174,4 @@ retires the resolved handle for that epoch and wipes its binding after active
 work joins; a later Serve requires fresh binding. No automatic retry is permitted
 after ambiguous output. Existing host-key/username enforcement and replay limits
 remain unchanged. This proves neither remote login nor command/channel policy.
-Shared authority and remote principal authentication are not added.
+Remote principal authentication is not added.

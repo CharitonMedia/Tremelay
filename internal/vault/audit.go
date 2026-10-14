@@ -13,46 +13,32 @@ const (
 	auditCapabilityVersion = 2
 	auditNoticeVersion     = 3
 	auditHealthVersion     = 4
-	auditSharedVersion     = 5
 
-	actionCreate        = "vault_create"
-	actionUnlock        = "vault_unlock"
-	actionPassphrase    = "vault_passphrase_change"
-	actionPut           = "credential_put"
-	actionGet           = "credential_get"
-	actionList          = "credential_list"
-	actionAgentCreate   = "agent_create"
-	actionGrantCreate   = "grant_create"
-	actionGrantRevoke   = "grant_revoke"
-	actionAuthorize     = "capability_authorize"
-	actionCapList       = "capability_list"
-	actionBroker        = "broker_http"
-	actionLocalAttest   = "local_attest"
-	actionSSHUserAuth   = "ssh_userauth"
-	actionAgentCap      = "agent_capability"
-	actionNotify        = "notify"
-	actionContain       = "contain"
-	actionRespond       = "respond"
-	actionReplace       = "credential_replace"
-	actionLifecycle     = "credential_lifecycle"
-	actionHealth        = "health_assess"
-	actionRefresh       = "health_refresh"
-	actionHealthPolicy  = "health_policy"
-	actionHealthGet     = "health_get"
-	actionHealthList    = "health_list"
-	actionBootstrap     = "shared_bootstrap"
-	actionMemberAttach  = "member_attach"
-	actionMemberRemove  = "member_remove"
-	actionMemberRole    = "member_role"
-	actionAccessReq     = "access_request"
-	actionAccessCancel  = "access_cancel"
-	actionAccessReject  = "access_reject"
-	actionAccessApprove = "access_approve"
-	actionAccessExpire  = "access_expire"
-	actionSharedGrant   = "shared_grant"
-	actionSharedRevoke  = "shared_revoke"
-	actionSharedAudit   = "shared_audit"
-	actionInventory     = "shared_inventory"
+	actionCreate       = "vault_create"
+	actionUnlock       = "vault_unlock"
+	actionPassphrase   = "vault_passphrase_change"
+	actionPut          = "credential_put"
+	actionGet          = "credential_get"
+	actionList         = "credential_list"
+	actionAgentCreate  = "agent_create"
+	actionGrantCreate  = "grant_create"
+	actionGrantRevoke  = "grant_revoke"
+	actionAuthorize    = "capability_authorize"
+	actionCapList      = "capability_list"
+	actionBroker       = "broker_http"
+	actionLocalAttest  = "local_attest"
+	actionSSHUserAuth  = "ssh_userauth"
+	actionAgentCap     = "agent_capability"
+	actionNotify       = "notify"
+	actionContain      = "contain"
+	actionRespond      = "respond"
+	actionReplace      = "credential_replace"
+	actionLifecycle    = "credential_lifecycle"
+	actionHealth       = "health_assess"
+	actionRefresh      = "health_refresh"
+	actionHealthPolicy = "health_policy"
+	actionHealthGet    = "health_get"
+	actionHealthList   = "health_list"
 
 	resultAllowed           = "allowed"
 	resultDenied            = "denied"
@@ -106,8 +92,9 @@ type auditEvent struct {
 	RefSeq    uint64 `json:"ref_seq,omitempty"`
 	Reasons   string `json:"reasons,omitempty"`
 	CredGen   uint64 `json:"cred_gen,omitempty"`
-	// ActorID, OrgID, TargetID, RequestID, and Decision are authenticated
-	// only by audit version 5. Older versions must leave them empty.
+	// ActorID, OrgID, TargetID, RequestID, and Decision are columns of the
+	// removed shared-vault authorization. No audit version authenticates
+	// them, so any row that carries one is rejected. See ADR 0015.
 	ActorID   string `json:"actor_id,omitempty"`
 	OrgID     string `json:"org_id,omitempty"`
 	TargetID  string `json:"target_id,omitempty"`
@@ -163,7 +150,7 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 	if matchHealth(events, doc.Credentials) != nil {
 		return "", ErrAudit
 	}
-	if validateDocument(doc) != nil || sharedMatchesVault(doc, header.ID) != nil || sharedHistoryBound(events, doc.Organization, doc.Memberships, doc.Requests, doc.Grants) != nil {
+	if validateDocument(doc) != nil {
 		return "", ErrAudit
 	}
 	return events[len(events)-1].Hash, nil
@@ -188,13 +175,6 @@ func eventHashV3(prev []byte, seq uint64, timeStr, action, vaultID, credID, cred
 // eventHashV4 extends the version-1 preimage with the canonical reason list
 // and the credential generation the assessment is bound to. Version-1, 2, and
 // 3 preimages do not include these fields.
-// eventHashV5 extends the version-1 preimage with the shared-authorization
-// fields. Versions 1–4 do not include them.
-func eventHashV5(prev []byte, ev auditEvent) []byte {
-	return hashParts(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result,
-		ev.ActorID, ev.OrgID, ev.TargetID, ev.RequestID, ev.Decision, ev.GrantID)
-}
-
 func eventHashV4(prev []byte, seq uint64, timeStr, action, vaultID, credID, credType, result, reasons string, credGen uint64) []byte {
 	var gen [8]byte
 	binary.BigEndian.PutUint64(gen[:], credGen)
@@ -251,11 +231,6 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 	ev.Prev = hex.EncodeToString(prev)
 	var sum []byte
 	switch ev.V {
-	case auditSharedVersion:
-		if err := sharedAuditClear(ev); err != nil || !canonicalSharedAudit(ev) {
-			return auditEvent{}, ErrAudit
-		}
-		sum = eventHashV5(prev, ev)
 	case auditHealthVersion:
 		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 || !canonicalReasons(ev.Reasons) || !sharedColumnsClear(ev) {
 			return auditEvent{}, ErrAudit
@@ -283,8 +258,6 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 
 func auditVersionFor(action string) int {
 	switch {
-	case sharedAction(action):
-		return auditSharedVersion
 	case healthAction(action):
 		return auditHealthVersion
 	case noticeAction(action):
@@ -297,7 +270,7 @@ func auditVersionFor(action string) int {
 }
 
 func knownAuditVersion(v int) bool {
-	return v == auditVersion || v == auditCapabilityVersion || v == auditNoticeVersion || v == auditHealthVersion || v == auditSharedVersion
+	return v == auditVersion || v == auditCapabilityVersion || v == auditNoticeVersion || v == auditHealthVersion
 }
 
 func sharedColumnsClear(ev auditEvent) bool {
@@ -315,8 +288,6 @@ func healthAction(action string) bool {
 
 func hashEvent(prev []byte, ev auditEvent) []byte {
 	switch ev.V {
-	case auditSharedVersion:
-		return eventHashV5(prev, ev)
 	case auditHealthVersion:
 		return eventHashV4(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.Reasons, ev.CredGen)
 	case auditNoticeVersion:
@@ -393,10 +364,7 @@ func knownAction(action string) bool {
 		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
 		actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
-		actionHealthGet, actionHealthList,
-		actionBootstrap, actionMemberAttach, actionMemberRemove, actionMemberRole,
-		actionAccessReq, actionAccessCancel, actionAccessReject, actionAccessApprove, actionAccessExpire,
-		actionSharedGrant, actionSharedRevoke, actionSharedAudit, actionInventory:
+		actionHealthGet, actionHealthList:
 		return true
 	default:
 		return false
@@ -405,17 +373,6 @@ func knownAction(action string) bool {
 
 func noticeAction(action string) bool {
 	return action == actionNotify || action == actionContain || action == actionRespond
-}
-
-func sharedAction(action string) bool {
-	switch action {
-	case actionBootstrap, actionMemberAttach, actionMemberRemove, actionMemberRole,
-		actionAccessReq, actionAccessCancel, actionAccessReject, actionAccessApprove, actionAccessExpire,
-		actionSharedGrant, actionSharedRevoke, actionSharedAudit, actionInventory:
-		return true
-	default:
-		return false
-	}
 }
 
 func capabilityAction(action string) bool {
@@ -433,9 +390,6 @@ func validAuditShape(ev auditEvent) error {
 	}
 	if healthAction(ev.Action) {
 		return validHealthAudit(ev)
-	}
-	if sharedAction(ev.Action) {
-		return validSharedAudit(ev)
 	}
 	if !sharedColumnsClear(ev) {
 		return ErrAudit

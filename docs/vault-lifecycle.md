@@ -44,7 +44,7 @@ tremelay vault backup --path /canonical/vault.db --output /canonical/backups/sna
 
 The command emits the checkpoint only on stdout; prompts and diagnostic text use
 stderr. Preserve the entire checkpoint exactly. The backup is an encrypted SQLite
-snapshot. Its checkpoint binds its digest, vault and organization identity, and
+snapshot. Its checkpoint binds its digest, vault identity, and
 audit tip. There is no automatic sibling manifest and no backup audit event. The
 source is read-only, including if authentication fails.
 

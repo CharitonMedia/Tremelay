@@ -387,11 +387,14 @@ func TestMCPSSHDiscoveryRestrictions(t *testing.T) {
 			t.Fatal("noncanonical SSH grant discovered")
 		}
 	}
-	shared := newSharedEnv(t)
-	grant.AgentID = shared.agent.ID
-	grant.CredentialID = shared.cred.ID
-	if shared.s.capGrantSupported(grant) {
-		t.Fatal("shared SSH authority added")
+	absent, err := newID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := grant
+	foreign.CredentialID = absent
+	if env.session.capGrantSupported(foreign) {
+		t.Fatal("SSH grant for a credential this vault does not hold was discovered")
 	}
 }
 

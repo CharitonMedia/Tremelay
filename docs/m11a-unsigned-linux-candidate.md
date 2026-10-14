@@ -59,7 +59,6 @@ These synthetic compatibility cases exercise older audit schemas in temporary da
 
 - `TestM5MigratesPriorAuditSchema`
 - `TestHealthAuditTamperTruncationAndMigration`
-- `TestSharedTamperLegacyAndOldReader`
 - `TestBackupMigratesLegacyAuditSchema`
 
-Related limits that remain in force are documented in [ADR 0016](adr/0016-local-checkpoint-backup.md) and [docs/m9b-local-backup.md](m9b-local-backup.md): an old snapshot paired with the checkpoint issued for it is not detected as stale; a lost passphrase is not recovered; after an uncertain restore the host must reconcile single-active-instance state before retry or cutover; Windows directory-entry durability is only what the platform syncs; there is no backup CLI. M9a shared authorization is [ADR 0015](adr/0015-local-shared-vault-authorization.md). M10a and M10b are [ADR 0017](adr/0017-agent-capability-interface.md) and [ADR 0018](adr/0018-local-mcp-capability.md). The production-credential warning in `SECURITY.md` is unchanged.
+Related limits that remain in force are documented in [ADR 0016](adr/0016-local-checkpoint-backup.md) and [docs/m9b-local-backup.md](m9b-local-backup.md): an old snapshot paired with the checkpoint issued for it is not detected as stale; a lost passphrase is not recovered; after an uncertain restore the host must reconcile single-active-instance state before retry or cutover; Windows directory-entry durability is only what the platform syncs; there is no backup CLI. M10a and M10b are [ADR 0017](adr/0017-agent-capability-interface.md) and [ADR 0018](adr/0018-local-mcp-capability.md). The production-credential warning in `SECURITY.md` is unchanged.

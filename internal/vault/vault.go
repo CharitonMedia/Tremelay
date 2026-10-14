@@ -2,8 +2,7 @@
 //
 // Retrieval requires an unlocked session, which requires the vault passphrase.
 // Agent principals and capability grants are a separate authority from that
-// human session. A shared vault binds host-asserted humans to owner and member
-// roles; those handles are not authentication and cannot retrieve plaintext.
+// human session. One human holds the passphrase; many agents hold grants.
 // AgentPrincipal can list capabilities, authorize them, invoke
 // the HTTP broker, request one local Ed25519 attestation, and open one
 // host-bound SSH userauth stream for one identity.
@@ -258,12 +257,6 @@ type document struct {
 	// HealthPolicy is absent on vaults sealed before M6. Absence means the
 	// documented defaults, not a fabricated healthy assessment.
 	HealthPolicy healthPolicy `json:"health_policy,omitempty"`
-	// Organization is absent on a legacy single-user vault. Presence binds
-	// this database to one organization. A malformed member is corrupt;
-	// it is not a downgrade to legacy mode. See ADR 0015.
-	Organization *orgRecord         `json:"organization,omitempty"`
-	Memberships  []membershipRecord `json:"memberships,omitempty"`
-	Requests     []requestRecord    `json:"requests,omitempty"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -332,16 +325,6 @@ type Session struct {
 	// checker is the process-local compromise lookup. Nil means no lookup.
 	// It is not sealed, and a new process starts without one. See ADR 0010.
 	checker CompromiseChecker
-	// org, members, and requests are shared-mode state. Nil org means legacy
-	// single-user mode. They are sealed with every document write.
-	org      *orgRecord
-	members  []membershipRecord
-	requests []requestRecord
-	// bootstrap is the allowed shared-bootstrap binding derived from the
-	// audit chain. Unlock builds it once. A commit extends it with the new
-	// rows and stores the result only after that commit succeeds, so the
-	// existing prefix is not copied. Reopen builds it again.
-	bootstrap bootstrapBind
 	// mu serializes authorization and document writes on this session.
 	// Callbacks run outside it. A second unlocked session is not covered by
 	// mu; its commit must match the durable audit sequence or it fails closed.
@@ -349,11 +332,6 @@ type Session struct {
 	locked atomic.Bool
 	// defunct is set when a commit loses a race. Later calls return ErrStale.
 	defunct bool
-	// boundActor, when set, attributes the commit with one version-5 inventory
-	// row. Human inventory methods set it for the duration of one call and
-	// restore the previous value, including across a callback. It is not a
-	// caller-supplied audit id.
-	boundActor string
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -495,19 +473,6 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		wipe(dek)
 		return nil, deny(err)
 	}
-	if err := sharedMatchesVault(doc, header.ID); err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
-	bind, err := (bootstrapBind{}).extend(events)
-	if err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
-	if err := bind.check(doc.Organization, doc.Memberships, doc.Requests, doc.Grants); err != nil {
-		wipe(dek)
-		return nil, deny(err)
-	}
 	idx := indexFromAudit(events)
 	if err := matchDetection(idx.state(), doc.Detection); err != nil {
 		wipe(dek)
@@ -543,10 +508,6 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		logger:      logger,
 		db:          db,
 		hpolicy:     doc.HealthPolicy,
-		org:         doc.Organization,
-		members:     doc.Memberships,
-		requests:    doc.Requests,
-		bootstrap:   bind,
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -588,10 +549,6 @@ func (s *Session) lockLocked() {
 	s.responding = false
 	s.checker = nil
 	s.hpolicy = healthPolicy{}
-	s.org = nil
-	s.members = nil
-	s.requests = nil
-	s.bootstrap = bootstrapBind{}
 	s.locked.Store(false)
 	if s.redactor != nil {
 		s.redactor.Wipe()
@@ -609,13 +566,6 @@ func (s *Session) Put(label, typ string, secret []byte, opt PutOptions) (Credent
 		return Credential{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		return s.denyPut(ErrDenied)
-	}
-	return s.putUnlocked(label, typ, secret, opt)
-}
-
-func (s *Session) putUnlocked(label, typ string, secret []byte, opt PutOptions) (Credential, error) {
 	if err := validateLabel(label); err != nil {
 		return s.denyPut(err)
 	}
@@ -683,17 +633,6 @@ func (s *Session) Get(id string) (Credential, error) {
 		return Credential{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.persistEvent(actionGet, "", "", resultDenied); err != nil {
-			return Credential{}, err
-		}
-		s.logf("credential_get result=denied")
-		return Credential{}, ErrDenied
-	}
-	return s.getUnlocked(id)
-}
-
-func (s *Session) getUnlocked(id string) (Credential, error) {
 	for i := range s.creds {
 		c := &s.creds[i]
 		if c.ID != id {
@@ -722,17 +661,6 @@ func (s *Session) List() ([]Credential, error) {
 		return nil, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.persistEvent(actionList, "", "", resultDenied); err != nil {
-			return nil, err
-		}
-		s.logf("credential_list result=denied")
-		return nil, ErrDenied
-	}
-	return s.listUnlocked()
-}
-
-func (s *Session) listUnlocked() ([]Credential, error) {
 	if err := s.persistEvent(actionList, "", "", resultAllowed); err != nil {
 		return nil, err
 	}
@@ -760,6 +688,23 @@ func (c credential) public() Credential {
 			ReviewEvery:   time.Duration(c.Lifecycle.ReviewEvery) * time.Second,
 		},
 	}
+}
+
+// requireCurrent fails closed when this cached session is no longer the
+// durable audit tip. A commit from another session makes it defunct.
+func (s *Session) requireCurrent() error {
+	if s == nil || s.defunct {
+		return ErrStale
+	}
+	var seq int64
+	if err := s.db.QueryRow(`SELECT audit_seq FROM vault WHERE id=?`, s.id).Scan(&seq); err != nil || seq < 0 {
+		return ErrAudit
+	}
+	if uint64(seq) != s.header.AuditSeq {
+		s.defunct = true
+		return ErrStale
+	}
+	return nil
 }
 
 func (s *Session) live() error {
@@ -805,14 +750,9 @@ func (s *Session) duringCallback(fn func()) {
 		fn()
 		return
 	}
-	// Attribution belongs to this call, not to another operation admitted
-	// while its callback runs. Restore it only after owning the lock again.
-	actor := s.boundActor
-	s.boundActor = ""
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
-		s.boundActor = actor
 		s.locked.Store(true)
 	}()
 	fn()
@@ -897,19 +837,19 @@ func (s *Session) commit(ev auditEvent, creds []credential) error {
 }
 
 func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentRecord, grants []grantRecord) error {
-	return s.commitBatch([]auditEvent{ev}, creds, agents, grants, true, nil, nil)
+	return s.commitBatch([]auditEvent{ev}, creds, agents, grants, true, nil)
 }
 
 // commitBatch seals creds and events in one transaction.
 // withResp lets one ordinary security event pick up its M5 response.
 // policy, when non-nil, becomes the durable health policy only after commit.
-func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, shared *sharedSnap) error {
-	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, shared, nil)
+func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy) error {
+	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil)
 }
 
 // commitBatchWrap optionally replaces the passphrase wrap in the same transaction.
 // Neither the session header nor its audit cache changes before commit succeeds.
-func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, shared *sharedSnap, wrap *passphraseWrap) error {
+func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
@@ -933,29 +873,6 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 			}
 		}
 	}
-	if s.boundActor != "" && s.org != nil && safeID(s.boundActor) != "" {
-		partial := auditEvent{
-			Action: actionInventory, Result: resultAllowed, Decision: decisionInventory,
-			ActorID: s.boundActor, OrgID: s.org.ID,
-		}
-		for _, ev := range events {
-			if ev.Result == resultDenied {
-				partial.Result = resultDenied
-			}
-			if partial.CredID == "" && safeID(ev.CredID) != "" {
-				partial.CredID = ev.CredID
-				partial.CredType = ev.CredType
-			}
-			if partial.TargetID == "" && safeID(ev.AgentID) != "" {
-				partial.TargetID = ev.AgentID
-			}
-		}
-		ev, err := nextAudit(events, s.id, partial)
-		if err != nil {
-			return err
-		}
-		events = append(events, ev)
-	}
 	base := s.denials
 	if base == nil {
 		base = indexFromAudit(s.audit)
@@ -968,24 +885,9 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	if err := validateDetection(det); err != nil {
 		return err
 	}
-	org, members, requests := s.org, s.members, s.requests
-	if shared != nil {
-		org, members, requests = shared.org, shared.members, shared.requests
-	}
-	if err := validateSharedState(org, members, requests, creds, agents, grants); err != nil {
-		return err
-	}
-	nextBind, err := s.bootstrap.extend(events)
-	if err != nil {
-		return err
-	}
-	if err := nextBind.check(org, members, requests, grants); err != nil {
-		return err
-	}
 	tip := events[len(events)-1]
 	plain, err := json.Marshal(document{
 		Credentials: creds, Agents: agents, Grants: grants, Detection: det, HealthPolicy: pol,
-		Organization: org, Memberships: members, Requests: requests,
 	})
 	if err != nil {
 		return ErrIO
@@ -1035,10 +937,6 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	s.detection = det
 	s.denials = nextDenials
 	s.hpolicy = pol
-	s.org = org
-	s.members = members
-	s.requests = requests
-	s.bootstrap = nextBind
 	for _, row := range events {
 		applyNotice(s.notices, row)
 		s.suspensions.apply(s.audit, row)
@@ -1221,6 +1119,19 @@ func cloneTime(t *time.Time) *time.Time {
 	}
 	u := t.UTC()
 	return &u
+}
+
+func validateDocument(doc document) error {
+	if err := validateStored(doc.Credentials); err != nil {
+		return err
+	}
+	if err := validateAgentsAndGrants(doc); err != nil {
+		return err
+	}
+	if err := validateHealthPolicyStored(doc.HealthPolicy); err != nil {
+		return err
+	}
+	return validateDetection(doc.Detection)
 }
 
 func validateStored(creds []credential) error {

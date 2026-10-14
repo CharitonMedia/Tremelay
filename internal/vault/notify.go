@@ -447,8 +447,6 @@ func noticeAlertClass(src auditEvent, st noticeSrc) Classification {
 	case ClassHealth:
 		// Advisory. The recorded class asks for delivery and does not suspend.
 		return Classification{Class: ClassHealth, Severity: SeverityHigh}
-	case ClassApproval:
-		return Classification{Class: ClassApproval, Severity: SeverityHigh}
 	}
 	return base
 }

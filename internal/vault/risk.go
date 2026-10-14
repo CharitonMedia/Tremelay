@@ -46,10 +46,6 @@ const (
 	ClassNotice = "notice"
 	// ClassHealth is an advisory credential-health alert. It does not contain.
 	ClassHealth = "health"
-	// ClassApproval is an owner notification for a shared grant approval.
-	// It references the audit row and does not contain.
-	ClassApproval = "approval"
-
 	// ponytail: one counter per agent over the last 32 broker rows, capped at
 	// 256 agents by dropping whoever has the oldest latest broker row.
 	// Upgrade path: a time window keyed by grant and credential.
@@ -76,7 +72,7 @@ func knownClass(class string) bool {
 	switch class {
 	case ClassRoutine, ClassExpectedDenial, ClassRepeatedDenial, ClassSecretProbe,
 		ClassOriginMismatch, ClassSSRF, ClassRedirectEscape, ClassPolicyViolation,
-		ClassReplay, ClassAuditTamper, ClassRate, ClassDestructive, ClassNotice, ClassHealth, ClassApproval:
+		ClassReplay, ClassAuditTamper, ClassRate, ClassDestructive, ClassNotice, ClassHealth:
 		return true
 	default:
 		return false
@@ -614,11 +610,6 @@ type AuditRecord struct {
 	RefSeq         uint64 `json:"ref_seq,omitempty"`
 	Reasons        string `json:"reasons,omitempty"`
 	CredGen        uint64 `json:"cred_gen,omitempty"`
-	ActorID        string `json:"actor_id,omitempty"`
-	OrgID          string `json:"org_id,omitempty"`
-	TargetID       string `json:"target_id,omitempty"`
-	RequestID      string `json:"request_id,omitempty"`
-	Decision       string `json:"decision,omitempty"`
 	Hash           string `json:"hash"`
 }
 
@@ -643,13 +634,6 @@ func (s *Session) AuditHistory(f AuditFilter) ([]AuditRecord, error) {
 		return nil, err
 	}
 	defer s.end()
-	if s.shared() {
-		return nil, ErrDenied
-	}
-	return s.auditHistoryUnlocked(f)
-}
-
-func (s *Session) auditHistoryUnlocked(f AuditFilter) ([]AuditRecord, error) {
 	if err := s.verified(); err != nil {
 		return nil, err
 	}
@@ -750,13 +734,6 @@ func (s *Session) AuditBySeq(seq uint64, hash string) (AuditRecord, error) {
 		return AuditRecord{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		return AuditRecord{}, ErrDenied
-	}
-	return s.auditBySeqUnlocked(seq, hash)
-}
-
-func (s *Session) auditBySeqUnlocked(seq uint64, hash string) (AuditRecord, error) {
 	if err := s.live(); err != nil {
 		return AuditRecord{}, err
 	}
@@ -789,12 +766,6 @@ func (s *Session) verified() error {
 	if err := matchHealth(s.audit, s.creds); err != nil {
 		return ErrAudit
 	}
-	if err := validateSharedState(s.org, s.members, s.requests, s.creds, s.agents, s.grants); err != nil {
-		return ErrAudit
-	}
-	if err := sharedHistoryBound(s.audit, s.org, s.members, s.requests, s.grants); err != nil {
-		return ErrAudit
-	}
 	return nil
 }
 
@@ -818,11 +789,6 @@ func auditRecordClass(ev auditEvent, class Classification) AuditRecord {
 		RefSeq:         ev.RefSeq,
 		Reasons:        ev.Reasons,
 		CredGen:        ev.CredGen,
-		ActorID:        ev.ActorID,
-		OrgID:          ev.OrgID,
-		TargetID:       ev.TargetID,
-		RequestID:      ev.RequestID,
-		Decision:       ev.Decision,
 		Hash:           ev.Hash,
 	}
 }

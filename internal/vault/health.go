@@ -281,13 +281,6 @@ func (s *Session) SetHealthPolicy(p HealthPolicy) error {
 		return err
 	}
 	defer s.end()
-	if s.shared() {
-		return s.denyAction(actionHealthPolicy, ErrDenied)
-	}
-	return s.setHealthPolicyUnlocked(p)
-}
-
-func (s *Session) setHealthPolicyUnlocked(p HealthPolicy) error {
 	if err := s.live(); err != nil {
 		return err
 	}
@@ -310,12 +303,6 @@ func (s *Session) Health(id string) (Health, error) {
 		return Health{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.denyAction(actionHealthGet, ErrDenied); err != nil {
-			return Health{}, err
-		}
-		return Health{}, ErrDenied
-	}
 	if safeID(id) == "" {
 		return Health{}, s.denyAction(actionHealthGet, ErrInvalid)
 	}
@@ -342,12 +329,6 @@ func (s *Session) ListHealth() ([]Health, HealthPolicy, error) {
 		return nil, HealthPolicy{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.denyAction(actionHealthList, ErrDenied); err != nil {
-			return nil, HealthPolicy{}, err
-		}
-		return nil, HealthPolicy{}, ErrDenied
-	}
 	if err := s.persistEvent(actionHealthList, "", "", resultAllowed); err != nil {
 		return nil, HealthPolicy{}, err
 	}
@@ -366,9 +347,6 @@ func (s *Session) RefreshHealth(id string) error {
 		return err
 	}
 	defer s.end()
-	if s.shared() {
-		return s.denyAction(actionRefresh, ErrDenied)
-	}
 	if id != "" && safeID(id) == "" {
 		return s.denyAction(actionRefresh, ErrInvalid)
 	}
@@ -400,16 +378,6 @@ func (s *Session) Replace(id string, secret []byte, opt LifecycleOptions) (Crede
 		return Credential{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.denyAction(actionReplace, ErrDenied); err != nil {
-			return Credential{}, err
-		}
-		return Credential{}, ErrDenied
-	}
-	return s.replaceUnlocked(id, secret, opt)
-}
-
-func (s *Session) replaceUnlocked(id string, secret []byte, opt LifecycleOptions) (Credential, error) {
 	if safeID(id) == "" || validateSecret(secret) != nil {
 		return Credential{}, s.denyAction(actionReplace, ErrInvalid)
 	}
@@ -460,16 +428,6 @@ func (s *Session) SetLifecycle(id string, opt LifecycleOptions) (Credential, err
 		return Credential{}, err
 	}
 	defer s.end()
-	if s.shared() {
-		if err := s.denyAction(actionLifecycle, ErrDenied); err != nil {
-			return Credential{}, err
-		}
-		return Credential{}, ErrDenied
-	}
-	return s.setLifecycleUnlocked(id, opt)
-}
-
-func (s *Session) setLifecycleUnlocked(id string, opt LifecycleOptions) (Credential, error) {
 	if safeID(id) == "" || !lifecycleTouched(opt) {
 		return Credential{}, s.denyAction(actionLifecycle, ErrInvalid)
 	}
@@ -672,7 +630,7 @@ func (s *Session) commitPlans(rows []plannedRow, creds []credential, policy *hea
 		}
 		events = append(events, resp)
 	}
-	if err := s.commitBatch(events, creds, s.agents, s.grants, false, policy, nil); err != nil {
+	if err := s.commitBatch(events, creds, s.agents, s.grants, false, policy); err != nil {
 		return err
 	}
 	for _, ev := range events {

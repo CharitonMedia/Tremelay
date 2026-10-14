@@ -1,6 +1,6 @@
 # ADR 0015: Local shared-vault authorization reference
 
-Status: Accepted
+Status: Superseded (shared vaults removed from v1; single user, many agents)
 
 ## Context
 
