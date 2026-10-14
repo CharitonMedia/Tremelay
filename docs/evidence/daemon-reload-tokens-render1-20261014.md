@@ -1,6 +1,6 @@
 # Daemon reload (3d) and agent token custody (3c) on render-1 (Linux), 2026-10-14
 
-Commit under test: 44d9866 (branch `v1-daemon-reload-tokens`, rebased on v1 4db8ea5). Throwaway
+Commits under test: 44d9866 and, re-run with identical results after review fixes, 8d21ee3 (branch `v1-daemon-reload-tokens`, on v1 4db8ea5). Throwaway
 tmpfs vault, generated passphrase in a 0600 file, private `XDG_RUNTIME_DIR`, dummy `api_key`
 credential, `http_broker` grants on `https://httpbin.org/anything/{one,two,three}` (GET, bearer).
 Claude Code ran as `claude -p --strict-mcp-config --mcp-config mcp.json` with server command
