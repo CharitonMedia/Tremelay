@@ -67,6 +67,9 @@ the machine, so it is checked rather than assumed.
   refused. macOS `xucred` with an unexpected version is refused, because x/sys
   does not export `XUCRED_VERSION` and a silent reinterpretation of that struct
   is not an acceptable way to identify a caller.
+- The client (`tremelay mcp --daemon`, `tremelay ssh-agent`) makes the same
+  peer-uid check on the daemon before sending its token, so a socket another
+  user created first at the temp-dir fallback path never receives one.
 
 Permission and ownership checks protect the path; the peer-uid check protects
 the connection. Neither is sufficient alone, so both are enforced.

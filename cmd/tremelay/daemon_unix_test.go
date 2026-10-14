@@ -126,6 +126,35 @@ func TestDaemonPeerUID(t *testing.T) {
 	}
 }
 
+// TestDaemonDialChecksServerUID: the client refuses a daemon endpoint served
+// by another uid (a squatted fallback path) before any token is sent.
+func TestDaemonDialChecksServerUID(t *testing.T) {
+	path := filepath.Join(socketDir(t), "squat.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	conn, err := dialSelf(path, os.Getuid())
+	if err != nil {
+		t.Fatalf("own daemon refused: %v", err)
+	}
+	conn.Close()
+	if conn, err := dialSelf(path, os.Getuid()+1); err == nil {
+		conn.Close()
+		t.Fatal("a daemon served by another uid was accepted")
+	}
+}
+
 // TestAgentTokenFileMode covers the Unix half of token-file custody: the mode
 // the file is written with, and the refusal of one any other user can read.
 func TestAgentTokenFileMode(t *testing.T) {
