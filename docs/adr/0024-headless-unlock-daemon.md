@@ -150,7 +150,13 @@ relay closes the whole connection when the client's stdin ends, instead of
 Token-file custody moves from a mode check to a per-platform one: Windows
 creates the file with the same owner-only descriptor (a file inheriting a
 normal profile's permissions would also admit SYSTEM and Administrators) and
-refuses to read a token file whose owner or DACL names anyone else.
+refuses to read a token file whose owner or DACL names anyone else. A
+descriptor passed to `CreateFile` is a request, not a result: a volume without
+ACL support — FAT, exFAT, some network redirectors — accepts it and ignores
+it, which would leave the token world-readable. So the creator reads the
+descriptor back from the open handle through the same check the reader uses,
+before any token byte is written, and deletes the still-empty file and names
+the filesystem requirement rather than returning a file it cannot protect.
 
 ### `tremelay ssh-agent` stays closed on Windows
 
@@ -321,7 +327,11 @@ well-known principal named anywhere); a second daemon refused on a name the
 first still holds, and that name reusable once released; instance labels that
 are not plainly safe producing no endpoint, and an unformable endpoint
 refusing before the passphrase is read; a token file widened to Everyone
-refused; and `ssh-agent` failing closed. The end-to-end acceptance — unlock,
+refused; the creator's own read-back of the descriptor it just set, accepting
+the owner-only file it creates on NTFS and refusing a deliberately permissive
+descriptor, which is the effective state an ACL-less volume leaves behind and
+is reproducible without admin rights or a second volume; and `ssh-agent`
+failing closed. The end-to-end acceptance — unlock,
 an agent capability call with no prompt, a wrong token refused and audited,
 `lock` making the next call fail closed — is the shared test, running over a
 real named pipe.

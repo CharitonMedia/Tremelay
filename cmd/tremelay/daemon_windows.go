@@ -412,9 +412,23 @@ func createUserOnlyFile(path string) (*os.File, error) {
 	sa := windows.SecurityAttributes{SecurityDescriptor: sd}
 	sa.Length = uint32(unsafe.Sizeof(sa))
 	// CREATE_NEW refuses an existing file, as O_EXCL does on Unix.
-	handle, err := windows.CreateFile(wide, windows.GENERIC_WRITE, 0, &sa,
+	// READ_CONTROL is what the read-back below needs; the generic write
+	// mapping already carries it, and naming it keeps that from being
+	// accidental.
+	handle, err := windows.CreateFile(wide, windows.GENERIC_WRITE|windows.READ_CONTROL, 0, &sa,
 		windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
+		return nil, err
+	}
+	// A volume with no ACL support — FAT, exFAT, some network redirectors —
+	// accepts the SECURITY_ATTRIBUTES and silently ignores them, which would
+	// leave the bearer token readable by every user of the machine. So the
+	// descriptor the object actually carries is read back from the open
+	// handle before a single token byte is written, and a file that does not
+	// carry it leaves with us while it is still empty.
+	if err := handleIsUserOnly(handle); err != nil {
+		windows.CloseHandle(handle)
+		os.Remove(path)
 		return nil, err
 	}
 	file := os.NewFile(uintptr(handle), path)
@@ -423,6 +437,22 @@ func createUserOnlyFile(path string) (*os.File, error) {
 		return nil, errAgentToken
 	}
 	return file, nil
+}
+
+// handleIsUserOnly applies the same check userOnlyFile makes by path to the
+// object behind an open handle, so a creator can verify its own result
+// without a second lookup that could resolve to a different file.
+func handleIsUserOnly(handle windows.Handle) error {
+	self, err := currentUserSID()
+	if err != nil {
+		return errTokenFileACL
+	}
+	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil || sd == nil || descriptorIsUserOnly(sd, self) != nil {
+		return errTokenFileACL
+	}
+	return nil
 }
 
 // userOnlyFile refuses a token file any other principal can read.

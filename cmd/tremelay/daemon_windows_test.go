@@ -159,6 +159,58 @@ func TestAgentTokenFileRefusesWiderDACL(t *testing.T) {
 	}
 }
 
+// TestCreateUserOnlyFileVerifiesDescriptor covers the read-back that keeps a
+// token file off a volume which cannot carry its descriptor: FAT and exFAT
+// accept the SECURITY_ATTRIBUTES and ignore them, leaving the token readable
+// by every user. The positive case is the NTFS temp directory the suite runs
+// in. The negative case is a file created with a deliberately permissive
+// descriptor, which is the effective state an ACL-less volume leaves behind
+// and needs no admin rights and no second volume to produce.
+func TestCreateUserOnlyFileVerifiesDescriptor(t *testing.T) {
+	self, err := currentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	everyone, err := windows.CreateWellKnownSid(windows.WinWorldSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if everyone.Equals(self) {
+		t.Fatal("this process runs as Everyone")
+	}
+	dir := t.TempDir()
+
+	file, err := createUserOnlyFile(filepath.Join(dir, "agent.token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := handleIsUserOnly(windows.Handle(file.Fd())); err != nil {
+		t.Fatalf("a file this command created fails its own descriptor check: %v", err)
+	}
+
+	sd, err := windows.SecurityDescriptorFromString("O:" + self.String() + "G:" + self.String() +
+		"D:P(A;;GA;;;" + self.String() + ")(A;;GR;;;" + everyone.String() + ")")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wide, err := windows.UTF16PtrFromString(filepath.Join(dir, "wider.token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sa := windows.SecurityAttributes{SecurityDescriptor: sd}
+	sa.Length = uint32(unsafe.Sizeof(sa))
+	wider, err := windows.CreateFile(wide, windows.GENERIC_WRITE|windows.READ_CONTROL, 0, &sa,
+		windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(wider)
+	if err := handleIsUserOnly(wider); err != errTokenFileACL {
+		t.Fatalf("a descriptor Everyone can read was accepted: %v", err)
+	}
+}
+
 // TestSSHAgentFailsClosedOnWindows pins the one daemon command this platform
 // does not carry. See ADR 0024.
 func TestSSHAgentFailsClosedOnWindows(t *testing.T) {

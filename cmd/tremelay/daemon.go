@@ -51,6 +51,7 @@ var (
 	errDaemonSession  = errors.New("daemon agent session failed; inspect the vault audit before retrying an operation")
 	errDaemonTerminal = errors.New("daemon can no longer serve this vault and has locked; inspect the vault audit, then restart it")
 	errAgentToken     = errors.New("agent token file must be a regular user-only file holding one hex token")
+	errTokenFileACL   = errors.New("agent token file needs a filesystem that supports ACLs; the owner-only security descriptor was not applied")
 )
 
 func cmdDaemon(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -467,6 +468,11 @@ func readAgentToken(path string) ([]byte, error) {
 func writeAgentToken(path string, token []byte) error {
 	f, err := createUserOnlyFile(path)
 	if err != nil {
+		// A volume that cannot carry the descriptor is the one failure the
+		// generic diagnostic cannot be acted on, so it keeps its own.
+		if errors.Is(err, errTokenFileACL) {
+			return err
+		}
 		return errAgentToken
 	}
 	encoded := encodeAgentToken(token)
@@ -495,6 +501,9 @@ func replaceAgentToken(path string, token []byte) error {
 	// file and the final file have one custody rule.
 	f, err := createUserOnlyFile(filepath.Join(filepath.Dir(path), tempTokenName()))
 	if err != nil {
+		if errors.Is(err, errTokenFileACL) {
+			return err
+		}
 		return errAgentToken
 	}
 	encoded := encodeAgentToken(token)
