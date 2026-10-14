@@ -32,8 +32,8 @@ func TestChangePassphraseRewrapAndSnapshot(t *testing.T) {
 	if err := s.ChangePassphrase(oldPass, newPass); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(s.dek, dek) {
-		t.Fatal("passphrase change replaced DEK")
+	if bytes.Equal(s.dek, dek) {
+		t.Fatal("passphrase change did not rotate DEK")
 	}
 	if bytes.Equal(s.header.KDF.Salt, header.KDF.Salt) || bytes.Equal(s.header.WrapNonce, header.WrapNonce) || bytes.Equal(s.header.WrappedDEK, header.WrappedDEK) {
 		t.Fatal("wrap was not refreshed")
@@ -157,6 +157,9 @@ func TestChangePassphraseStaleSession(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer current.Lock()
+			if err := stale.PublishDaemonReloadPubKey(); err != nil {
+				t.Fatal(err)
+			}
 			newPass := []byte(randHex(t, 24))
 			if err := current.ChangePassphrase(oldPass, newPass); err != nil {
 				t.Fatal(err)

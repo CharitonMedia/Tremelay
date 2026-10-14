@@ -11,12 +11,16 @@ type passphraseWrap struct {
 	ciphertext []byte
 }
 
-// ChangePassphrase reauthenticates the current passphrase and rewraps the
-// existing DEK with a fresh salt and nonce. The wrap, encrypted state, and
-// vault_passphrase_change audit row commit atomically. A stale session cannot
-// replace a newer wrap. This is host custody, not an agent operation.
-// Snapshots keep their original passphrase. This does not revoke a DEK that
-// another process already holds or defend against a compromised host.
+// ChangePassphrase reauthenticates the current passphrase, generates a fresh
+// DEK, re-encrypts every credential under it, and commits the new wrap, the
+// resealed document, and the vault_passphrase_change audit row atomically. A
+// one-time handoff sealed to the reload public key in the authenticated document
+// lets a resident
+// session reload without re-prompting when that key was published before the
+// change. A stale session cannot replace a newer wrap. This is
+// host custody, not an agent operation. Snapshots keep their original
+// passphrase and DEK. This does not revoke a DEK that another process already
+// holds or defend against a compromised host.
 func (s *Session) ChangePassphrase(oldPassphrase, newPassphrase []byte) error {
 	if err := s.begin(); err != nil {
 		return err
@@ -43,13 +47,18 @@ func (s *Session) ChangePassphrase(oldPassphrase, newPassphrase []byte) error {
 	if subtle.ConstantTimeCompare(dek, s.dek) != 1 {
 		return s.denyAction(actionPassphrase, ErrUnauthenticated)
 	}
+	newDEK, err := randBytes(keyLen)
+	if err != nil {
+		return err
+	}
+	defer wipe(newDEK)
 	kdf, err := newKDF()
 	if err != nil {
 		return err
 	}
 	kek := deriveKEK(newPassphrase, kdf)
 	defer wipe(kek)
-	nonce, ciphertext, err := seal(kek, s.dek, dekAAD(s.id))
+	wrapNonce, wrapped, err := seal(kek, newDEK, dekAAD(s.id))
 	if err != nil {
 		return err
 	}
@@ -57,8 +66,23 @@ func (s *Session) ChangePassphrase(oldPassphrase, newPassphrase []byte) error {
 	if err != nil {
 		return err
 	}
+	var handoffCipher []byte
+	if len(s.dekReloadPubKey) == 32 {
+		handoffCipher, err = sealDEKHandoff(s.dekReloadPubKey, dek, newDEK, s.id, ev.Hash, ev.Seq)
+		if err != nil {
+			return err
+		}
+	}
+	if s.rotateFault != nil {
+		if err := s.rotateFault("reseal"); err != nil {
+			return err
+		}
+	}
+	rot := &dekRotation{newDEK: newDEK, handoffCipher: handoffCipher}
+	// newDEK is adopted by commitBatchWrap on success; do not wipe it here.
+	newDEK = nil
 	if err := s.commitBatchWrap([]auditEvent{ev}, s.creds, s.agents, s.grants, true, nil,
-		&passphraseWrap{kdf: kdf, nonce: nonce, ciphertext: ciphertext}); err != nil {
+		&passphraseWrap{kdf: kdf, nonce: wrapNonce, ciphertext: wrapped}, rot); err != nil {
 		return err
 	}
 	s.logf("vault_passphrase_change result=allowed")

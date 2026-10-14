@@ -562,3 +562,35 @@ invocation with each refusal audited and attributed, a rotated token file
 still owner-only with no temporary file left beside it, `issue` refusing to
 overwrite another agent's token file without committing, and the daemon
 locking on a forked chain. These are security controls under invariant 13.
+
+## Amendment 2026-10-14: DEK rotation handoff for resident reload (V1.md item 3e)
+
+Status stays Accepted pending owner veto.
+
+Passphrase change now rotates the vault DEK in one transaction (ADR 0019,
+amendment of 2026-10-14). A running daemon must adopt that rotation through
+the reload path without re-prompting, but the handoff must not be readable
+with an old backup and passphrase: sealing the new DEK under the previous DEK
+would let anyone who derived the old DEK from a snapshot read the handoff
+while it remains on disk.
+
+On unlock, before serving connections, the daemon generates an ephemeral
+X25519 key pair (`golang.org/x/crypto/nacl/box`), seals the public key into
+the encrypted credential document on an audited `daemon_reload_pubkey /
+allowed` commit, and keeps the private key in memory until lock or exit. The
+legacy `dek_reload_pubkey` SQLite column may remain for migration but is
+cleared on write and is never trusted for handoff. When another holder runs
+`change-passphrase` and the authenticated document carries a reload public
+key, the change commit may store `dek_handoff` as: inner AES-256-GCM of the
+new DEK under the **session's previous DEK** with AAD binding the vault id
+and that commit's audit head and sequence; outer anonymous box to the reload
+public key over `inner nonce||inner ciphertext`. If no reload key is in the
+document, no handoff is written. Reload adoption opens the outer box with the
+in-memory private key, opens the inner with the resident DEK and binding,
+swaps in the new DEK, and runs the same `openDocument` verification as any
+other reload; failure retires the session and the daemon locks. This stops
+(1) a same-uid agent planting a reload public key in plaintext and steering
+the handoff to its own key, and (2) a same-uid writer forging a handoff with
+`SealAnonymous` alone using an attacker-chosen DEK without the old DEK.
+Ordinary commits clear the handoff; if it is cleared before reload, the
+resident session fails closed, which is acceptable.

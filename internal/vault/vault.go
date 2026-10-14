@@ -238,16 +238,19 @@ type kdfParams struct {
 }
 
 type fileHeader struct {
-	Version    int
-	ID         string
-	Root       string
-	KDF        kdfParams
-	WrapNonce  []byte
-	WrappedDEK []byte
-	DataNonce  []byte
-	Data       []byte
-	AuditHead  string
-	AuditSeq   uint64
+	Version         int
+	ID              string
+	Root            string
+	KDF             kdfParams
+	WrapNonce       []byte
+	WrappedDEK      []byte
+	DataNonce       []byte
+	Data            []byte
+	AuditHead       string
+	AuditSeq        uint64
+	DEKReloadPubKey []byte
+	DEKHandoffNonce []byte
+	DEKHandoff      []byte
 }
 
 // document is the plaintext inside the encrypted blob. Audit history lives
@@ -257,6 +260,9 @@ type document struct {
 	Credentials []credential  `json:"credentials"`
 	Agents      []agentRecord `json:"agents,omitempty"`
 	Grants      []grantRecord `json:"grants,omitempty"`
+	// DEKReloadPubKey is an ephemeral X25519 public key for resident DEK handoff.
+	// It is authenticated by the DEK; the plaintext dek_reload_pubkey column is not trusted.
+	DEKReloadPubKey []byte `json:"dek_reload_pubkey,omitempty"`
 	// Detection is always written, including when empty. A missing member
 	// means the document was sealed before M5. See sealedDetection.
 	Detection detectionState `json:"detection"`
@@ -281,6 +287,11 @@ type Session struct {
 	// commitFault, when set, fails a credential-state transaction before commit.
 	// Tests use it to prove rollback. Production leaves it nil.
 	commitFault func() error
+	// rotateFault, when set, fails ChangePassphrase at named steps. Tests only.
+	rotateFault func(step string) error
+	// postCommitFault, when set, fails after a successful durable commit before
+	// the session cache is updated. Tests only.
+	postCommitFault func() error
 	// attestFault, when set, runs after the local-attestation allowed row
 	// commits and before Ed25519 signing. A non-nil error withholds the
 	// signature. Tests use it. Production leaves it nil.
@@ -339,6 +350,15 @@ type Session struct {
 	// defunct is set when a commit loses a race it cannot recover from.
 	// Later calls return ErrStale.
 	defunct bool
+	// reloadPriv, when set, opens a DEK handoff left by a passphrase rotation.
+	// It is wiped on Lock and is never written to disk.
+	reloadPriv *[32]byte
+	// reloadPub is the public half of reloadPriv, kept only in memory.
+	reloadPub *[32]byte
+	// dekReloadPubKey is the reload public key from the authenticated document.
+	dekReloadPubKey []byte
+	// pendingReloadPub is sealed into the document on the next commit only.
+	pendingReloadPub []byte
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -516,22 +536,23 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		red.Add(doc.Credentials[i].Secret)
 	}
 	s := &Session{
-		path:        path,
-		id:          header.ID,
-		dek:         dek,
-		header:      header,
-		creds:       doc.Credentials,
-		agents:      doc.Agents,
-		grants:      doc.Grants,
-		audit:       events,
-		detection:   doc.Detection,
-		denials:     idx,
-		notices:     noticeIndex(events),
-		suspensions: suspensionFromAudit(events),
-		redactor:    red,
-		logger:      logger,
-		db:          db,
-		hpolicy:     doc.HealthPolicy,
+		path:            path,
+		id:              header.ID,
+		dek:             dek,
+		header:          header,
+		creds:           doc.Credentials,
+		agents:          doc.Agents,
+		grants:          doc.Grants,
+		audit:           events,
+		detection:       doc.Detection,
+		denials:         idx,
+		notices:         noticeIndex(events),
+		suspensions:     suspensionFromAudit(events),
+		redactor:        red,
+		logger:          logger,
+		db:              db,
+		hpolicy:         doc.HealthPolicy,
+		dekReloadPubKey: append([]byte(nil), doc.DEKReloadPubKey...),
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -573,6 +594,10 @@ func (s *Session) lockLocked() {
 	s.responding = false
 	s.checker = nil
 	s.hpolicy = healthPolicy{}
+	s.reloadPriv = nil
+	s.reloadPub = nil
+	s.dekReloadPubKey = nil
+	s.pendingReloadPub = nil
 	s.locked.Store(false)
 	if s.redactor != nil {
 		s.redactor.Wipe()
@@ -759,11 +784,13 @@ func (s *Session) adoptLocked() error {
 
 // reloadLocked replaces this session's cached authority with the durable state
 // under the DEK it already holds. No passphrase is involved: the KEK was
-// consumed at unlock and the DEK has not changed. Verification is Unlock's,
-// through readVaultState and openDocument, so a tampered document, a broken
-// chain, a forged denial suffix or a foreign vault id all fail here. Nothing
-// is swapped until every check passes, and a failure makes the session
-// permanently unusable rather than leaving it serving unverified state.
+// consumed at unlock. A passphrase change may have rotated the DEK; a one-time
+// handoff sealed to this session's ephemeral reload public key lets a resident
+// session adopt the new key without re-prompting. Verification is Unlock's, through readVaultState
+// and openDocument, so a tampered document, a broken chain, a forged denial
+// suffix or a foreign vault id all fail here. Nothing is swapped until every
+// check passes, and a failure makes the session permanently unusable rather
+// than leaving it serving unverified state.
 func (s *Session) reloadLocked() error {
 	fail := func(err error) error {
 		s.defunct = true
@@ -792,6 +819,20 @@ func (s *Session) reloadLocked() error {
 		return fail(ErrCorrupt)
 	}
 	doc, idx, err := openDocument(s.dek, header, events)
+	if err != nil && len(header.DEKHandoff) > 0 {
+		if s.reloadPriv == nil || s.reloadPub == nil {
+			return fail(ErrCorrupt)
+		}
+		oldDEK := append([]byte(nil), s.dek...)
+		next, herr := openDEKHandoffReload(s.reloadPriv, s.reloadPub, oldDEK, header)
+		wipe(oldDEK)
+		if herr != nil {
+			return fail(herr)
+		}
+		wipe(s.dek)
+		s.dek = next
+		doc, idx, err = openDocument(s.dek, header, events)
+	}
 	if err != nil {
 		return fail(err)
 	}
@@ -811,6 +852,7 @@ func (s *Session) reloadLocked() error {
 	s.notices = noticeIndex(events)
 	s.suspensions = suspensionFromAudit(events)
 	s.hpolicy = doc.HealthPolicy
+	s.dekReloadPubKey = append([]byte(nil), doc.DEKReloadPubKey...)
 	return nil
 }
 
@@ -973,12 +1015,18 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 // withResp lets one ordinary security event pick up its M5 response.
 // policy, when non-nil, becomes the durable health policy only after commit.
 func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy) error {
-	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil)
+	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil, nil)
 }
 
-// commitBatchWrap optionally replaces the passphrase wrap in the same transaction.
-// Neither the session header nor its audit cache changes before commit succeeds.
-func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap) error {
+type dekRotation struct {
+	newDEK        []byte
+	handoffCipher []byte
+}
+
+// commitBatchWrap optionally replaces the passphrase wrap and/or rotates the DEK
+// in the same transaction. Neither the session header nor its audit cache
+// changes before commit succeeds.
+func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap, rot *dekRotation) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
@@ -1015,20 +1063,35 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 		return err
 	}
 	tip := events[len(events)-1]
+	reloadPub := s.dekReloadPubKey
+	if s.pendingReloadPub != nil {
+		reloadPub = s.pendingReloadPub
+	}
 	plain, err := json.Marshal(document{
 		Credentials: creds, Agents: agents, Grants: grants, Detection: det, HealthPolicy: pol,
+		DEKReloadPubKey: reloadPub,
 	})
 	if err != nil {
 		return ErrIO
 	}
 	defer wipe(plain)
-	nonce, ct, err := seal(s.dek, plain, dataAAD(s.id, tip.Hash, tip.Seq))
+	dekSeal := s.dek
+	if rot != nil {
+		dekSeal = rot.newDEK
+	}
+	nonce, ct, err := seal(dekSeal, plain, dataAAD(s.id, tip.Hash, tip.Seq))
 	if err != nil {
 		return err
 	}
 	h := s.header
 	if wrap != nil {
 		h.KDF, h.WrapNonce, h.WrappedDEK = wrap.kdf, wrap.nonce, wrap.ciphertext
+	}
+	h.DEKReloadPubKey = nil
+	if rot != nil {
+		h.DEKHandoffNonce, h.DEKHandoff = nil, rot.handoffCipher
+	} else {
+		h.DEKHandoffNonce, h.DEKHandoff = nil, nil
 	}
 	h.Version = formatVersion
 	h.ID = s.id
@@ -1051,7 +1114,16 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 		}
 		return err
 	}
+	if s.postCommitFault != nil {
+		if err := s.postCommitFault(); err != nil {
+			return ErrAudit
+		}
+	}
 	s.header = h
+	if rot != nil {
+		wipe(s.dek)
+		s.dek = append([]byte(nil), rot.newDEK...)
+	}
 	// Append only after the transaction succeeds. A failed commit leaves the
 	// prefix in place, and append grows the backing array instead of copying
 	// it on every row. The notice index follows the same commit: a failed
@@ -1069,6 +1141,9 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	s.detection = det
 	s.denials = nextDenials
 	s.hpolicy = pol
+	if s.pendingReloadPub != nil {
+		s.dekReloadPubKey = append([]byte(nil), s.pendingReloadPub...)
+	}
 	for _, row := range events {
 		applyNotice(s.notices, row)
 		s.suspensions.apply(s.audit, row)
@@ -1263,6 +1338,9 @@ func validateDocument(doc document) error {
 	if err := validateHealthPolicyStored(doc.HealthPolicy); err != nil {
 		return err
 	}
+	if len(doc.DEKReloadPubKey) != 0 && len(doc.DEKReloadPubKey) != 32 {
+		return ErrCorrupt
+	}
 	return validateDetection(doc.Detection)
 }
 
@@ -1324,6 +1402,15 @@ func validateHeader(h fileHeader) error {
 		return ErrCorrupt
 	}
 	if _, err := hex.DecodeString(h.AuditHead); err != nil {
+		return ErrCorrupt
+	}
+	if len(h.DEKHandoffNonce) != 0 {
+		return ErrCorrupt
+	}
+	if len(h.DEKReloadPubKey) != 0 && len(h.DEKReloadPubKey) != 32 {
+		return ErrCorrupt
+	}
+	if len(h.DEKHandoff) != 0 && len(h.DEKHandoff) < minDEKHandoffLen() {
 		return ErrCorrupt
 	}
 	return nil

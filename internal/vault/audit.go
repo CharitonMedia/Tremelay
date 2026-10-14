@@ -25,28 +25,29 @@ const (
 	// They never carry the token, its digest, its length or its generation:
 	// an audit row is readable by anyone who can read the chain, and any of
 	// those is a verifier for a guessed token.
-	actionAgentTokenIssue  = "agent_token_issue"
-	actionAgentTokenRotate = "agent_token_rotate"
-	actionAgentTokenRevoke = "agent_token_revoke"
-	actionDaemonAuth       = "daemon_auth"
-	actionGrantCreate      = "grant_create"
-	actionGrantRevoke      = "grant_revoke"
-	actionAuthorize        = "capability_authorize"
-	actionCapList          = "capability_list"
-	actionBroker           = "broker_http"
-	actionLocalAttest      = "local_attest"
-	actionSSHUserAuth      = "ssh_userauth"
-	actionAgentCap         = "agent_capability"
-	actionNotify           = "notify"
-	actionContain          = "contain"
-	actionRespond          = "respond"
-	actionReplace          = "credential_replace"
-	actionLifecycle        = "credential_lifecycle"
-	actionHealth           = "health_assess"
-	actionRefresh          = "health_refresh"
-	actionHealthPolicy     = "health_policy"
-	actionHealthGet        = "health_get"
-	actionHealthList       = "health_list"
+	actionAgentTokenIssue    = "agent_token_issue"
+	actionAgentTokenRotate   = "agent_token_rotate"
+	actionAgentTokenRevoke   = "agent_token_revoke"
+	actionDaemonAuth         = "daemon_auth"
+	actionDaemonReloadPubkey = "daemon_reload_pubkey"
+	actionGrantCreate        = "grant_create"
+	actionGrantRevoke        = "grant_revoke"
+	actionAuthorize          = "capability_authorize"
+	actionCapList            = "capability_list"
+	actionBroker             = "broker_http"
+	actionLocalAttest        = "local_attest"
+	actionSSHUserAuth        = "ssh_userauth"
+	actionAgentCap           = "agent_capability"
+	actionNotify             = "notify"
+	actionContain            = "contain"
+	actionRespond            = "respond"
+	actionReplace            = "credential_replace"
+	actionLifecycle          = "credential_lifecycle"
+	actionHealth             = "health_assess"
+	actionRefresh            = "health_refresh"
+	actionHealthPolicy       = "health_policy"
+	actionHealthGet          = "health_get"
+	actionHealthList         = "health_list"
 
 	resultAllowed           = "allowed"
 	resultDenied            = "denied"
@@ -354,7 +355,7 @@ func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPassphrase, actionPut, actionGet, actionList,
 		actionAgentCreate, actionAgentTokenIssue, actionAgentTokenRotate, actionAgentTokenRevoke,
-		actionDaemonAuth, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
+		actionDaemonAuth, actionDaemonReloadPubkey, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
 		actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
 		actionHealthGet, actionHealthList:
