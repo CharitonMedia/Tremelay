@@ -281,8 +281,11 @@ func daemonDial(getenv func(string) string) (net.Conn, error) {
 	}
 	var handle windows.Handle
 	for attempt := range pipeBusyAttempts {
+		// Identification level only: a squatting server must never be able
+		// to impersonate this client, even before the owner check below.
 		handle, err = windows.CreateFile(wide, windows.GENERIC_READ|windows.GENERIC_WRITE,
-			0, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED, 0)
+			0, nil, windows.OPEN_EXISTING,
+			windows.FILE_FLAG_OVERLAPPED|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
 		// Every instance is momentarily busy between a client connecting and
 		// the daemon creating its replacement.
 		if !errors.Is(err, windows.ERROR_PIPE_BUSY) || attempt == pipeBusyAttempts-1 {
