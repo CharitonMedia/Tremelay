@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -266,6 +267,80 @@ func TestSSHAgentGrantsStaySeparate(t *testing.T) {
 	}
 	if hex.EncodeToString(secondPub) == env.grant.KeyID {
 		t.Fatal("the two grants should not share a key")
+	}
+}
+
+// TestSSHAgentSignWithoutStreamIsAudited covers the conversation that owns no
+// stream, because the principal holds no ssh_userauth grant or because its
+// only grant is revoked. The sign request is still an attempted credential
+// operation and owes exactly one denial row (invariant 4), with no signature.
+// Listing identities is not an attempt and is not recorded.
+func TestSSHAgentSignWithoutStreamIsAudited(t *testing.T) {
+	env := newSSHEnv(t)
+	preimage := env.preimage(env.sessionID(32), env.user, env.userBlob, env.hostBlob)
+	signOnce := func(t *testing.T, principal *AgentPrincipal) {
+		t.Helper()
+		conversation, err := principal.SSHAgent()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conversation.Close()
+		before := len(mustAudit(t, env.path))
+		resp, err := conversation.dispatch([]byte{sshAgentRequestIdentities})
+		if err != nil || !bytes.Equal(resp, sshEmptyIdentities()) {
+			t.Fatalf("list %x %v", resp, err)
+		}
+		if n := len(mustAudit(t, env.path)); n != before {
+			t.Fatalf("listing identities recorded %d rows", n-before)
+		}
+		resp, err = conversation.dispatch(env.signBody(env.userBlob, preimage, 0))
+		if err != nil || !bytes.Equal(resp, []byte{sshAgentFailure}) {
+			t.Fatalf("sign returned %x, %v", resp, err)
+		}
+		rows := mustAudit(t, env.path)[before:]
+		if len(rows) != 1 {
+			t.Fatalf("sign attempt recorded %d rows, want 1", len(rows))
+		}
+		row := rows[0]
+		if row.Action != actionSSHUserAuth || row.Operation != OpSSHUserAuth ||
+			row.Result != resultDenied || row.AgentID != principal.id ||
+			row.GrantID != "" || row.CredID != "" || row.CredType != "" {
+			t.Fatalf("unsafe no-grant denial: %+v", row)
+		}
+	}
+
+	bare, err := env.session.CreateAgent("no-ssh-worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := env.session.Agent(bare.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("no grant", func(t *testing.T) { signOnce(t, principal) })
+
+	t.Run("audit failure", func(t *testing.T) {
+		conversation, err := principal.SSHAgent()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conversation.Close()
+		before := len(mustAudit(t, env.path))
+		env.session.commitFault = func() error { return errors.New("induced audit failure") }
+		resp, err := conversation.dispatch(env.signBody(env.userBlob, preimage, 0))
+		env.session.commitFault = nil
+		if resp != nil || !errors.Is(err, ErrAudit) || len(mustAudit(t, env.path)) != before {
+			t.Fatalf("audit failure returned %x, %v", resp, err)
+		}
+	})
+
+	if err := env.session.RevokeGrant(env.grant.ID); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("revoked grant", func(t *testing.T) { signOnce(t, env.principal) })
+
+	if sshCount(t, env.path, resultCompleted) != 0 {
+		t.Fatal("no signature should have been released")
 	}
 }
 

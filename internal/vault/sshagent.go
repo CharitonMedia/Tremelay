@@ -17,6 +17,9 @@ import (
 // that leaves is a granted public key, and only after that grant's own host
 // proof. Private keys never leave the broker.
 type SSHAgent struct {
+	broker  sshBroker
+	agentID string
+
 	mu      sync.Mutex
 	closed  bool
 	streams []*SSHUserAuth
@@ -30,11 +33,15 @@ func (a *AgentPrincipal) SSHAgent() (*SSHAgent, error) {
 	if a == nil || a.view == nil {
 		return nil, ErrUnauthenticated
 	}
+	broker, ok := a.view.(sshBroker)
+	if !ok {
+		return nil, ErrUnauthenticated
+	}
 	caps, err := a.Capabilities()
 	if err != nil {
 		return nil, err
 	}
-	m := &SSHAgent{}
+	m := &SSHAgent{broker: broker, agentID: a.id}
 	for _, c := range caps {
 		if !soleSSH(c.Operations) || c.Status != GrantActive {
 			continue
@@ -61,7 +68,7 @@ func (a *AgentPrincipal) SSHAgent() (*SSHAgent, error) {
 // or oversize frame is ErrInvalid, and any other transport failure is fixed.
 // Close runs on every return and wipes every binding.
 func (m *SSHAgent) Serve(rw io.ReadWriter) error {
-	if m == nil {
+	if m == nil || m.broker == nil {
 		return ErrUnauthenticated
 	}
 	defer m.Close()
@@ -119,6 +126,17 @@ func (m *SSHAgent) dispatch(body []byte) ([]byte, error) {
 	}
 	if len(body) == 1 && body[0] == sshAgentRequestIdentities {
 		return m.identities()
+	}
+	// A principal whose grants are all absent, revoked or expired owns no
+	// stream, so no stream can record the denial this attempt owes
+	// (invariant 4). The row is the conversation's own: it names the
+	// principal and the operation, and nothing from the frame. Listing
+	// identities is not a credential attempt and is not recorded here.
+	if len(m.streams) == 0 && len(body) > 0 && body[0] == sshAgentSignRequest {
+		if err := m.broker.sshDenyNoGrant(m.agentID); err != nil {
+			return nil, err
+		}
+		return []byte{sshAgentFailure}, nil
 	}
 	// Every other message is the per-grant codec's decision. A binding goes
 	// to all of them, because each grant pins its own host key and needs its
