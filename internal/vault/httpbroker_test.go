@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // These tests use a private synthetic TLS upstream and disposable random
@@ -704,6 +706,97 @@ func TestBrokerRedactForms(t *testing.T) {
 	}
 	if string(redactForms([]byte("plain"), nil, false)) != "plain" {
 		t.Fatal("empty form set rewrote the buffer")
+	}
+}
+
+func TestBrokerRedactsEquivalentCredentialEncodings(t *testing.T) {
+	var secret []byte
+	for {
+		secret = randBytesT(t, 32)
+		std := base64.StdEncoding.EncodeToString(secret)
+		url64 := base64.URLEncoding.EncodeToString(secret)
+		escaped := url.QueryEscape(string(secret))
+		lowerEscaped := lowerPercentHex(escaped)
+		mixedEscaped := mixedPercentHex(escaped)
+		if std != url64 && escaped != lowerEscaped && mixedEscaped != escaped && mixedEscaped != lowerEscaped {
+			break
+		}
+	}
+	forms := credentialForms(grantInjection{style: InjectBearer}, secret)
+	defer wipeForms(forms)
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"uppercase-hex", []byte(strings.ToUpper(hex.EncodeToString(secret)))},
+		{"lowercase-percent-escapes", []byte(lowerPercentHex(url.QueryEscape(string(secret))))},
+		{"mixed-case-percent-escapes", []byte(mixedPercentHex(url.QueryEscape(string(secret))))},
+		{"base64-standard-padded", []byte(base64.StdEncoding.EncodeToString(secret))},
+		{"base64-standard-raw", []byte(base64.RawStdEncoding.EncodeToString(secret))},
+		{"base64-url-padded", []byte(base64.URLEncoding.EncodeToString(secret))},
+		{"base64-url-raw", []byte(base64.RawURLEncoding.EncodeToString(secret))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactForms(append([]byte(nil), tc.body...), forms, false); string(got) != redacted {
+				t.Fatal("equivalent credential encoding survived redaction")
+			}
+		})
+	}
+}
+
+func TestBrokerWithholdsMCPBase64EncodingLeak(t *testing.T) {
+	secret := []byte(base64.RawStdEncoding.EncodeToString(randBytesT(t, 18)))
+	encoded := "/" + string(secret)
+	encoded += strings.Repeat("A", (4-len(encoded)%4)%4)
+	body, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || utf8.Valid(body) {
+		t.Fatal("invalid binary response fixture")
+	}
+	forms := credentialForms(grantInjection{style: InjectBearer}, secret)
+	defer wipeForms(forms)
+	for _, form := range forms {
+		if bytes.Contains(body, form) {
+			t.Fatal("binary fixture already held a credential form")
+		}
+	}
+
+	resp, err := projectResponse(grantInjection{style: InjectBearer}, secret, http.Header{}, body, false)
+	if err == nil {
+		projected := brokerBody(resp)
+		if projected.BodyBase64 == "" || !strings.Contains(projected.BodyBase64, string(secret)) {
+			t.Fatal("fixture did not reproduce the MCP encoding leak")
+		}
+		t.Fatal("MCP base64 credential form was not withheld")
+	}
+	if !errors.Is(err, ErrBrokerUpstream) || resp.Body != nil {
+		t.Fatal("MCP base64 credential form did not fail closed")
+	}
+}
+
+func TestBrokerCapsExpandedRedaction(t *testing.T) {
+	var secret []byte
+	for {
+		secret = randBytesT(t, 1)
+		forms := credentialForms(grantInjection{style: InjectBearer}, secret)
+		safeMarker := true
+		for _, form := range forms {
+			if bytes.Contains([]byte(redacted), form) {
+				safeMarker = false
+			}
+		}
+		wipeForms(forms)
+		if safeMarker {
+			break
+		}
+	}
+	body := bytes.Repeat(secret, maxAgentBody)
+	resp, err := projectResponse(grantInjection{style: InjectBearer}, secret, http.Header{}, body, false)
+	if err != nil {
+		t.Fatal("expanded redaction was unexpectedly withheld")
+	}
+	if len(resp.Body) > maxAgentBody || !resp.Truncated {
+		t.Fatal("expanded redaction exceeded the response cap")
 	}
 }
 

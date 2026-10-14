@@ -136,16 +136,20 @@ every transport header are absent because they are not on the list, not because
 they were subtracted from one.
 
 Every spelling of the credential is removed from both the body and the returned
-headers: raw, URL-encoded, base64, hex and JSON-string-escaped, plus the basic
-`user:pass` pair in those same spellings. Each occurrence becomes `[redacted]`.
+headers: raw, URL-encoded with percent-escape hex matched case-insensitively,
+standard and URL-safe base64 in padded and raw forms, lower- and uppercase hex,
+and JSON-string-escaped, plus the basic `user:pass` pair in those same
+spellings. Each occurrence becomes `[redacted]`.
 
 Redaction is streaming-safe by construction: the capped buffer is assembled
 first, then rewritten in one left-to-right pass, so a credential split across
 upstream read boundaries is still one match and inserted marker bytes are never
-rescanned. Truncation can cut a credential in half, so a truncated buffer also
-loses its longest trailing proper prefix of any spelling. After projection the
-broker re-checks containment and withholds the whole response as
-`upstream_error` if any spelling survived; a leak fails the call, not the check.
+rescanned. Replacement can expand the body, so the rewritten result is capped
+again at 32 KiB and marked truncated. Truncation can cut a credential in half,
+so a truncated buffer also loses its longest trailing proper prefix of any
+spelling. After projection the broker re-checks containment and withholds the
+whole response as `upstream_error` if any spelling survived; a leak fails the
+call, not the check.
 
 The request-side refusals above cannot bind an upstream, which may send a
 content coding or a partial response nobody asked for. So the response is
@@ -204,6 +208,11 @@ credential value.
 
 The response body is a JSON string when the redacted bytes are valid UTF-8
 without NUL, and `body_base64` otherwise. Exactly one of the two is present.
+Before releasing a body that requires `body_base64`, the response projection
+computes that exact standard padded base64 string while the credential is still
+in scope and withholds the response if the encoding creates any credential
+spelling. MCP never performs an unchecked secret-derived transformation after
+the credential has left scope.
 
 ### 9. CLI
 
@@ -290,6 +299,13 @@ Synthetic only. No live API is called by the test suite.
   matching, including the `/repos/o/rx` sibling case.
 - `TestBrokerGrantShapeValidation`, `TestBrokerRequestShapeLimits`,
   `TestBrokerRedactForms`, `TestBrokerPathUnderPrefix`.
+- `TestBrokerRedactsEquivalentCredentialEncodings` — uppercase hex,
+  case-insensitive percent escapes, and all four standard/URL-safe padded/raw
+  base64 forms are removed.
+- `TestBrokerWithholdsMCPBase64EncodingLeak` — a binary body that contains no
+  credential form but whose MCP base64 projection creates one is withheld.
+- `TestBrokerCapsExpandedRedaction` — replacement expansion cannot make the
+  projected body exceed 32 KiB and sets `truncated`.
 - `TestMCPNetworkBroker*` — the whole MCP path: catalogue scope, handle
   retargeting, foreign handles, lifecycle, credential replacement, destination
   denials and fail-closed audit, now parameterised over `http_broker`.
