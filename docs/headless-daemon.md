@@ -1,0 +1,130 @@
+# Headless unlock: one daemon, many agents
+
+`tremelay mcp serve` prompts for the passphrase every time a client launches it
+([ADR 0020](adr/0020-local-stdio-mcp.md)). Unattended agents cannot answer a
+prompt, so `tremelay daemon` moves the unlock to you, once, in your terminal:
+it holds the unlocked vault in memory and serves agents on a user-only local
+endpoint until you lock it. Each agent authenticates with its own token file
+and gets exactly the three MCP tools it already had — `list_capabilities`,
+`describe_capability`, `invoke_capability` — scoped to its own grants.
+
+No raw secret, no passphrase, and no human control-plane operation is reachable
+over that endpoint. See [ADR 0024](adr/0024-headless-unlock-daemon.md) for the
+trust boundary this moves and the tradeoff you are accepting.
+
+**Linux and macOS only.** On other platforms these three commands fail closed;
+use the pinentry path in [local stdio MCP](local-stdio-mcp.md) instead.
+
+## Give an agent a token
+
+Create the agent with a token file, then grant it the operations it needs. The
+token is 32 random bytes; the vault seals only its SHA-256. The command prints
+the agent ID and the token path — never the token itself.
+
+```sh
+tremelay agent create --path /absolute/vault.db --label claude-code --token-file ~/.tremelay/claude-code.token
+tremelay grant create --path /absolute/vault.db --agent AGENT_ID --credential CRED_ID \
+  --operation local_artifact_attest --resource build/release.tar.gz --expires 2027-01-01T00:00:00Z
+```
+
+The token file is written 0600 with `O_EXCL`, so it will not overwrite an
+existing file. It is a bearer secret: anything that can read it can use that
+agent's grants while the daemon is unlocked. Without `--token-file` no token
+copy survives the command, and that agent can only be used through pinentry.
+
+An agent created before this feature has no token digest and cannot
+authenticate to the daemon. Create a new agent for it. There is no
+`agent token rotate` yet; revoke the agent and create another.
+
+## Unlock
+
+```sh
+tremelay daemon --vault /absolute/vault.db --idle-timeout 8h
+```
+
+It prompts for the passphrase on your terminal, then prints the endpoint path
+and serves. `--idle-timeout` accepts `1s` through `24h`, defaults to `1h`, and
+counts only time with no agent connected. Keep this terminal, a `tmux` window,
+or a user service running — the key lives nowhere else, so closing the process
+or rebooting locks the vault.
+
+Leave the control plane alone while it runs. Creating an agent or changing a
+grant commits to the same vault, which makes the daemon's session stale; it
+then zeroises and exits with a fixed diagnostic rather than serving. Lock
+first, make the change, unlock again.
+
+## Register the stdio command with a client
+
+`tremelay mcp --daemon --token-file FILE` is what the client launches. It
+connects to the daemon, authenticates with the token, and relays MCP. It never
+prompts.
+
+### Claude Code
+
+```sh
+claude mcp add --transport stdio --scope local tremelay -- /absolute/tremelay mcp --daemon --token-file /absolute/claude-code.token
+```
+
+### Hermes
+
+```yaml
+mcp_servers:
+  tremelay:
+    command: /absolute/tremelay
+    args: [mcp, --daemon, --token-file, /absolute/claude-code.token]
+    protocol: legacy
+    connect_timeout: 10
+    supports_parallel_tool_calls: false
+```
+
+### Codex
+
+```toml
+[mcp_servers.tremelay]
+command = "/absolute/tremelay"
+args = ["mcp", "--daemon", "--token-file", "/absolute/codex.token"]
+startup_timeout_sec = 10
+tool_timeout_sec = 30
+```
+
+Give each client its own agent and its own token file. Startup timeouts can be
+short here: there is no human entry and no KDF in this path. The protocol
+profile, retry contract and ambiguous-outcome rules are unchanged from
+[local stdio MCP](local-stdio-mcp.md#protocol-and-retry-contract) — in
+particular, never automatically replay an invocation whose response went
+missing; read the audit.
+
+## Lock
+
+```sh
+tremelay lock
+```
+
+The daemon zeroises the session and exits, and the next client call fails
+closed with a generic error. The idle timeout and losing the process do the
+same thing. Nothing survives to be unlocked without your passphrase.
+
+## What gets audited
+
+Every authentication attempt lands in the audit chain as `daemon_auth`:
+accepted and inactive-agent attempts name the agent, an unknown token names
+nobody because there is nobody to name. The token never appears in a row, a log
+line, or an error. Capability use is audited exactly as before.
+
+```sh
+tremelay audit list --path /absolute/vault.db --action daemon_auth
+```
+
+## Endpoint custody
+
+The socket lives in `$XDG_RUNTIME_DIR/tremelay`, or `tremelay-<uid>` under the
+system temporary directory when that variable is unset. The directory is 0700
+and the socket is 0600, both verified at startup: a path owned by another user,
+of the wrong type, or readable by group or other refuses to start, and a socket
+that still answers a dial is treated as a live daemon rather than replaced.
+Every connection's peer uid must equal the daemon's before any byte is read.
+
+That uid is the boundary. Code already running as you, while the daemon is
+unlocked, can use your agents' granted capabilities — it still cannot read a
+credential, change a grant, or learn your passphrase, and everything it does is
+in the audit chain.

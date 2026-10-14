@@ -86,3 +86,14 @@ Exact private bindings include credential generation, username and host key;
 public discovery omits SSH key identity. One private, bounded stream epoch belongs
 to each Serve, with cancellation retirement and joined wiping. Raw Exchange cannot
 borrow that state. This adds no listener, remote SSH connection or command runner.
+
+## Headless unlock
+
+[ADR 0024](docs/adr/0024-headless-unlock-daemon.md) adds `tremelay daemon`, the
+one resident process that holds an unlocked session for unattended agents. The
+human unlocks it once in a terminal; agents authenticate with per-agent bearer
+tokens whose SHA-256 the vault seals, over a user-only local endpoint with
+peer-uid enforcement. It serves the same capability adapter and the same stdio
+MCP profile, adds `daemon_auth` audit rows, and exposes no human operation and
+no raw secret. The boundary becomes the owner's uid rather than the owner's
+presence at a prompt; Linux and macOS only, elsewhere it fails closed.

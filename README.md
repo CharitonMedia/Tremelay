@@ -51,6 +51,18 @@ the broker. The initialize-based profile supports `2025-06-18` and
 and [measured Codex, Claude Code and Hermes integration](docs/named-client-mcp-tests.md).
 This command ignores the environment-passphrase shortcut described above.
 
+Unattended agents cannot answer a prompt, so `tremelay daemon --vault PATH`
+unlocks once in your terminal and serves agents on a user-only local endpoint
+until `tremelay lock`, its idle timeout, or process loss zeroises the session.
+Each agent gets its own token file from `tremelay agent create --token-file`,
+and `tremelay mcp --daemon --token-file FILE` is the stdio command the client
+launches. The daemon derives the agent principal only from that token, serves
+only the same three tools, and exposes no human operation and no raw secret.
+Linux and macOS only; elsewhere these commands fail closed. See
+[the headless daemon guide](docs/headless-daemon.md) and
+[ADR 0024](docs/adr/0024-headless-unlock-daemon.md) for the trust boundary this
+moves: while unlocked, code running as you can use your agents' authority.
+
 ## Core goals
 
 - Self-hosted and open source from day one.

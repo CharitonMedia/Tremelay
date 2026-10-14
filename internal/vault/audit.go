@@ -21,6 +21,7 @@ const (
 	actionGet          = "credential_get"
 	actionList         = "credential_list"
 	actionAgentCreate  = "agent_create"
+	actionDaemonAuth   = "daemon_auth"
 	actionGrantCreate  = "grant_create"
 	actionGrantRevoke  = "grant_revoke"
 	actionAuthorize    = "capability_authorize"
@@ -361,7 +362,7 @@ func verifyLinked(events []auditEvent) error {
 func knownAction(action string) bool {
 	switch action {
 	case actionCreate, actionUnlock, actionPassphrase, actionPut, actionGet, actionList,
-		actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
+		actionAgentCreate, actionDaemonAuth, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
 		actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
 		actionHealthGet, actionHealthList:
@@ -377,7 +378,7 @@ func noticeAction(action string) bool {
 
 func capabilityAction(action string) bool {
 	switch action {
-	case actionAgentCreate, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap:
+	case actionAgentCreate, actionDaemonAuth, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList, actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap:
 		return true
 	default:
 		return false
@@ -469,6 +470,24 @@ func validAuditShape(ev auditEvent) error {
 			if ev.Result == resultAllowed && (ev.AgentID == "" || ev.GrantID == "" || ev.CredID == "" || ev.CredType == "" || ev.Operation == "") {
 				return ErrAudit
 			}
+		}
+	case actionDaemonAuth:
+		// Token authentication names only the agent the token resolved to.
+		// An unknown token has no attribution; the token is never a field.
+		if ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
+			return ErrAudit
+		}
+		switch ev.Result {
+		case resultAllowed, resultDeniedAgent:
+			if ev.AgentID == "" {
+				return ErrAudit
+			}
+		case resultDenied:
+			if ev.AgentID != "" {
+				return ErrAudit
+			}
+		default:
+			return ErrAudit
 		}
 	case actionCapList:
 		if ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
