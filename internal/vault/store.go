@@ -353,8 +353,6 @@ func loadVaultMode(path string, readonly, legacyAudit bool) (*sql.DB, fileHeader
 		if err = migrateVault(db); err != nil {
 			return fail(err)
 		}
-	} else if err = vaultHandoffReady(db); err != nil {
-		return fail(err)
 	}
 	header, events, err := readVaultSnapshot(db, legacyAudit)
 	if err != nil {
@@ -420,9 +418,23 @@ func readVaultRow(db queryer) (fileHeader, error) {
 	if n != 1 {
 		return fileHeader{}, ErrCorrupt
 	}
+	// Vaults written before V1 item 3e have no handoff columns. They read as
+	// empty (no handoff pending); Unlock adds them, read-only paths never do.
+	cols, err := vaultColumnSet(db)
+	if err != nil {
+		return fileHeader{}, err
+	}
+	handoff := make([]string, 0, 3)
+	for _, name := range []string{"dek_reload_pubkey", "dek_handoff_nonce", "dek_handoff"} {
+		if cols[name] {
+			handoff = append(handoff, name)
+		} else {
+			handoff = append(handoff, "X''")
+		}
+	}
 	var h fileHeader
 	var timeCost, memory, threads, keyLen, seq int64
-	err := db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, dek_reload_pubkey, dek_handoff_nonce, dek_handoff FROM vault`).Scan(
+	err = db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, ` + strings.Join(handoff, ", ") + ` FROM vault`).Scan(
 		&h.ID, &h.Version, &h.Root, &h.KDF.Algorithm, &h.KDF.Salt, &timeCost, &memory, &threads, &keyLen,
 		&h.WrapNonce, &h.WrappedDEK, &h.DataNonce, &h.Data, &h.AuditHead, &seq, &h.DEKReloadPubKey, &h.DEKHandoffNonce, &h.DEKHandoff,
 	)
