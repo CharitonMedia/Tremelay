@@ -611,29 +611,31 @@ func migrateVault(db *sql.DB) error {
 	if !missing {
 		return nil
 	}
-	tx, err := db.Begin()
-	if err != nil {
-		return ErrIO
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
+			return err
 		}
-	}()
-	for _, col := range adds {
-		if cols[col.name] {
-			continue
+		committed := false
+		defer func() {
+			if !committed {
+				_ = tx.Rollback()
+			}
+		}()
+		for _, col := range adds {
+			if cols[col.name] {
+				continue
+			}
+			if _, err := tx.Exec(col.ddl); err != nil {
+				return ErrCorrupt
+			}
 		}
-		if _, err := tx.Exec(col.ddl); err != nil {
-			return ErrCorrupt
+		if err := commitWriteTx(tx); err != nil {
+			return err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return ErrIO
-	}
-	committed = true
-	return nil
+		committed = true
+		return nil
+	})
 }
 
 func backfillAuditVersion(tx *sql.Tx) error {
