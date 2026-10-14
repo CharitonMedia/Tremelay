@@ -422,7 +422,7 @@ var wipedSecret func([]byte)
 // the detection mirror against the chain, health against the chain, and the
 // stored credential, agent and grant shapes. It is the whole verification
 // Unlock performs once the DEK is in hand, and the whole verification
-// Session.Reload performs with the DEK it already holds. A rejected document
+// Session.reloadLocked performs with the DEK it already holds. A rejected document
 // is wiped here, so no caller receives decoded credential bytes to leak.
 func openDocument(dek []byte, header fileHeader, events []auditEvent) (document, *detectionIndex, error) {
 	plain, err := openAEAD(dek, header.DataNonce, header.Data, dataAAD(header.ID, header.AuditHead, header.AuditSeq))
