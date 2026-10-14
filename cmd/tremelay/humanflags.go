@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"strings"
 )
 
 const (
@@ -37,9 +36,12 @@ func newHumanFlagSet(name string) *flag.FlagSet {
 	return fs
 }
 
-// parseHumanFlags discards flag-package diagnostics that may echo caller-supplied
-// secret-like text. On failure it prints the fixed usage line and, when known,
-// the bare flag name only. -h/--help still prints the flag set usage to stderr.
+// parseHumanFlags discards flag-package diagnostics, which quote the offending
+// argument and so can echo caller-supplied secret-like text. On failure it
+// prints the command's usage line and nothing of the arguments: the flag
+// package's error carries the value and the name in one string, and every way
+// of splitting one from the other is a parse of attacker-chosen bytes.
+// -h/--help still prints the flag set usage to stderr.
 func parseHumanFlags(fs *flag.FlagSet, usageLine string, stderr io.Writer, args []string) error {
 	err := fs.Parse(args)
 	if err == nil {
@@ -51,38 +53,5 @@ func parseHumanFlags(fs *flag.FlagSet, usageLine string, stderr io.Writer, args 
 		return err
 	}
 	fmt.Fprintln(stderr, usageLine)
-	if name := flagNameFromParseError(err); name != "" {
-		fmt.Fprintln(stderr, name)
-	}
 	return err
-}
-
-func flagNameFromParseError(err error) string {
-	if err == nil {
-		return ""
-	}
-	msg := err.Error()
-	switch {
-	case strings.HasPrefix(msg, "invalid boolean value "):
-		if i := strings.Index(msg, " for -"); i >= 0 {
-			return flagNameBeforeColon(msg[i+len(" for -"):])
-		}
-	case strings.HasPrefix(msg, "invalid value "):
-		if i := strings.Index(msg, " for flag -"); i >= 0 {
-			return flagNameBeforeColon(msg[i+len(" for flag -"):])
-		}
-		if i := strings.Index(msg, " for -"); i >= 0 {
-			return flagNameBeforeColon(msg[i+len(" for -"):])
-		}
-	case strings.HasPrefix(msg, "flag provided but not defined: -"):
-		return strings.TrimPrefix(msg, "flag provided but not defined: -")
-	}
-	return ""
-}
-
-func flagNameBeforeColon(rest string) string {
-	if j := strings.Index(rest, ":"); j >= 0 {
-		return rest[:j]
-	}
-	return rest
 }

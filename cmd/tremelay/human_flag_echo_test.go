@@ -2,34 +2,43 @@ package main
 
 import (
 	"bytes"
-	"flag"
-	"io"
 	"strings"
 	"testing"
 )
 
 const humanFlagSentinel = "TREMELAY_SENTINEL_DO_NOT_ECHO_7f3a9c2b1d4e8f6a0b5c"
 
-func TestFlagNameFromParseError(t *testing.T) {
-	for _, tc := range []struct {
-		args []string
-		want string
-	}{
-		{[]string{"--limit=" + humanFlagSentinel}, "limit"},
-		{[]string{"--clear-expires=" + humanFlagSentinel}, "clear-expires"},
-		{[]string{"--=" + humanFlagSentinel}, ""},
-		{[]string{"--unknown=" + humanFlagSentinel}, "unknown"},
-	} {
-		fs := flag.NewFlagSet("probe", flag.ContinueOnError)
-		fs.SetOutput(io.Discard)
-		fs.Int("limit", 0, "")
-		fs.Bool("clear-expires", false, "")
-		err := fs.Parse(tc.args)
-		if err == nil {
-			t.Fatalf("%v: expected parse error", tc.args)
-		}
-		if got := flagNameFromParseError(err); got != tc.want {
-			t.Fatalf("%v: got %q want %q (err %v)", tc.args, got, tc.want, err)
+// TestCLIHumanFlagParseErrorsOmitAdversarialSpellings covers values chosen to
+// look like the flag package's own error text. Nothing of the argument is
+// printed, so a value carrying " for flag -" or sitting in the flag name
+// itself is no different from any other.
+func TestCLIHumanFlagParseErrorsOmitAdversarialSpellings(t *testing.T) {
+	path := "/tmp/tremelay-test-vault"
+	id := "cred-id"
+	spellings := []string{
+		humanFlagSentinel,
+		"x for flag -" + humanFlagSentinel + ":y",
+		"x for -" + humanFlagSentinel + ":y",
+		`"` + humanFlagSentinel + `" for flag -limit`,
+	}
+	for _, secret := range spellings {
+		for _, args := range [][]string{
+			{"audit", "list", "--path", path, "--limit=" + secret},
+			{"audit", "get", "--path", path, "--seq=" + secret},
+			{"credential", "policy", "--path", path, "--min-length=" + secret},
+			{"credential", "lifecycle", "--path", path, "--id", id, "--clear-expires=" + secret},
+			{"credential", "replace", "--path", path, "--id", id, "--clear-review=" + secret},
+			{"audit", "list", "--path", path, "--" + humanFlagSentinel},
+			{"audit", "list", "--path", path, "--" + humanFlagSentinel + "=1"},
+		} {
+			var stdout, stderr bytes.Buffer
+			if code := run(args, envGet(nil), strings.NewReader(""), &stdout, &stderr); code == 0 {
+				t.Fatalf("%v: parse error succeeded", args)
+			}
+			combined := stdout.String() + stderr.String()
+			if strings.Contains(combined, humanFlagSentinel) {
+				t.Fatalf("%v: output contained sentinel: stdout=%q stderr=%q", args, stdout.String(), stderr.String())
+			}
 		}
 	}
 }
