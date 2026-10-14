@@ -84,7 +84,8 @@ jobs:
             if ($log -notmatch "--- PASS: $name\b") { throw "$name did not run on windows-latest." }
           }
       - name: Test
-        run: go test ./...
+        # internal/vault took 190-600s on windows-latest; the default is 10m.
+        run: go test -timeout 20m ./...
       - name: Vet
         run: go vet ./...
       - name: Test build-evidence verifier
