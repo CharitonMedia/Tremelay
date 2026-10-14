@@ -97,11 +97,13 @@ and no destination field beyond the granted origin.
 
 Refused, before DNS and before any secret is copied: `Authorization`,
 `Proxy-Authorization`, `Cookie`, `Host`, `Content-Length`,
-`Transfer-Encoding`, `Expect`, `Accept-Encoding`, `Range`, `If-Range`, the
+`Transfer-Encoding`, `Expect`, `Accept-Encoding`, `Range`, `If-Range`,
+`X-HTTP-Method-Override`, `X-HTTP-Method`, `X-Method-Override`,
+`X-Original-URL`, `X-Rewrite-URL`, `X-Forwarded-Host`, `Forwarded`, the
 hop-by-hop names (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`,
 `Trailer`, `Trailers`, `Upgrade`), the grant's own named injection header,
-and — for query injection — any query parameter with the grant's parameter
-name.
+any query parameter named `_method` (case-insensitive), and — for query
+injection — any query parameter with the grant's parameter name.
 
 `Accept-Encoding`, `Range` and `If-Range` are refused for the same reason as
 the framing headers: they choose the *form* of the response bytes, and
@@ -161,6 +163,15 @@ fail-closed `upstream_error` path as a surviving credential form. A
 transparently decoded gzip body is unaffected: the transport removes
 `Content-Encoding` when it does the decoding, and the decoded bytes are an
 ordinary literal match.
+
+`2026-10-14`: After the body is read, the same withholding applies when there
+is no `Content-Encoding` but the bytes begin with a known compressed-container
+prefix: gzip (`1f 8b`), zstd (`28 b5 2f fd`), xz (`fd 37 7a 58 5a 00`), or
+bzip2 (`BZh` + block digit `1`–`9` + `31 41 59 26 53 59`). zlib (`0x78`) is
+not matched on magic alone because it collides with text. Brotli, deflate/zlib
+when framed only by `Content-Encoding`, and other custom codings remain
+covered by the header-side `Content-Encoding` check above when the transport
+did not decode them.
 
 ### 6. Defences kept unchanged
 
@@ -309,6 +320,11 @@ Synthetic only. No live API is called by the test suite.
   a `206`, and a `Content-Range` without a `206` are each withheld whole as
   `upstream_error`; neither the compressed bytes, the decompressed token nor a
   range fragment reaches the agent.
+- `TestBrokerWithholdsCompressedBodyWithoutContentEncoding` — gzip, zstd, xz
+  and bzip2 container prefixes with no `Content-Encoding` are withheld as
+  `upstream_error`; a plaintext echo without those prefixes is still redacted.
+- `TestBrokerRefusesHeaderSmuggling` also covers method/path override headers,
+  `Forwarded`, and a `_method` query parameter (each denied before upstream).
 - `TestBrokerRefusesRedirect` — a 3xx is refused, its `Location` and body are
   not projected, and the credential is not forwarded.
 - `TestBrokerGrantMatching` — positive and negative origin, prefix and method

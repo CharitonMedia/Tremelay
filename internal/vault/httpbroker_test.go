@@ -365,6 +365,15 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 		{name: "injected-header-slot-folded", inject: InjectHeader, injectName: "X-Api-Key", headers: map[string]string{"x-API-key": "attacker"}},
 		{name: "injected-query-slot", inject: InjectQuery, injectName: "access_token", query: "access_token=attacker"},
 		{name: "injected-query-slot-folded", inject: InjectQuery, injectName: "access_token", query: "a=1&ACCESS_Token=attacker"},
+		{name: "method-override-header", inject: InjectBearer, headers: map[string]string{"X-HTTP-Method-Override": "DELETE"}},
+		{name: "method-override-header-folded", inject: InjectBearer, headers: map[string]string{"x-http-METHOD": "PATCH"}},
+		{name: "x-method-override", inject: InjectBearer, headers: map[string]string{"X-Method-Override": "POST"}},
+		{name: "x-original-url", inject: InjectBearer, headers: map[string]string{"X-Original-URL": "/admin"}},
+		{name: "x-rewrite-url", inject: InjectBearer, headers: map[string]string{"X-Rewrite-URL": "/admin"}},
+		{name: "x-forwarded-host", inject: InjectBearer, headers: map[string]string{"X-Forwarded-Host": "evil.example"}},
+		{name: "forwarded", inject: InjectBearer, headers: map[string]string{"Forwarded": `host=evil.example`}},
+		{name: "method-override-query", inject: InjectBearer, query: "_method=DELETE"},
+		{name: "method-override-query-folded", inject: InjectBearer, query: "a=1&_METHOD=PATCH"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -381,7 +390,7 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 			// A collision with the grant's own slot is a policy refusal and is
 			// attributed; a forbidden name is refused before attribution.
 			wantResult := resultDenied
-			if strings.HasPrefix(tc.name, "injected-") {
+			if strings.HasPrefix(tc.name, "injected-") || strings.Contains(tc.name, "method-override-query") {
 				wantResult = resultDeniedMalformed
 				if !errors.Is(err, ErrDeniedMalformed) {
 					t.Fatalf("injection collision error %v", err)
@@ -484,6 +493,63 @@ func TestBrokerWithholdsUndecodedOrPartialBody(t *testing.T) {
 			e.assertNoLeak(t, err.Error())
 		})
 	}
+}
+
+// TestBrokerWithholdsCompressedBodyWithoutContentEncoding covers upstream
+// bodies that are compressed containers with no Content-Encoding: the literal
+// scan cannot match them and gunzip would recover the credential.
+func TestBrokerWithholdsCompressedBodyWithoutContentEncoding(t *testing.T) {
+	const echoLabel = "SENTINEL_ECHO:"
+	cases := []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "gzip-no-header", raw: nil},
+		{name: "zstd-magic", raw: []byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00}},
+		{name: "xz-magic", raw: []byte{0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00}},
+		{name: "bzip2-magic", raw: []byte("BZh1\x31\x41\x59\x26\x53\x59\x00")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newHTTPBrokerEnv(t, InjectBearer, "")
+			e.s.httpDo = func(req *http.Request) (*http.Response, error) {
+				e.requests++
+				auth := req.Header.Get("Authorization")
+				raw := tc.raw
+				if raw == nil {
+					raw = gzipBytes(t, echoLabel+auth)
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/plain"}},
+					Body:       io.NopCloser(bytes.NewReader(raw)),
+				}, nil
+			}
+			resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
+			if !errors.Is(err, ErrBrokerUpstream) || resp.StatusCode != 0 || resp.Body != nil || resp.Headers != nil {
+				t.Fatalf("compressed body without coding was projected: %+v %v", resp, err)
+			}
+			if e.requests != 1 || e.lastResult(t) != resultUpstreamError {
+				t.Fatalf("requests %d result %s", e.requests, e.lastResult(t))
+			}
+			e.assertNoLeak(t, err.Error())
+		})
+	}
+	t.Run("plaintext-prefix-still-redacted", func(t *testing.T) {
+		e := newHTTPBrokerEnv(t, InjectBearer, "")
+		e.handler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, echoLabel+r.Header.Get("Authorization"))
+		}
+		resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
+		if err != nil {
+			t.Fatalf("plaintext echo failed: %v", err)
+		}
+		if !strings.HasPrefix(string(resp.Body), echoLabel) || !bytes.Contains(resp.Body, []byte(redacted)) {
+			t.Fatalf("plaintext body was not redacted: %q", resp.Body)
+		}
+		e.assertNoLeak(t, string(resp.Body), mustHeaderText(resp.Headers))
+	})
 }
 
 // TestBrokerRefusesRedirect keeps ADR 0006's refusal: the credential is never

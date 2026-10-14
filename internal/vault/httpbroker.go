@@ -63,6 +63,8 @@ var refusedAgentHeaders = []string{
 	"authorization", "proxy-authorization", "cookie", "host",
 	"content-length", "transfer-encoding", "expect",
 	"accept-encoding", "range", "if-range",
+	"x-http-method-override", "x-http-method", "x-method-override",
+	"x-original-url", "x-rewrite-url", "x-forwarded-host", "forwarded",
 	"connection", "keep-alive", "proxy-connection", "te", "trailer", "trailers", "upgrade",
 }
 
@@ -594,14 +596,27 @@ func injectionCollides(headers map[string]string, query string, inj grantInjecti
 			}
 		}
 	case InjectQuery:
-		for _, pair := range strings.Split(query, "&") {
-			name := pair
-			if i := strings.IndexByte(pair, '='); i >= 0 {
-				name = pair[:i]
-			}
-			if strings.EqualFold(name, inj.name) {
-				return true
-			}
+		if queryParamNamed(query, inj.name) {
+			return true
+		}
+	}
+	return false
+}
+
+// queryMethodOverride reports a query parameter that would retarget the HTTP
+// method on frameworks that honor `_method`.
+func queryMethodOverride(query string) bool {
+	return queryParamNamed(query, "_method")
+}
+
+func queryParamNamed(query, want string) bool {
+	for _, pair := range strings.Split(query, "&") {
+		name := pair
+		if i := strings.IndexByte(pair, '='); i >= 0 {
+			name = pair[:i]
+		}
+		if strings.EqualFold(name, want) {
+			return true
 		}
 	}
 	return false
@@ -723,14 +738,39 @@ func wipeForms(forms [][]byte) {
 }
 
 // bodyNotRedactable reports an upstream response whose bytes redaction cannot
-// read: a content coding the transport did not transparently decode, or a
-// partial-content fragment, which can carry a slice of a credential shorter
-// than any whole form. Transparent gzip is unaffected: the transport strips
-// Content-Encoding when it decodes the body itself.
+// read from headers alone: a content coding the transport did not transparently
+// decode, or a partial-content fragment, which can carry a slice of a
+// credential shorter than any whole form. Transparent gzip is unaffected: the
+// transport strips Content-Encoding when it decodes the body itself. After the
+// body is read, bodyCompressedContainerMagic applies the same withholding to
+// undecoded compressed-container prefixes with no Content-Encoding.
 func bodyNotRedactable(status int, h http.Header) bool {
 	coding := strings.ToLower(strings.TrimSpace(h.Get("Content-Encoding")))
 	return (coding != "" && coding != "identity") ||
 		status == http.StatusPartialContent || h.Get("Content-Range") != ""
+}
+
+// bodyCompressedContainerMagic reports a body that begins with a known
+// compressed-container prefix (gzip, zstd, xz, bzip2). zlib is excluded
+// because 0x78 collides with text; brotli and other codings rely on
+// Content-Encoding refusal when the transport did not decode them.
+func bodyCompressedContainerMagic(body []byte) bool {
+	switch {
+	case len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b:
+		return true
+	case len(body) >= 4 && body[0] == 0x28 && body[1] == 0xb5 && body[2] == 0x2f && body[3] == 0xfd:
+		return true
+	case len(body) >= 6 && body[0] == 0xfd && body[1] == 0x37 && body[2] == 0x7a &&
+		body[3] == 0x58 && body[4] == 0x5a && body[5] == 0x00:
+		return true
+	case len(body) >= 10 && body[0] == 'B' && body[1] == 'Z' && body[2] == 'h' &&
+		body[3] >= '1' && body[3] <= '9' &&
+		body[4] == 0x31 && body[5] == 0x41 && body[6] == 0x59 && body[7] == 0x26 &&
+		body[8] == 0x53 && body[9] == 0x59:
+		return true
+	default:
+		return false
+	}
 }
 
 // projectResponse builds the agent-visible response: the allowlisted headers
