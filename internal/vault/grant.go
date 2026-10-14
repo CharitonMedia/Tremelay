@@ -138,9 +138,22 @@ type agentRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 	State     string    `json:"state"`
 	// TokenHash is SHA-256 of this agent's bearer token. The token itself is
-	// never stored. It is absent on agents sealed before ADR 0024, which
-	// cannot authenticate to the daemon.
+	// never stored. It is absent on an agent sealed before ADR 0024 and on
+	// one whose token was revoked; neither can authenticate to the daemon.
 	TokenHash []byte `json:"token_hash,omitempty"`
+	// TokenGen counts the tokens this agent has been given. Issue and rotate
+	// raise it, revoke keeps it, so a token minted after a revocation is
+	// never the generation of the one it replaced. An agent sealed before
+	// the generation existed reads as generation 1 when it holds a digest.
+	TokenGen uint64 `json:"token_gen,omitempty"`
+}
+
+// tokenGen is the stored generation with the pre-generation shape normalized.
+func (a agentRecord) tokenGen() uint64 {
+	if a.TokenGen == 0 && len(a.TokenHash) == sha256.Size {
+		return 1
+	}
+	return a.TokenGen
 }
 
 type grantRecord struct {
@@ -307,6 +320,7 @@ func (s *Session) CreateAgent(label string) (Agent, error) {
 		CreatedAt: time.Now().UTC(),
 		State:     agentStateActive,
 		TokenHash: sum[:],
+		TokenGen:  1,
 	}
 	next := append(append([]agentRecord{}, s.agents...), rec)
 	partial := auditEvent{Action: actionAgentCreate, Result: resultAllowed, AgentID: id}
@@ -510,6 +524,123 @@ func (s *Session) RevokeGrant(id string) error {
 	}, s.creds, s.agents, next)
 }
 
+// IssueAgentToken mints the first bearer token for an agent that has none,
+// which is how an agent created before ADR 0024, or one whose token was
+// revoked, reaches the daemon without being recreated. It refuses an agent
+// that still holds a token: replacing a live token is RotateAgentToken, so
+// neither call can retire a working client by accident. The returned
+// Agent.Token is the only copy.
+func (s *Session) IssueAgentToken(id string) (Agent, error) {
+	return s.mintAgentToken(actionAgentTokenIssue, id)
+}
+
+// RotateAgentToken replaces the token of an agent that holds one. The old
+// token stops authenticating at once, including in a running daemon, which
+// re-reads the vault (ADR 0024, amendment of 2026-10-13). The agent keeps its
+// id, its state and every grant, so no client configuration changes.
+func (s *Session) RotateAgentToken(id string) (Agent, error) {
+	return s.mintAgentToken(actionAgentTokenRotate, id)
+}
+
+// mintAgentToken is issue and rotate, which differ only in whether a token
+// must already be there. One body, so the digest, the generation and the
+// audit row cannot drift apart between them.
+func (s *Session) mintAgentToken(action, id string) (Agent, error) {
+	if err := s.begin(); err != nil {
+		return Agent{}, err
+	}
+	defer s.end()
+	idx := s.agentIndex(id)
+	if idx < 0 {
+		return Agent{}, s.finish(auditEvent{Action: action, Result: resultDenied}, ErrAgentNotFound)
+	}
+	cur := s.agents[idx]
+	held := len(cur.TokenHash) == sha256.Size
+	if held && action == actionAgentTokenIssue {
+		return Agent{}, s.finish(auditEvent{Action: action, Result: resultDeniedAgent, AgentID: cur.ID}, ErrAgentTokenPresent)
+	}
+	if !held && action == actionAgentTokenRotate {
+		return Agent{}, s.finish(auditEvent{Action: action, Result: resultDeniedAgent, AgentID: cur.ID}, ErrAgentTokenAbsent)
+	}
+	token, err := randBytes(AgentTokenLen)
+	if err != nil {
+		return Agent{}, err
+	}
+	sum := sha256.Sum256(token)
+	next := append([]agentRecord{}, s.agents...)
+	next[idx].TokenHash = sum[:]
+	next[idx].TokenGen = cur.tokenGen() + 1
+	if err := s.writeAudit(auditEvent{Action: action, Result: resultAllowed, AgentID: cur.ID}, s.creds, next, s.grants); err != nil {
+		wipe(token)
+		return Agent{}, err
+	}
+	out := next[idx].public()
+	out.Token = token
+	return out, nil
+}
+
+// RevokeAgentToken clears an agent's token digest. The agent keeps its id,
+// its state and its grants, and a later IssueAgentToken restores access to
+// exactly those grants under a new generation. A daemon serving the old token
+// refuses it on the next call.
+func (s *Session) RevokeAgentToken(id string) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	idx := s.agentIndex(id)
+	if idx < 0 {
+		return s.finish(auditEvent{Action: actionAgentTokenRevoke, Result: resultDenied}, ErrAgentNotFound)
+	}
+	cur := s.agents[idx]
+	if len(cur.TokenHash) != sha256.Size {
+		return s.finish(auditEvent{Action: actionAgentTokenRevoke, Result: resultDeniedAgent, AgentID: cur.ID}, ErrAgentTokenAbsent)
+	}
+	next := append([]agentRecord{}, s.agents...)
+	next[idx].TokenHash = nil
+	next[idx].TokenGen = cur.tokenGen()
+	return s.writeAudit(auditEvent{Action: actionAgentTokenRevoke, Result: resultAllowed, AgentID: cur.ID}, s.creds, next, s.grants)
+}
+
+func (s *Session) agentIndex(id string) int {
+	if safeID(id) == "" {
+		return -1
+	}
+	for i := range s.agents {
+		if s.agents[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// RejectAgentTokenIssue records a metadata-free agent_token_issue denial.
+func (s *Session) RejectAgentTokenIssue(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	return s.denyAction(actionAgentTokenIssue, cause)
+}
+
+// RejectAgentTokenRotate records a metadata-free agent_token_rotate denial.
+func (s *Session) RejectAgentTokenRotate(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	return s.denyAction(actionAgentTokenRotate, cause)
+}
+
+// RejectAgentTokenRevoke records a metadata-free agent_token_revoke denial.
+func (s *Session) RejectAgentTokenRevoke(cause error) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	return s.denyAction(actionAgentTokenRevoke, cause)
+}
+
 // RejectAgentCreate records a metadata-free agent_create denial.
 func (s *Session) RejectAgentCreate(cause error) error {
 	if err := s.begin(); err != nil {
@@ -672,12 +803,7 @@ func (s *Session) finish(partial auditEvent, cause error) error {
 }
 
 func (s *Session) agentExists(id string) bool {
-	for i := range s.agents {
-		if s.agents[i].ID == id {
-			return true
-		}
-	}
-	return false
+	return s.agentIndex(id) >= 0
 }
 
 func (s *Session) agentActive(id string) bool {
@@ -1005,8 +1131,11 @@ func validateAgentsAndGrants(doc document) error {
 		if _, err := requireTime(a.CreatedAt); err != nil {
 			return ErrCorrupt
 		}
-		// Absent is a pre-ADR-0024 agent that cannot authenticate. Any other
-		// length is not a SHA-256 digest and is not silently accepted.
+		// Absent is a pre-ADR-0024 agent or a revoked token, neither of which
+		// can authenticate. Any other length is not a SHA-256 digest and is
+		// not silently accepted. A digest with no generation is the shape
+		// sealed before generations existed; a generation with no digest is
+		// a revoked token and keeps its count.
 		if a.TokenHash != nil && len(a.TokenHash) != sha256.Size {
 			return ErrCorrupt
 		}

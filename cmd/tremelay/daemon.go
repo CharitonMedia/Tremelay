@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -467,8 +468,7 @@ func writeAgentToken(path string, token []byte) error {
 	if err != nil {
 		return errAgentToken
 	}
-	encoded := hex.AppendEncode(make([]byte, 0, hex.EncodedLen(len(token))+1), token)
-	encoded = append(encoded, '\n')
+	encoded := encodeAgentToken(token)
 	defer vault.Wipe(encoded)
 	_, err = f.Write(encoded)
 	if closeErr := f.Close(); err == nil {
@@ -479,4 +479,55 @@ func writeAgentToken(path string, token []byte) error {
 		return errAgentToken
 	}
 	return nil
+}
+
+// replaceAgentToken puts a rotated token at the path the client is already
+// configured with. The new token is written and flushed to a user-only
+// temporary file beside it and then renamed over it, so a reader either gets
+// the whole old token or the whole new one, never a truncated file and never
+// a file the daemon has already stopped accepting while the old one is gone.
+func replaceAgentToken(path string, token []byte) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".tremelay-token-")
+	if err != nil {
+		return errAgentToken
+	}
+	encoded := encodeAgentToken(token)
+	defer vault.Wipe(encoded)
+	fail := func() error {
+		f.Close()
+		os.Remove(f.Name())
+		return errAgentToken
+	}
+	// CreateTemp is 0600 already; this states the requirement rather than
+	// inheriting it, because the file holds a bearer secret.
+	if err := f.Chmod(0o600); err != nil {
+		return fail()
+	}
+	if _, err := f.Write(encoded); err != nil {
+		return fail()
+	}
+	// ponytail: the file is flushed, the directory entry is not, so a crash
+	// between the rename and the directory's own writeback can leave the old
+	// token in place. That is the recoverable direction — the operator sees
+	// the old token still working and rotates again — and os.File cannot
+	// fsync a directory portably. Upgrade path: a build-tagged directory
+	// sync on Unix.
+	if err := f.Sync(); err != nil {
+		return fail()
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return errAgentToken
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
+		os.Remove(f.Name())
+		return errAgentToken
+	}
+	return nil
+}
+
+func encodeAgentToken(token []byte) []byte {
+	encoded := hex.AppendEncode(make([]byte, 0, hex.EncodedLen(len(token))+1), token)
+	return append(encoded, '\n')
 }

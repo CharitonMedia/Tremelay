@@ -185,17 +185,17 @@ memory until the command returns.
 - `Session.AuthenticateAgentToken` hashes the presented token and compares
   digests with `crypto/subtle`, returning one active `AgentPrincipal`. No
   caller-supplied identifier takes part: the principal is whatever the digest
-  resolved to, or the call is refused. An agent record with no digest (created
-  before this ADR) cannot authenticate; a digest that is not 32 bytes is
-  corruption, not a usable credential.
+  resolved to, or the call is refused. An agent record with no digest cannot
+  authenticate — that is an agent created before this ADR, or one whose token
+  was revoked, and either can be given a token without being recreated (see
+  the 2026-10-13 amendment). A digest that is not 32 bytes is corruption, not
+  a usable credential.
 - No new cryptography: `crypto/rand`, `crypto/sha256`, `crypto/subtle`. The
   token is a bearer secret protected by the same file permissions and uid
   boundary as the endpoint, not a new key hierarchy.
 
-`tremelay agent token rotate` is **not** in this slice. Rotation needs its own
-audit action, shape validation and tests, so it is not the trivial addition the
-task allowed for. Today an operator revokes an agent and creates a new one,
-which is already audited.
+Token custody — issue, rotate and revoke — was not in the original slice and
+is added by the 2026-10-13 amendment below.
 
 ## What the socket exposes
 
@@ -270,7 +270,8 @@ under `-race`.
   principal or the call is refused.
 - **Store the token in the vault so it can be re-shown.** Rejected. A
   recoverable bearer token is a second raw secret with no capability check in
-  front of it. Only the digest is sealed; a lost token means a new agent.
+  front of it. Only the digest is sealed; a lost token means a new token for
+  the same agent, which the 2026-10-13 amendment adds.
 - **TCP on loopback with the token as the only control.** Rejected. A Unix
   socket gives the kernel's own peer identity and filesystem permissions,
   neither of which loopback offers.
@@ -404,3 +405,77 @@ working agent's call rate and loses outright against roughly a hundred agent
 calls per second. The upgrade path is in the code next to the check: take the
 write transaction first and re-run the caller's mutation against the state
 read inside it, which requires every mutating method to be a redoable closure.
+
+## Amendment 2026-10-13: agent token custody (V1.md item 3c)
+
+Status stays Accepted pending owner veto.
+
+The original slice left one way to change a token: delete the agent and make
+another. That takes the agent's id and all of its grants with it, so the
+operator has to reissue every grant and edit the client's MCP configuration,
+and an agent created before this ADR could not reach the daemon at all. The
+practical result is that nobody rotates, which is the opposite of what a
+bearer token needs.
+
+Three commands now manage the token and nothing else:
+
+| Command | Precondition | Effect |
+| --- | --- | --- |
+| `tremelay agent token issue --path P --agent ID --token-file F` | the agent holds no token | mints one, writes `F` |
+| `tremelay agent token rotate --path P --agent ID --token-file F` | the agent holds a token | replaces it, rewrites `F` in place |
+| `tremelay agent token revoke --path P --agent ID` | the agent holds a token | clears the digest, writes no file |
+
+The agent's id, label, state and every grant survive all three, so a client's
+configuration never changes and no grant is reissued. `issue` refuses an agent
+that already holds a token rather than silently retiring a working client, and
+`rotate` refuses one that holds none; each refusal names the other command.
+
+The replaced token stops authenticating immediately, including in a daemon
+that is already serving, because that daemon re-reads the vault (see the
+amendment above). The two halves of V1.md item 3 are one feature: rotation
+without the reload would still mean a restart.
+
+`agentRecord` gains `token_gen`, the count of tokens this agent has held.
+Issue and rotate raise it; revoke clears the digest and keeps the count, so a
+token minted after a revocation is never the generation of the one it
+replaced and a record cannot be rolled back to an earlier custody period
+without that being visible in the sealed document. A record sealed before the
+field existed reads as generation 1 while it holds a digest. Authentication
+is unchanged: the digest resolves the principal or the call is refused.
+
+Three new audit actions, `agent_token_issue`, `agent_token_rotate` and
+`agent_token_revoke`, at audit version 2 under the existing
+`knownAction`/`capabilityAction`/`validAuditShape` allowlists:
+
+| Outcome | Result | Fields |
+| --- | --- | --- |
+| Minted or cleared | `allowed` | `agent_id` |
+| Refused, agent identified | `denied_agent` | `agent_id` |
+| Unknown or malformed agent id | `denied` | none |
+
+A row carries no credential, grant or operation, and nothing derived from the
+token: not the material, not its digest, not its length, and not the
+generation. The shape validator rejects each of those, and rejects an
+`agent_id` on the unattributed outcome. A digest in the chain would be an
+offline verifier for a guessed token, and the generation would narrow a
+guess at which file is current.
+
+File custody: the vault commits before the file is written, so there is never
+a token on disk that the vault has already stopped accepting. A rotation
+writes a 0600 temporary file in the target's own directory, flushes it, and
+renames it over the target, so a reader gets the whole old token or the whole
+new one. The directory entry itself is not fsynced; the failure that leaves
+behind is the recoverable one — the old token still works and the operator
+rotates again — and that ceiling is marked in the code. A `--token-file` path
+that exists and is not already a readable token file is refused before the
+vault commits, so a mistyped argument cannot overwrite an unrelated file.
+
+Tests: in `internal/vault`, custody end to end on an agent with no digest
+(issue, authenticate, rotate, old token refused, revoke, reissue) with grants
+unchanged throughout and generations strictly increasing; every refusal with
+its exact audit row; the shapes the validator must reject; the stored
+generation surviving a seal and unlock; and no token, digest or passphrase in
+the file or the logs. In `cmd/tremelay`, the same custody over the real CLI
+on every platform, and over a live daemon on Unix, including a superseded
+token refused by the running daemon and audited as an unattributed
+`daemon_auth` denial. These are security controls under invariant 13.

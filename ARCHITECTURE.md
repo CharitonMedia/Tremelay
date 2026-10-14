@@ -98,7 +98,11 @@ on Linux and macOS, an owner-only named pipe with a client-SID check on
 Windows. It serves the same capability adapter and the same stdio MCP profile,
 adds `daemon_auth` audit rows, and exposes no human operation and no raw
 secret. The boundary becomes the owner's account rather than the owner's
-presence at a prompt.
+presence at a prompt. While it runs,
+the control plane stays usable: a commit from the human CLI is re-read and
+re-verified by the resident session with the key it already holds, so new
+grants and rotated or revoked agent tokens take effect on the next call, and
+only a file that fails that verification locks the daemon.
 
 ## SSH agent socket
 

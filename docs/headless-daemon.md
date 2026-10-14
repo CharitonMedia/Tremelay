@@ -35,9 +35,32 @@ read is refused when it is used. It is a bearer secret: anything that can read
 it can use that agent's grants while the daemon is unlocked. Without `--token-file` no token
 copy survives the command, and that agent can only be used through pinentry.
 
-An agent created before this feature has no token digest and cannot
-authenticate to the daemon. Create a new agent for it. There is no
-`agent token rotate` yet; revoke the agent and create another.
+## Give an existing agent a token, or replace one
+
+No agent ever has to be recreated to get a working token, and no client
+configuration has to change: the three commands below keep the agent's id,
+its state and every grant it holds.
+
+```sh
+# An agent that has no token: one created before this feature, or one whose
+# token was revoked.
+tremelay agent token issue --path /absolute/vault.db --agent AGENT_ID --token-file ~/.tremelay/claude-code.token
+
+# Replace a live token at the path the client already points at.
+tremelay agent token rotate --path /absolute/vault.db --agent AGENT_ID --token-file ~/.tremelay/claude-code.token
+
+# Take daemon access away and leave the agent and its grants in place.
+tremelay agent token revoke --path /absolute/vault.db --agent AGENT_ID
+```
+
+Each command prints the token path, or the agent id for `revoke`, and never
+the token. `issue` refuses an agent that still holds a token, so it cannot
+retire a working client by accident; `rotate` is the command for that.
+Rotation writes a user-only temporary file beside the target and renames it
+over it, so a reader gets the whole old token or the whole new one. The
+replaced token stops authenticating at once, including in a running daemon.
+A path that is not already a token file is refused before the vault commits,
+so a mistyped `--token-file` cannot overwrite something else.
 
 ## Unlock
 
@@ -130,6 +153,10 @@ line, or an error. Capability use is audited exactly as before.
 ```sh
 tremelay audit list --path /absolute/vault.db --action daemon_auth
 ```
+
+Token custody is audited the same way, as `agent_token_issue`,
+`agent_token_rotate` and `agent_token_revoke`. Each row names the agent and
+nothing else: no credential, no grant, and nothing derived from the token.
 
 ## Endpoint custody
 

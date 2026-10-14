@@ -781,6 +781,113 @@ func TestCLIAuditVerifyReportsStdoutWriteFailure(t *testing.T) {
 	}
 }
 
+// TestCLIAgentTokenCustody is the V1.md item 3c control plane with no daemon
+// in the picture, so it runs on every platform: a token is rotated, revoked
+// and reissued at one path, the agent keeps its id and its grant throughout,
+// and no token byte is printed.
+func TestCLIAgentTokenCustody(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault.db")
+	pass := randHex(t, 16)
+	env := envGet(map[string]string{"TREMELAY_PASSPHRASE": pass})
+	tokenFile := filepath.Join(dir, "worker.token")
+	cli := func(t *testing.T, args ...string) string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		if code := run(args, env, strings.NewReader(""), &stdout, &stderr); code != 0 {
+			t.Fatalf("%v exited %d: %s", args, code, stderr.String())
+		}
+		return strings.TrimSpace(stdout.String())
+	}
+	cli(t, "vault", "create", "--path", path)
+	secretPath := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secretPath, randBytes(t, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credID := cli(t, "credential", "put", "--path", path, "--label", "ci", "--type", "api_key", "--secret-file", secretPath)
+	agentID := strings.Split(cli(t, "agent", "create", "--path", path, "--label", "worker", "--token-file", tokenFile), "\n")[0]
+	cli(t, "grant", "create", "--path", path, "--agent", agentID, "--credential", credID,
+		"--operation", "http_request", "--resource", "svc:one",
+		"--expires", time.Now().UTC().Add(time.Hour).Format(time.RFC3339))
+	read := func(t *testing.T) string {
+		t.Helper()
+		raw, err := os.ReadFile(tokenFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(raw))
+	}
+	minted := read(t)
+
+	// Rotation replaces the file in place: same path, same mode, new token.
+	if out := cli(t, "agent", "token", "rotate", "--path", path, "--agent", agentID, "--token-file", tokenFile); out != tokenFile {
+		t.Fatalf("rotate printed %q", out)
+	}
+	rotated := read(t)
+	if rotated == minted || len(rotated) != len(minted) {
+		t.Fatalf("rotate wrote %q", rotated)
+	}
+	info, err := os.Lstat(tokenFile)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("rotated token file is %v (%v)", info.Mode(), err)
+	}
+	if entries, err := os.ReadDir(dir); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".tremelay-token-") {
+				t.Fatal("rotation left its temporary file behind")
+			}
+		}
+	}
+
+	// Revoke takes the token away and issue restores one at the same path.
+	cli(t, "agent", "token", "revoke", "--path", path, "--agent", agentID)
+	cli(t, "agent", "token", "issue", "--path", path, "--agent", agentID, "--token-file", tokenFile)
+	reissued := read(t)
+	if reissued == rotated || reissued == minted {
+		t.Fatalf("issue reused a retired token")
+	}
+
+	// The agent and its grant are the ones the client is configured with.
+	var listed map[string]any
+	if err := json.Unmarshal([]byte(cli(t, "capability", "list", "--path", path, "--agent", agentID)), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed["status"] != "active" || listed["resource"] != "svc:one" {
+		t.Fatalf("token custody changed the agent's authority: %#v", listed)
+	}
+
+	// Every attempt is audited, and no token byte is printed or sealed.
+	for _, action := range []string{"agent_token_rotate", "agent_token_revoke", "agent_token_issue"} {
+		out := cli(t, "audit", "list", "--path", path, "--action", action)
+		if !strings.Contains(out, `"result":"allowed"`) || !strings.Contains(out, agentID) {
+			t.Fatalf("%s row %q", action, out)
+		}
+		for _, token := range []string{minted, rotated, reissued} {
+			if strings.Contains(out, token) {
+				t.Fatalf("%s row carries token material", action)
+			}
+		}
+	}
+	sealed, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{minted, rotated, reissued} {
+		raw, err := hex.DecodeString(token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(sealed, raw) {
+			t.Fatal("the vault file contains a raw token")
+		}
+	}
+	if _, err := vault.VerifyAudit(path, []byte(pass)); err != nil {
+		t.Fatalf("audit chain invalid: %v", err)
+	}
+}
+
 func TestCLIAgentGrantAndCapability(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "vault.db")

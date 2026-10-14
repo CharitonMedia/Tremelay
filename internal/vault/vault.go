@@ -108,6 +108,12 @@ var (
 	ErrAgentNotFound = errors.New("agent not found")
 	// ErrGrantNotFound means the grant id is not in this vault.
 	ErrGrantNotFound = errors.New("grant not found")
+	// ErrAgentTokenPresent means this agent already holds a token. Issuing a
+	// second one would retire a working client silently; rotate instead.
+	ErrAgentTokenPresent = errors.New("agent already holds a token; rotate it instead")
+	// ErrAgentTokenAbsent means this agent holds no token to replace or
+	// revoke. Issuing one gives it daemon access without touching its grants.
+	ErrAgentTokenAbsent = errors.New("agent holds no token; issue one instead")
 	// ErrDeniedAgent means authorization failed because the principal does not hold the grant.
 	ErrDeniedAgent = errors.New("denied_agent")
 	// ErrDeniedCredential means authorization failed because the credential does not match.

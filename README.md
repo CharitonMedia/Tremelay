@@ -108,7 +108,8 @@ Copy-paste setup from install to first successful call, one page per client:
 The shape is the same everywhere. `tremelay daemon --vault PATH` asks for your
 passphrase once in your terminal and then serves agents on a user-only local
 socket; `tremelay agent create --token-file FILE` gives each agent its own bearer
-token file; `tremelay mcp --daemon --token-file FILE` is the stdio command the
+token file, and `tremelay agent token issue|rotate|revoke` manage it later without
+recreating the agent; `tremelay mcp --daemon --token-file FILE` is the stdio command the
 client launches. `tremelay lock`, the idle timeout, or losing the process
 zeroises the key. See [the headless daemon guide](docs/headless-daemon.md), or
 [local stdio MCP](docs/local-stdio-mcp.md) for the per-launch pinentry path

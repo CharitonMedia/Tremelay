@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -222,6 +223,17 @@ func (f *daemonFixture) relay(t *testing.T, tokenFile string) *agentRelay {
 	}()
 	t.Cleanup(func() { stdinW.Close(); stdoutR.Close() })
 	return r
+}
+
+// relayToken connects with a token that is no longer at the agent's path,
+// which is how a client holding a superseded token is simulated.
+func (f *daemonFixture) relayToken(t *testing.T, token string) *agentRelay {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "held.token")
+	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return f.relay(t, path)
 }
 
 func (r *agentRelay) send(t *testing.T, frame string) {
@@ -682,6 +694,193 @@ func TestDaemonConcurrentCallsDuringReload(t *testing.T) {
 	if _, err := vault.VerifyAudit(f.path, []byte(f.pass)); err != nil {
 		t.Fatalf("audit chain invalid: %v", err)
 	}
+}
+
+// auditRows returns the result and agent of every row with this action, in
+// chain order, straight from the file.
+func (f *daemonFixture) auditRows(t *testing.T, action string) [][2]string {
+	t.Helper()
+	db, err := sql.Open("sqlite", f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT result, agent_id FROM audit WHERE action = ? ORDER BY seq`, action)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out [][2]string
+	for rows.Next() {
+		var result, agent string
+		if err := rows.Scan(&result, &agent); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, [2]string{result, agent})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestDaemonAgentTokenCustody is the V1.md item 3c acceptance path over the
+// real CLI and a live daemon: a token is rotated and revoked and reissued at
+// the path the client is already configured with, the agent keeps its id and
+// its grants throughout, and the daemon honours each change on the next call
+// with no restart.
+func TestDaemonAgentTokenCustody(t *testing.T) {
+	f := startDaemon(t, time.Hour)
+	worker := f.agents[0]
+	stale := f.token(t, worker)
+	working := f.relay(t, worker.tokenFile)
+	if listed := working.capabilities(t); !strings.Contains(listed, worker.resource) {
+		t.Fatalf("capability call before rotation: %q", listed)
+	}
+	working.finish(t)
+
+	if out := f.cli(t, "agent", "token", "rotate", "--path", f.path, "--agent", worker.id,
+		"--token-file", worker.tokenFile); out != worker.tokenFile {
+		t.Fatalf("rotate reported %q, want the same path", out)
+	}
+	rotated := f.token(t, worker)
+	if rotated == stale {
+		t.Fatal("rotate left the same token at the path")
+	}
+	// The daemon re-reads the vault, so the superseded token is refused by
+	// the process that was serving it a moment ago.
+	if code := f.relayToken(t, stale).finish(t); code != 1 {
+		t.Fatal("the superseded token still authenticated")
+	}
+	after := f.relay(t, worker.tokenFile)
+	if listed := after.capabilities(t); !strings.Contains(listed, worker.resource) {
+		t.Fatalf("the rotated token lost the agent's grants: %q", listed)
+	}
+	after.finish(t)
+
+	// Revoking the token takes daemon access away and leaves everything else
+	// in place; reissuing to the same path restores it.
+	f.cli(t, "agent", "token", "revoke", "--path", f.path, "--agent", worker.id)
+	if code := f.relay(t, worker.tokenFile).finish(t); code != 1 {
+		t.Fatal("a revoked token still authenticated")
+	}
+	f.cli(t, "agent", "token", "issue", "--path", f.path, "--agent", worker.id, "--token-file", worker.tokenFile)
+	reissued := f.relay(t, worker.tokenFile)
+	entries := capabilityEntries(t, reissued.capabilities(t))
+	if len(entries) != 1 || entries[0].Resource != worker.resource || entries[0].Status != vault.GrantActive {
+		t.Fatalf("the reissued token does not hold the agent's grants: %+v", entries)
+	}
+	if frame, signed := reissued.attest(t, 3, entries[0].Handle); !signed {
+		t.Fatalf("the reissued token could not use the grant: %q", frame)
+	}
+	reissued.finish(t)
+	if f.exited() {
+		t.Fatalf("daemon exited during token custody: %q", f.stderr.String())
+	}
+
+	// Each attempt is audited, and the refused ones are daemon_auth denials
+	// with no attribution, since a retired token resolves to no agent.
+	custody := map[string][][2]string{
+		"agent_token_rotate": {{"allowed", worker.id}},
+		"agent_token_revoke": {{"allowed", worker.id}},
+		"agent_token_issue":  {{"allowed", worker.id}},
+	}
+	for action, want := range custody {
+		if got := f.auditRows(t, action); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s rows %v, want %v", action, got, want)
+		}
+	}
+	denied := 0
+	for _, row := range f.auditRows(t, "daemon_auth") {
+		if row[0] == "denied" && row[1] == "" {
+			denied++
+		}
+	}
+	if denied != 2 {
+		t.Fatalf("retired tokens produced %d unattributed denials", denied)
+	}
+	// Nothing printed the token, and the file still holds only the digest.
+	if strings.Contains(f.stdout.String()+f.stderr.String(), rotated) {
+		t.Fatal("a token reached daemon output")
+	}
+	sealed, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{stale, rotated, f.token(t, worker)} {
+		raw, err := hex.DecodeString(token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(sealed, raw) {
+			t.Fatal("the vault file contains a raw token")
+		}
+	}
+
+	f.cancel()
+	f.wait(t, 15*time.Second)
+	if _, err := vault.VerifyAudit(f.path, []byte(f.pass)); err != nil {
+		t.Fatalf("audit chain invalid: %v", err)
+	}
+}
+
+// TestAgentTokenCustodyCLIRefusals covers the control-plane refusals, which
+// happen with no daemon in the picture at all.
+func TestAgentTokenCustodyCLIRefusals(t *testing.T) {
+	f := startDaemon(t, time.Hour)
+	worker := f.agents[0]
+	spare := filepath.Join(filepath.Dir(worker.tokenFile), "spare.token")
+	cases := map[string]struct {
+		args []string
+		code int
+	}{
+		// issue refuses an agent that still holds a token, rather than
+		// retiring a client that is working right now.
+		"issue over a live token": {[]string{"agent", "token", "issue", "--path", f.path, "--agent", worker.id, "--token-file", spare}, 1},
+		"unknown agent":           {[]string{"agent", "token", "rotate", "--path", f.path, "--agent", randHex(t, 16), "--token-file", spare}, 1},
+		"rotate with no path":     {[]string{"agent", "token", "rotate", "--path", f.path, "--agent", worker.id}, 1},
+		"revoke with a path":      {[]string{"agent", "token", "revoke", "--path", f.path, "--agent", worker.id, "--token-file", spare}, 1},
+		"no agent":                {[]string{"agent", "token", "rotate", "--path", f.path, "--token-file", spare}, 1},
+		"unknown verb":            {[]string{"agent", "token", "renew", "--path", f.path, "--agent", worker.id}, 2},
+		"unknown flag":            {[]string{"agent", "token", "rotate", "--path", f.path, "--agent", worker.id, "--force"}, 1},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := run(tc.args, envGet(f.env), strings.NewReader(""), &stdout, &stderr); code != tc.code {
+				t.Fatalf("exited %d, want %d: %q", code, tc.code, stderr.String())
+			}
+			if _, err := os.Lstat(spare); err == nil {
+				t.Fatal("a refused command wrote a token file")
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("a refused command printed %q", stdout.String())
+			}
+		})
+	}
+	// A path that is not a token file is a mistyped argument, and the vault
+	// must not commit before saying so.
+	other := filepath.Join(filepath.Dir(worker.tokenFile), "notes.txt")
+	if err := os.WriteFile(other, []byte("not a token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := run([]string{"agent", "token", "rotate", "--path", f.path, "--agent", worker.id, "--token-file", other},
+		envGet(f.env), strings.NewReader(""), io.Discard, &stderr); code != 1 {
+		t.Fatalf("rotate overwrote a file that was not a token: %q", stderr.String())
+	}
+	if raw, err := os.ReadFile(other); err != nil || string(raw) != "not a token\n" {
+		t.Fatalf("a refused rotate changed the file: %q %v", raw, err)
+	}
+	// The token the agent is using is untouched by every refusal above.
+	if _, err := vault.VerifyAudit(f.path, []byte(f.pass)); err != nil {
+		t.Fatalf("audit chain invalid: %v", err)
+	}
+	live := f.relay(t, worker.tokenFile)
+	if listed := live.capabilities(t); !strings.Contains(listed, worker.resource) {
+		t.Fatalf("a refused command disturbed a live token: %q", listed)
+	}
+	live.finish(t)
 }
 
 func TestAgentTokenFile(t *testing.T) {
