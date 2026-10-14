@@ -85,8 +85,23 @@ func listenUserSocket(path string) (net.Listener, error) {
 	return listener, nil
 }
 
+// daemonDial sends the agent token only to a daemon the kernel reports as
+// this uid. Without XDG_RUNTIME_DIR the endpoint is under the shared temp dir,
+// where another user can create the path first.
 func daemonDial(getenv func(string) string) (net.Conn, error) {
-	return net.Dial("unix", daemonEndpoint(getenv))
+	return dialSelf(daemonEndpoint(getenv), os.Getuid())
+}
+
+func dialSelf(path string, self int) (net.Conn, error) {
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if !peerIsSelf(conn, self) {
+		conn.Close()
+		return nil, errDaemonEndpoint
+	}
+	return conn, nil
 }
 
 // userOnlyFile refuses a token file any other user can read. Mode 0 is the
