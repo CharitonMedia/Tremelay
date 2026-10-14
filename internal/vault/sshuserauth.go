@@ -78,9 +78,9 @@ type SSHUserAuth struct {
 	// is_forwarding is outside the host signature, and a plain publickey
 	// preimage names no host key, so such a signature could log in elsewhere.
 	forwarded bool
-	hostKey    []byte
-	sessionID  []byte
-	hostSig    []byte
+	hostKey   []byte
+	sessionID []byte
+	hostSig   []byte
 }
 
 // sshBroker is the in-process session surface used by one stream.

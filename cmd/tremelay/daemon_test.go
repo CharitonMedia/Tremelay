@@ -218,6 +218,9 @@ type agentRelay struct {
 	out    *bufio.Reader
 	stderr *daemonOutput
 	exit   chan int
+	// rest is whatever the relay wrote to stdout after finish stopped reading
+	// frame by frame.
+	rest string
 }
 
 func (f *daemonFixture) relay(t *testing.T, tokenFile string) *agentRelay {
@@ -290,8 +293,17 @@ func (r *agentRelay) receive(t *testing.T) string {
 func (r *agentRelay) finish(t *testing.T) int {
 	t.Helper()
 	r.in.Close()
+	// stdout is a synchronous pipe, so a last frame the relay is still
+	// writing holds run open until someone reads it. Drain to EOF, which the
+	// relay goroutine reaches by closing its end before it reports the code.
+	drained := make(chan string, 1)
+	go func() {
+		rest, _ := io.ReadAll(r.out)
+		drained <- string(rest)
+	}()
 	select {
 	case code := <-r.exit:
+		r.rest = <-drained
 		return code
 	case <-time.After(15 * time.Second):
 		t.Fatal("relay did not exit")
@@ -620,9 +632,8 @@ func TestDaemonLocksOnPassphraseChange(t *testing.T) {
 		t.Fatalf("daemon did not report the passphrase lock: %q", f.stderr.String())
 	}
 	agent.finish(t)
-	rest, _ := io.ReadAll(agent.out)
-	if strings.Contains(string(rest), worker.resource) {
-		t.Fatalf("call after the passphrase change was served: %q", rest)
+	if strings.Contains(agent.rest, worker.resource) {
+		t.Fatalf("call after the passphrase change was served: %q", agent.rest)
 	}
 	if rows := f.auditRows(t, "vault_unlock"); len(rows) == 0 || rows[len(rows)-1][0] != "denied" {
 		t.Fatalf("refused daemon key not audited: %v", rows)

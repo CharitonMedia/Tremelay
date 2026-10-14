@@ -434,7 +434,7 @@ func readVaultRow(db queryer) (fileHeader, error) {
 	}
 	var h fileHeader
 	var timeCost, memory, threads, keyLen, seq int64
-	err = db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, ` + strings.Join(handoff, ", ") + ` FROM vault`).Scan(
+	err = db.QueryRow(`SELECT id, format_version, root, kdf_algorithm, kdf_salt, kdf_time, kdf_memory, kdf_threads, kdf_key_len, wrap_nonce, wrapped_dek, data_nonce, encrypted_document, audit_head, audit_seq, `+strings.Join(handoff, ", ")+` FROM vault`).Scan(
 		&h.ID, &h.Version, &h.Root, &h.KDF.Algorithm, &h.KDF.Salt, &timeCost, &memory, &threads, &keyLen,
 		&h.WrapNonce, &h.WrappedDEK, &h.DataNonce, &h.Data, &h.AuditHead, &seq, &h.DEKReloadPubKey, &h.DEKHandoffNonce, &h.DEKHandoff,
 	)

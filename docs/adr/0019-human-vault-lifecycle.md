@@ -177,7 +177,18 @@ passphrase (ADR 0024, 3g amendment). `change-passphrase` writes no handoff and
 the daemon publishes no reload key.
 
 Accepted ceiling: someone holding an old backup and the old passphrase who can
-also write the vault file as the same user can still substitute a forged vault
-under a passphrase they choose. That locks the owner out of the file. No
-running daemon adopts it, and they learn nothing added after their backup.
+also write the vault file as the same user can still substitute a forged vault.
+They learn nothing added after their backup. Two shapes:
+
+- A forgery under a passphrase they choose uses a DEK no session holds. It locks
+  the owner out of the file, and a resident daemon refuses it as corrupt and exits.
+- A forgery under the DEK their backup already yields is indistinguishable from
+  an authentic continuation to a session holding that same DEK. Omitting the
+  `vault_passphrase_change` row from the chain they write keeps this lock from
+  triggering, so a daemon unlocked before the rotation can be made to serve
+  credentials of their choosing until it is restarted. The lock closes the
+  honest rotation path, not a forger who already has the key.
+
+Nothing the daemon holds can tell the two apart: the chain is hashed, not keyed,
+so every input to that decision is something the old DEK already authenticates.
 Closing it needs a keyed or external audit tip (ADR 0003), which is outside v1.

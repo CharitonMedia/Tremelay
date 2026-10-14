@@ -612,7 +612,10 @@ still read; nothing opens them, and the next commit clears the handoff.
 
 The change row is read from the chain before the document is authenticated, so
 a forged row also locks the daemon. A same-uid file writer can already deny
-service; this adds no reach. Cost: one re-unlock per passphrase change.
+service; this adds no reach. The converse is the ADR 0019 ceiling: a writer who
+also holds the DEK this session holds can omit the row and have the session
+adopt a document sealed under it, which no unkeyed chain can detect. Cost: one
+re-unlock per passphrase change.
 
 Tests: `TestDaemonLocksOnPassphraseChange` (Linux, macOS and Windows CI: next
 call refused, refusal audited, daemon exits, new passphrase serves, `grant
