@@ -167,10 +167,11 @@
         is Linux and macOS only and fails closed on Windows.</li>
       <li><strong>The agent still reads broker responses.</strong> An <code>http_broker</code>
         grant returns the status code, an allowlisted set of response headers, and up to
-        32 KiB of the body with every spelling of the credential redacted. The agent never
-        sees the credential, but it does see the data that credential unlocks — and
-        anything in that body can be prompt injection. Tremelay guarantees the secret is
-        not in the response, not that the response is trustworthy.</li>
+        32 KiB of the body with the credential redacted in its common encodings (raw, URL,
+        base64, hex, JSON-escaped). The agent never sees the credential, but it does see
+        the data that credential unlocks — and anything in that body can be prompt
+        injection. A hostile upstream that deliberately re-encodes or splits the credential
+        is not caught; grant only origins you trust with the credential.</li>
       <li><strong>An unlocked daemon trusts your uid.</strong> While it is unlocked, any code
         running as you can use your agents' granted capabilities. It still cannot read a
         credential, change a grant, or learn your passphrase, and everything it does is
@@ -179,6 +180,9 @@
         fill, no TOTP, no provider-assisted rotation.</strong> These are in
         <a href="https://github.com/CharitonMedia/Tremelay/blob/v1/VISION.md">VISION.md</a>
         and on the roadmap, not in v1.</li>
+      <li><strong>Legacy GitHub issue grants block unlock.</strong> A vault that still holds a
+        pre-v1 <code>github_issue_state</code> grant will not unlock until that grant is
+        revoked with the pre-v1 binary.</li>
       <li><strong>No third-party audit.</strong> No independent security review and no signed
         releases yet. The audit chain is tamper-evident to <em>you</em>; nobody else
         checkpoints it.</li>
