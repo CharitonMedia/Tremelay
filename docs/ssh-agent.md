@@ -25,10 +25,11 @@ attestation uses. Generate it, store it, and delete your copy — nothing but
 the vault needs it again.
 
 ```sh
-openssl genpkey -algorithm ed25519 -outform DER -out /tmp/git-key.der
+D=$(mktemp -d)   # private dir: a fixed /tmp name can be pre-created by another user
+openssl genpkey -algorithm ed25519 -outform DER -out "$D/git-key.der"
 tremelay credential put --path /absolute/vault.db --label "git signing key" \
-  --type ed25519 --secret-file /tmp/git-key.der
-shred -u /tmp/git-key.der
+  --type ed25519 --secret-file "$D/git-key.der"
+shred -u "$D/git-key.der" && rmdir "$D"
 ```
 
 Pin the server. The grant stores the host public key itself, not a hostname:

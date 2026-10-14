@@ -138,7 +138,7 @@ header the broker injected, and it comes back redacted (body abridged):
 
 Response headers are limited to `Content-Type`, `Content-Length`, `ETag`,
 `Last-Modified`, `Link`, `Retry-After` and `X-RateLimit-{Limit,Remaining,Reset,Used,Resource}`; the body is capped
-at 32 KiB; every spelling of the secret becomes `[redacted]`. A denial is only
+at 32 KiB; the secret's common encodings become `[redacted]`. A denial is only
 `{"code":"denied","message":"request denied"}` — the reason is in your audit.
 Never automatically replay an invocation whose response went missing; read the
 audit instead.
