@@ -173,3 +173,39 @@ func TestBrokerRequestRevokedDuringLookupRefused(t *testing.T) {
 		t.Fatalf("upstream saw %d requests after revoke", e.requests)
 	}
 }
+
+// TestBrokerRequestRecheckAfterDNS: everything decided before the lookup is
+// decided again after it on the unbound path, before the secret is copied.
+func TestBrokerRequestRecheckAfterDNS(t *testing.T) {
+	cases := map[string]struct {
+		method string
+		during func(e *httpBrokerEnv)
+	}{
+		"suspended": {http.MethodGet, func(e *httpBrokerEnv) {
+			for i := range e.s.agents {
+				if e.s.agents[i].ID == e.agentID {
+					e.s.agents[i].State = agentStateSuspended
+				}
+			}
+		}},
+		"destructive deny": {http.MethodDelete, func(e *httpBrokerEnv) { e.s.policy.Destructive = DestructiveDeny }},
+		"locked":           {http.MethodGet, func(e *httpBrokerEnv) { e.s.Lock() }},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newHTTPBrokerEnv(t, InjectBearer, "", tc.method)
+			e.s.resolve = func(context.Context, string) ([]net.IP, error) {
+				tc.during(e)
+				return []net.IP{net.ParseIP("1.1.1.1")}, nil
+			}
+			req := e.request(brokerTestPrefix)
+			req.Method = tc.method
+			if _, err := e.principal.BrokerRequest(req); err == nil {
+				t.Fatal("request completed after a change made during DNS")
+			}
+			if e.requests != 0 {
+				t.Fatalf("upstream saw %d requests", e.requests)
+			}
+		})
+	}
+}
