@@ -230,7 +230,18 @@ func (f *daemonFixture) relay(t *testing.T, tokenFile string) *agentRelay {
 func (f *daemonFixture) relayToken(t *testing.T, token string) *agentRelay {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "held.token")
-	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
+	// The platform's owner-only creator: on Windows a plain 0600 write keeps
+	// the inherited ACL, and the client would refuse the file before the
+	// daemon ever saw the token.
+	file, err := createUserOnlyFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = file.WriteString(token + "\n")
+	if cerr := file.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 	return f.relay(t, path)
