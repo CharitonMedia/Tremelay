@@ -20,10 +20,12 @@ const (
 	// OpSign authorizes a future signing operation. Authorizing it does not sign
 	// or reveal key material, and it does not authorize local attestation.
 	OpSign = "sign"
-	// OpGitHubIssueState authorizes one typed GitHub issue-state read.
-	// It does not authorize BrokerHTTP, and an http_request grant does not
-	// authorize this response projection.
-	OpGitHubIssueState = "github_issue_state"
+	// OpHTTPBroker authorizes brokered HTTP requests inside one origin, one
+	// allowed method set and one path prefix, with one credential injection
+	// style. It is the only operation whose response carries upstream headers
+	// and body bytes. An http_request grant does not authorize it, and it does
+	// not authorize BrokerHTTP. See ADR 0025.
+	OpHTTPBroker = "http_broker"
 
 	// AgentTokenLen is the size of a per-agent bearer token from crypto/rand.
 	AgentTokenLen = 32
@@ -36,7 +38,7 @@ const (
 
 // grantOperations is the closed set of capability operations. Secret retrieval
 // is not in the set.
-var grantOperations = []string{OpHTTPRequest, OpSign, OpGitHubIssueState, OpLocalArtifactAttest, OpSSHUserAuth}
+var grantOperations = []string{OpHTTPRequest, OpSign, OpHTTPBroker, OpLocalArtifactAttest, OpSSHUserAuth}
 
 // GrantOperations returns a copy of the operation allowlist.
 func GrantOperations() []string {
@@ -67,6 +69,13 @@ type GrantSpec struct {
 	// on every other operation. SSHHostKey is the canonical ssh-ed25519 blob.
 	SSHUsername string
 	SSHHostKey  []byte
+	// HTTPMethods, HTTPInject and HTTPInjectName are required for http_broker
+	// and forbidden on every other operation. Resource carries that grant's
+	// origin and path prefix. HTTPInjectName is the header name, the basic
+	// user, or the query parameter name, and is empty for bearer.
+	HTTPMethods    []string
+	HTTPInject     string
+	HTTPInjectName string
 }
 
 // Grant is a persisted capability. It does not carry credential plaintext.
@@ -89,6 +98,12 @@ type Grant struct {
 	// constrain the account, the host, or anything that happens after authentication.
 	SSHUsername string
 	SSHHostKey  []byte
+	// HTTPMethods, HTTPInject and HTTPInjectName are the http_broker scope.
+	// Resource carries the origin and path prefix. They are empty for every
+	// other operation. The credential value is not stored here.
+	HTTPMethods    []string
+	HTTPInject     string
+	HTTPInjectName string
 }
 
 // Capability is the agent-visible description of one grant.
@@ -109,6 +124,11 @@ type Capability struct {
 	// They are empty for every other operation.
 	SSHUsername string
 	SSHHostKey  []byte
+	// HTTPMethods, HTTPInject and HTTPInjectName describe an http_broker
+	// grant. HTTPInjectName names the injection slot, never its value.
+	HTTPMethods    []string
+	HTTPInject     string
+	HTTPInjectName string
 }
 
 type agentRecord struct {
@@ -136,6 +156,9 @@ type grantRecord struct {
 	KeyID           string     `json:"key_id,omitempty"`
 	SSHUsername     string     `json:"ssh_username,omitempty"`
 	SSHHostKey      []byte     `json:"ssh_host_key,omitempty"`
+	HTTPMethods     []string   `json:"http_methods,omitempty"`
+	HTTPInject      string     `json:"http_inject,omitempty"`
+	HTTPInjectName  string     `json:"http_inject_name,omitempty"`
 }
 
 // capabilityView is the slice of the vault an agent principal can call.
@@ -144,7 +167,7 @@ type capabilityView interface {
 	listCapabilities(agentID string) ([]Capability, error)
 	authorizeCapability(agentID, credentialID, operation, resource string) (string, error)
 	brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error)
-	githubIssueState(agentID string, req GitHubIssueRequest) (GitHubIssueState, error)
+	brokerRequest(agentID string, req HTTPRequest) (HTTPResponse, error)
 	localAttest(agentID string, req LocalAttestRequest) (LocalAttestation, error)
 }
 
@@ -173,11 +196,11 @@ func (b agentBinder) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrok
 	return b.s.brokerHTTP(agentID, req)
 }
 
-func (b agentBinder) githubIssueState(agentID string, req GitHubIssueRequest) (GitHubIssueState, error) {
+func (b agentBinder) brokerRequest(agentID string, req HTTPRequest) (HTTPResponse, error) {
 	if b.s == nil {
-		return GitHubIssueState{}, ErrUnauthenticated
+		return HTTPResponse{}, ErrUnauthenticated
 	}
-	return b.s.githubIssueState(agentID, req)
+	return b.s.brokerRequest(agentID, req)
 }
 
 func (b agentBinder) localAttest(agentID string, req LocalAttestRequest) (LocalAttestation, error) {
@@ -236,19 +259,21 @@ func (a *AgentPrincipal) BrokerHTTP(req HTTPBrokerRequest) (HTTPBrokerResponse, 
 	return a.view.brokerHTTP(a.id, req)
 }
 
-// GitHubIssueState reads one authorized GitHub issue and returns its state
-// summary. The credential stays inside the broker. An http_request grant does
-// not authorize this call.
-func (a *AgentPrincipal) GitHubIssueState(req GitHubIssueRequest) (GitHubIssueState, error) {
+// BrokerRequest performs one prefix-scoped HTTP request on an http_broker
+// grant. The credential is injected inside the broker and is not a request
+// field. The response carries the status, the allowlisted response headers and
+// the capped body with every occurrence of the credential redacted. An
+// http_request grant does not authorize this call.
+func (a *AgentPrincipal) BrokerRequest(req HTTPRequest) (HTTPResponse, error) {
 	if a == nil || a.view == nil {
-		return GitHubIssueState{}, ErrUnauthenticated
+		return HTTPResponse{}, ErrUnauthenticated
 	}
-	return a.view.githubIssueState(a.id, req)
+	return a.view.brokerRequest(a.id, req)
 }
 
 // LocalAttest signs one bounded payload with the vault-held Ed25519 key named
 // by an exact local_artifact_attest grant. The private key is not returned.
-// A sign, http_request, or github_issue_state grant does not authorize this call.
+// A sign, http_request, or http_broker grant does not authorize this call.
 func (a *AgentPrincipal) LocalAttest(req LocalAttestRequest) (LocalAttestation, error) {
 	if a == nil || a.view == nil {
 		return LocalAttestation{}, ErrUnauthenticated
@@ -383,6 +408,10 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 	if err := sshGrantOK(ops, spec, credType); err != nil {
 		return deny(err)
 	}
+	if err := brokerGrantOK(ops, spec); err != nil {
+		return deny(err)
+	}
+	methods, _ := canonicalMethods(spec.HTTPMethods)
 	keyID := ""
 	if soleLocalAttest(ops) || soleSSH(ops) {
 		secret, ok := s.copySecret(credID)
@@ -400,15 +429,18 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 		return Grant{}, err
 	}
 	rec := grantRecord{
-		ID:          id,
-		AgentID:     agentID,
-		Operations:  ops,
-		Resource:    spec.Resource,
-		CreatedAt:   now,
-		ExpiresAt:   expires,
-		KeyID:       keyID,
-		SSHUsername: spec.SSHUsername,
-		SSHHostKey:  dup(spec.SSHHostKey),
+		ID:             id,
+		AgentID:        agentID,
+		Operations:     ops,
+		Resource:       spec.Resource,
+		CreatedAt:      now,
+		ExpiresAt:      expires,
+		KeyID:          keyID,
+		SSHUsername:    spec.SSHUsername,
+		SSHHostKey:     dup(spec.SSHHostKey),
+		HTTPMethods:    methods,
+		HTTPInject:     spec.HTTPInject,
+		HTTPInjectName: spec.HTTPInjectName,
 	}
 	if spec.CredentialID != "" {
 		rec.CredentialID = credID
@@ -833,6 +865,9 @@ func (g grantRecord) capability(now time.Time) Capability {
 		KeyID:           g.KeyID,
 		SSHUsername:     g.SSHUsername,
 		SSHHostKey:      dup(g.SSHHostKey),
+		HTTPMethods:     append([]string(nil), g.HTTPMethods...),
+		HTTPInject:      g.HTTPInject,
+		HTTPInjectName:  g.HTTPInjectName,
 	}
 }
 
@@ -864,6 +899,9 @@ func (g grantRecord) public() Grant {
 		KeyID:           g.KeyID,
 		SSHUsername:     g.SSHUsername,
 		SSHHostKey:      dup(g.SSHHostKey),
+		HTTPMethods:     append([]string(nil), g.HTTPMethods...),
+		HTTPInject:      g.HTTPInject,
+		HTTPInjectName:  g.HTTPInjectName,
 	}
 }
 
@@ -1035,6 +1073,9 @@ func validateAgentsAndGrants(doc document) error {
 			}
 		}
 		if err := validateGrantKey(g, credTypes); err != nil {
+			return err
+		}
+		if err := validateBrokerGrant(g); err != nil {
 			return err
 		}
 	}

@@ -71,7 +71,7 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay credential refresh --path PATH [--id ID]
   tremelay credential policy --path PATH [--min-length N] [--pattern-run N] [--freshness DURATION] [--reminder-lead DURATION] [--compromise-opt-in true|false]
   tremelay agent create --path PATH --label LABEL [--token-file PATH]
-  tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339 [--ssh-user USER --ssh-host-key HEX]
+  tremelay grant create --path PATH --agent ID (--credential ID | --class TYPE) --operation OP --resource SCOPE --expires RFC3339 [--ssh-user USER --ssh-host-key HEX] [--method M ... --inject STYLE [--inject-name NAME]]
   tremelay grant revoke --path PATH --id ID
   tremelay capability list --path PATH --agent ID
   tremelay capability authorize --path PATH --agent ID --credential ID --operation OP --resource SCOPE
@@ -837,8 +837,12 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 	expires := fs.String("expires", "", "expiration time (RFC3339)")
 	sshUser := fs.String("ssh-user", "", "exact SSH username for ssh_userauth")
 	sshHost := fs.String("ssh-host-key", "", "hex ssh-ed25519 host public key blob for ssh_userauth")
+	inject := fs.String("inject", "", "http_broker credential placement: "+strings.Join(vault.InjectionStyles(), ", "))
+	injectName := fs.String("inject-name", "", "http_broker header name, basic user, or query parameter name")
 	var ops opsFlag
 	fs.Var(&ops, "operation", "permitted operation")
+	var methods opsFlag
+	fs.Var(&methods, "method", "http_broker allowed method (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
 			return session.RejectGrantCreate(vault.ErrInvalid)
@@ -873,6 +877,9 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 			ExpiresAt:       exp.UTC(),
 			SSHUsername:     *sshUser,
 			SSHHostKey:      hostKey,
+			HTTPMethods:     methods,
+			HTTPInject:      *inject,
+			HTTPInjectName:  *injectName,
 		})
 		if err != nil {
 			return err

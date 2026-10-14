@@ -2,7 +2,7 @@
 
 An agent with one expiring `local_artifact_attest` grant can obtain an Ed25519 signature over a bounded local payload. The private key stays in the vault. This is not an SSH agent. It does not open a socket, forward a key, or accept a caller-chosen message.
 
-The grant names one agent, one `ed25519` credential, and one resource. At issuance Tremelay records the public key. A later replacement of the credential bytes keeps the credential id and does not move the grant onto the new key. `sign`, `http_request`, and `github_issue_state` do not authorize this call.
+The grant names one agent, one `ed25519` credential, and one resource. At issuance Tremelay records the public key. A later replacement of the credential bytes keeps the credential id and does not move the grant onto the new key. `sign`, `http_request`, and `http_broker` do not authorize this call.
 
 ## Signed bytes
 

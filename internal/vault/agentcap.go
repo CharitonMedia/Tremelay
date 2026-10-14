@@ -32,26 +32,32 @@ const (
 	capMethodInvoke   = 3
 	capMethodRequest  = 4
 
-	capFieldHandle        = 1
-	capFieldPayload       = 2
-	capFieldOperation     = 3
-	capFieldResource      = 4
-	capFieldKeyID         = 5
-	capFieldStatus        = 6
-	capFieldExpiry        = 7
-	capFieldCatalog       = 8
-	capFieldSignature     = 9
-	capFieldPublicKey     = 10
-	capFieldDomain        = 11
-	capFieldPurpose       = 12
-	capFieldCode          = 13
-	capFieldMessage       = 14
-	capFieldHTTPStatus    = 15
-	capFieldIssueNumber   = 16
-	capFieldIssueState    = 17
-	capFieldIssueLocked   = 18
-	capFieldIssueComments = 19
-	capFieldSSHResponse   = 20
+	capFieldHandle      = 1
+	capFieldPayload     = 2
+	capFieldOperation   = 3
+	capFieldResource    = 4
+	capFieldKeyID       = 5
+	capFieldStatus      = 6
+	capFieldExpiry      = 7
+	capFieldCatalog     = 8
+	capFieldSignature   = 9
+	capFieldPublicKey   = 10
+	capFieldDomain      = 11
+	capFieldPurpose     = 12
+	capFieldCode        = 13
+	capFieldMessage     = 14
+	capFieldHTTPStatus  = 15
+	capFieldSSHResponse = 20
+	// 16 through 19 are retired github_issue_state fields. They are not
+	// reallocated, so a stale encoder cannot be read as a broker response.
+	capFieldHTTPHeaders   = 21
+	capFieldHTTPBody      = 22
+	capFieldHTTPTruncated = 23
+	capFieldHTTPMethod    = 24
+	capFieldHTTPPath      = 25
+	capFieldHTTPQuery     = 26
+	capFieldHTTPMethods   = 27
+	capFieldInjection     = 28
 
 	capTypeBytes  = 1
 	capTypeString = 2
@@ -86,6 +92,11 @@ type agentCapGrant struct {
 	credGen   uint64
 	sshUser   string
 	sshHost   string
+	// methods is the http_broker method set, comma joined in sorted order.
+	// inject is that grant's credential placement as `style[:name]`. Both are
+	// comparable so a handle cannot be retargeted at a rescoped grant.
+	methods string
+	inject  string
 }
 
 type agentCapSnapshot struct {
@@ -105,7 +116,7 @@ type agentCapBroker interface {
 	agentCapList(agentID string) ([]agentCapSnapshot, error)
 	agentCapDescribe(agentID string, bound agentCapGrant) (agentCapView, error)
 	agentCapInvoke(agentID, grantID string, payload []byte) (LocalAttestation, error)
-	agentCapNetwork(context.Context, string, agentCapGrant) (capNetworkResult, error)
+	agentCapNetwork(context.Context, string, agentCapGrant, HTTPRequest) (capNetworkResult, error)
 	agentCapDeny(agentID string, invoke bool) error
 }
 
@@ -175,7 +186,7 @@ func (a *AgentCapability) exchangeSSH(ctx context.Context, message []byte, epoch
 	case capMethodDescribe:
 		return a.describe(req.handle)
 	case capMethodInvoke:
-		return a.invokeSSHContext(ctx, req.handle, req.payload, epoch)
+		return a.invokeBroker(ctx, req, epoch)
 	default:
 		return a.protocolDeny(false, capUnknownMethod)
 	}
@@ -237,7 +248,7 @@ func (a *AgentCapability) describe(handle [32]byte) ([]byte, error) {
 	if err != nil {
 		return nil, ErrInvalid
 	}
-	entry, err := encodeEntry(capEntry{handle: handle, operation: bound.operation, resource: bound.resource, keyID: disclosedCapKey(bound.operation, bound.keyID), status: view.status, expires: exp})
+	entry, err := encodeEntry(capEntry{handle: handle, operation: bound.operation, resource: bound.resource, keyID: disclosedCapKey(bound.operation, bound.keyID), status: view.status, expires: exp, methods: bound.methods, injection: bound.inject})
 	if err != nil {
 		return nil, err
 	}
@@ -253,21 +264,32 @@ func (a *AgentCapability) invokeContext(ctx context.Context, handle [32]byte, pa
 }
 
 func (a *AgentCapability) invokeSSHContext(ctx context.Context, handle [32]byte, payload []byte, epoch *capSSHEpoch) ([]byte, error) {
+	return a.invokeBroker(ctx, capRequest{method: capMethodInvoke, handle: handle, payload: payload}, epoch)
+}
+
+func (a *AgentCapability) invokeBroker(ctx context.Context, req capRequest, epoch *capSSHEpoch) ([]byte, error) {
+	handle, payload := req.handle, req.payload
 	bound, ok := a.lookup(handle)
 	if !ok {
 		return a.protocolDeny(true, capUnknownHandle)
 	}
 	if bound.operation == OpSSHUserAuth {
-		if len(payload) == 0 || len(payload) > MaxSSHFrame {
+		if req.broker != nil || len(payload) == 0 || len(payload) > MaxSSHFrame {
 			return a.protocolDeny(false, capMalformed)
 		}
 		return a.invokeSSH(ctx, handle, bound, payload, epoch)
 	}
 	if networkOperation(bound.operation) {
-		if payload != nil {
+		// An http_request handle takes no arguments; an http_broker handle
+		// requires the request shape and never a signing payload.
+		if payload != nil || (req.broker == nil) != (bound.operation == OpHTTPRequest) {
 			return a.protocolDeny(false, capMalformed)
 		}
-		out, err := a.broker.agentCapNetwork(ctx, a.agentID, bound)
+		var shape HTTPRequest
+		if req.broker != nil {
+			shape = *req.broker
+		}
+		out, err := a.broker.agentCapNetwork(ctx, a.agentID, bound, shape)
 		if err != nil {
 			if capHost(err) {
 				return nil, err
@@ -275,6 +297,9 @@ func (a *AgentCapability) invokeSSHContext(ctx context.Context, handle [32]byte,
 			return encodeCapError(capFromErr(err))
 		}
 		return encodeNetworkResult(out)
+	}
+	if req.broker != nil {
+		return a.protocolDeny(false, capMalformed)
 	}
 	if len(payload) == 0 {
 		return a.protocolDeny(false, capMalformed)
@@ -340,6 +365,8 @@ func (a *AgentCapability) bindAll(snaps []agentCapSnapshot) ([]capEntry, error) 
 			keyID:     disclosedCapKey(stored.operation, stored.keyID),
 			status:    sn.status,
 			expires:   exp,
+			methods:   stored.methods,
+			injection: stored.inject,
 		})
 	}
 	return out, nil
@@ -403,6 +430,7 @@ func (s *Session) agentCapList(agentID string) ([]agentCapSnapshot, error) {
 		snaps = append(snaps, agentCapSnapshot{
 			agentCapGrant: agentCapGrant{
 				grantID: g.ID, credID: g.CredentialID, keyID: g.KeyID, resource: g.Resource, operation: g.Operations[0], credGen: c.Gen, sshUser: g.SSHUsername, sshHost: string(g.SSHHostKey),
+				methods: strings.Join(g.HTTPMethods, ","), inject: formatInjection(grantInjectionOf(g)),
 			},
 			status:  s.attestCapStatus(g, now),
 			expires: g.ExpiresAt.UTC(),
@@ -444,7 +472,7 @@ func (s *Session) agentCapDescribe(agentID string, bound agentCapGrant) (agentCa
 	deny := s.boundAgentDenial(agentID)
 	deny.Action = actionAgentCap
 	g, ok := s.grantByID(bound.grantID)
-	if !ok || g.AgentID != agentID || g.CredentialID != bound.credID || g.Resource != bound.resource || g.KeyID != bound.keyID || g.SSHUsername != bound.sshUser || string(g.SSHHostKey) != bound.sshHost || !s.capGrantSupported(g) || g.Operations[0] != bound.operation {
+	if !ok || g.AgentID != agentID || g.CredentialID != bound.credID || g.Resource != bound.resource || g.KeyID != bound.keyID || g.SSHUsername != bound.sshUser || string(g.SSHHostKey) != bound.sshHost || !s.capGrantSupported(g) || g.Operations[0] != bound.operation || !brokerScopePinned(g, bound) {
 		if err := s.finish(deny, nil); err != nil {
 			return agentCapView{}, err
 		}
@@ -647,6 +675,7 @@ type capRequest struct {
 	method  byte
 	handle  [32]byte
 	payload []byte
+	broker  *HTTPRequest
 }
 
 type capEntry struct {
@@ -656,6 +685,10 @@ type capEntry struct {
 	keyID     string
 	status    string
 	expires   time.Time
+	// methods and injection are the disclosed http_broker scope. The
+	// injection text names the credential slot, never its value.
+	methods   string
+	injection string
 }
 
 type capResponse struct {
@@ -717,13 +750,26 @@ func parseCapRequest(msg []byte) (capRequest, string) {
 		return req, ""
 	case capMethodInvoke:
 		handle, hok := capExactBytes(fields, capFieldHandle, 32)
-		payload, pok := fields[capFieldPayload]
-		if !hok || (pok && (payload.typ != capTypeBytes || len(fields) != 2 || len(payload.val) == 0 || len(payload.val) > MaxAttestPayload)) || (!pok && len(fields) != 1) {
+		if !hok {
 			return capRequest{method: method}, capMalformed
 		}
 		var req capRequest
 		req.method = method
 		copy(req.handle[:], handle)
+		// An http_broker invoke carries the request shape instead of a
+		// payload. The handle, not these fields, chooses the authority.
+		if _, present := fields[capFieldHTTPMethod]; present {
+			shape, ok := brokerInvokeFields(fields)
+			if !ok {
+				return capRequest{method: method}, capMalformed
+			}
+			req.broker = &shape
+			return req, ""
+		}
+		payload, pok := fields[capFieldPayload]
+		if (pok && (payload.typ != capTypeBytes || len(fields) != 2 || len(payload.val) == 0 || len(payload.val) > MaxAttestPayload)) || (!pok && len(fields) != 1) {
+			return capRequest{method: method}, capMalformed
+		}
 		req.payload = append([]byte(nil), payload.val...)
 		return req, ""
 	case capMethodRequest:
@@ -832,7 +878,7 @@ func encodeCatalog(entries []capEntry) ([]byte, error) {
 }
 
 func encodeEntry(e capEntry) ([]byte, error) {
-	if !capEntryScopeOK(e.operation, e.resource, e.keyID) || !capStatusOK(e.status) {
+	if !capEntryScopeOK(e.operation, e.resource, e.keyID) || !capStatusOK(e.status) || !brokerEntryOK(e) {
 		return nil, ErrInvalid
 	}
 	exp, err := requireTime(e.expires)
@@ -848,6 +894,12 @@ func encodeEntry(e capEntry) ([]byte, error) {
 	}
 	if e.operation == OpLocalArtifactAttest {
 		fields = append(fields, capWire{id: capFieldKeyID, typ: capTypeString, val: []byte(e.keyID)})
+	}
+	if e.operation == OpHTTPBroker {
+		fields = append(fields,
+			capWire{id: capFieldHTTPMethods, typ: capTypeString, val: []byte(e.methods)},
+			capWire{id: capFieldInjection, typ: capTypeString, val: []byte(e.injection)},
+		)
 	}
 	slices.SortFunc(fields, func(a, b capWire) int { return int(a.id) - int(b.id) })
 	body := make([]byte, 2)
@@ -939,10 +991,17 @@ func decodeCapEntryFields(fields map[byte]capWire) (capEntry, error) {
 	keyID, kok := capString(fields, capFieldKeyID)
 	status, sok := capString(fields, capFieldStatus)
 	expiry, eok := capString(fields, capFieldExpiry)
-	if !hok || !ook || !rok || !sok || !eok || (op == OpLocalArtifactAttest && (!kok || len(fields) != 6)) || ((networkOperation(op) || op == OpSSHUserAuth) && (kok || len(fields) != 5)) {
-		return capEntry{}, ErrInvalid
+	methods, mok := capString(fields, capFieldHTTPMethods)
+	injection, iok := capString(fields, capFieldInjection)
+	want := 5
+	switch op {
+	case OpLocalArtifactAttest:
+		want = 6
+	case OpHTTPBroker:
+		want = 7
 	}
-	if !capEntryScopeOK(op, resource, keyID) || !capStatusOK(status) {
+	if !hok || !ook || !rok || !sok || !eok || len(fields) != want ||
+		kok != (op == OpLocalArtifactAttest) || mok != (op == OpHTTPBroker) || iok != (op == OpHTTPBroker) {
 		return capEntry{}, ErrInvalid
 	}
 	exp, ok := canonicalAuditTime(expiry)
@@ -956,7 +1015,26 @@ func decodeCapEntryFields(fields map[byte]capWire) (capEntry, error) {
 	entry.keyID = keyID
 	entry.status = status
 	entry.expires = exp
+	entry.methods = methods
+	entry.injection = injection
+	if !capEntryScopeOK(op, resource, keyID) || !capStatusOK(status) || !brokerEntryOK(entry) {
+		return capEntry{}, ErrInvalid
+	}
 	return entry, nil
+}
+
+// brokerEntryOK validates the disclosed http_broker scope, and keeps those
+// fields off every other operation's entry.
+func brokerEntryOK(e capEntry) bool {
+	if e.operation != OpHTTPBroker {
+		return e.methods == "" && e.injection == ""
+	}
+	canonical, ok := canonicalMethods(strings.Split(e.methods, ","))
+	if !ok || strings.Join(canonical, ",") != e.methods {
+		return false
+	}
+	_, ok = parseInjection(e.injection)
+	return ok
 }
 
 func decodeCapInvoke(fields map[byte]capWire) (capResponse, error) {
@@ -967,9 +1045,6 @@ func decodeCapInvoke(fields map[byte]capWire) (capResponse, error) {
 		return capResponse{method: capMethodInvoke, sshResponse: f.val}, nil
 	}
 	if _, ok := fields[capFieldHTTPStatus]; ok {
-		return decodeNetworkResult(fields)
-	}
-	if _, ok := fields[capFieldIssueNumber]; ok {
 		return decodeNetworkResult(fields)
 	}
 	sig, sok := capExactBytes(fields, capFieldSignature, ed25519.SignatureSize)

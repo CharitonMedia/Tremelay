@@ -149,8 +149,13 @@ open, and real production credentials are outside the demonstrated evidence.
 ## MCP network capability limits
 
 [ADR 0021](docs/adr/0021-mcp-credential-brokers.md) exposes only grant-derived
-HTTP or GitHub issue requests, with the existing status-only or four-field
-response projection. Handles are not bearer authentication. Host identity,
+HTTP requests. An `http_request` grant keeps the status-only projection. An
+`http_broker` grant ([ADR 0025](docs/adr/0025-http-broker-v1.md)) returns the
+status, a closed allowlist of response headers, and the body up to a fixed cap
+with every spelling of the credential redacted and the call failed closed if any
+spelling survives. Response content is not validated and may be hostile text;
+only the credential's absence and the response shape are guaranteed. Handles are
+not bearer authentication. Host identity,
 credential custody and public destination controls remain unchanged. A handle
 pins one grant and credential generation; an active duplicate cannot rescue a
 revoked/expired/replaced binding.

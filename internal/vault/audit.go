@@ -612,7 +612,7 @@ func brokerOnlyResult(result string) bool {
 }
 
 func brokerOp(op string) bool {
-	return op == OpHTTPRequest || op == OpGitHubIssueState
+	return op == OpHTTPRequest || op == OpHTTPBroker
 }
 
 func localAttestResult(result string) bool {

@@ -359,8 +359,12 @@ func TestLocalAttest(t *testing.T) {
 		t.Fatal(err)
 	}
 	exp := time.Now().Add(time.Hour).UTC()
-	for _, op := range []string{OpSign, OpHTTPRequest, OpGitHubIssueState} {
-		if _, err := session.IssueGrant(GrantSpec{AgentID: agent.ID, CredentialID: cred.ID, Operations: []string{op}, Resource: resource, ExpiresAt: exp}); err != nil {
+	for _, op := range []string{OpSign, OpHTTPRequest, OpHTTPBroker} {
+		spec := GrantSpec{AgentID: agent.ID, CredentialID: cred.ID, Operations: []string{op}, Resource: resource, ExpiresAt: exp}
+		if op == OpHTTPBroker {
+			spec.Resource, spec.HTTPMethods, spec.HTTPInject = "https://legacy.example/v1", []string{"GET"}, InjectBearer
+		}
+		if _, err := session.IssueGrant(spec); err != nil {
 			t.Fatal(err)
 		}
 	}
