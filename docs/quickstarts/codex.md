@@ -118,6 +118,14 @@ With the daemon unlocked, ask Codex:
 > and `path: /anything/hello`. Show me the status code and the `Authorization`
 > header in the response body.
 
+Interactive Codex asks you to approve each tool call. Non-interactive
+`codex exec` cannot ask, so it refuses with `MCP tool call requires approval`;
+approve this server's tools for that run:
+
+```sh
+codex exec -c 'mcp_servers.tremelay.default_tools_approval_mode="approve"' "<the prompt above>" </dev/null
+```
+
 `list_capabilities` returns one entry per grant:
 
 ```json
