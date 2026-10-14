@@ -160,7 +160,7 @@ func createDB(path string) (*sql.DB, error) {
 	if path == "" {
 		return nil, ErrInvalid
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := openExclusiveOwnerOnly(path, os.O_RDWR|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return nil, ErrInvalid

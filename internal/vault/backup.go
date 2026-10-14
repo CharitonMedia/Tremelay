@@ -116,7 +116,7 @@ func Backup(srcPath, artifactPath string, passphrase []byte, logger *log.Logger)
 	if err = requireFreshSQLiteName(dst); err != nil {
 		return Checkpoint{}, err
 	}
-	f, err := os.OpenFile(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := openExclusiveOwnerOnly(dst, os.O_RDWR|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return Checkpoint{}, ErrInvalid
@@ -483,10 +483,11 @@ func sqliteFileURI(path string) (string, error) {
 }
 
 func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
-	staging, err := createStaging(filepath.Dir(dest))
+	stagingFile, staging, err := createStaging(filepath.Dir(dest))
 	if err != nil {
 		return err
 	}
+	defer stagingFile.Close()
 	published := false
 	defer func() {
 		if !published {
@@ -494,17 +495,20 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 			removeSidecars(staging)
 		}
 	}()
-	if err := streamCopy(artifact, staging); err != nil {
+	if err := streamCopyToFile(artifact, stagingFile); err != nil {
 		return err
 	}
-	sum, err := fileSHA256(staging)
+	if err := verifyRegularSameFile(staging, stagingFile); err != nil {
+		return err
+	}
+	sum, err := fileSHA256File(stagingFile)
 	if err != nil {
 		return err
 	}
 	if sum != want.Digest {
 		return ErrIO
 	}
-	view, err := readSnapshot(staging, passphrase)
+	view, err := readSnapshotFile(stagingFile, passphrase)
 	if err != nil {
 		return err
 	}
@@ -516,12 +520,18 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 			return ErrIO
 		}
 	}
+	if err := verifyRegularSameFile(staging, stagingFile); err != nil {
+		return err
+	}
 	// Mode is on the inode the link will share. A failure here is still
 	// before the destination name exists.
-	if ioFaultStep("chmod") != nil || os.Chmod(staging, 0o600) != nil {
+	if ioFaultStep("chmod") != nil || stagingFile.Chmod(0o600) != nil {
 		return ErrIO
 	}
 	if err := requireFreshSQLiteName(dest); err != nil {
+		return err
+	}
+	if err := verifyRegularSameFile(staging, stagingFile); err != nil {
 		return err
 	}
 	if err := os.Link(staging, dest); err != nil {
@@ -533,9 +543,12 @@ func publish(artifact, dest string, passphrase []byte, want Checkpoint) error {
 	// The destination name is committed. Later steps must not report
 	// absence while this name remains.
 	published = true
-	sum, err = fileSHA256(dest)
+	if err := verifyRegularSameFile(dest, stagingFile); err != nil {
+		return rollbackPublish(staging, dest, err)
+	}
+	sum, err = fileSHA256File(stagingFile)
 	if err == nil && sum == want.Digest {
-		view, err = readSnapshot(dest, passphrase)
+		view, err = readSnapshotFile(stagingFile, passphrase)
 		if err == nil {
 			err = want.matches(view)
 		}
@@ -580,42 +593,29 @@ func rollbackPublish(staging, dest string, result error) error {
 	return result
 }
 
-func createStaging(dir string) (string, error) {
+func createStaging(dir string) (*os.File, string, error) {
 	id, err := newID()
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 	// ponytail: O_EXCL refuses a final symlink, and cleanPath refuses a
 	// symlink component beforehand. A parent swapped for a symlink after
 	// that walk can still redirect the create. Upgrade path: openat with
 	// O_NOFOLLOW on each component.
 	path := filepath.Join(dir, "."+id+".restore-incomplete")
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := openExclusiveOwnerOnly(path, os.O_RDWR|os.O_CREATE|os.O_EXCL)
 	if err != nil {
-		return "", ErrIO
+		return nil, "", ErrIO
 	}
-	if err := f.Close(); err != nil {
-		os.Remove(path)
-		return "", ErrIO
-	}
-	return path, nil
+	return f, path, nil
 }
 
-func streamCopy(src, dst string) (err error) {
+func streamCopyToFile(src string, out *os.File) (err error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return ErrIO
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY, 0o600)
-	if err != nil {
-		return ErrIO
-	}
-	defer func() {
-		if closeErr := out.Close(); err == nil && closeErr != nil {
-			err = ErrIO
-		}
-	}()
 	buf := make([]byte, copyBuf)
 	if _, err := io.CopyBuffer(out, in, buf); err != nil {
 		return ErrIO
@@ -624,6 +624,46 @@ func streamCopy(src, dst string) (err error) {
 		return ErrIO
 	}
 	return nil
+}
+
+// verifyRegularSameFile requires path to name the same regular file as f.
+// A symlink at path is rejected so publication cannot commit an alias.
+func verifyRegularSameFile(path string, f *os.File) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return ErrIO
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+		return ErrCheckpoint
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return ErrIO
+	}
+	if !os.SameFile(fi, st) {
+		return ErrCheckpoint
+	}
+	return nil
+}
+
+func readSnapshotFile(f *os.File, passphrase []byte) (snapshotView, error) {
+	path, err := sqlitePathForOpenFile(f)
+	if err != nil {
+		return snapshotView{}, err
+	}
+	return readSnapshot(path, passphrase)
+}
+
+func fileSHA256File(f *os.File) (string, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", ErrIO
+	}
+	h := sha256.New()
+	buf := make([]byte, copyBuf)
+	if _, err := io.CopyBuffer(h, f, buf); err != nil {
+		return "", ErrIO
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func syncFile(path string) error {
