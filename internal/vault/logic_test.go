@@ -236,6 +236,9 @@ func TestNoGetSecretMethod(t *testing.T) {
 	if _, ok := sessionType.MethodByName("SSHUserAuth"); ok {
 		t.Fatal("human session exports the SSH userauth stream")
 	}
+	if _, ok := sessionType.MethodByName("SSHAgent"); ok {
+		t.Fatal("human session exports the SSH agent conversation")
+	}
 	for _, typ := range []reflect.Type{sessionType, reflect.TypeOf(&AgentPrincipal{})} {
 		for i := 0; i < typ.NumMethod(); i++ {
 			name := strings.ToLower(typ.Method(i).Name)
@@ -245,7 +248,7 @@ func TestNoGetSecretMethod(t *testing.T) {
 		}
 	}
 	typ := reflect.TypeOf(&AgentPrincipal{})
-	if typ.NumMethod() != 6 {
+	if typ.NumMethod() != 7 {
 		t.Fatalf("agent method count %d", typ.NumMethod())
 	}
 	for i := 0; i < typ.NumMethod(); i++ {
@@ -380,6 +383,13 @@ func TestNoGetSecretMethod(t *testing.T) {
 			if m.Type.Out(0) != reflect.TypeOf(&SSHUserAuth{}) {
 				t.Fatal(m.Type.Out(0))
 			}
+		case "SSHAgent":
+			if m.Type.NumIn() != 1 || m.Type.NumOut() != 2 {
+				t.Fatalf("SSHAgent signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
+			}
+			if m.Type.Out(0) != reflect.TypeOf(&SSHAgent{}) {
+				t.Fatal(m.Type.Out(0))
+			}
 		default:
 			t.Fatal(m.Name)
 		}
@@ -396,18 +406,19 @@ func TestNoGetSecretMethod(t *testing.T) {
 			t.Fatal("AgentPrincipal holds *Session")
 		}
 	}
-	stream := reflect.TypeOf(&SSHUserAuth{})
-	for i := 0; i < stream.NumMethod(); i++ {
-		name := stream.Method(i).Name
-		switch name {
-		case "Serve", "Close":
-		default:
-			t.Fatal(name)
+	for _, stream := range []reflect.Type{reflect.TypeOf(&SSHUserAuth{}), reflect.TypeOf(&SSHAgent{})} {
+		for i := 0; i < stream.NumMethod(); i++ {
+			name := stream.Method(i).Name
+			switch name {
+			case "Serve", "Close":
+			default:
+				t.Fatal(name)
+			}
 		}
-	}
-	for i := 0; i < stream.Elem().NumField(); i++ {
-		if stream.Elem().Field(i).Type == reflect.TypeOf(&Session{}) {
-			t.Fatal("SSHUserAuth holds *Session")
+		for i := 0; i < stream.Elem().NumField(); i++ {
+			if stream.Elem().Field(i).Type == reflect.TypeOf(&Session{}) {
+				t.Fatalf("%s holds *Session", stream)
+			}
 		}
 	}
 }

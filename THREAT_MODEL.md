@@ -57,6 +57,23 @@ The caller is treated as adversarial, including on a first hop. Signing requires
 
 Wire messages cannot choose the principal, grant, credential, clock, or host key. One stream is tied to the grant selected at construction and is not retargeted when the vault key changes or another grant would match. The private key does not leave the broker. Username, host key, session identifier, preimage, and signature stay out of plaintext audit, notifications, logs, and errors. This is synthetic in-memory compatibility with a protocol subset, not a deployable general SSH agent and not a completed login.
 
+## SSH agent socket limits
+
+[ADR 0026](docs/adr/0026-ssh-agent-socket.md) puts the ADR 0013 subset on a
+local ssh-agent socket served by the ADR 0024 daemon. Reach widens, authority
+does not: anything running as the owner that can reach the socket can ask, and
+what it can obtain is still one authentication signature for the pinned
+username on a connection whose session binding proves the grant's host key.
+Ordinary `publickey`, other preimages, key insertion, removal, locking and
+other extensions stay refused, and identities stay hidden until that binding.
+The relay process holds only a bearer token and copies bytes; it parses
+nothing and holds no vault state. A caller that replays a genuine binding on a
+fresh connection is outside what this process can observe, as in ADR 0013. A
+released signature cannot be recalled and an authenticated SSH session is not
+closed by later revocation. Each connection adds `daemon_auth` and `cap_list`
+rows beside the existing `ssh_userauth` rows. Real-client evidence is one
+unprivileged OpenSSH server on Linux, not a claim about hosted forges.
+
 ## Single-human custody
 
 One human holds the passphrase; many agents hold grants. Tremelay has no second

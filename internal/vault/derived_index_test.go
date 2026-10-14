@@ -17,11 +17,11 @@ func TestCommitUpdatesDetectionIndexIncrementally(t *testing.T) {
 		}
 	}
 	before := len(session.audit)
-	detectionApplyVisits = 0
+	detectionApplyVisits.Store(0)
 	if err := session.writeAudit(brokerRow(id, resultDeniedMissing), session.creds, session.agents, session.grants); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := detectionApplyVisits, len(session.audit)-before; got != want {
+	if got, want := int(detectionApplyVisits.Load()), len(session.audit)-before; got != want {
 		t.Fatalf("commit visited %d rows, wrote %d", got, want)
 	}
 	if !reflect.DeepEqual(session.detection, detectionFromAudit(session.audit)) {
@@ -79,14 +79,14 @@ func TestReopenRebuildsDetectionIndexOnce(t *testing.T) {
 	}
 	want := session.detection
 	session.Lock()
-	detectionApplyVisits = 0
+	detectionApplyVisits.Store(0)
 	opened, err := Unlock(path, pass, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(opened.Lock)
-	if detectionApplyVisits != len(opened.audit) {
-		t.Fatalf("rebuild visited %d rows for %d audit rows", detectionApplyVisits, len(opened.audit))
+	if got := int(detectionApplyVisits.Load()); got != len(opened.audit) {
+		t.Fatalf("rebuild visited %d rows for %d audit rows", got, len(opened.audit))
 	}
 	if !reflect.DeepEqual(opened.detection, want) {
 		t.Fatalf("reopen mirror %+v want %+v", opened.detection.Denials, want.Denials)
@@ -94,13 +94,13 @@ func TestReopenRebuildsDetectionIndexOnce(t *testing.T) {
 	if !reflect.DeepEqual(opened.denials.state(), detectionFromAudit(opened.audit)) {
 		t.Fatal("rebuilt index does not match the chain")
 	}
-	detectionApplyVisits = 0
+	detectionApplyVisits.Store(0)
 	if _, err := VerifyAudit(path, pass); err != nil {
 		t.Fatal(err)
 	}
 	// The mirror is already stored, so verify builds the index once.
-	if detectionApplyVisits != len(opened.audit) {
-		t.Fatalf("verify visited %d rows for %d durable rows", detectionApplyVisits, len(opened.audit))
+	if got := int(detectionApplyVisits.Load()); got != len(opened.audit) {
+		t.Fatalf("verify visited %d rows for %d durable rows", got, len(opened.audit))
 	}
 }
 

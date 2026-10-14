@@ -94,6 +94,12 @@ profile, retry contract and ambiguous-outcome rules are unchanged from
 particular, never automatically replay an invocation whose response went
 missing; read the audit.
 
+## Sign SSH with the same daemon
+
+An agent that holds an `ssh_userauth` grant can also get an `SSH_AUTH_SOCK`
+from this daemon, for `git push` and plain `ssh`, with the key still inside
+it. See [SSH signing for agents](ssh-agent.md).
+
 ## Lock
 
 ```sh

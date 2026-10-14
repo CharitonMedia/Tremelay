@@ -23,16 +23,18 @@ const (
 	lockUsage   = "usage: tremelay lock"
 
 	// The handshake is one bounded line. Its only verbs are agent token
-	// authentication and the owner's lock-and-exit request. There is no human
-	// control-plane operation and no raw-secret retrieval path on this wire.
-	daemonHello     = "TREMELAY/1 "
-	daemonVerbAuth  = "AUTH "
-	daemonVerbLock  = "LOCK"
-	daemonOK        = "OK\n"
-	daemonErr       = "ERR\n"
-	maxDaemonHello  = 96
-	maxDaemonAnswer = 8
-	daemonHelloWait = 10 * time.Second
+	// authentication, the same authentication for one ssh-agent conversation,
+	// and the owner's lock-and-exit request. There is no human control-plane
+	// operation and no raw-secret retrieval path on this wire.
+	daemonHello        = "TREMELAY/1 "
+	daemonVerbAuth     = "AUTH "
+	daemonVerbSSHAgent = "SSHAGENT "
+	daemonVerbLock     = "LOCK"
+	daemonOK           = "OK\n"
+	daemonErr          = "ERR\n"
+	maxDaemonHello     = 96
+	maxDaemonAnswer    = 8
+	daemonHelloWait    = 10 * time.Second
 
 	minIdleTimeout = time.Second
 	maxIdleTimeout = 24 * time.Hour
@@ -212,6 +214,10 @@ func (d *daemon) handle(conn net.Conn) {
 		_, _ = io.WriteString(conn, daemonErr)
 		return
 	}
+	if verb == daemonVerbSSHAgent {
+		d.serveSSHAgent(conn, principal)
+		return
+	}
 	capability, err := vault.BindAgentCapability(principal)
 	if err != nil {
 		_, _ = io.WriteString(conn, daemonErr)
@@ -230,6 +236,34 @@ func (d *daemon) handle(conn net.Conn) {
 		return
 	}
 	if err := endpoint.Serve(d.ctx, conn, conn); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintln(d.stderr, errDaemonSession.Error())
+		d.checkTerminal(err)
+	}
+}
+
+// serveSSHAgent answers ssh-agent protocol frames for the authenticated
+// principal's own ssh_userauth grants. The vault, the private key and every
+// grant check stay in this process; the relay that forwarded these bytes
+// holds nothing. Serve has no context, so shutdown closes the connection and
+// then waits for it, which is the ordering the SSH stream requires before a
+// lock.
+func (d *daemon) serveSSHAgent(conn net.Conn, principal *vault.AgentPrincipal) {
+	agent, err := principal.SSHAgent()
+	if err != nil {
+		d.checkTerminal(err)
+		_, _ = io.WriteString(conn, daemonErr)
+		return
+	}
+	defer agent.Close()
+	if _, err := io.WriteString(conn, daemonOK); err != nil {
+		return
+	}
+	if conn.SetDeadline(time.Time{}) != nil {
+		return
+	}
+	stop := context.AfterFunc(d.ctx, func() { conn.Close() })
+	defer stop()
+	if err := agent.Serve(conn); err != nil && d.ctx.Err() == nil {
 		fmt.Fprintln(d.stderr, errDaemonSession.Error())
 		d.checkTerminal(err)
 	}
@@ -261,15 +295,27 @@ func readDaemonHello(conn net.Conn) (string, []byte, error) {
 	if rest == daemonVerbLock {
 		return daemonVerbLock, nil, nil
 	}
-	encoded, ok := strings.CutPrefix(rest, daemonVerbAuth)
-	if !ok || len(encoded) != hex.EncodedLen(vault.AgentTokenLen) {
-		return "", nil, errDaemonRefused
+	for _, verb := range []string{daemonVerbAuth, daemonVerbSSHAgent} {
+		encoded, ok := strings.CutPrefix(rest, verb)
+		if !ok || len(encoded) != hex.EncodedLen(vault.AgentTokenLen) {
+			continue
+		}
+		token, err := hex.DecodeString(encoded)
+		if err != nil {
+			return "", nil, errDaemonRefused
+		}
+		return verb, token, nil
 	}
-	token, err := hex.DecodeString(encoded)
-	if err != nil {
-		return "", nil, errDaemonRefused
-	}
-	return daemonVerbAuth, token, nil
+	return "", nil, errDaemonRefused
+}
+
+// daemonHelloLine is the one bounded handshake line a client sends. The token
+// is hex only so the line stays delimiter-safe; it is never logged or printed.
+func daemonHelloLine(verb string, token []byte) []byte {
+	line := make([]byte, 0, len(daemonHello)+len(verb)+hex.EncodedLen(len(token))+1)
+	line = append(line, daemonHello+verb...)
+	line = hex.AppendEncode(line, token)
+	return append(line, '\n')
 }
 
 func readDaemonLine(conn net.Conn, limit int) (string, error) {
@@ -327,10 +373,7 @@ func relayDaemonMCP(getenv func(string) string, tokenFile string, stdin io.Reade
 		return 1
 	}
 	defer conn.Close()
-	hello := make([]byte, 0, len(daemonHello)+len(daemonVerbAuth)+hex.EncodedLen(len(token))+1)
-	hello = append(hello, daemonHello+daemonVerbAuth...)
-	hello = hex.AppendEncode(hello, token)
-	hello = append(hello, '\n')
+	hello := daemonHelloLine(daemonVerbAuth, token)
 	err = daemonRequest(conn, string(hello))
 	vault.Wipe(hello)
 	vault.Wipe(token)
