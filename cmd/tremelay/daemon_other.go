@@ -10,9 +10,13 @@ import "net"
 // Every other CLI command, including `tremelay mcp serve`, stays buildable.
 func daemonEndpoint(func(string) string) string { return "" }
 
+func sshAgentDefaultSocket(func(string) string) string { return "" }
+
 func daemonListen(func(string) string) (net.Listener, string, error) {
 	return nil, "", errDaemonEndpoint
 }
+
+func listenUserSocket(string) (net.Listener, error) { return nil, errDaemonEndpoint }
 
 func daemonDial(func(string) string) (net.Conn, error) { return nil, errDaemonEndpoint }
 

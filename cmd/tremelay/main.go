@@ -46,6 +46,8 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 		return cmdMCP(args[1:], getenv, stdin, stdout, stderr)
 	case "daemon":
 		return cmdDaemon(args[1:], getenv, stdin, stdout, stderr)
+	case "ssh-agent":
+		return cmdSSHAgent(args[1:], getenv, stdout, stderr)
 	case "lock":
 		return cmdLock(args[1:], getenv, stdout, stderr)
 	default:
@@ -77,6 +79,7 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay capability authorize --path PATH --agent ID --credential ID --operation OP --resource SCOPE
   tremelay daemon --vault PATH [--idle-timeout 1h]
   tremelay mcp --daemon --token-file PATH
+  tremelay ssh-agent --token-file PATH [--socket /absolute/path]
   tremelay lock
   tremelay mcp serve --path PATH --agent ID --pinentry /absolute/helper [--pinentry-tty /absolute/tty] [--unlock-timeout 2m]
   tremelay audit verify --path PATH
@@ -89,6 +92,7 @@ Passphrase: TREMELAY_PASSPHRASE, or a no-echo terminal prompt.
 change-passphrase requires no-echo terminal entry of old, new, and confirmation; it ignores the environment.
 daemon unlocks once in your terminal and then serves agents on a user-only endpoint until lock, idle timeout, or exit.
 mcp --daemon is the stdio command an MCP client launches; it authenticates with one agent token file and relays MCP only.
+ssh-agent publishes an SSH_AUTH_SOCK backed by that agent's ssh_userauth grants; the key stays in the daemon.
 mcp serve uses a trusted pinentry helper over private pipes; it ignores the passphrase environment and keeps stdout MCP-only.
 The passphrase is not accepted as an argument. credential get writes the raw secret to stdout.
 Health is advisory. Refresh runs only while the vault is unlocked; a locked or stopped process does not evaluate credentials.

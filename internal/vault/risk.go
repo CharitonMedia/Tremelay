@@ -437,7 +437,8 @@ type denialSubject struct {
 
 // detectionApplyVisits counts audit rows applied to a detection index.
 // A commit applies the new rows. Unlock and verify apply the chain once.
-var detectionApplyVisits int
+// It is atomic because one process may hold more than one Session.
+var detectionApplyVisits atomic.Int64
 
 // detectionIndex is the derived lookback. It is rebuilt from the chain on
 // unlock and verify, then updated one new row at a time. The encrypted
@@ -470,7 +471,7 @@ func (idx *detectionIndex) clone() *detectionIndex {
 }
 
 func (idx *detectionIndex) apply(ev auditEvent) {
-	detectionApplyVisits++
+	detectionApplyVisits.Add(1)
 	idx.observe(ev)
 }
 

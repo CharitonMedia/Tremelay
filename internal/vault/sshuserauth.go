@@ -1075,11 +1075,7 @@ func sshEmptyIdentities() []byte {
 }
 
 func sshIdentities(blob []byte) []byte {
-	body := []byte{sshAgentIdentitiesAnswer}
-	body = appendU32(body, 1)
-	body = appendSSHString(body, blob)
-	body = appendSSHString(body, nil)
-	return body
+	return sshIdentityList([][]byte{blob})
 }
 
 func sshSignResponse(sigBlob []byte) []byte {

@@ -10,7 +10,10 @@ import (
 	"syscall"
 )
 
-const daemonSocketName = "daemon.sock"
+const (
+	daemonSocketName   = "daemon.sock"
+	sshAgentSocketName = "ssh-agent.sock"
+)
 
 // daemonDir is the user-only directory that holds the endpoint. XDG_RUNTIME_DIR
 // is already a per-user directory the OS clears on logout; the fallback is a
@@ -28,41 +31,58 @@ func daemonEndpoint(getenv func(string) string) string {
 	return filepath.Join(daemonDir(getenv), daemonSocketName)
 }
 
-// daemonListen refuses to serve on anything but a directory and socket this
-// uid owns with no group or other access. An existing socket that still
-// answers is a running daemon, not a stale file to replace.
+// sshAgentDefaultSocket sits beside the daemon endpoint, in the same
+// already-verified user-only directory.
+func sshAgentDefaultSocket(getenv func(string) string) string {
+	return filepath.Join(daemonDir(getenv), sshAgentSocketName)
+}
+
 func daemonListen(getenv func(string) string) (net.Listener, string, error) {
-	dir := daemonDir(getenv)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, "", errDaemonEndpoint
-	}
-	if err := ownedExclusively(dir, os.ModeDir); err != nil {
+	path := daemonEndpoint(getenv)
+	listener, err := listenUserSocket(path)
+	if err != nil {
 		return nil, "", err
 	}
-	path := filepath.Join(dir, daemonSocketName)
+	return listener, path, nil
+}
+
+// listenUserSocket refuses to serve on anything but a directory and socket
+// this uid owns with no group or other access. An existing socket that still
+// answers is a running endpoint, not a stale file to replace.
+func listenUserSocket(path string) (net.Listener, error) {
+	if !filepath.IsAbs(path) {
+		return nil, errDaemonEndpoint
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, errDaemonEndpoint
+	}
+	if err := ownedExclusively(dir, os.ModeDir); err != nil {
+		return nil, err
+	}
 	if _, err := os.Lstat(path); err == nil {
 		if err := ownedExclusively(path, os.ModeSocket); err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		if conn, err := net.Dial("unix", path); err == nil {
 			conn.Close()
-			return nil, "", errDaemonRunning
+			return nil, errDaemonRunning
 		}
 		if err := os.Remove(path); err != nil {
-			return nil, "", errDaemonEndpoint
+			return nil, errDaemonEndpoint
 		}
 	}
 	listener, err := net.Listen("unix", path)
 	if err != nil {
-		return nil, "", errDaemonEndpoint
+		return nil, errDaemonEndpoint
 	}
 	// Bind inherits the process umask. The 0700 parent already excludes other
 	// users during that window; this makes the socket itself user-only too.
 	if err := os.Chmod(path, 0o600); err != nil {
 		listener.Close()
-		return nil, "", errDaemonEndpoint
+		return nil, errDaemonEndpoint
 	}
-	return listener, path, nil
+	return listener, nil
 }
 
 func daemonDial(getenv func(string) string) (net.Conn, error) {

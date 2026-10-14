@@ -97,3 +97,16 @@ peer-uid enforcement. It serves the same capability adapter and the same stdio
 MCP profile, adds `daemon_auth` audit rows, and exposes no human operation and
 no raw secret. The boundary becomes the owner's uid rather than the owner's
 presence at a prompt; Linux and macOS only, elsewhere it fails closed.
+
+## SSH agent socket
+
+[ADR 0026](docs/adr/0026-ssh-agent-socket.md) gives that daemon one more
+handshake verb and `tremelay ssh-agent`, a relay that publishes an
+ssh-agent-protocol socket under the same endpoint custody. The relay holds no
+vault state. Inside the daemon, one conversation owns one ADR 0013 stream per
+active `ssh_userauth` grant: identities are merged, a session binding is
+offered to each grant that may pin a different host key, and any other message
+stops at the first stream that does not refuse it. No grant check, preimage
+rule, audit row or dependency changes, and ordinary `publickey` stays denied,
+so the socket works only with servers that offer
+`publickey-hostbound-v00@openssh.com`.
