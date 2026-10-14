@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<!--
+  Tremelay landing page (gh-pages).
+
+  LAUNCH TODO: every github.com/CharitonMedia/Tremelay link below points at
+  /blob/v1/ because v1 is still the working branch. At launch (v1 merged to
+  main, tagged v1.0.0) switch every /blob/v1/ to /blob/main/.
+
+  No JavaScript, no external fonts, no CDNs, no analytics, no trackers.
+  Every claim here must match README.md on the v1 branch.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tremelay — a local credential broker for AI agents</title>
+<meta name="description" content="Tremelay is a local credential broker: your AI agents use your API keys and SSH keys without ever seeing them. Pre-release.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b5a8f'/%3E%3Cpath d='M16 5l9 3.2v7.3c0 5.6-3.7 9.6-9 11.5-5.3-1.9-9-5.9-9-11.5V8.2z' fill='%23ffffff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header>
+  <h1>Tremelay</h1>
+  <p class="tagline">A local credential broker, so your AI agents can use your credentials without ever seeing them.</p>
+  <p class="status"><strong>Status:</strong> pre-release. Do not put production credentials in it until v1.0.0.</p>
+</header>
+
+<main id="main">
+
+  <section aria-labelledby="why">
+    <h2 id="why">Why</h2>
+    <p>You already give agents real authority: read these issues, push this branch, call
+      that API. Today that means pasting a token into a config file, an environment
+      variable, or an MCP server, and hoping nothing logs it, echoes it, or wanders off
+      to the wrong host with it.</p>
+    <p>Tremelay splits <strong>possession</strong> of a secret from <strong>authority</strong> to
+      use it. You keep credentials in a local encrypted vault. Each agent gets its own
+      identity and its own narrow, expiring, revocable grants — “GET anything under
+      <code>https://api.github.com/repos/you/yourrepo</code> with this token”,
+      “authenticate to <code>git.example.com</code> as <code>git</code> with this SSH key”.
+      The agent asks Tremelay to perform the operation; Tremelay performs it with the
+      credential and returns only the result the grant allows. The agent never receives
+      the secret, there is no <code>getSecret</code> tool to call, and every attempt —
+      allowed or denied — lands in a hash-chained audit log.</p>
+    <blockquote><p>The broker possesses secrets. Agents possess capabilities.</p></blockquote>
+    <p>Agents connect over MCP (<code>list_capabilities</code>, <code>describe_capability</code>,
+      <code>invoke_capability</code>), or over an ssh-agent socket for SSH signing.
+      Everything is local: one SQLite vault file, one user-only socket or named pipe, no
+      server, no account, no telemetry.</p>
+  </section>
+
+  <section aria-labelledby="how">
+    <h2 id="how">How it works</h2>
+    <svg class="diagram" viewBox="0 0 440 568" role="img"
+         aria-labelledby="diagram-title diagram-desc">
+      <title id="diagram-title">How Tremelay brokers a credential</title>
+      <desc id="diagram-desc">Five steps. One: you unlock the vault once in your
+        terminal with your passphrase. Two: the tremelay daemon holds the vault key in
+        memory and listens on a user-only socket or named pipe. Three: your agent
+        connects over MCP on stdio, or over the ssh-agent socket, using its own token
+        file. Four: the broker inside the daemon makes the HTTPS call or the SSH
+        signature with the credential, which never leaves the daemon. Five: your agent
+        gets back only the result the grant allows — the status code, an allowlisted set
+        of response headers, and a capped body with the credential redacted. Every
+        attempt, allowed or denied, is appended to the hash-chained audit log.</desc>
+
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
+                markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path class="d-head" d="M 0 0 L 10 5 L 0 10 z"></path>
+        </marker>
+      </defs>
+
+      <g class="d-step">
+        <rect class="d-box" x="20" y="8" width="400" height="56" rx="8"></rect>
+        <text class="d-title" x="36" y="32">1 · You</text>
+        <text class="d-text" x="36" y="52">unlock the vault once, in your terminal</text>
+      </g>
+      <line class="d-arrow" x1="120" y1="64" x2="120" y2="94" marker-end="url(#arrow)"></line>
+      <text class="d-label" x="134" y="84">passphrase</text>
+
+      <g class="d-step">
+        <rect class="d-box" x="20" y="96" width="400" height="74" rx="8"></rect>
+        <text class="d-title" x="36" y="120">2 · tremelay daemon</text>
+        <text class="d-text" x="36" y="140">holds the vault key in memory</text>
+        <text class="d-text" x="36" y="158">on a user-only socket or named pipe</text>
+      </g>
+      <line class="d-arrow" x1="120" y1="170" x2="120" y2="200" marker-end="url(#arrow)"></line>
+      <text class="d-label" x="134" y="190">per-agent token file</text>
+
+      <g class="d-step">
+        <rect class="d-box" x="20" y="202" width="400" height="74" rx="8"></rect>
+        <text class="d-title" x="36" y="226">3 · Your agent connects</text>
+        <text class="d-text" x="36" y="246">over MCP on stdio, or over the</text>
+        <text class="d-text" x="36" y="264">ssh-agent socket</text>
+      </g>
+      <line class="d-arrow" x1="120" y1="276" x2="120" y2="306" marker-end="url(#arrow)"></line>
+      <text class="d-label" x="134" y="296">names the operation, not the secret</text>
+
+      <g class="d-step">
+        <rect class="d-box" x="20" y="308" width="400" height="74" rx="8"></rect>
+        <text class="d-title" x="36" y="332">4 · The broker performs it</text>
+        <text class="d-text" x="36" y="352">the HTTPS call or the SSH signature,</text>
+        <text class="d-text" x="36" y="370">with the credential it never hands over</text>
+      </g>
+      <line class="d-arrow" x1="120" y1="382" x2="120" y2="412" marker-end="url(#arrow)"></line>
+      <text class="d-label" x="134" y="402">result only</text>
+
+      <g class="d-step">
+        <rect class="d-box" x="20" y="414" width="400" height="74" rx="8"></rect>
+        <text class="d-title" x="36" y="438">5 · Your agent gets the result</text>
+        <text class="d-text" x="36" y="458">status, allowlisted response headers and a</text>
+        <text class="d-text" x="36" y="476">capped body, credential redacted</text>
+      </g>
+
+      <g class="d-step">
+        <rect class="d-box d-audit" x="20" y="504" width="400" height="56" rx="8"></rect>
+        <text class="d-text" x="36" y="528">Every attempt above, allowed or denied, is</text>
+        <text class="d-text" x="36" y="546">appended to the hash-chained audit log.</text>
+      </g>
+    </svg>
+  </section>
+
+  <section aria-labelledby="install">
+    <h2 id="install">Install</h2>
+    <p>Tremelay is pre-release security software and no stable release is published yet,
+      so building from source is the only install path. It needs the pinned Go toolchain
+      (1.26.9, see <a href="https://github.com/CharitonMedia/Tremelay/blob/v1/go.mod">go.mod</a>).</p>
+    <pre><code>go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest</code></pre>
+    <p>From a clone, <code>make build</code> or <code>go build ./cmd/tremelay</code> does the
+      same thing. Releases will carry per-platform archives, a CycloneDX SBOM and a
+      <code>SHA256SUMS</code> file — a checksum detects a corrupt download, not a
+      substituted release. Signed releases are not in v1.</p>
+  </section>
+
+  <section aria-labelledby="quickstarts">
+    <h2 id="quickstarts">Quickstarts</h2>
+    <p>Copy-paste setup from install to first successful call, one page per client:</p>
+    <ul>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/claude-code.md">Claude Code</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/codex.md">Codex</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/hermes.md">Hermes</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/generic-mcp.md">Any stdio MCP client</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/README.md">All quickstarts</a></li>
+    </ul>
+    <p>The shape is the same everywhere. <code>tremelay daemon --vault PATH</code> asks for
+      your passphrase once in your terminal and then serves agents on a user-only local
+      socket; <code>tremelay agent create --token-file FILE</code> gives each agent its own
+      bearer token file, and <code>tremelay agent token issue|rotate|revoke</code> manage it
+      later without recreating the agent; <code>tremelay mcp --daemon --token-file FILE</code>
+      is the stdio command the client launches. <code>tremelay lock</code>, the idle timeout,
+      or losing the process zeroises the key.</p>
+  </section>
+
+  <section aria-labelledby="limits">
+    <h2 id="limits">What it does not do</h2>
+    <p>Read this before you trust it with anything.</p>
+    <ul>
+      <li><strong>One human.</strong> Single user, single vault. No multi-user, no orgs,
+        no shared vaults, no team policy.</li>
+      <li><strong>One machine.</strong> A user-only Unix socket or Windows named pipe, and
+        stdio; there is no network or remote MCP transport. <code>tremelay ssh-agent</code>
+        is Linux and macOS only and fails closed on Windows.</li>
+      <li><strong>The agent still reads broker responses.</strong> An <code>http_broker</code>
+        grant returns the status code, an allowlisted set of response headers, and up to
+        32 KiB of the body with every spelling of the credential redacted. The agent never
+        sees the credential, but it does see the data that credential unlocks — and
+        anything in that body can be prompt injection. Tremelay guarantees the secret is
+        not in the response, not that the response is trustworthy.</li>
+      <li><strong>An unlocked daemon trusts your uid.</strong> While it is unlocked, any code
+        running as you can use your agents' granted capabilities. It still cannot read a
+        credential, change a grant, or learn your passphrase, and everything it does is
+        audited — but that is the boundary.</li>
+      <li><strong>No OAuth refresh brokering, no database session brokering, no browser form
+        fill, no TOTP, no provider-assisted rotation.</strong> These are in
+        <a href="https://github.com/CharitonMedia/Tremelay/blob/v1/VISION.md">VISION.md</a>
+        and on the roadmap, not in v1.</li>
+      <li><strong>No third-party audit.</strong> No independent security review and no signed
+        releases yet. The audit chain is tamper-evident to <em>you</em>; nobody else
+        checkpoints it.</li>
+      <li><strong><code>credential get</code> prints the raw secret.</strong> That is the human
+        control plane, by design — it is not reachable from any agent interface.</li>
+      <li><strong>Pre-release.</strong> Do not put production credentials in it yet.</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="security">
+    <h2 id="security">Security</h2>
+    <ul>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/SECURITY_INVARIANTS.md">SECURITY_INVARIANTS.md</a>
+        — the rules that outrank convenience.</li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/THREAT_MODEL.md">THREAT_MODEL.md</a>
+        — who the adversary is, including the agent.</li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/SECURITY.md">SECURITY.md</a>
+        — reporting a vulnerability.</li>
+    </ul>
+  </section>
+
+</main>
+
+<footer>
+  <nav aria-label="Project links">
+    <ul>
+      <li><a href="https://github.com/CharitonMedia/Tremelay">GitHub repository</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/discussions">Discussions</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/README.md">README</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/ARCHITECTURE.md">Architecture</a></li>
+    </ul>
+  </nav>
+  <p>Apache License 2.0. No trackers, no analytics, no external requests on this page.</p>
+</footer>
+
+</body>
+</html>
