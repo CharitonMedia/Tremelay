@@ -2,9 +2,8 @@
 <!--
   Tremelay landing page (gh-pages).
 
-  LAUNCH TODO: every github.com/CharitonMedia/Tremelay link below points at
-  /blob/v1/ because v1 is still the working branch. At launch (v1 merged to
-  main, tagged v1.0.0) switch every /blob/v1/ to /blob/main/.
+  Every github.com/CharitonMedia/Tremelay link below points at /blob/main/,
+  which carries v1.0.0.
 
   No JavaScript, no external fonts, no CDNs, no analytics, no trackers.
   Every claim here must match README.md on the v1 branch.
@@ -14,7 +13,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tremelay — a local credential broker for AI agents</title>
-<meta name="description" content="Tremelay is a local credential broker: your AI agents use your API keys and SSH keys without ever seeing them. Pre-release.">
+<meta name="description" content="Tremelay is a local credential broker: your AI agents use your API keys and SSH keys without ever seeing them. v1.0.0.">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b5a8f'/%3E%3Cpath d='M16 5l9 3.2v7.3c0 5.6-3.7 9.6-9 11.5-5.3-1.9-9-5.9-9-11.5V8.2z' fill='%23ffffff'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
@@ -26,7 +25,7 @@
 <header>
   <h1>Tremelay</h1>
   <p class="tagline">A local credential broker, so your AI agents can use your credentials without ever seeing them.</p>
-  <p class="status"><strong>Status:</strong> pre-release. Do not put production credentials in it until v1.0.0.</p>
+  <p class="status"><strong>Status:</strong> <a href="https://github.com/CharitonMedia/Tremelay/releases/tag/v1.0.0">v1.0.0</a>, released 2026-10-14. Single user, local only, and not independently audited.</p>
 </header>
 
 <main id="main">
@@ -127,12 +126,14 @@
 
   <section aria-labelledby="install">
     <h2 id="install">Install</h2>
-    <p>Tremelay is pre-release security software and no stable release is published yet,
-      so building from source is the only install path. It needs the pinned Go toolchain
-      (1.26.9, see <a href="https://github.com/CharitonMedia/Tremelay/blob/v1/go.mod">go.mod</a>).</p>
-    <pre><code>go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest</code></pre>
+    <p>Tremelay needs the pinned Go toolchain (1.26.9, see
+      <a href="https://github.com/CharitonMedia/Tremelay/blob/main/go.mod">go.mod</a>);
+      <code>go install</code> switches to it for you.</p>
+    <pre><code>go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0</code></pre>
     <p>From a clone, <code>make build</code> or <code>go build ./cmd/tremelay</code> does the
-      same thing. Releases will carry per-platform archives, a CycloneDX SBOM and a
+      same thing. The
+      <a href="https://github.com/CharitonMedia/Tremelay/releases/tag/v1.0.0">v1.0.0 release</a>
+      carries per-platform archives, a CycloneDX SBOM and a
       <code>SHA256SUMS</code> file — a checksum detects a corrupt download, not a
       substituted release. Signed releases are not in v1.</p>
   </section>
@@ -141,11 +142,11 @@
     <h2 id="quickstarts">Quickstarts</h2>
     <p>Copy-paste setup from install to first successful call, one page per client:</p>
     <ul>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/claude-code.md">Claude Code</a></li>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/codex.md">Codex</a></li>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/hermes.md">Hermes</a></li>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/generic-mcp.md">Any stdio MCP client</a></li>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/docs/quickstarts/README.md">All quickstarts</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/docs/quickstarts/claude-code.md">Claude Code</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/docs/quickstarts/codex.md">Codex</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/docs/quickstarts/hermes.md">Hermes</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/docs/quickstarts/generic-mcp.md">Any stdio MCP client</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/docs/quickstarts/README.md">All quickstarts</a></li>
     </ul>
     <p>The shape is the same everywhere. <code>tremelay daemon --vault PATH</code> asks for
       your passphrase once in your terminal and then serves agents on a user-only local
@@ -178,7 +179,7 @@
         audited — but that is the boundary.</li>
       <li><strong>No OAuth refresh brokering, no database session brokering, no browser form
         fill, no TOTP, no provider-assisted rotation.</strong> These are in
-        <a href="https://github.com/CharitonMedia/Tremelay/blob/v1/VISION.md">VISION.md</a>
+        <a href="https://github.com/CharitonMedia/Tremelay/blob/main/VISION.md">VISION.md</a>
         and on the roadmap, not in v1.</li>
       <li><strong>Legacy GitHub issue grants block unlock.</strong> A vault that still holds a
         pre-v1 <code>github_issue_state</code> grant will not unlock until that grant is
@@ -188,18 +189,17 @@
         checkpoints it.</li>
       <li><strong><code>credential get</code> prints the raw secret.</strong> That is the human
         control plane, by design — it is not reachable from any agent interface.</li>
-      <li><strong>Pre-release.</strong> Do not put production credentials in it yet.</li>
     </ul>
   </section>
 
   <section aria-labelledby="security">
     <h2 id="security">Security</h2>
     <ul>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/SECURITY_INVARIANTS.md">SECURITY_INVARIANTS.md</a>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/SECURITY_INVARIANTS.md">SECURITY_INVARIANTS.md</a>
         — the rules that outrank convenience.</li>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/THREAT_MODEL.md">THREAT_MODEL.md</a>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/THREAT_MODEL.md">THREAT_MODEL.md</a>
         — who the adversary is, including the agent.</li>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/SECURITY.md">SECURITY.md</a>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/SECURITY.md">SECURITY.md</a>
         — reporting a vulnerability.</li>
     </ul>
   </section>
@@ -211,8 +211,8 @@
     <ul>
       <li><a href="https://github.com/CharitonMedia/Tremelay">GitHub repository</a></li>
       <li><a href="https://github.com/CharitonMedia/Tremelay/discussions">Discussions</a></li>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/README.md">README</a></li>
-      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/v1/ARCHITECTURE.md">Architecture</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/README.md">README</a></li>
+      <li><a href="https://github.com/CharitonMedia/Tremelay/blob/main/ARCHITECTURE.md">Architecture</a></li>
     </ul>
   </nav>
   <p>Apache License 2.0. No trackers, no analytics, no external requests on this page.</p>
