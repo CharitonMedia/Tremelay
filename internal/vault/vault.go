@@ -780,6 +780,15 @@ func (s *Session) reloadLocked() error {
 		// A different vault at this handle is not a newer commit of this one.
 		return fail(ErrCorrupt)
 	}
+	if !containsEvent(events, s.header.AuditSeq, s.header.AuditHead) {
+		// A higher sequence is not by itself a continuation. An older
+		// authentic copy of this vault verifies on its own terms, so an
+		// attacker who restores one and lets ordinary commands push it past
+		// this session's tip would otherwise have the revocations, rotations
+		// and suspensions this session already served quietly undone. The
+		// chain being adopted must extend the history this session verified.
+		return fail(ErrCorrupt)
+	}
 	doc, idx, err := openDocument(s.dek, header, events)
 	if err != nil {
 		return fail(err)
@@ -801,6 +810,21 @@ func (s *Session) reloadLocked() error {
 	s.suspensions = suspensionFromAudit(events)
 	s.hpolicy = doc.HealthPolicy
 	return nil
+}
+
+// containsEvent reports whether a verified chain holds exactly this event at
+// this sequence. The chain is ordered, and the sequence looked for is the old
+// tip, so the scan starts at the end.
+func containsEvent(events []auditEvent, seq uint64, hash string) bool {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Seq == seq {
+			return events[i].Hash == hash
+		}
+		if events[i].Seq < seq {
+			return false
+		}
+	}
+	return false
 }
 
 func (s *Session) live() error {

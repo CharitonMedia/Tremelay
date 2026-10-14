@@ -43,7 +43,8 @@ its state and every grant it holds.
 
 ```sh
 # An agent that has no token: one created before this feature, or one whose
-# token was revoked.
+# token was revoked. The token file must not exist yet; delete the file a
+# revoked token left behind and reuse its path.
 tremelay agent token issue --path /absolute/vault.db --agent AGENT_ID --token-file ~/.tremelay/claude-code.token
 
 # Replace a live token at the path the client already points at.
@@ -54,13 +55,18 @@ tremelay agent token revoke --path /absolute/vault.db --agent AGENT_ID
 ```
 
 Each command prints the token path, or the agent id for `revoke`, and never
-the token. `issue` refuses an agent that still holds a token, so it cannot
-retire a working client by accident; `rotate` is the command for that.
-Rotation writes a user-only temporary file beside the target and renames it
-over it, so a reader gets the whole old token or the whole new one. The
-replaced token stops authenticating at once, including in a running daemon.
-A path that is not already a token file is refused before the vault commits,
-so a mistyped `--token-file` cannot overwrite something else.
+the token. `issue` refuses an agent that still holds a token and refuses a
+token file that already exists, so it cannot retire a working client by
+accident; `rotate` is the command that replaces one in place. Rotation writes
+a user-only temporary file beside the target and renames it over it, so a
+reader gets the whole old token or the whole new one. A `rotate` path that is
+not already a token file is refused before the vault commits, so a mistyped
+`--token-file` cannot overwrite something else.
+
+The replaced or revoked token stops authenticating at once, including in a
+daemon that is already serving and including on a connection that agent
+already has open: its next call is refused and audited, and it does not have
+to reconnect for that to happen.
 
 ## Unlock
 
@@ -83,7 +89,9 @@ committed at the same moment and nothing of your command was written: run it
 again.
 
 The daemon still locks and exits when it cannot verify the file — a tampered
-document, a broken audit chain or a rolled-back audit head.
+document, a broken audit chain, a rolled-back audit head, or a chain that no
+longer contains the audit event the daemon last served, which is what an
+older copy of the vault restored underneath it looks like.
 
 ## Register the stdio command with a client
 

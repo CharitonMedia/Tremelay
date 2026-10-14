@@ -86,9 +86,17 @@ document are checked with the same code an unlock runs, under the key the
 session already holds. An attacker who can write the file cannot make a
 resident session adopt a forged document, a broken chain, a rolled-back audit
 head or another vault's identity; each of those locks the session and the
-daemon exits. Rollback is detected only while a session is live and remembers
-the tip it served — an older authentic copy opened fresh still verifies on
-its own terms, as in the snapshot limits below. A reload appends no audit
+daemon exits. A higher sequence is not taken for a continuation either: the
+re-read chain must contain the event the session last served, so an older
+authentic copy restored under the daemon and then pushed past that sequence
+by the owner's own commands is refused rather than adopted, and the
+revocations and retired tokens the session had already seen cannot be
+reinstated that way. Rollback is detected only while a session is live and
+remembers the tip it served — an older authentic copy opened fresh still
+verifies on its own terms, as in the snapshot limits below. A token retired
+while a connection is open is refused on that connection's next call, because
+the authenticated principal is bound to the agent's token generation and not
+only to its identity. A reload appends no audit
 row; the commit it adopts is already in the chain under the identity that
 wrote it. Commits remain optimistic, so a writer that loses the
 compare-and-swap writes nothing and reports a stale session rather than

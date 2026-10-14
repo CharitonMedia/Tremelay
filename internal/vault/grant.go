@@ -184,41 +184,56 @@ type capabilityView interface {
 	localAttest(agentID string, req LocalAttestRequest) (LocalAttestation, error)
 }
 
+// agentBinder is one principal's view of a session. gen is the agent token
+// generation that principal authenticated with, so the binding outlives the
+// handshake: see bound.
 type agentBinder struct {
-	s *Session
+	s   *Session
+	gen uint64
+}
+
+// bound is the gate every agent-facing call passes. A daemon connection
+// authenticates once (ADR 0024), so without this a daemon already serving
+// would keep honouring a token the owner has rotated away or revoked: the
+// reload makes the changed digest visible, and this is what acts on it.
+func (b agentBinder) bound(agentID string) error {
+	if b.s == nil {
+		return ErrUnauthenticated
+	}
+	return b.s.requireAgentToken(agentID, b.gen)
 }
 
 func (b agentBinder) listCapabilities(agentID string) ([]Capability, error) {
-	if b.s == nil {
-		return nil, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return nil, err
 	}
 	return b.s.listCapabilities(agentID)
 }
 
 func (b agentBinder) authorizeCapability(agentID, credentialID, operation, resource string) (string, error) {
-	if b.s == nil {
-		return "", ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return "", err
 	}
 	return b.s.authorizeCapability(agentID, credentialID, operation, resource)
 }
 
 func (b agentBinder) brokerHTTP(agentID string, req HTTPBrokerRequest) (HTTPBrokerResponse, error) {
-	if b.s == nil {
-		return HTTPBrokerResponse{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return HTTPBrokerResponse{}, err
 	}
 	return b.s.brokerHTTP(agentID, req)
 }
 
 func (b agentBinder) brokerRequest(agentID string, req HTTPRequest) (HTTPResponse, error) {
-	if b.s == nil {
-		return HTTPResponse{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return HTTPResponse{}, err
 	}
 	return b.s.brokerRequest(agentID, req)
 }
 
 func (b agentBinder) localAttest(agentID string, req LocalAttestRequest) (LocalAttestation, error) {
-	if b.s == nil {
-		return LocalAttestation{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return LocalAttestation{}, err
 	}
 	return b.s.localAttest(agentID, req)
 }
@@ -352,7 +367,7 @@ func (s *Session) AuthenticateAgentToken(token []byte) (*AgentPrincipal, error) 
 	defer s.end()
 	sum := sha256.Sum256(token)
 	defer wipe(sum[:])
-	matched, active := "", false
+	matched, active, gen := "", false, uint64(0)
 	if len(token) == AgentTokenLen {
 		for i := range s.agents {
 			if len(s.agents[i].TokenHash) != sha256.Size {
@@ -360,6 +375,7 @@ func (s *Session) AuthenticateAgentToken(token []byte) (*AgentPrincipal, error) 
 			}
 			if subtle.ConstantTimeCompare(s.agents[i].TokenHash, sum[:]) == 1 {
 				matched, active = s.agents[i].ID, s.agents[i].State == agentStateActive
+				gen = s.agents[i].tokenGen()
 				break
 			}
 		}
@@ -373,7 +389,40 @@ func (s *Session) AuthenticateAgentToken(token []byte) (*AgentPrincipal, error) 
 	if err := s.finish(auditEvent{Action: actionDaemonAuth, Result: resultAllowed, AgentID: matched}, nil); err != nil {
 		return nil, err
 	}
-	return &AgentPrincipal{view: agentBinder{s: s}, id: matched}, nil
+	// The principal is bound to this token, not just to its agent: see
+	// requireAgentToken.
+	return &AgentPrincipal{view: agentBinder{s: s, gen: gen}, id: matched}, nil
+}
+
+// requireAgentToken refuses a call whose principal was authenticated by a
+// token the agent no longer holds. gen is the generation that authenticated
+// it; generation 0 is a principal the human control plane bound by id, which
+// has no token to be bound to. A digest that is gone — revoked, or the agent
+// deleted — or a generation that has moved on after a reload is refused, and
+// the refusal is audited as the daemon_auth denial it is. Nothing derived
+// from the token reaches the row: not the material, not its digest, not the
+// generation (ADR 0024).
+//
+// ponytail: one more indexed single-row read per agent call, and the check
+// takes the session mutex separately from the operation that follows it, so a
+// rotation committing in that gap is caught on the call after. Upgrade path:
+// thread the binding through begin so one critical section covers both.
+func (s *Session) requireAgentToken(agentID string, gen uint64) error {
+	if gen == 0 {
+		return nil
+	}
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	idx := s.agentIndex(agentID)
+	if idx < 0 {
+		return s.finish(auditEvent{Action: actionDaemonAuth, Result: resultDenied}, ErrUnauthenticated)
+	}
+	if rec := s.agents[idx]; len(rec.TokenHash) != sha256.Size || rec.tokenGen() != gen {
+		return s.finish(auditEvent{Action: actionDaemonAuth, Result: resultDeniedAgent, AgentID: rec.ID}, ErrUnauthenticated)
+	}
+	return nil
 }
 
 // IssueGrant persists a revocable, expiring capability for one agent.

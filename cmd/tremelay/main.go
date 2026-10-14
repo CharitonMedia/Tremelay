@@ -862,19 +862,25 @@ func cmdAgentToken(verb string, args []string, getenv func(string) string, stdin
 			_, err := fmt.Fprintln(stdout, *agent)
 			return err
 		}
-		// Both verbs replace whatever is at the path, because the point of
-		// this command is that a client's configured path never changes.
-		// What is replaced must already be a token file this tool could
-		// read: an existing path that is anything else is a mistyped
-		// argument, and the vault must not commit before saying so.
-		if stale, err := readAgentToken(*tokenFile); err == nil {
+		// rotate is the only verb that replaces a file, because the point of
+		// it is that a client's configured path never changes. What it
+		// replaces must already be a token file this tool could read: an
+		// existing path that is anything else is a mistyped argument. issue
+		// writes a path that is new, like agent create, so it cannot retire
+		// another agent's working token file. Either refusal happens before
+		// the vault commits.
+		if verb == "issue" {
+			if _, err := os.Lstat(*tokenFile); err == nil {
+				return reject(session)
+			}
+		} else if stale, err := readAgentToken(*tokenFile); err == nil {
 			vault.Wipe(stale)
 		} else if _, statErr := os.Lstat(*tokenFile); statErr == nil {
 			return reject(session)
 		}
-		mint := session.IssueAgentToken
+		mint, write := session.IssueAgentToken, writeAgentToken
 		if verb == "rotate" {
-			mint = session.RotateAgentToken
+			mint, write = session.RotateAgentToken, replaceAgentToken
 		}
 		minted, err := mint(*agent)
 		if err != nil {
@@ -883,7 +889,7 @@ func cmdAgentToken(verb string, args []string, getenv func(string) string, stdin
 		// The vault keeps only the digest, so this is the only copy. It is
 		// written to the file or wiped; it is never printed.
 		defer vault.Wipe(minted.Token)
-		if err := replaceAgentToken(*tokenFile, minted.Token); err != nil {
+		if err := write(*tokenFile, minted.Token); err != nil {
 			return err
 		}
 		_, err = fmt.Fprintln(stdout, *tokenFile)

@@ -66,8 +66,8 @@ func (s *Session) capGrantSupported(g grantRecord) bool {
 }
 
 func (b agentBinder) agentCapNetwork(ctx context.Context, agentID string, bound agentCapGrant, req HTTPRequest) (capNetworkResult, error) {
-	if b.s == nil {
-		return capNetworkResult{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return capNetworkResult{}, err
 	}
 	return b.s.agentCapNetwork(ctx, agentID, bound, req)
 }

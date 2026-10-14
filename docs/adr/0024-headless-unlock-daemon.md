@@ -276,9 +276,11 @@ under `-race`.
   socket gives the kernel's own peer identity and filesystem permissions,
   neither of which loopback offers.
 - **One daemon connection per agent process, authenticated once at startup**
-  (chosen) versus re-authenticating per MCP call. Per-call authentication would
-  multiply `daemon_auth` rows without narrowing anything: the connection is
-  already pinned to one principal for its lifetime.
+  (chosen) versus re-authenticating per MCP call. Presenting the token again
+  on every call would multiply `daemon_auth` allowed rows and put the bearer
+  secret back on the wire repeatedly. The connection is pinned to one
+  principal for its lifetime, and the per-call generation check in the
+  2026-10-13 token-custody amendment is what gives that pinning an expiry.
 - **Add `go-winio` for the Windows transport.** Rejected; `x/sys/windows` and
   `os.NewFile` cover it, and a new dependency inside the process holding the
   vault key needs a stronger reason.
@@ -376,6 +378,17 @@ and exits with the same fixed diagnostic. Rollback detection is the session's
 memory of the tip it already served — an older authentic copy verifies on its
 own terms, so only a live session can notice the substitution.
 
+A sequence that merely moved forward does not establish a continuation, and
+that distinction is the whole of the rollback defence. An attacker who can
+write the file can restore an older authentic copy and then let the owner's
+own later commands push it past the sequence this session served: every check
+above passes, because the fork is this vault, just not this history, and the
+revocations and retired tokens the session had already adopted would come
+back. So the re-read chain must contain the tip itself — one event whose
+sequence is the session's durable sequence and whose hash is the session's
+audit head — and a chain that forks below it is refused as corruption, which
+retires the session and locks the daemon.
+
 Two security expectations changed shape and were reviewed against invariant 13
 rather than quietly dropped:
 
@@ -421,7 +434,7 @@ Three commands now manage the token and nothing else:
 
 | Command | Precondition | Effect |
 | --- | --- | --- |
-| `tremelay agent token issue --path P --agent ID --token-file F` | the agent holds no token | mints one, writes `F` |
+| `tremelay agent token issue --path P --agent ID --token-file F` | the agent holds no token and `F` does not exist | mints one, writes `F` |
 | `tremelay agent token rotate --path P --agent ID --token-file F` | the agent holds a token | replaces it, rewrites `F` in place |
 | `tremelay agent token revoke --path P --agent ID` | the agent holds a token | clears the digest, writes no file |
 
@@ -434,6 +447,20 @@ The replaced token stops authenticating immediately, including in a daemon
 that is already serving, because that daemon re-reads the vault (see the
 amendment above). The two halves of V1.md item 3 are one feature: rotation
 without the reload would still mean a restart.
+
+Immediately means on the next call, not on the next connection. A daemon
+connection authenticates once by design (see the alternative considered
+below), so refusing the handshake is not enough on its own: the authenticated
+principal is bound to the pair (agent id, token generation), and every later
+call it makes — list, describe, invoke, broker, attest, and an SSH
+conversation at its entry point — re-checks that pair against the state the
+reload brought in. A digest that is gone, a generation that has moved, or an
+agent record that is no longer there refuses the call with the session's
+fixed unauthenticated error, releases nothing, and appends one `daemon_auth`
+row under the shapes the table above already allows: `denied_agent` with the
+agent id when the record is still there, `denied` with no attribution when it
+is not. The generation is not in the row, and neither is anything else
+derived from the token.
 
 `agentRecord` gains `token_gen`, the count of tokens this agent has held.
 Issue and rotate raise it; revoke clears the digest and keeps the count, so a
@@ -461,21 +488,53 @@ offline verifier for a guessed token, and the generation would narrow a
 guess at which file is current.
 
 File custody: the vault commits before the file is written, so there is never
-a token on disk that the vault has already stopped accepting. A rotation
-writes a 0600 temporary file in the target's own directory, flushes it, and
-renames it over the target, so a reader gets the whole old token or the whole
-new one. The directory entry itself is not fsynced; the failure that leaves
-behind is the recoverable one — the old token still works and the operator
-rotates again — and that ceiling is marked in the code. A `--token-file` path
-that exists and is not already a readable token file is refused before the
-vault commits, so a mistyped argument cannot overwrite an unrelated file.
+a token on disk that the vault has already stopped accepting. The other
+direction is the recoverable one — a commit whose file write then fails
+leaves the operator rotating again — and it is the only ordering available,
+because the commit is what mints the token.
+
+A rotation creates its temporary file in the target's own directory, under a
+random name, through the same platform owner-only creator `agent create`
+uses: `O_EXCL` at 0600 on Unix, `CREATE_NEW` with the owner-only descriptor
+on Windows. It is flushed, closed, and renamed over the target, which
+replaces it atomically on both platforms (`rename(2)`, and `MoveFileEx` with
+`MOVEFILE_REPLACE_EXISTING`), so a reader gets the whole old token or the
+whole new one and the temporary file is never wider than the file it becomes.
+`os.CreateTemp` plus `Chmod` is not that creator and was the original
+mistake: 0600 is a Unix mode, and on Windows the file keeps the directory's
+inherited ACL, which the token-file read then refuses — with the vault
+already committed, which left the agent with no usable token and no command
+that would fix it. The directory entry itself is not fsynced; the failure
+that leaves behind is recoverable the same way, and that ceiling is marked in
+the code.
+
+`rotate` is the only verb that replaces a file. `issue` refuses an existing
+path exactly as `agent create` does, because that path may be another agent's
+live token file and overwriting it would retire a working client; a file a
+revoked token left behind is removed by the operator before reissuing to the
+same path, which is the path a client is configured with either way. A
+`rotate --token-file` path that exists and is not already a readable token
+file is refused before the vault commits, so a mistyped argument cannot
+overwrite an unrelated file.
 
 Tests: in `internal/vault`, custody end to end on an agent with no digest
 (issue, authenticate, rotate, old token refused, revoke, reissue) with grants
 unchanged throughout and generations strictly increasing; every refusal with
 its exact audit row; the shapes the validator must reject; the stored
-generation surviving a seal and unlock; and no token, digest or passphrase in
-the file or the logs. In `cmd/tremelay`, the same custody over the real CLI
-on every platform, and over a live daemon on Unix, including a superseded
-token refused by the running daemon and audited as an unattributed
-`daemon_auth` denial. These are security controls under invariant 13.
+generation surviving a seal and unlock; a principal that authenticated before
+a rotation and before a revocation refused on list, describe, invoke,
+capability listing and its SSH entry point, each refusal audited and carrying
+no token material, with the replacement token serving the same grant; and no
+token, digest or passphrase in the file or the logs. The forked chain above
+has its own test: a session adopts a revocation, an older copy of the file is
+restored and pushed past that tip by ordinary unlocks, and the session is
+retired rather than serving a view in which the revoked grant is active.
+
+In `cmd/tremelay`, the same custody over the real CLI on every platform, and
+over a live daemon on Unix: a superseded token refused at the handshake and
+audited as an unattributed `daemon_auth` denial, connections opened before a
+rotation and before a revocation refused on their next listing and their next
+invocation with each refusal audited and attributed, a rotated token file
+still owner-only with no temporary file left beside it, `issue` refusing to
+overwrite another agent's token file without committing, and the daemon
+locking on a forked chain. These are security controls under invariant 13.

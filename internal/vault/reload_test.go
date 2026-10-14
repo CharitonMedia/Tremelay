@@ -134,6 +134,67 @@ func TestSessionReloadFailsClosed(t *testing.T) {
 	}
 }
 
+// TestSessionRefusesForkedChain is the rollback a sequence comparison cannot
+// see. An attacker restores an older authentic copy of the vault file and
+// lets the owner's own later commands push it past the sequence this session
+// has already served: the header, the chain, the suffix and the sealed
+// document all verify, because they are this vault's, just not this history.
+// The only thing that can refuse it is the session's memory of the tip it
+// verified, so that is what the reload requires the new chain to contain.
+func TestSessionRefusesForkedChain(t *testing.T) {
+	env := newAttestEnv(t)
+	grant := env.grant(t, time.Hour)
+	cap := bindCap(t, env.s, env.agent.ID)
+	handle := capCall(t, cap, okBytes(t)(encodeCapList())).entries[0].handle
+
+	// The copy an attacker keeps: the vault as it is before the revocation.
+	var nonce, doc []byte
+	var head string
+	var seq int64
+	mutateDB(t, env.path, func(db *sql.DB) {
+		if err := db.QueryRow(`SELECT data_nonce, encrypted_document, audit_head, audit_seq FROM vault`).Scan(&nonce, &doc, &head, &seq); err != nil {
+			t.Fatal(err)
+		}
+	})
+	control, err := Unlock(env.path, env.pass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.RevokeGrant(grant.ID); err != nil {
+		t.Fatal(err)
+	}
+	control.Lock()
+	// The session adopts the revocation. That tip is what it must not lose.
+	if got := capCall(t, cap, okBytes(t)(encodeCapInvoke(handle, []byte("revoked")))); got.code != capDeniedRevoked {
+		t.Fatalf("the revocation was not adopted: %q", got.code)
+	}
+	tip := env.s.header.AuditSeq
+
+	// Restore the copy, then let ordinary unlocks push the fork past that
+	// tip, which is all the attacker needs from the owner.
+	mutateDB(t, env.path, func(db *sql.DB) {
+		execSQL(t, db, `DELETE FROM audit WHERE seq > ?`, seq)
+		execSQL(t, db, `UPDATE vault SET data_nonce=?, encrypted_document=?, audit_head=?, audit_seq=?`, nonce, doc, head, seq)
+	})
+	for forked := uint64(seq); forked <= tip; {
+		owner, err := Unlock(env.path, env.pass, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		forked = owner.header.AuditSeq
+		owner.Lock()
+	}
+
+	// The fork is never adopted, so the revoked grant is not active again,
+	// and the session is retired rather than left serving either view.
+	if raw, err := cap.Exchange(okBytes(t)(encodeCapList())); raw != nil || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("a forked chain was adopted: %x %v", raw, err)
+	}
+	if _, err := env.s.List(); !errors.Is(err, ErrStale) {
+		t.Fatalf("retired session still served: %v", err)
+	}
+}
+
 // TestSessionReloadUnderConcurrentCalls runs the session's own entry points
 // against each other while another holder commits, which is where a reload
 // swaps the credential, grant and audit state underneath them. Under -race

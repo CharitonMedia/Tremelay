@@ -339,15 +339,15 @@ func fixedStreamErr(err error) error {
 }
 
 func (b agentBinder) sshConstruct(agentID, grantID string) (agentCapGrant, error) {
-	if b.s == nil {
-		return agentCapGrant{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return agentCapGrant{}, err
 	}
 	return b.s.sshConstruct(agentID, grantID)
 }
 
 func (b agentBinder) sshJudge(agentID string, bound agentCapGrant) (auditEvent, []byte, error) {
-	if b.s == nil {
-		return auditEvent{}, nil, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return auditEvent{}, nil, err
 	}
 	return b.s.sshJudge(agentID, bound)
 }
@@ -360,22 +360,22 @@ func (b agentBinder) sshRecord(ev auditEvent) error {
 }
 
 func (b agentBinder) sshDeny(agentID string, bound agentCapGrant) error {
-	if b.s == nil {
-		return ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return err
 	}
 	return b.s.sshDeny(agentID, bound)
 }
 
 func (b agentBinder) sshShowKey(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig []byte) ([]byte, error) {
-	if b.s == nil {
-		return nil, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return nil, err
 	}
 	return b.s.sshShowKey(agentID, bound, hostKey, sessionID, hostSig)
 }
 
 func (b agentBinder) sshRelease(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error) {
-	if b.s == nil {
-		return nil, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return nil, err
 	}
 	return b.s.sshRelease(agentID, bound, hostKey, sessionID, hostSig, signBody)
 }

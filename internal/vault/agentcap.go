@@ -373,29 +373,29 @@ func (a *AgentCapability) bindAll(snaps []agentCapSnapshot) ([]capEntry, error) 
 }
 
 func (b agentBinder) agentCapList(agentID string) ([]agentCapSnapshot, error) {
-	if b.s == nil {
-		return nil, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return nil, err
 	}
 	return b.s.agentCapList(agentID)
 }
 
 func (b agentBinder) agentCapDescribe(agentID string, bound agentCapGrant) (agentCapView, error) {
-	if b.s == nil {
-		return agentCapView{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return agentCapView{}, err
 	}
 	return b.s.agentCapDescribe(agentID, bound)
 }
 
 func (b agentBinder) agentCapInvoke(agentID, grantID string, payload []byte) (LocalAttestation, error) {
-	if b.s == nil {
-		return LocalAttestation{}, ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return LocalAttestation{}, err
 	}
 	return b.s.localAttestExact(agentID, grantID, payload)
 }
 
 func (b agentBinder) agentCapDeny(agentID string, invoke bool) error {
-	if b.s == nil {
-		return ErrUnauthenticated
+	if err := b.bound(agentID); err != nil {
+		return err
 	}
 	return b.s.agentCapDeny(agentID, invoke)
 }

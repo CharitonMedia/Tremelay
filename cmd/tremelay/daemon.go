@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -487,8 +488,12 @@ func writeAgentToken(path string, token []byte) error {
 // the whole old token or the whole new one, never a truncated file and never
 // a file the daemon has already stopped accepting while the old one is gone.
 func replaceAgentToken(path string, token []byte) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, ".tremelay-token-")
+	// os.CreateTemp is not the creator here: its 0600 is a Unix mode, and on
+	// Windows the file would keep the directory's inherited ACL, which
+	// readAgentToken then refuses after the vault has already committed. The
+	// platform creator is the same one agent create uses, so the temporary
+	// file and the final file have one custody rule.
+	f, err := createUserOnlyFile(filepath.Join(filepath.Dir(path), tempTokenName()))
 	if err != nil {
 		return errAgentToken
 	}
@@ -498,11 +503,6 @@ func replaceAgentToken(path string, token []byte) error {
 		f.Close()
 		os.Remove(f.Name())
 		return errAgentToken
-	}
-	// CreateTemp is 0600 already; this states the requirement rather than
-	// inheriting it, because the file holds a bearer secret.
-	if err := f.Chmod(0o600); err != nil {
-		return fail()
 	}
 	if _, err := f.Write(encoded); err != nil {
 		return fail()
@@ -520,11 +520,20 @@ func replaceAgentToken(path string, token []byte) error {
 		os.Remove(f.Name())
 		return errAgentToken
 	}
+	// os.Rename replaces an existing target on both platforms: rename(2) on
+	// Unix, MoveFileEx with MOVEFILE_REPLACE_EXISTING on Windows.
 	if err := os.Rename(f.Name(), path); err != nil {
 		os.Remove(f.Name())
 		return errAgentToken
 	}
 	return nil
+}
+
+// tempTokenName is a name nothing else holds, because the owner-only creator
+// refuses an existing file on both platforms. A collision is not retried: the
+// vault has already committed, so the operator rotates again.
+func tempTokenName() string {
+	return ".tremelay-token-" + rand.Text()
 }
 
 func encodeAgentToken(token []byte) []byte {

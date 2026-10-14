@@ -116,6 +116,118 @@ func TestAgentTokenCustody(t *testing.T) {
 	}
 }
 
+// TestAgentTokenBindsTheConnection is the other half of "refused
+// immediately": a daemon connection authenticates once and then serves calls
+// for as long as it is open, so a principal must stop working the moment the
+// token that authenticated it stops being the agent's. Rotation and
+// revocation are checked on the connection that is already serving, not only
+// on the next one.
+func TestAgentTokenBindsTheConnection(t *testing.T) {
+	for _, retire := range []string{"rotate", "revoke"} {
+		t.Run(retire, func(t *testing.T) {
+			env := newAttestEnv(t)
+			grant := env.grant(t, time.Hour)
+			minted, err := env.s.RotateAgentToken(env.agent.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			held := append([]byte(nil), minted.Token...)
+			Wipe(minted.Token)
+			principal, err := env.s.AuthenticateAgentToken(held)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cap, err := BindAgentCapability(principal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries := capCall(t, cap, okBytes(t)(encodeCapList())).entries
+			if len(entries) != 1 || entries[0].status != GrantActive {
+				t.Fatalf("the authenticated connection does not hold its grant: %+v", entries)
+			}
+			handle := entries[0].handle
+
+			// The owner retires the token from another holder of the same
+			// passphrase, exactly as the human CLI does to a live daemon.
+			control, err := Unlock(env.path, env.pass, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var replacement []byte
+			if retire == "rotate" {
+				next, err := control.RotateAgentToken(env.agent.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				replacement = append([]byte(nil), next.Token...)
+				Wipe(next.Token)
+			} else if err := control.RevokeAgentToken(env.agent.ID); err != nil {
+				t.Fatal(err)
+			}
+			control.Lock()
+
+			// Every call the open connection can make is refused, and the
+			// refusal is an error rather than a response, so no handle, no
+			// status and no signature is released.
+			calls := map[string][]byte{
+				"list":     okBytes(t)(encodeCapList()),
+				"describe": okBytes(t)(encodeCapDescribe(handle)),
+				"invoke":   okBytes(t)(encodeCapInvoke(handle, []byte("after retirement"))),
+			}
+			// A reload brings the other holder's own rows in too, so the
+			// refusals are counted by what they are.
+			denials := func() int {
+				n := 0
+				for _, row := range env.s.audit {
+					if row.Action == actionDaemonAuth && row.Result == resultDeniedAgent {
+						n++
+					}
+				}
+				return n
+			}
+			for name, msg := range calls {
+				before := denials()
+				raw, err := cap.Exchange(msg)
+				if raw != nil || !errors.Is(err, ErrUnauthenticated) {
+					t.Fatalf("%s on a retired token: %x %v", name, raw, err)
+				}
+				// Invariant 4: the attempt is audited, attributed to the
+				// agent the digest used to resolve, and carries nothing
+				// derived from the token.
+				if denials() != before+1 {
+					t.Fatalf("%s wrote %d refusal rows", name, denials()-before)
+				}
+				row := env.s.audit[len(env.s.audit)-1]
+				if row.Action != actionDaemonAuth || row.Result != resultDeniedAgent || row.AgentID != env.agent.ID {
+					t.Fatalf("%s refusal row %s/%s/%q", name, row.Action, row.Result, row.AgentID)
+				}
+				if row.GrantID != "" || row.Operation != "" || row.CredID != "" || row.CredType != "" || row.CredGen != 0 {
+					t.Fatalf("%s refusal row carries unrelated metadata: %+v", name, row)
+				}
+				if err := validAuditShape(row); err != nil {
+					t.Fatalf("%s refusal row shape: %v", name, err)
+				}
+			}
+			// The SSH half of the same principal is refused at its entry
+			// point, before any frame is read.
+			if _, err := principal.SSHAgent(); !errors.Is(err, ErrUnauthenticated) {
+				t.Fatalf("a retired token still opened an ssh conversation: %v", err)
+			}
+			if _, err := principal.Capabilities(); !errors.Is(err, ErrUnauthenticated) {
+				t.Fatalf("a retired token still listed capabilities: %v", err)
+			}
+			// The agent itself is untouched: the replacement token holds the
+			// same grant on a new connection.
+			if retire == "rotate" {
+				assertAuthenticates(t, env.s, replacement, env.agent.ID, grant.ID)
+			}
+			if _, err := VerifyAudit(env.path, env.pass); err != nil {
+				t.Fatalf("audit chain invalid: %v", err)
+			}
+		})
+	}
+}
+
 func assertAuthenticates(t *testing.T, s *Session, token []byte, agentID, grantID string) {
 	t.Helper()
 	principal, err := s.AuthenticateAgentToken(token)

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -842,7 +843,19 @@ func TestCLIAgentTokenCustody(t *testing.T) {
 	}
 
 	// Revoke takes the token away and issue restores one at the same path.
+	// issue writes a path that is new, so the file the revoked token left
+	// behind goes first; replacing one in place is rotate's job alone.
 	cli(t, "agent", "token", "revoke", "--path", path, "--agent", agentID)
+	if code := run([]string{"agent", "token", "issue", "--path", path, "--agent", agentID, "--token-file", tokenFile},
+		env, strings.NewReader(""), io.Discard, io.Discard); code != 1 {
+		t.Fatal("issue replaced an existing token file")
+	}
+	if read(t) != rotated {
+		t.Fatal("a refused issue changed the token file")
+	}
+	if err := os.Remove(tokenFile); err != nil {
+		t.Fatal(err)
+	}
 	cli(t, "agent", "token", "issue", "--path", path, "--agent", agentID, "--token-file", tokenFile)
 	reissued := read(t)
 	if reissued == rotated || reissued == minted {
