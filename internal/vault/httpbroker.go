@@ -701,7 +701,11 @@ func credentialForms(inj grantInjection, secret []byte) [][]byte {
 		add([]byte(encodedHex))
 		add([]byte(strings.ToUpper(encodedHex)))
 		if quoted, err := json.Marshal(raw); err == nil && len(quoted) >= 2 {
-			add(quoted[1 : len(quoted)-1])
+			inner := quoted[1 : len(quoted)-1]
+			add(inner)
+			if bytes.Contains(inner, []byte{'/'}) {
+				add(bytes.ReplaceAll(inner, []byte("/"), []byte("\\/")))
+			}
 		}
 	}
 	spellings(string(secret))
@@ -769,6 +773,17 @@ func projectResponse(inj grantInjection, secret []byte, upstream http.Header, bo
 			return HTTPResponse{}, ErrBrokerUpstream
 		}
 	}
+	mcpJSON, err := json.Marshal(brokerBody(out))
+	if err != nil {
+		wipe(out.Body)
+		return HTTPResponse{}, ErrBrokerUpstream
+	}
+	if containsCredentialForm(mcpJSON, forms) {
+		wipe(mcpJSON)
+		wipe(out.Body)
+		return HTTPResponse{}, ErrBrokerUpstream
+	}
+	wipe(mcpJSON)
 	return out, nil
 }
 
@@ -852,11 +867,20 @@ func containsCredentialForm(buf []byte, forms [][]byte) bool {
 	return false
 }
 
-// formPrefixEqual compares percent-escape hex digits case-insensitively and
-// every other byte exactly.
+// formPrefixEqual compares percent-escape hex digits case-insensitively,
+// whole hex spellings case-insensitively on a-f/A-F, and every other byte
+// exactly.
 func formPrefixEqual(got, form []byte) bool {
 	if len(got) > len(form) {
 		return false
+	}
+	if isHexSpelling(form) {
+		for i := range got {
+			if foldHex(got[i]) != foldHex(form[i]) {
+				return false
+			}
+		}
+		return true
 	}
 	for i := range got {
 		if got[i] == form[i] {
@@ -882,6 +906,18 @@ func percentHexDigit(form []byte, i int) bool {
 
 func isHex(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func isHexSpelling(form []byte) bool {
+	if len(form) == 0 {
+		return false
+	}
+	for _, c := range form {
+		if !isHex(c) {
+			return false
+		}
+	}
+	return true
 }
 
 func foldHex(c byte) byte {
