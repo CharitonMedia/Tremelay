@@ -75,6 +75,17 @@ If the two sources disagree, stop; do not pin either. Use `--ssh-user git` for
 GitHub, and note that the grant authorizes authentication to github.com as a
 whole, not one repository.
 
+The agent only accepts the pinned Ed25519 host key, so make OpenSSH negotiate
+Ed25519 with GitHub. Otherwise OpenSSH may prefer an ECDSA or RSA key already in
+`known_hosts`, the bind carries that key, the agent refuses it, and you see a bare
+`Permission denied (publickey)`. Keep only GitHub's `ssh-ed25519` line for
+github.com in `known_hosts`, and add to `~/.ssh/config`:
+
+```
+Host github.com
+  HostKeyAlgorithms ssh-ed25519
+```
+
 Create the agent, its token file and the grant. `--ssh-user` is the account on
 that server (`git` for a hosted forge, your login name for your own box). The
 resource label is recorded with the grant; it does not restrict the repository

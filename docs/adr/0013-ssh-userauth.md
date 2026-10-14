@@ -85,7 +85,7 @@ Each stream holds at most one binding. `Serve` and `roundTrip` serialize that st
 - **Reuse `sign` or `local_artifact_attest`.** Rejected. Existing grants would gain SSH authority, and the attestation domain is not an SSH userauth encoding.
 - **Pass the restrictive agent to `ServeAgent`.** Rejected for this dependency version. The server parses and logs before the callback, so the Tremelay boundary would not hold.
 - **Retarget the stream to the current key's grant.** Rejected. That is the ambiguity ADR 0012's attestation path still has, and this operation pins the grant at construction instead.
-- **Accept ordinary publickey on a first hop.** Rejected. OpenSSH allows it in some trusted cases. This adapter assumes the caller can forge or replay a binding.
+- **Accept ordinary publickey on a first hop.** Rejected. OpenSSH allows it in some trusted cases. This adapter assumes the caller can forge or replay a binding. *Superseded 2026-10-14 by the V1 item 5b amendment below: ordinary publickey is now signed only when its session identifier equals one verified, non-forwarded `session-bind@openssh.com` for the pinned host key on the same agent connection, so a forged or replayed bind cannot obtain a signature for a live session the pinned host did not sign.*
 - **Treat a binding as a live local session.** Rejected. The process cannot see the SSH transport. The guarantee is the signed username, host key, and session identifier.
 
 ## Security implications
