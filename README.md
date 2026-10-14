@@ -6,6 +6,34 @@ Tremelay is a self-hosted credential vault and capability broker. Humans can sto
 
 > The broker possesses secrets. Agents possess capabilities.
 
+## Install
+
+Tremelay is pre-release security software. No release is published yet, so
+`go install` from source is the only install path today; the download commands
+below are the shape of the published one.
+
+```
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest
+```
+
+Each release will carry a `tar.gz` (linux, macOS) or `zip` (windows) for
+amd64 and arm64, a CycloneDX SBOM per binary, and a `SHA256SUMS` file. To
+download and verify on linux or macOS, with `OS` as `linux` or `darwin` and
+`ARCH` as `amd64` or `arm64`:
+
+```
+VERSION=v1.0.0 OS=linux ARCH=amd64 && name=tremelay_${VERSION}_${OS}_${ARCH} &&
+base=https://github.com/CharitonMedia/Tremelay/releases/download/$VERSION &&
+curl -fsSL -O $base/$name.tar.gz -O $base/SHA256SUMS &&
+grep "  $name.tar.gz$" SHA256SUMS | shasum -a 256 -c - &&
+tar -xzf $name.tar.gz && install -m 755 $name ~/.local/bin/tremelay
+```
+
+`SHA256SUMS` is a checksum file, not a signature: it detects a corrupted or
+truncated download, not a substituted release. Signed releases are out of v1.
+`make release-dry` builds the same artifacts into `dist/release` locally. See
+[ADR 0027](docs/adr/0027-release-artifacts.md).
+
 ## Project status
 
 M1 is a local single-user vault. A human can create a vault, unlock it with a passphrase, and store and retrieve a credential with the `tremelay` CLI. M2 adds distinct agent principals and revocable, expiring capability grants. M3 adds an in-process HTTP broker on an agent principal: the broker injects a stored credential into one authorized HTTPS request and does not return the credential. An `http_request` grant used by the broker names the exact method and canonical URL, for example `GET https://svc.example/v1/ping`. M4 enforces that text as origin, method, path, and action policy, and refuses SSRF, DNS rebinding, proxy bypass, and redirects before a credential can follow them. M5 adds human audit views, a fixed risk classification, a secret-free notification interface, and optional containment. M6 evaluates credentials when they are added or replaced and records secret-free health, review, expiry, and rotation reminders. Health is advisory and is not available to agents. M7 adds one scoped GitHub issue-state read: an agent with a `github_issue_state` grant for a single issue receives that issue's number, open or closed state, lock flag, and comment count. The credential stays in the broker, and an existing `http_request` grant does not receive those fields. The local demonstration uses a synthetic credential and does not call GitHub. See [docs/m7-github-issue.md](docs/m7-github-issue.md). M8 adds one local Ed25519 attestation and one host-bound SSH userauth signature. An agent with a `local_artifact_attest` grant receives a signature over a bounded payload. An agent with an `ssh_userauth` grant can obtain an SSH Ed25519 authentication signature for one username and one pinned host key through an in-memory agent stream. The private key stays in the vault. Neither operation authorizes the other, and older grants do not gain either one. Both demonstrations use disposable keys. The SSH demonstration does not open a socket or complete a login. See [docs/m8-local-attest.md](docs/m8-local-attest.md) and [docs/m8-ssh-userauth.md](docs/m8-ssh-userauth.md). M9b adds a local checkpoint-bound snapshot of the vault. The host keeps the checkpoint outside the encrypted file. An old snapshot with its own old checkpoint is not detected as stale, and this slice does not recover a lost passphrase. See [docs/m9b-local-backup.md](docs/m9b-local-backup.md). M10a adds an in-process capability interface for one bound agent: it can list, describe, and invoke that agent's `local_artifact_attest` grants by an exact handle, and it rejects `request_capability`. This is not a public SDK or an MCP transport. See [docs/m10a-agent-capability.md](docs/m10a-agent-capability.md). The CLI remains the human control plane and has no human-id flag: agent and grant commands do not retrieve raw secrets, and there is no agent-facing `getSecret`. See [MILESTONES.md](MILESTONES.md).
