@@ -82,6 +82,7 @@ type sshBroker interface {
 	sshJudge(agentID string, bound agentCapGrant) (auditEvent, []byte, error)
 	sshRecord(ev auditEvent) error
 	sshDeny(agentID string, bound agentCapGrant) error
+	sshDenyNoGrant(agentID string) error
 	sshShowKey(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig []byte) ([]byte, error)
 	sshRelease(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig, signBody []byte) ([]byte, error)
 }
@@ -366,6 +367,13 @@ func (b agentBinder) sshDeny(agentID string, bound agentCapGrant) error {
 	return b.s.sshDeny(agentID, bound)
 }
 
+func (b agentBinder) sshDenyNoGrant(agentID string) error {
+	if err := b.bound(agentID); err != nil {
+		return err
+	}
+	return b.s.sshDenyNoGrant(agentID)
+}
+
 func (b agentBinder) sshShowKey(agentID string, bound agentCapGrant, hostKey, sessionID, hostSig []byte) ([]byte, error) {
 	if err := b.bound(agentID); err != nil {
 		return nil, err
@@ -417,6 +425,24 @@ func (s *Session) sshConstructUnlocked(agentID, grantID string) (agentCapGrant, 
 		resource: g.Resource, operation: OpSSHUserAuth, credGen: c.Gen,
 		sshUser: g.SSHUsername, sshHost: string(g.SSHHostKey),
 	}, nil
+}
+
+// sshDenyNoGrant audits an SSH attempt from a principal that holds no usable
+// ssh_userauth authority at all, so no selected grant exists to judge. The row
+// carries the same fields a rejected construction writes: a verified principal
+// ID, the operation, and nothing of the caller's frame.
+func (s *Session) sshDenyNoGrant(agentID string) error {
+	if err := s.begin(); err != nil {
+		return err
+	}
+	defer s.end()
+	if err := s.live(); err != nil {
+		return err
+	}
+	if err := s.adoptLocked(); err != nil {
+		return err
+	}
+	return s.denySSHConstruct(agentID, nil)
 }
 
 func (s *Session) denySSHConstruct(agentID string, cause error) error {
