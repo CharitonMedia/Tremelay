@@ -124,3 +124,108 @@ The application now pins `golang.org/x/crypto` v0.56.0 and its required `golang.
 Official Go vulnerability records put the fixes for 19 findings against the former v0.41.0 pin at or below v0.56.0: GO-2025-4116 (v0.43.0); GO-2025-4134 and GO-2025-4135 (v0.45.0); GO-2026-5005, GO-2026-5006, GO-2026-5013 through GO-2026-5021, GO-2026-5023 and GO-2026-5033 (v0.52.0); GO-2026-6303 (v0.55.0); and [GO-2026-6354](https://vuln.go.dev/ID/GO-2026-6354.json) and [GO-2026-6355](https://vuln.go.dev/ID/GO-2026-6355.json) (v0.56.0). [GO-2026-5932](https://vuln.go.dev/ID/GO-2026-5932.json) remains: it covers seven unmaintained OpenPGP package paths and has no fixed version. Tremelay imports none of those packages, including in tests, so this remains a module-level finding, not a claim of vulnerability absence. Dated scanner reports must distinguish required modules, imported packages and called symbols; a test-inclusive source scan is separate from the candidate's source scan, which omits tests.
 
 Production uses `x/crypto/argon2` and its `blake2b` dependency; SSH imports remain test-only. KDF parameters, vault encodings, signature authority and the custom stream codec are unchanged. The [tagged official agent client](https://github.com/golang/crypto/blob/v0.56.0/ssh/agent/client.go) starts a reader and supports up to 32 outstanding requests on an `io.ReadWriteCloser`. `TestSSHUserAuthInterop` therefore also checks bounded concurrent identity/sign requests, their signatures and audit counts, clean EOF, closed-client rejection, and transport/goroutine cleanup. This remains synthetic in-memory compatibility, not a completed SSH login or production-security assurance.
+
+## Amendment — 2026-10-14: plain `publickey` bound to a verified session
+
+V1.md item 5b (Patrick, 2026-10-13) widens the signed message set by exactly
+one encoding, so that this credential works with servers that do not implement
+`publickey-hostbound-v00@openssh.com` — github.com among them. Besides the
+host-bound preimage above, the stream signs the ordinary `publickey` preimage:
+
+```
+string    session identifier
+byte      SSH_MSG_USERAUTH_REQUEST (50)
+string    username
+string    "ssh-connection"
+string    "publickey"
+byte      1
+string    "ssh-ed25519"
+string    user public key
+```
+
+It has no host-key field, so it is released only when all of the following
+hold at once:
+
+- this stream already accepted one `session-bind@openssh.com`: the host key in
+  the bind was byte-equal to the grant's pinned host key, its attached
+  canonical `ssh-ed25519` signature over the session identifier verified under
+  that key, and `is_forwarding` was the canonical false byte;
+- the request's session identifier is byte-equal to that bind's session
+  identifier;
+- the bind was received on this same stream, which is one agent connection;
+- the username, user public key, algorithm, service, signed boolean, sign
+  flag, length caps and absence of trailing bytes pass the checks the
+  host-bound preimage already passes.
+
+An unbound plain request, a session identifier matching no verified bind, a
+bind for any other host key, a bind whose host-key signature does not verify, a
+forwarded bind, a bind held by another connection, and a plain request with a
+host key appended are each refused and audited exactly as before. Everything
+else is unchanged: grant shape and scoping, the pinned grant per stream,
+revocation and expiry taking effect on the next request, the credential
+generation check, every audit row and its field set, the bounds table, and the
+absence of key material from rows, logs and errors. No new dependency and no
+new primitive: the wire is parsed by this codec, the host proof is verified
+with `crypto/ed25519` through the existing `golang.org/x/crypto/ssh` encodings.
+
+### What is trusted
+
+The pinned host key's own signature over the session identifier, and nothing
+the caller asserts. The session identifier is the exchange hash of one SSH
+transport; it covers that transport's host key and its ephemeral key exchange,
+so a proof for it cannot be moved to another session, and producing one for a
+session the pinned host did not terminate requires that host's private key.
+OpenSSH 8.9 and later send the bind immediately after key exchange and before
+they ask the agent for anything, so by the time a signature is requested the
+agent has already checked which destination the connection reached.
+
+### Why the bind gives equivalent host binding here
+
+The two preimages differ only in whether the destination is named inside the
+signed bytes. `publickey-hostbound-v00@openssh.com` names it so that the
+*server* can detect a signature produced for somewhere else; a server that does
+not implement the method cannot be made to check anything. The protection this
+agent needs is upstream of that: it must not release a signature usable against
+a destination the grant does not pin. The session-identifier equality check
+provides it, because the signature it releases is valid only in the one
+transport whose exchange hash it names, and that transport verifiably
+terminated at the pinned host key. A hostile local caller gains nothing by
+asking for the plain form: without a bind it is refused, and a bind requires
+the pinned host key's private key or a genuine session with that host.
+
+For OpenSSH clients older than 8.9, which send no bind, both forms are refused.
+The interoperability requirement therefore moves from the server to the client.
+
+### Residual risk
+
+- A released plain signature carries no destination in its bytes. Its scope is
+  the session identifier alone, so a holder can use it only inside that one
+  transport — but anyone who can read the agent's response can complete that
+  one authentication.
+- Everything ADR 0013's limits section already says still holds, and the
+  host-key limits bite the same way: two servers that share the pinned host key
+  and username are one destination, and a caller that relays bytes from a
+  genuine session is outside what this process observes. Such a caller could
+  already obtain a host-bound signature for that session; it can now obtain the
+  plain one instead, which is the same authority over the same transport.
+- Forwarded binds remain refused, so a second hop cannot obtain either form.
+- Pinning is now more consequential for hosted forges: the grant must hold the
+  provider's published host key. [The guide](../ssh-agent.md) states that it is
+  taken from the provider's published fingerprints and never from
+  `ssh-keyscan` output accepted unchecked.
+- Nothing here closes an authenticated session or recalls a released
+  signature.
+
+### Tests
+
+`TestSSHUserAuthPlainPublickey` drives real wire bytes through one stream: the
+positive release and its independent verification, and refusal for no bind, a
+bind by another host key, a bind whose signature does not verify, a bind over
+another session, a forwarded bind, a mismatched session identifier, another
+username, another user key, an appended host key, a trailing byte, a non-zero
+flag, a bind held by a second connection, and a revoked grant on the next
+request. `TestSSHAgentConversation` and `TestSSHAgentGrantsStaySeparate` cover
+the same release and the cross-grant refusal through the official
+`ssh/agent` client. Key material, usernames, host keys, session identifiers,
+preimages and signatures are still scanned out of the wire, logs, vault file
+and audit rows.

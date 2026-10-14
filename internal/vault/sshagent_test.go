@@ -127,14 +127,28 @@ func TestSSHAgentConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A server without the host-bound method, such as github.com, asks for a
+	// plain publickey signature over the same session identifier. That is
+	// released too, authorized by the same verified binding.
+	plain := plainPreimage(sessionID, env.user, env.userBlob)
+	plainSig, err := peer.Sign(sshPub, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parsed.Verify(plain, plainSig); err != nil {
+		t.Fatal(err)
+	}
+
 	// Scope: the username and the host key in the preimage are the grant's,
 	// and the data must be a host-bound userauth request.
 	refused := map[string][]byte{
-		"another username":   userauthPreimage(sessionID, "root", env.userBlob, env.hostBlob),
-		"another host key":   userauthPreimage(sessionID, env.user, env.userBlob, marshalEd25519Pub(otherHostPub)),
-		"another session":    userauthPreimage(env.sessionID(32), env.user, env.userBlob, env.hostBlob),
-		"ordinary publickey": env.methodPreimage(sessionID, "publickey"),
-		"not userauth data":  []byte("sign this arbitrary payload for me"),
+		"another username":                         userauthPreimage(sessionID, "root", env.userBlob, env.hostBlob),
+		"another host key":                         userauthPreimage(sessionID, env.user, env.userBlob, marshalEd25519Pub(otherHostPub)),
+		"another session":                          userauthPreimage(env.sessionID(32), env.user, env.userBlob, env.hostBlob),
+		"plain publickey with a host key appended": env.methodPreimage(sessionID, "publickey"),
+		"plain publickey for another session":      plainPreimage(env.sessionID(32), env.user, env.userBlob),
+		"plain publickey for another username":     plainPreimage(sessionID, "root", env.userBlob),
+		"not userauth data":                        []byte("sign this arbitrary payload for me"),
 	}
 	for name, data := range refused {
 		if _, err := peer.Sign(sshPub, data); err == nil {
@@ -178,8 +192,8 @@ func TestSSHAgentConversation(t *testing.T) {
 		t.Fatalf("revoked grant still listed an identity %+v %v", keys, err)
 	}
 
-	if sshCount(t, env.path, resultCompleted) != 1 {
-		t.Fatal("exactly one signature release should be recorded")
+	if sshCount(t, env.path, resultCompleted) != 2 {
+		t.Fatal("exactly one host-bound and one plain signature release should be recorded")
 	}
 	if sshCount(t, env.path, resultDenied) < len(refused) {
 		t.Fatal("every refused signing attempt should be audited")
@@ -241,6 +255,12 @@ func TestSSHAgentGrantsStaySeparate(t *testing.T) {
 	}
 	if _, err := peer.Sign(secondSSHPub, userauthPreimage(sessionID, secondUser, secondBlob, secondHostBlob)); err == nil {
 		t.Fatal("signed for a grant whose host was never proved")
+	}
+	// A plain publickey request names no host key at all, so the only thing
+	// keeping the second grant out of this conversation is its own unproved
+	// binding.
+	if _, err := peer.Sign(secondSSHPub, plainPreimage(sessionID, secondUser, secondBlob)); err == nil {
+		t.Fatal("signed plain publickey for a grant whose host was never proved")
 	}
 
 	// A fresh conversation bound to the other host serves the other grant.

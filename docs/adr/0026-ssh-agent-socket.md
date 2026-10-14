@@ -213,3 +213,59 @@ The suite runs under `-race`.
 
 Tests are security controls (invariant 13); none of these may be weakened to
 make CI pass.
+
+## Amendment — 2026-10-14: hosted forges, and the recorded conflict resolved
+
+V1.md item 5b (Patrick, 2026-10-13: "S1 yes") lifts the interoperability
+ceiling above. [ADR 0013's amendment of the same date](0013-ssh-userauth.md)
+adds one signed encoding: the ordinary `publickey` userauth preimage, released
+only when its session identifier is byte-equal to that of a
+`session-bind@openssh.com` the same connection already verified against that
+grant's pinned host key, with `is_forwarding` false. Unbound plain requests, a
+session identifier matching no verified bind, binds for another host key, binds
+whose host-key signature does not verify, and forwarded binds stay refused and
+audited.
+
+Nothing in this ADR's own decision changes. The relay still parses nothing and
+holds only a bearer token; the daemon verb, the per-connection conversation,
+the per-grant streams, the merged identity listing, the broadcast bind, the
+one-signature rule, the endpoint custody rules and the audit rows are all as
+above. Each grant still pins its own host key and still needs its own proof on
+each connection. The served subset grows by that one preimage and by nothing
+else: add, remove, lock, unlock, other extensions and every other opcode are
+refused from the opcode byte as before.
+
+### What this changes in practice
+
+`ssh` and `git` now work against servers that do not implement
+`publickey-hostbound-v00@openssh.com`, which includes github.com and other
+hosted forges. The requirement moves from the server to the client: OpenSSH
+8.9 or later, because a client that sends no `session-bind@openssh.com` gets no
+identity and no signature. The operator must pin the provider's host key from
+its published fingerprints; [the guide](../ssh-agent.md) says so explicitly and
+warns against trusting `ssh-keyscan` output without that comparison.
+
+The trust boundary does not move. What a local caller as the owner can obtain
+is still one authentication signature on a connection that provably reached the
+grant's pinned host key, for the grant's username, with no access to the
+private key, the grant or the passphrase, and with every attempt in the audit
+chain.
+
+### The conflict recorded above is resolved
+
+The section "Interoperability ceiling, and a conflict with the requested test"
+recorded, per AGENTS.md rule 9, that the requested acceptance test — an
+in-process `golang.org/x/crypto/ssh` server completing publickey
+authentication through the socket — could not be satisfied, because that
+library implements no host-bound userauth method and ADR 0013 denied the plain
+one. Item 5b resolves the conflict in the direction Patrick chose, so that test
+now exists: `TestSSHAgentOpenSSHPlainPublickey` has a real `ssh` client
+authenticate to such a server through this socket, with exactly one signature
+released. Its adversarial twin, `TestSSHAgentOpenSSHUnpinnedHostKey`, points
+the same client at the same kind of server presenting a host key the grant does
+not pin, with the client's own `known_hosts` trusting it so the refusal has to
+come from the agent: the binding is refused, no identity is disclosed,
+authentication fails, no signature is released and the refusal is audited.
+`TestSSHAgentOpenSSHGitPush` keeps the real-`sshd` host-bound evidence. The
+in-vault conversation tests cover the same release and refusals through the
+official agent client.

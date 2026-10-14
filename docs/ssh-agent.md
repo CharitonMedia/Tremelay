@@ -11,12 +11,15 @@ under one `ssh_userauth` grant ([ADR 0013](adr/0013-ssh-userauth.md),
 command does not and fails closed there; see
 [ADR 0024](adr/0024-headless-unlock-daemon.md).
 
-**Your server must be OpenSSH 8.9 or later.** This agent signs only
-`publickey-hostbound-v00@openssh.com` requests, so the server has to offer
-that method. Against a server without it, `ssh` asks for an ordinary
-`publickey` signature, the agent refuses, and authentication fails. That
-refusal is the point: without the host binding there is no proof of which
-destination the signature is for.
+**Your client must be OpenSSH 8.9 or later.** The agent authorizes a signature
+against the `session-bind@openssh.com` the client sends after key exchange: the
+pinned host key's signature over that connection's session identifier. A client
+that sends no binding is told about no key and gets no signature, because
+without it there is no proof of which destination the signature is for. The
+server can be anything, including GitHub and other hosted forges, which do not
+implement `publickey-hostbound-v00@openssh.com`
+([ADR 0013](adr/0013-ssh-userauth.md), amendment of 2026-10-14). Forwarded
+agent connections (`ssh -A` on a second hop) are still refused.
 
 ## Create the key and the grant
 
@@ -33,14 +36,44 @@ shred -u "$D/git-key.der" && rmdir "$D"
 ```
 
 Pin the server. The grant stores the host public key itself, not a hostname:
-that is the destination this signature can reach. Read it from the server and
-check the fingerprint the way you would check `known_hosts`.
+that is the destination this signature can reach, and it is the only thing
+standing between your agent and a signature for somewhere else.
+
+`ssh-keyscan` asks the host you are about to trust what its key is, which
+proves nothing on its own. **Never pin keyscan output you have not compared
+against a fingerprint from the operator.** For your own server, read the key
+out of `/etc/ssh/ssh_host_ed25519_key.pub` on the box itself. Otherwise
+keyscan it and check the fingerprint:
 
 ```sh
 ssh-keyscan -t ed25519 -p 22 git.example.com > /tmp/hostkey.pub
-ssh-keygen -lf /tmp/hostkey.pub          # compare with the server's published fingerprint
+ssh-keygen -lf /tmp/hostkey.pub          # compare with the operator's published fingerprint
 HOST_KEY_HEX=$(awk '{print $3}' /tmp/hostkey.pub | base64 -d | xxd -p -c 0)
 ```
+
+### Pinning github.com
+
+GitHub publishes its host keys in two places you can check independently of
+whatever answered your keyscan: the [SSH key fingerprints
+page](https://docs.github.com/authentication/keeping-your-account-secure/githubs-ssh-key-fingerprints)
+and `https://api.github.com/meta` (field `ssh_keys`), both over TLS. The
+Ed25519 fingerprint published there at the time of writing is
+`SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`; treat that page, not this
+file, as the authority, and expect it to change when GitHub rotates.
+
+```sh
+curl -fsS https://api.github.com/meta |
+  python3 -c 'import json,sys; print([k for k in json.load(sys.stdin)["ssh_keys"] if k.startswith("ssh-ed25519")][0])' \
+  > /tmp/github.pub
+ssh-keygen -lf /tmp/github.pub   # must match the fingerprint on GitHub's page
+HOST_KEY_HEX=$(awk '{print $2}' /tmp/github.pub | base64 -d | xxd -p -c 0)
+```
+
+The field order differs: `api.github.com/meta` gives `ssh-ed25519 AAAA...`
+(key in field 2), while `ssh-keyscan` prefixes the hostname (key in field 3).
+If the two sources disagree, stop; do not pin either. Use `--ssh-user git` for
+GitHub, and note that the grant authorizes authentication to github.com as a
+whole, not one repository.
 
 Create the agent, its token file and the grant. `--ssh-user` is the account on
 that server (`git` for a hosted forge, your login name for your own box). The

@@ -5,7 +5,7 @@
 // human session. One human holds the passphrase; many agents hold grants.
 // AgentPrincipal can list capabilities, authorize them, invoke
 // the HTTP broker, request one local Ed25519 attestation, and open one
-// host-bound SSH userauth stream for one identity.
+// session-bound SSH userauth stream for one identity.
 // BindAgentCapability is a separate in-process byte interface for that
 // principal's local attestation grants. BindMCPEndpoint is one in-memory MCP
 // peer for an adapter the host already bound. Neither can retrieve credential
