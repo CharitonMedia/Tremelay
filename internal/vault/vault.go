@@ -238,19 +238,19 @@ type kdfParams struct {
 }
 
 type fileHeader struct {
-	Version    int
-	ID         string
-	Root       string
-	KDF        kdfParams
-	WrapNonce  []byte
-	WrappedDEK       []byte
-	DataNonce        []byte
-	Data             []byte
-	AuditHead        string
-	AuditSeq         uint64
-	DEKReloadPubKey  []byte
-	DEKHandoffNonce  []byte
-	DEKHandoff       []byte
+	Version         int
+	ID              string
+	Root            string
+	KDF             kdfParams
+	WrapNonce       []byte
+	WrappedDEK      []byte
+	DataNonce       []byte
+	Data            []byte
+	AuditHead       string
+	AuditSeq        uint64
+	DEKReloadPubKey []byte
+	DEKHandoffNonce []byte
+	DEKHandoff      []byte
 }
 
 // document is the plaintext inside the encrypted blob. Audit history lives
@@ -536,21 +536,21 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		red.Add(doc.Credentials[i].Secret)
 	}
 	s := &Session{
-		path:        path,
-		id:          header.ID,
-		dek:         dek,
-		header:      header,
-		creds:       doc.Credentials,
-		agents:      doc.Agents,
-		grants:      doc.Grants,
-		audit:       events,
-		detection:   doc.Detection,
-		denials:     idx,
-		notices:     noticeIndex(events),
-		suspensions: suspensionFromAudit(events),
-		redactor:    red,
-		logger:      logger,
-		db:          db,
+		path:            path,
+		id:              header.ID,
+		dek:             dek,
+		header:          header,
+		creds:           doc.Credentials,
+		agents:          doc.Agents,
+		grants:          doc.Grants,
+		audit:           events,
+		detection:       doc.Detection,
+		denials:         idx,
+		notices:         noticeIndex(events),
+		suspensions:     suspensionFromAudit(events),
+		redactor:        red,
+		logger:          logger,
+		db:              db,
 		hpolicy:         doc.HealthPolicy,
 		dekReloadPubKey: append([]byte(nil), doc.DEKReloadPubKey...),
 	}
