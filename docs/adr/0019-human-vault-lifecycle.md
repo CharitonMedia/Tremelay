@@ -133,18 +133,23 @@ Status stays Accepted pending owner veto.
 stored credential under it in one SQLite transaction with the new passphrase
 wrap and the fixed `vault_passphrase_change / allowed` audit row. Crash or
 injected failure before commit leaves the prior wrap, DEK, and ciphertext;
-after commit the vault unlocks only with the new passphrase. A long-running
-daemon session publishes an ephemeral X25519 public key (`dek_reload_pubkey`)
-through the audited commit path when it unlocks; the matching private key
-lives only in that process until lock or exit. When a reload public key is
-recorded, `change-passphrase` may leave a one-time `dek_handoff` blob:
-`nacl/box` anonymous seal of the new DEK plus a binding to the vault id and
-the change commit's audit head and sequence. The handoff is never sealed
-under the previous DEK or anything derivable from the old passphrase or an
-old backup. A resident session that still holds the reload private key opens
-the handoff on reload, verifies the binding, adopts the new DEK, and
-continues the existing verification path; any failure retires the session.
-Ordinary writes clear the handoff; if it is cleared before the daemon reloads,
-the session fails closed. An old backup plus the old passphrase and wrapped
-DEK cannot decrypt the current document or recover the new DEK from the
-handoff without the daemon's ephemeral private key.
+after commit the vault unlocks only with the new passphrase. A long-running daemon session publishes an ephemeral X25519 public key through
+the audited commit path when it unlocks; the matching private key lives only
+in that process until lock or exit. The reload public key is stored inside the
+encrypted credential document (authenticated by the DEK), not in a trusted
+plaintext column; a same-uid writer may still overwrite the legacy
+`dek_reload_pubkey` column, but `change-passphrase` and reload never read it.
+When a reload public key is present in the authenticated document,
+`change-passphrase` may leave a one-time `dek_handoff` blob: an inner
+AES-256-GCM seal of the new DEK under the **previous** DEK with AAD binding
+the vault id and the change commit's audit head and sequence, wrapped in an
+outer `nacl/box` anonymous seal to the reload public key
+(`inner nonce||inner ciphertext`). The outer box alone does not prove rotation
+authority; the inner layer requires the old DEK, so a same-uid writer cannot
+forge a handoff with an attacker-chosen DEK using only the public key. The
+handoff is not readable from an old backup and passphrase without the daemon's
+ephemeral private key. A resident session that still holds the reload key pair
+opens the outer box, opens the inner under its current DEK and binding,
+adopts the new DEK, and continues the existing verification path; any failure
+retires the session. Ordinary writes clear the handoff; if it is cleared before
+the daemon reloads, the session fails closed.

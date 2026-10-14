@@ -572,15 +572,22 @@ would let anyone who derived the old DEK from a snapshot read the handoff
 while it remains on disk.
 
 On unlock, before serving connections, the daemon generates an ephemeral
-X25519 key pair (`golang.org/x/crypto/nacl/box`), commits only the public key
-to `dek_reload_pubkey` with a fixed `daemon_reload_pubkey / allowed` audit
-row, and keeps the private key in memory until lock or exit. When another
-holder runs `change-passphrase` and a reload public key is present, the
-change commit may store `dek_handoff` as an anonymous box of the new DEK and
-a binding to the vault id and that commit's audit head and sequence. If no
-reload key is recorded, no handoff is written. Reload adoption opens the
-handoff with the in-memory private key, verifies the binding, swaps in the new
-DEK, and runs the same `openDocument` verification as any other reload; failure
-retires the session and the daemon locks. Ordinary commits clear the handoff;
-if it is cleared before reload, the resident session fails closed, which is
-acceptable. The handoff is never sealed under the old DEK or the old wrap.
+X25519 key pair (`golang.org/x/crypto/nacl/box`), seals the public key into
+the encrypted credential document on an audited `daemon_reload_pubkey /
+allowed` commit, and keeps the private key in memory until lock or exit. The
+legacy `dek_reload_pubkey` SQLite column may remain for migration but is
+cleared on write and is never trusted for handoff. When another holder runs
+`change-passphrase` and the authenticated document carries a reload public
+key, the change commit may store `dek_handoff` as: inner AES-256-GCM of the
+new DEK under the **session's previous DEK** with AAD binding the vault id
+and that commit's audit head and sequence; outer anonymous box to the reload
+public key over `inner nonce||inner ciphertext`. If no reload key is in the
+document, no handoff is written. Reload adoption opens the outer box with the
+in-memory private key, opens the inner with the resident DEK and binding,
+swaps in the new DEK, and runs the same `openDocument` verification as any
+other reload; failure retires the session and the daemon locks. This stops
+(1) a same-uid agent planting a reload public key in plaintext and steering
+the handoff to its own key, and (2) a same-uid writer forging a handoff with
+`SealAnonymous` alone using an attacker-chosen DEK without the old DEK.
+Ordinary commits clear the handoff; if it is cleared before reload, the
+resident session fails closed, which is acceptable.

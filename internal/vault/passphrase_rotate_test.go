@@ -53,13 +53,18 @@ func TestChangePassphraseOldWrappedDEKCannotDecryptPostChange(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		opened, err := Unlock(path, newPass, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		var pub [32]byte
-		copy(pub[:], after.DEKReloadPubKey)
+		copy(pub[:], opened.dekReloadPubKey)
+		opened.Lock()
 		if plain, ok := box.OpenAnonymous(nil, after.DEKHandoff, &pub, attackerPriv); ok {
 			wipe(plain)
-			t.Fatal("foreign private key opened DEK handoff")
+			t.Fatal("foreign private key opened DEK handoff outer box")
 		}
-		if _, err := openDEKHandoffReload(attackerPriv, after); err == nil {
+		if _, err := openDEKHandoffReload(attackerPriv, &pub, staleDEK, after); err == nil {
 			t.Fatal("wrong reload key recovered DEK handoff")
 		}
 		_ = attackerPub
@@ -226,12 +231,20 @@ func TestChangePassphraseNoReloadKeyWritesNoHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after.DEKHandoff) != 0 || len(after.DEKReloadPubKey) != 0 {
-		t.Fatal("passphrase change without reload key wrote handoff or pubkey")
+	if len(after.DEKHandoff) != 0 {
+		t.Fatal("passphrase change without reload key wrote handoff")
 	}
+	opened, err := Unlock(path, newPass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(opened.dekReloadPubKey) != 0 {
+		t.Fatal("passphrase change without reload key left reload pubkey in document")
+	}
+	opened.Lock()
 }
 
-func TestSessionReloadRejectsForeignReloadPubKey(t *testing.T) {
+func TestSessionReloadIgnoresPlantedReloadPubKeyColumn(t *testing.T) {
 	path, oldPass, resident := mustCreate(t, nil)
 	defer resident.Lock()
 	secret := randBytesT(t, 32)
@@ -247,11 +260,7 @@ func TestSessionReloadRejectsForeignReloadPubKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer control.Lock()
-	newPass := []byte(randHex(t, 24))
-	if err := control.ChangePassphrase(oldPass, newPass); err != nil {
-		t.Fatal(err)
-	}
-	foreign, _, err := box.GenerateKey(rand.Reader)
+	foreignPub, foreignPriv, err := box.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,15 +272,89 @@ func TestSessionReloadRejectsForeignReloadPubKey(t *testing.T) {
 	if err := vaultHandoffReady(db); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE vault SET dek_reload_pubkey = ?`, foreign[:]); err != nil {
+	if _, err := db.Exec(`UPDATE vault SET dek_reload_pubkey = ?`, foreignPub[:]); err != nil {
+		t.Fatal(err)
+	}
+	newPass := []byte(randHex(t, 24))
+	if err := control.ChangePassphrase(oldPass, newPass); err != nil {
+		t.Fatal(err)
+	}
+	after, err := readHeaderFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.DEKHandoff) == 0 {
+		t.Fatal("expected handoff")
+	}
+	var daemonPub [32]byte
+	copy(daemonPub[:], resident.reloadPub[:])
+	if plain, ok := box.OpenAnonymous(nil, after.DEKHandoff, &daemonPub, foreignPriv); ok {
+		wipe(plain)
+		t.Fatal("agent private key opened handoff after planting plaintext reload pubkey column")
+	}
+	got, err := resident.Get(cred.ID)
+	if err != nil || !bytes.Equal(got.Secret, secret) {
+		t.Fatalf("resident session failed after planted reload pubkey column: %v", err)
+	}
+	wipe(got.Secret)
+}
+
+func TestSessionReloadRejectsForgedDEKHandoff(t *testing.T) {
+	path, oldPass, resident := mustCreate(t, nil)
+	defer resident.Lock()
+	secret := randBytesT(t, 32)
+	cred, err := resident.Put("forge", "generic", secret, PutOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resident.PublishDaemonReloadPubKey(); err != nil {
+		t.Fatal(err)
+	}
+	control, err := Unlock(path, oldPass, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Lock()
+	newPass := []byte(randHex(t, 24))
+	if err := control.ChangePassphrase(oldPass, newPass); err != nil {
+		t.Fatal(err)
+	}
+	after, err := readHeaderFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeDEK := randBytesT(t, keyLen)
+	binding := dekHandoffBinding(after.ID, after.AuditHead, after.AuditSeq)
+	innerNonce, innerCT, err := seal(fakeDEK, fakeDEK, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := append(innerNonce, innerCT...)
+	var pub [32]byte
+	copy(pub[:], resident.reloadPub[:])
+	forged, err := box.SealAnonymous(nil, inner, &pub, rand.Reader)
+	wipe(inner)
+	wipe(fakeDEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := vaultHandoffReady(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE vault SET dek_handoff = ?`, forged); err != nil {
 		t.Fatal(err)
 	}
 	_, err = resident.Get(cred.ID)
 	if !errors.Is(err, ErrStale) && !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("foreign reload pubkey: %v", err)
+		t.Fatalf("forged handoff: %v", err)
 	}
 	if !resident.defunct {
-		t.Fatal("foreign reload pubkey did not retire session")
+		t.Fatal("forged handoff did not retire session")
 	}
 }
 

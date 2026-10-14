@@ -37,7 +37,6 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
-	"golang.org/x/crypto/nacl/box"
 )
 
 const (
@@ -261,6 +260,9 @@ type document struct {
 	Credentials []credential  `json:"credentials"`
 	Agents      []agentRecord `json:"agents,omitempty"`
 	Grants      []grantRecord `json:"grants,omitempty"`
+	// DEKReloadPubKey is an ephemeral X25519 public key for resident DEK handoff.
+	// It is authenticated by the DEK; the plaintext dek_reload_pubkey column is not trusted.
+	DEKReloadPubKey []byte `json:"dek_reload_pubkey,omitempty"`
 	// Detection is always written, including when empty. A missing member
 	// means the document was sealed before M5. See sealedDetection.
 	Detection detectionState `json:"detection"`
@@ -351,7 +353,11 @@ type Session struct {
 	// reloadPriv, when set, opens a DEK handoff left by a passphrase rotation.
 	// It is wiped on Lock and is never written to disk.
 	reloadPriv *[32]byte
-	// pendingReloadPub is written into the vault row on the next commit only.
+	// reloadPub is the public half of reloadPriv, kept only in memory.
+	reloadPub *[32]byte
+	// dekReloadPubKey is the reload public key from the authenticated document.
+	dekReloadPubKey []byte
+	// pendingReloadPub is sealed into the document on the next commit only.
 	pendingReloadPub []byte
 }
 
@@ -545,7 +551,8 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		redactor:    red,
 		logger:      logger,
 		db:          db,
-		hpolicy:     doc.HealthPolicy,
+		hpolicy:         doc.HealthPolicy,
+		dekReloadPubKey: append([]byte(nil), doc.DEKReloadPubKey...),
 	}
 	if err := s.persistEvent(actionUnlock, "", "", resultAllowed); err != nil {
 		s.Lock()
@@ -588,6 +595,8 @@ func (s *Session) lockLocked() {
 	s.checker = nil
 	s.hpolicy = healthPolicy{}
 	s.reloadPriv = nil
+	s.reloadPub = nil
+	s.dekReloadPubKey = nil
 	s.pendingReloadPub = nil
 	s.locked.Store(false)
 	if s.redactor != nil {
@@ -811,7 +820,12 @@ func (s *Session) reloadLocked() error {
 	}
 	doc, idx, err := openDocument(s.dek, header, events)
 	if err != nil && len(header.DEKHandoff) > 0 {
-		next, herr := openDEKHandoffReload(s.reloadPriv, header)
+		if s.reloadPriv == nil || s.reloadPub == nil {
+			return fail(ErrCorrupt)
+		}
+		oldDEK := append([]byte(nil), s.dek...)
+		next, herr := openDEKHandoffReload(s.reloadPriv, s.reloadPub, oldDEK, header)
+		wipe(oldDEK)
 		if herr != nil {
 			return fail(herr)
 		}
@@ -838,6 +852,7 @@ func (s *Session) reloadLocked() error {
 	s.notices = noticeIndex(events)
 	s.suspensions = suspensionFromAudit(events)
 	s.hpolicy = doc.HealthPolicy
+	s.dekReloadPubKey = append([]byte(nil), doc.DEKReloadPubKey...)
 	return nil
 }
 
@@ -1048,8 +1063,13 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 		return err
 	}
 	tip := events[len(events)-1]
+	reloadPub := s.dekReloadPubKey
+	if s.pendingReloadPub != nil {
+		reloadPub = s.pendingReloadPub
+	}
 	plain, err := json.Marshal(document{
 		Credentials: creds, Agents: agents, Grants: grants, Detection: det, HealthPolicy: pol,
+		DEKReloadPubKey: reloadPub,
 	})
 	if err != nil {
 		return ErrIO
@@ -1067,9 +1087,7 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	if wrap != nil {
 		h.KDF, h.WrapNonce, h.WrappedDEK = wrap.kdf, wrap.nonce, wrap.ciphertext
 	}
-	if s.pendingReloadPub != nil {
-		h.DEKReloadPubKey = append([]byte(nil), s.pendingReloadPub...)
-	}
+	h.DEKReloadPubKey = nil
 	if rot != nil {
 		h.DEKHandoffNonce, h.DEKHandoff = nil, rot.handoffCipher
 	} else {
@@ -1123,6 +1141,9 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	s.detection = det
 	s.denials = nextDenials
 	s.hpolicy = pol
+	if s.pendingReloadPub != nil {
+		s.dekReloadPubKey = append([]byte(nil), s.pendingReloadPub...)
+	}
 	for _, row := range events {
 		applyNotice(s.notices, row)
 		s.suspensions.apply(s.audit, row)
@@ -1317,6 +1338,9 @@ func validateDocument(doc document) error {
 	if err := validateHealthPolicyStored(doc.HealthPolicy); err != nil {
 		return err
 	}
+	if len(doc.DEKReloadPubKey) != 0 && len(doc.DEKReloadPubKey) != 32 {
+		return ErrCorrupt
+	}
 	return validateDetection(doc.Detection)
 }
 
@@ -1386,10 +1410,8 @@ func validateHeader(h fileHeader) error {
 	if len(h.DEKReloadPubKey) != 0 && len(h.DEKReloadPubKey) != 32 {
 		return ErrCorrupt
 	}
-	if len(h.DEKHandoff) != 0 {
-		if len(h.DEKReloadPubKey) != 32 || len(h.DEKHandoff) < keyLen+box.AnonymousOverhead {
-			return ErrCorrupt
-		}
+	if len(h.DEKHandoff) != 0 && len(h.DEKHandoff) < minDEKHandoffLen() {
+		return ErrCorrupt
 	}
 	return nil
 }

@@ -14,7 +14,8 @@ type passphraseWrap struct {
 // ChangePassphrase reauthenticates the current passphrase, generates a fresh
 // DEK, re-encrypts every credential under it, and commits the new wrap, the
 // resealed document, and the vault_passphrase_change audit row atomically. A
-// one-time handoff sealed to a recorded daemon reload public key lets a resident
+// one-time handoff sealed to the reload public key in the authenticated document
+// lets a resident
 // session reload without re-prompting when that key was published before the
 // change. A stale session cannot replace a newer wrap. This is
 // host custody, not an agent operation. Snapshots keep their original
@@ -66,8 +67,8 @@ func (s *Session) ChangePassphrase(oldPassphrase, newPassphrase []byte) error {
 		return err
 	}
 	var handoffCipher []byte
-	if len(s.header.DEKReloadPubKey) == 32 {
-		handoffCipher, err = sealDEKHandoff(s.header.DEKReloadPubKey, newDEK, s.id, ev.Hash, ev.Seq)
+	if len(s.dekReloadPubKey) == 32 {
+		handoffCipher, err = sealDEKHandoff(s.dekReloadPubKey, dek, newDEK, s.id, ev.Hash, ev.Seq)
 		if err != nil {
 			return err
 		}
