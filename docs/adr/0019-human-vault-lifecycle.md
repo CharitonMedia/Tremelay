@@ -107,8 +107,8 @@ transaction and cryptography is the smallest change satisfying atomic custody.
 credential retention, ordinary-write retention of the new wrap, original snapshot
 passphrase, invalid/wrong input, transaction rollback, stale sessions, crash
 recovery at each commit step, pre-change authority failing on post-change
-ciphertext, resident-session reload with ephemeral reload keys, handoff
-adversarial cases, and synthetic sentinel absence.
+ciphertext, a resident session locking on rotation (item 3g), and synthetic sentinel
+absence.
 `TestCLIChangePassphrase*` covers prompt order, confirmation,
 cancellation, buffer wiping, terminal-only entry and fixed argument errors.
 `TestCLIBackup*` and `TestCLIRestore*` exercise CLI checkpoint and engine boundaries.
@@ -167,3 +167,17 @@ as ADR 0003's unauthenticated tip: the wrap and document are not bound to
 anything the old-passphrase holder lacks. Closing the daemon half means not
 adopting rotations (the daemon locks on a passphrase change); closing the file
 half needs an external or keyed tip. Both are product decisions for the owner.
+
+## Amendment 2026-10-14: the daemon locks instead of adopting (V1.md item 3g)
+
+Owner decision N8: option (b) plus (a). The resident handoff described above is
+removed. A daemon that sees a passphrase change zeroises, records a
+`vault_unlock / denied` row and exits; the human unlocks again with the new
+passphrase (ADR 0024, 3g amendment). `change-passphrase` writes no handoff and
+the daemon publishes no reload key.
+
+Accepted ceiling: someone holding an old backup and the old passphrase who can
+also write the vault file as the same user can still substitute a forged vault
+under a passphrase they choose. That locks the owner out of the file. No
+running daemon adopts it, and they learn nothing added after their backup.
+Closing it needs a keyed or external audit tip (ADR 0003), which is outside v1.
