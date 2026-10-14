@@ -50,6 +50,7 @@ var (
 	errDaemonRefused  = errors.New("daemon refused the agent token")
 	errDaemonSession  = errors.New("daemon agent session failed; inspect the vault audit before retrying an operation")
 	errDaemonTerminal = errors.New("daemon can no longer serve this vault and has locked; inspect the vault audit, then restart it")
+	errDaemonRekeyed  = errors.New("vault passphrase changed; daemon locked. Run tremelay daemon again and unlock with the new passphrase")
 	errAgentToken     = errors.New("agent token file must be a regular user-only file holding one hex token")
 	errTokenFileACL   = errors.New("agent token file needs a filesystem that supports ACLs; the owner-only security descriptor was not applied")
 )
@@ -96,10 +97,6 @@ func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv fu
 	if err != nil {
 		return fail("vault unlock failed")
 	}
-	if err := session.PublishDaemonReloadPubKey(); err != nil {
-		session.Lock()
-		return fail("vault reload registration failed")
-	}
 	connCtx, cancelConns := context.WithCancel(ctx)
 	d := &daemon{
 		session: session,
@@ -122,6 +119,8 @@ func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv fu
 	case <-ctx.Done():
 	case <-d.locked:
 	case <-d.timer.C:
+	case <-session.Rekeyed():
+		fmt.Fprintln(stderr, errDaemonRekeyed.Error())
 	}
 	// Stop new work, interrupt every served connection, join dispatch and
 	// output, and only then zeroise. A client call after this fails closed.

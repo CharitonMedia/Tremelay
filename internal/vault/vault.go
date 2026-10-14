@@ -350,15 +350,11 @@ type Session struct {
 	// defunct is set when a commit loses a race it cannot recover from.
 	// Later calls return ErrStale.
 	defunct bool
-	// reloadPriv, when set, opens a DEK handoff left by a passphrase rotation.
-	// It is wiped on Lock and is never written to disk.
-	reloadPriv *[32]byte
-	// reloadPub is the public half of reloadPriv, kept only in memory.
-	reloadPub *[32]byte
-	// dekReloadPubKey is the reload public key from the authenticated document.
+	// dekReloadPubKey is a 3e reload public key carried in the authenticated
+	// document of older vaults. Nothing seals to it any more (item 3g).
 	dekReloadPubKey []byte
-	// pendingReloadPub is sealed into the document on the next commit only.
-	pendingReloadPub []byte
+	rekeyOnce       sync.Once
+	rekeyed         chan struct{}
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -594,10 +590,7 @@ func (s *Session) lockLocked() {
 	s.responding = false
 	s.checker = nil
 	s.hpolicy = healthPolicy{}
-	s.reloadPriv = nil
-	s.reloadPub = nil
 	s.dekReloadPubKey = nil
-	s.pendingReloadPub = nil
 	s.locked.Store(false)
 	if s.redactor != nil {
 		s.redactor.Wipe()
@@ -784,9 +777,10 @@ func (s *Session) adoptLocked() error {
 
 // reloadLocked replaces this session's cached authority with the durable state
 // under the DEK it already holds. No passphrase is involved: the KEK was
-// consumed at unlock. A passphrase change may have rotated the DEK; a one-time
-// handoff sealed to this session's ephemeral reload public key lets a resident
-// session adopt the new key without re-prompting. Verification is Unlock's, through readVaultState
+// consumed at unlock. A passphrase change rotates the DEK, and a resident
+// session never adopts the new one (V1 item 3g): it zeroises, records the
+// refused key as a vault_unlock denial, and signals Rekeyed so the daemon
+// locks and the human unlocks again. Verification is Unlock's, through readVaultState
 // and openDocument, so a tampered document, a broken chain, a forged denial
 // suffix or a foreign vault id all fail here. Nothing is swapped until every
 // check passes, and a failure makes the session permanently unusable rather
@@ -818,21 +812,24 @@ func (s *Session) reloadLocked() error {
 		// chain being adopted must extend the history this session verified.
 		return fail(ErrCorrupt)
 	}
-	doc, idx, err := openDocument(s.dek, header, events)
-	if err != nil && len(header.DEKHandoff) > 0 {
-		if s.reloadPriv == nil || s.reloadPub == nil {
-			return fail(ErrCorrupt)
-		}
-		oldDEK := append([]byte(nil), s.dek...)
-		next, herr := openDEKHandoffReload(s.reloadPriv, s.reloadPub, oldDEK, header)
-		wipe(oldDEK)
-		if herr != nil {
-			return fail(herr)
-		}
+	if passphraseChangedAfter(events, s.header.AuditSeq) {
+		// ponytail: the chain read here is not yet authenticated, so a forged
+		// change row also locks; same-uid file write can deny service anyway.
+		// The key this session holds no longer opens the vault: refuse it the
+		// way a wrong passphrase is refused, then forget it.
 		wipe(s.dek)
-		s.dek = next
-		doc, idx, err = openDocument(s.dek, header, events)
+		s.dek = nil
+		wipeCredentials(s.creds)
+		s.creds = nil
+		s.defunct = true
+		close(s.rekeyCh())
+		if aerr := appendDenial(s.db, s.id); aerr != nil {
+			return ErrAudit
+		}
+		s.logf("vault_unlock result=denied")
+		return ErrStale
 	}
+	doc, idx, err := openDocument(s.dek, header, events)
 	if err != nil {
 		return fail(err)
 	}
@@ -854,6 +851,28 @@ func (s *Session) reloadLocked() error {
 	s.hpolicy = doc.HealthPolicy
 	s.dekReloadPubKey = append([]byte(nil), doc.DEKReloadPubKey...)
 	return nil
+}
+
+// passphraseChangedAfter reports whether a passphrase change, and with it a
+// fresh DEK, was committed after seq.
+func passphraseChangedAfter(events []auditEvent, seq uint64) bool {
+	for i := len(events) - 1; i >= 0 && events[i].Seq > seq; i-- {
+		if events[i].Action == actionPassphrase && events[i].Result == resultAllowed {
+			return true
+		}
+	}
+	return false
+}
+
+// Rekeyed is closed when this session saw a passphrase change and zeroised
+// itself. A resident daemon locks on it; the human unlocks again.
+func (s *Session) Rekeyed() <-chan struct{} {
+	return s.rekeyCh()
+}
+
+func (s *Session) rekeyCh() chan struct{} {
+	s.rekeyOnce.Do(func() { s.rekeyed = make(chan struct{}) })
+	return s.rekeyed
 }
 
 // containsEvent reports whether a verified chain holds exactly this event at
@@ -1019,8 +1038,7 @@ func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []
 }
 
 type dekRotation struct {
-	newDEK        []byte
-	handoffCipher []byte
+	newDEK []byte
 }
 
 // commitBatchWrap optionally replaces the passphrase wrap and/or rotates the DEK
@@ -1063,13 +1081,9 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 		return err
 	}
 	tip := events[len(events)-1]
-	reloadPub := s.dekReloadPubKey
-	if s.pendingReloadPub != nil {
-		reloadPub = s.pendingReloadPub
-	}
 	plain, err := json.Marshal(document{
 		Credentials: creds, Agents: agents, Grants: grants, Detection: det, HealthPolicy: pol,
-		DEKReloadPubKey: reloadPub,
+		DEKReloadPubKey: s.dekReloadPubKey,
 	})
 	if err != nil {
 		return ErrIO
@@ -1088,11 +1102,7 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 		h.KDF, h.WrapNonce, h.WrappedDEK = wrap.kdf, wrap.nonce, wrap.ciphertext
 	}
 	h.DEKReloadPubKey = nil
-	if rot != nil {
-		h.DEKHandoffNonce, h.DEKHandoff = nil, rot.handoffCipher
-	} else {
-		h.DEKHandoffNonce, h.DEKHandoff = nil, nil
-	}
+	h.DEKHandoffNonce, h.DEKHandoff = nil, nil
 	h.Version = formatVersion
 	h.ID = s.id
 	h.Root = rootPassphrase
@@ -1141,9 +1151,6 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	s.detection = det
 	s.denials = nextDenials
 	s.hpolicy = pol
-	if s.pendingReloadPub != nil {
-		s.dekReloadPubKey = append([]byte(nil), s.pendingReloadPub...)
-	}
 	for _, row := range events {
 		applyNotice(s.notices, row)
 		s.suspensions.apply(s.audit, row)

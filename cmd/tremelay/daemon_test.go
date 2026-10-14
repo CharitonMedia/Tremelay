@@ -142,10 +142,21 @@ func startDaemon(t *testing.T, idle time.Duration) *daemonFixture {
 		f.agents = append(f.agents, a)
 	}
 
+	f.launch(t, idle)
+	return f
+}
+
+// launch starts serveDaemon on the fixture's vault and waits for its endpoint.
+// A test that saw the daemon exit can launch it again on the same vault.
+func (f *daemonFixture) launch(t *testing.T, idle time.Duration) {
+	t.Helper()
+	f.stdout, f.stderr = &daemonOutput{}, &daemonOutput{}
+	f.exit, f.once, f.endpoint = make(chan int, 1), sync.Once{}, ""
 	ctx, cancel := context.WithCancel(context.Background())
 	f.cancel = cancel
+	exit, stdout, stderr := f.exit, f.stdout, f.stderr
 	go func() {
-		f.exit <- serveDaemon(ctx, f.path, idle, envGet(f.env), strings.NewReader(""), f.stdout, f.stderr)
+		exit <- serveDaemon(ctx, f.path, idle, envGet(f.env), strings.NewReader(""), stdout, stderr)
 	}()
 	t.Cleanup(func() { cancel(); f.wait(t, 15*time.Second) })
 	deadline := time.Now().Add(20 * time.Second)
@@ -158,7 +169,6 @@ func startDaemon(t *testing.T, idle time.Duration) *daemonFixture {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	return f
 }
 
 // cli runs one human control-plane command and returns its trimmed stdout.
@@ -208,6 +218,9 @@ type agentRelay struct {
 	out    *bufio.Reader
 	stderr *daemonOutput
 	exit   chan int
+	// rest is whatever the relay wrote to stdout after finish stopped reading
+	// frame by frame.
+	rest string
 }
 
 func (f *daemonFixture) relay(t *testing.T, tokenFile string) *agentRelay {
@@ -280,8 +293,17 @@ func (r *agentRelay) receive(t *testing.T) string {
 func (r *agentRelay) finish(t *testing.T) int {
 	t.Helper()
 	r.in.Close()
+	// stdout is a synchronous pipe, so a last frame the relay is still
+	// writing holds run open until someone reads it. Drain to EOF, which the
+	// relay goroutine reaches by closing its end before it reports the code.
+	drained := make(chan string, 1)
+	go func() {
+		rest, _ := io.ReadAll(r.out)
+		drained <- string(rest)
+	}()
 	select {
 	case code := <-r.exit:
+		r.rest = <-drained
 		return code
 	case <-time.After(15 * time.Second):
 		t.Fatal("relay did not exit")
@@ -583,38 +605,66 @@ func TestDaemonReloadsOnControlPlaneChange(t *testing.T) {
 	}
 }
 
-// TestDaemonReloadsAfterPassphraseChange is the V1.md item 3e daemon half: a
-// running daemon keeps serving after another holder rotates the DEK.
-func TestDaemonReloadsAfterPassphraseChange(t *testing.T) {
+// TestDaemonLocksOnPassphraseChange is V1.md item 3g: a running daemon never
+// adopts a rotated DEK. The next agent call fails closed, the refused key is
+// audited, and the daemon zeroises and exits. Unlocking with the new
+// passphrase serves again, and an ordinary grant change still reloads in place.
+func TestDaemonLocksOnPassphraseChange(t *testing.T) {
 	f := startDaemon(t, time.Hour)
-	agent := f.relay(t, f.agents[0].tokenFile)
-	before := capabilityEntries(t, agent.capabilities(t))
-	if len(before) != 1 || before[0].Status != vault.GrantActive {
-		t.Fatalf("capabilities before passphrase change: %+v", before)
+	worker := f.agents[0]
+	agent := f.relay(t, worker.tokenFile)
+	if listed := agent.capabilities(t); !strings.Contains(listed, worker.resource) {
+		t.Fatalf("capabilities before passphrase change: %q", listed)
 	}
 	control, err := vault.Unlock(f.path, []byte(f.pass), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	newPass := []byte(randHex(t, 16))
-	if err := control.ChangePassphrase([]byte(f.pass), newPass); err != nil {
+	newPass := randHex(t, 16)
+	if err := control.ChangePassphrase([]byte(f.pass), []byte(newPass)); err != nil {
 		t.Fatal(err)
 	}
 	control.Lock()
-	f.pass = string(newPass)
-	if frame, signed := agent.attest(t, 4, before[0].Handle); !signed {
-		t.Fatalf("daemon broke after passphrase rotation: %q", frame)
+
+	agent.send(t, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_capabilities","arguments":{}}}`)
+	f.wait(t, 15*time.Second)
+	if !strings.Contains(f.stderr.String(), errDaemonRekeyed.Error()) {
+		t.Fatalf("daemon did not report the passphrase lock: %q", f.stderr.String())
+	}
+	agent.finish(t)
+	if strings.Contains(agent.rest, worker.resource) {
+		t.Fatalf("call after the passphrase change was served: %q", agent.rest)
+	}
+	if rows := f.auditRows(t, "vault_unlock"); len(rows) == 0 || rows[len(rows)-1][0] != "denied" {
+		t.Fatalf("refused daemon key not audited: %v", rows)
+	}
+	// A fresh connection to the locked endpoint fails closed too.
+	late := f.relay(t, worker.tokenFile)
+	if code := late.finish(t); code == 0 {
+		t.Fatal("relay to a locked daemon succeeded")
+	}
+
+	f.pass = newPass
+	f.env["TREMELAY_PASSPHRASE"] = newPass
+	f.launch(t, time.Hour)
+	agent = f.relay(t, worker.tokenFile)
+	if listed := agent.capabilities(t); !strings.Contains(listed, worker.resource) {
+		t.Fatalf("new passphrase did not restore service: %q", listed)
+	}
+	added := "synthetic-3g-" + randHex(t, 6)
+	f.cli(t, "grant", "create", "--path", f.path, "--agent", worker.id, "--credential", f.credID,
+		"--operation", vault.OpLocalArtifactAttest, "--resource", added,
+		"--expires", time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+	if listed := agent.callList(t, 3); !strings.Contains(listed, added) {
+		t.Fatalf("grant create after relock did not reload: %q", listed)
 	}
 	if f.exited() {
-		t.Fatalf("daemon exited on passphrase rotation: %q", f.stderr.String())
-	}
-	if strings.Contains(f.stderr.String(), errDaemonTerminal.Error()) {
-		t.Fatalf("daemon reported a terminal session: %q", f.stderr.String())
+		t.Fatalf("daemon exited on an ordinary grant change: %q", f.stderr.String())
 	}
 	agent.finish(t)
 	f.cancel()
 	f.wait(t, 15*time.Second)
-	if _, err := vault.VerifyAudit(f.path, newPass); err != nil {
+	if _, err := vault.VerifyAudit(f.path, []byte(newPass)); err != nil {
 		t.Fatalf("audit chain invalid: %v", err)
 	}
 }

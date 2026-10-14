@@ -19,8 +19,11 @@ change denial. Uncatchable termination, power loss, and OS restore failures cann
 guarantee terminal cleanup. The process/PTY regression tests exercise Linux;
 Windows/macOS terminal and signal behavior has not been directly tested.
 
-The same data-encryption key is rewrapped with a fresh salt and nonce. The wrap and
-audit change commit together. Wrong old input, rejected replacement, mismatched
+A fresh data-encryption key is generated, every credential is re-encrypted under
+it, and the new wrap and the audit change commit together, so an old backup plus
+the old passphrase cannot read what the vault holds now. A running `tremelay daemon`
+locks and exits on its next agent call; start it again and unlock with the new
+passphrase. Agents, grants and tokens are unchanged. Wrong old input, rejected replacement, mismatched
 confirmation or a failed transaction leave the original passphrase in authority.
 Denials may append audit rows. A stale session cannot overwrite the new wrap.
 Stop other instances first. A change cannot revoke a key already held in another

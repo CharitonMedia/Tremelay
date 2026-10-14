@@ -414,10 +414,8 @@ rather than quietly dropped:
   that asserted the refusal now assert the verification: a withdrawn grant is
   refused on the grant's own merits and audited, an unchanged grant keeps
   working, and an unverifiable file still fails closed.
-- A passphrase change committed by another holder is adopted like any other
-  commit, so the session's later writes use the new wrap. The old passphrase
-  stays dead: a rewrap presented with it is refused as unauthenticated, and
-  `VerifyAudit` accepts only the new one.
+- A passphrase change committed by another holder is not adopted; see the
+  2026-10-14 amendment below (V1.md item 3g). The session locks.
 
 A reload appends no audit row. The commit being adopted is already in the
 chain, written by whoever made it, and re-reading a file with a key already
@@ -594,3 +592,32 @@ the handoff to its own key, and (2) a same-uid writer forging a handoff with
 `SealAnonymous` alone using an attacker-chosen DEK without the old DEK.
 Ordinary commits clear the handoff; if it is cleared before reload, the
 resident session fails closed, which is acceptable.
+
+## Amendment 2026-10-14: the daemon locks on passphrase change (V1.md item 3g)
+
+Owner decision N8 (b). Supersedes the resident DEK handoff of the 3e amendment
+above and in ADR 0019. When a reload finds a `vault_passphrase_change` row past
+the session's tip, the session does not try to adopt the new DEK. It zeroises
+its key and credentials, appends a `vault_unlock / denied` row (the same
+unsealed denial a wrong passphrase leaves, needing no key), marks itself
+defunct and closes `Session.Rekeyed()`. The daemon selects on that channel,
+prints a fixed message, cancels every connection, and exits. The calling agent
+gets the ordinary fail-closed refusal. The human runs `tremelay daemon` again
+with the new passphrase. Agents, grants and tokens are untouched, so no agent
+is rebuilt (item 3c). Other control-plane commits still reload in place (3d).
+
+The daemon no longer publishes a reload public key and `change-passphrase` no
+longer writes a `dek_handoff`. Columns and document fields left by a 3e binary
+still read; nothing opens them, and the next commit clears the handoff.
+
+The change row is read from the chain before the document is authenticated, so
+a forged row also locks the daemon. A same-uid file writer can already deny
+service; this adds no reach. The converse is the ADR 0019 ceiling: a writer who
+also holds the DEK this session holds can omit the row and have the session
+adopt a document sealed under it, which no unkeyed chain can detect. Cost: one
+re-unlock per passphrase change.
+
+Tests: `TestDaemonLocksOnPassphraseChange` (Linux, macOS and Windows CI: next
+call refused, refusal audited, daemon exits, new passphrase serves, `grant
+create` still reloads with no lock) and `TestSessionLocksOnPassphraseRotation`
+(key zeroised, planted handoff ignored, audit chain verifies).

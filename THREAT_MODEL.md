@@ -89,10 +89,12 @@ from the control plane without a restart
 2026-10-13). What it adopts is bounded by verification, not by trust in the
 file: the header, the hash chain, the locked-denial suffix and the sealed
 document are checked with the same code an unlock runs, under the key the
-session already holds. An attacker who can write the file cannot make a
-resident session adopt a forged document, a broken chain, a rolled-back audit
-head or another vault's identity; each of those locks the session and the
-daemon exits. A higher sequence is not taken for a continuation either: the
+session already holds. An attacker who can write the file but does not hold that
+key cannot make a resident session adopt a forged document, a broken chain, a
+rolled-back audit head or another vault's identity; each of those locks the
+session and the daemon exits. An attacker who does hold it — an old backup plus
+the old passphrase, after a passphrase change — is the accepted ceiling in
+[ADR 0019](docs/adr/0019-human-vault-lifecycle.md). A higher sequence is not taken for a continuation either: the
 re-read chain must contain the event the session last served, so an older
 authentic copy restored under the daemon and then pushed past that sequence
 by the owner's own commands is refused rather than adopted, and the
