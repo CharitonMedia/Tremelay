@@ -1,8 +1,11 @@
 package vault
 
 import (
+	"archive/zip"
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -343,6 +346,7 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 		name, inject, injectName string
 		headers                  map[string]string
 		query                    string
+		body                     string
 	}{
 		{name: "authorization", inject: InjectBearer, headers: map[string]string{"Authorization": "Bearer attacker"}},
 		{name: "authorization-lowercase", inject: InjectBearer, headers: map[string]string{"authorization": "Bearer attacker"}},
@@ -374,12 +378,25 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 		{name: "forwarded", inject: InjectBearer, headers: map[string]string{"Forwarded": `host=evil.example`}},
 		{name: "method-override-query", inject: InjectBearer, query: "_method=DELETE"},
 		{name: "method-override-query-folded", inject: InjectBearer, query: "a=1&_METHOD=PATCH"},
+		{name: "method-override-form-body", inject: InjectBearer, body: "foo=1&_method=DELETE"},
+		{name: "method-override-form-body-folded", inject: InjectBearer, body: "_Method=PATCH"},
+		{name: "x-forwarded-prefix", inject: InjectBearer, headers: map[string]string{"X-Forwarded-Prefix": "/admin"}},
+		{name: "x-forwarded-proto", inject: InjectBearer, headers: map[string]string{"X-Forwarded-Proto": "http"}},
+		{name: "x-forwarded-for", inject: InjectBearer, headers: map[string]string{"X-Forwarded-For": "203.0.113.5"}},
+		{name: "x-original-uri", inject: InjectBearer, headers: map[string]string{"X-Original-URI": "/admin"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			e := newHTTPBrokerEnv(t, tc.inject, tc.injectName)
+			methods := []string{http.MethodGet}
+			if tc.body != "" {
+				methods = append(methods, http.MethodPost)
+			}
+			e := newHTTPBrokerEnv(t, tc.inject, tc.injectName, methods...)
 			req := e.request(brokerTestPrefix + "/issues")
 			req.Headers, req.Query = tc.headers, tc.query
+			if tc.body != "" {
+				req.Method, req.Body = "POST", []byte(tc.body)
+			}
 			resp, err := e.principal.BrokerRequest(req)
 			if err == nil || resp.StatusCode != 0 {
 				t.Fatalf("header smuggling was accepted: %d %v", resp.StatusCode, err)
@@ -390,7 +407,8 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 			// A collision with the grant's own slot is a policy refusal and is
 			// attributed; a forbidden name is refused before attribution.
 			wantResult := resultDenied
-			if strings.HasPrefix(tc.name, "injected-") || strings.Contains(tc.name, "method-override-query") {
+			if strings.HasPrefix(tc.name, "injected-") || strings.Contains(tc.name, "method-override-query") ||
+				strings.Contains(tc.name, "method-override-form-body") {
 				wantResult = resultDeniedMalformed
 				if !errors.Is(err, ErrDeniedMalformed) {
 					t.Fatalf("injection collision error %v", err)
@@ -495,39 +513,59 @@ func TestBrokerWithholdsUndecodedOrPartialBody(t *testing.T) {
 	}
 }
 
-// TestBrokerWithholdsCompressedBodyWithoutContentEncoding covers upstream
-// bodies that are compressed containers with no Content-Encoding: the literal
-// scan cannot match them and gunzip would recover the credential.
-func TestBrokerWithholdsCompressedBodyWithoutContentEncoding(t *testing.T) {
+// TestBrokerWithholdsBodiesTheScanCannotRead covers upstream bodies the
+// literal credential scan cannot read: compressed streams the upstream never
+// declared, an archive, a stream nested inside a declared one, and a deflate
+// coding hidden behind a leading `identity`. Each one carries the credential
+// in bytes a redactor would not match, and the agent could decompress it.
+func TestBrokerWithholdsBodiesTheScanCannotRead(t *testing.T) {
 	const echoLabel = "SENTINEL_ECHO:"
 	cases := []struct {
-		name string
-		raw  []byte
+		name   string
+		header http.Header
+		encode func(t *testing.T, echo string) []byte
 	}{
-		{name: "gzip-no-header", raw: nil},
-		{name: "zstd-magic", raw: []byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00}},
-		{name: "xz-magic", raw: []byte{0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00}},
-		{name: "bzip2-magic", raw: []byte("BZh1\x31\x41\x59\x26\x53\x59\x00")},
+		{name: "gzip-no-coding", encode: func(t *testing.T, echo string) []byte { return gzipBytes(t, echo) }},
+		{name: "gzip-after-a-newline", encode: func(t *testing.T, echo string) []byte {
+			return append([]byte("\n"), gzipBytes(t, echo)...)
+		}},
+		{name: "zlib-no-coding", encode: zlibBytes},
+		{name: "raw-deflate-no-coding", encode: flateBytes},
+		{name: "zip-member", encode: zipBytes},
+		{name: "zstd-skippable-frame", encode: func(t *testing.T, echo string) []byte {
+			frame := []byte{0x50, 0x2a, 0x4d, 0x18, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+			return append(frame, zlibBytes(t, echo)...)
+		}},
+		{
+			name:   "identity-then-deflate",
+			header: http.Header{"Content-Type": {"text/plain"}, "Content-Encoding": {"identity", "deflate"}},
+			encode: zlibBytes,
+		},
+		{
+			name:   "one-field-listing-identity-and-deflate",
+			header: http.Header{"Content-Type": {"text/plain"}, "Content-Encoding": {"identity, deflate"}},
+			encode: zlibBytes,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newHTTPBrokerEnv(t, InjectBearer, "")
 			e.s.httpDo = func(req *http.Request) (*http.Response, error) {
 				e.requests++
-				auth := req.Header.Get("Authorization")
-				raw := tc.raw
-				if raw == nil {
-					raw = gzipBytes(t, echoLabel+auth)
+				raw := tc.encode(t, echoLabel+req.Header.Get("Authorization"))
+				header := tc.header
+				if header == nil {
+					header = http.Header{"Content-Type": {"text/plain"}}
 				}
 				return &http.Response{
 					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": {"text/plain"}},
+					Header:     header,
 					Body:       io.NopCloser(bytes.NewReader(raw)),
 				}, nil
 			}
 			resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
 			if !errors.Is(err, ErrBrokerUpstream) || resp.StatusCode != 0 || resp.Body != nil || resp.Headers != nil {
-				t.Fatalf("compressed body without coding was projected: %+v %v", resp, err)
+				t.Fatalf("unreadable body was projected: %+v %v", resp, err)
 			}
 			if e.requests != 1 || e.lastResult(t) != resultUpstreamError {
 				t.Fatalf("requests %d result %s", e.requests, e.lastResult(t))
@@ -535,21 +573,68 @@ func TestBrokerWithholdsCompressedBodyWithoutContentEncoding(t *testing.T) {
 			e.assertNoLeak(t, err.Error())
 		})
 	}
-	t.Run("plaintext-prefix-still-redacted", func(t *testing.T) {
+	t.Run("text-is-still-projected-and-redacted", func(t *testing.T) {
 		e := newHTTPBrokerEnv(t, InjectBearer, "")
 		e.handler = func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/plain")
-			_, _ = io.WriteString(w, echoLabel+r.Header.Get("Authorization"))
+			// A leading 0x78 is zlib's first byte and ordinary text alike.
+			_, _ = io.WriteString(w, "x "+echoLabel+r.Header.Get("Authorization")+" \u00e9\u00e8")
 		}
 		resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
 		if err != nil {
 			t.Fatalf("plaintext echo failed: %v", err)
 		}
-		if !strings.HasPrefix(string(resp.Body), echoLabel) || !bytes.Contains(resp.Body, []byte(redacted)) {
+		if !bytes.Contains(resp.Body, []byte(echoLabel)) || !bytes.Contains(resp.Body, []byte(redacted)) {
 			t.Fatalf("plaintext body was not redacted: %q", resp.Body)
 		}
 		e.assertNoLeak(t, string(resp.Body), mustHeaderText(resp.Headers))
 	})
+}
+
+func zlibBytes(t *testing.T, text string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := io.WriteString(zw, text); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func flateBytes(t *testing.T, text string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	fw, err := flate.NewWriter(&buf, flate.BestCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(fw, text); err != nil {
+		t.Fatal(err)
+	}
+	if err := fw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func zipBytes(t *testing.T, text string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create("echo.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, text); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 // TestBrokerRefusesRedirect keeps ADR 0006's refusal: the credential is never

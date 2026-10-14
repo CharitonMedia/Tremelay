@@ -162,7 +162,8 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 			return s.failExchange(partial, call.method, ErrBrokerUpstream)
 		}
 		call.injection = grantInjectionOf(g)
-		if injectionCollides(call.headers, call.query, call.injection) || queryMethodOverride(call.query) {
+		if injectionCollides(call.headers, call.query, call.injection) ||
+			queryParamNamed(call.query, "_method") || queryParamNamed(string(call.body), "_method") {
 			partial.Result = resultDeniedMalformed
 			return s.failExchange(partial, call.method, ErrDeniedMalformed)
 		}
@@ -365,7 +366,7 @@ func (s *Session) finishCaptured(partial auditEvent, upstream *http.Request, pin
 	body, truncated, readErr := readTruncating(resp.Body, maxAgentBody)
 	defer wipe(body)
 	status, kind := responseClass(code, readErr)
-	if kind == brokerBodyOK && bodyCompressedContainerMagic(body) {
+	if kind == brokerBodyOK && bodyNotText(body, truncated) {
 		kind = brokerBodyBad
 	}
 	if kind == brokerBodyOK && call.capture(call.injection, secret, resp.Header, body, truncated) != nil {

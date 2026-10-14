@@ -64,7 +64,9 @@ var refusedAgentHeaders = []string{
 	"content-length", "transfer-encoding", "expect",
 	"accept-encoding", "range", "if-range",
 	"x-http-method-override", "x-http-method", "x-method-override",
-	"x-original-url", "x-rewrite-url", "x-forwarded-host", "forwarded",
+	"x-original-url", "x-original-uri", "x-rewrite-url", "forwarded",
+	"x-forwarded-host", "x-forwarded-prefix", "x-forwarded-proto",
+	"x-forwarded-port", "x-forwarded-ssl", "x-forwarded-for",
 	"connection", "keep-alive", "proxy-connection", "te", "trailer", "trailers", "upgrade",
 }
 
@@ -603,12 +605,9 @@ func injectionCollides(headers map[string]string, query string, inj grantInjecti
 	return false
 }
 
-// queryMethodOverride reports a query parameter that would retarget the HTTP
-// method on frameworks that honor `_method`.
-func queryMethodOverride(query string) bool {
-	return queryParamNamed(query, "_method")
-}
-
+// queryParamNamed reports a form-encoded parameter with this name. It reads a
+// query string and a form request body alike: Rack and Spring take `_method`
+// from either, and retarget the method of a POST with it.
 func queryParamNamed(query, want string) bool {
 	for _, pair := range strings.Split(query, "&") {
 		name := pair
@@ -741,36 +740,41 @@ func wipeForms(forms [][]byte) {
 // read from headers alone: a content coding the transport did not transparently
 // decode, or a partial-content fragment, which can carry a slice of a
 // credential shorter than any whole form. Transparent gzip is unaffected: the
-// transport strips Content-Encoding when it decodes the body itself. After the
-// body is read, bodyCompressedContainerMagic applies the same withholding to
-// undecoded compressed-container prefixes with no Content-Encoding.
+// transport strips Content-Encoding when it decodes the body itself. Every
+// coding in every Content-Encoding field counts: a response that lists
+// `identity, deflate` is deflate-coded, whatever the first value says.
 func bodyNotRedactable(status int, h http.Header) bool {
-	coding := strings.ToLower(strings.TrimSpace(h.Get("Content-Encoding")))
-	return (coding != "" && coding != "identity") ||
-		status == http.StatusPartialContent || h.Get("Content-Range") != ""
+	for _, field := range h.Values("Content-Encoding") {
+		for _, coding := range strings.Split(field, ",") {
+			coding = strings.ToLower(strings.TrimSpace(coding))
+			if coding != "" && coding != "identity" {
+				return true
+			}
+		}
+	}
+	return status == http.StatusPartialContent || h.Get("Content-Range") != ""
 }
 
-// bodyCompressedContainerMagic reports a body that begins with a known
-// compressed-container prefix (gzip, zstd, xz, bzip2). zlib is excluded
-// because 0x78 collides with text; brotli and other codings rely on
-// Content-Encoding refusal when the transport did not decode them.
-func bodyCompressedContainerMagic(body []byte) bool {
-	switch {
-	case len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b:
+// bodyNotText reports a body the credential scan cannot read: bytes that are
+// not valid UTF-8, or that carry a NUL. Redaction looks for spellings of a
+// credential in text, so anything else — a compressed stream the upstream did
+// not declare, an archive, a binary framing, a stream nested inside another —
+// is withheld rather than projected unscanned. An upstream that still wants to
+// hand the agent the credential can encode it as text; that residual is ADR
+// 0025's, and no byte-level check closes it.
+//
+// A truncated body can end mid-rune, which says nothing about the bytes before
+// it, so up to three trailing bytes are dropped before the verdict.
+func bodyNotText(body []byte, truncated bool) bool {
+	if bytes.IndexByte(body, 0) >= 0 {
 		return true
-	case len(body) >= 4 && body[0] == 0x28 && body[1] == 0xb5 && body[2] == 0x2f && body[3] == 0xfd:
-		return true
-	case len(body) >= 6 && body[0] == 0xfd && body[1] == 0x37 && body[2] == 0x7a &&
-		body[3] == 0x58 && body[4] == 0x5a && body[5] == 0x00:
-		return true
-	case len(body) >= 10 && body[0] == 'B' && body[1] == 'Z' && body[2] == 'h' &&
-		body[3] >= '1' && body[3] <= '9' &&
-		body[4] == 0x31 && body[5] == 0x41 && body[6] == 0x59 && body[7] == 0x26 &&
-		body[8] == 0x53 && body[9] == 0x59:
-		return true
-	default:
-		return false
 	}
+	if truncated {
+		for i := 0; i < utf8.UTFMax-1 && len(body) > 0 && !utf8.Valid(body); i++ {
+			body = body[:len(body)-1]
+		}
+	}
+	return !utf8.Valid(body)
 }
 
 // projectResponse builds the agent-visible response: the allowlisted headers
