@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -68,12 +69,13 @@ var refusedAgentHeaders = []string{
 // brokerResponseHeaders is the closed set of upstream response headers an
 // agent may see. Set-Cookie, authentication and transport headers are absent
 // by construction, not by subtraction.
+// Rate-limit headers are named one by one: an open X-RateLimit-* prefix let
+// an upstream put the credential in a header name, which is never scanned.
 var brokerResponseHeaders = []string{
 	"Content-Type", "Content-Length", "ETag", "Last-Modified", "Link", "Retry-After",
+	"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset",
+	"X-RateLimit-Used", "X-RateLimit-Resource",
 }
-
-// rateLimitPrefix is the one allowlisted response-header family.
-const rateLimitPrefix = "x-ratelimit-"
 
 // HTTPRequest is the agent-facing brokered request. It names the credential
 // and the granted origin, and supplies the method, the path under the grant's
@@ -651,9 +653,11 @@ func clearCredential(r *http.Request, inj grantInjection) {
 }
 
 // credentialForms are the spellings of the credential the broker removes from
-// agent-visible bytes: raw, URL-encoded, base64, hex and JSON-string-escaped,
-// and for basic auth the `user:pass` pair in those same spellings. An upstream
-// that echoes the credential usually echoes one of these.
+// agent-visible bytes: raw, URL-encoded with either percent-escape case, all
+// four standard/URL-safe padded/raw base64 variants, lower/upper hex and
+// JSON-string-escaped, and for basic auth the `user:pass` pair in those same
+// spellings. An upstream that echoes the credential usually echoes one of
+// these.
 //
 // ponytail: a closed list of literal spellings, not an encoding-aware scan.
 // Upgrade path: decode the body by Content-Type before matching, if a real
@@ -673,9 +677,29 @@ func credentialForms(inj grantInjection, secret []byte) [][]byte {
 	}
 	spellings := func(raw string) {
 		add([]byte(raw))
-		add([]byte(url.QueryEscape(raw)))
-		add([]byte(base64.StdEncoding.EncodeToString([]byte(raw))))
-		add([]byte(hex.EncodeToString([]byte(raw))))
+		escaped := []byte(url.QueryEscape(raw))
+		add(escaped)
+		lowerEscaped := append([]byte(nil), escaped...)
+		for i := 0; i+2 < len(lowerEscaped); i++ {
+			if lowerEscaped[i] != '%' {
+				continue
+			}
+			for j := i + 1; j <= i+2; j++ {
+				if lowerEscaped[j] >= 'A' && lowerEscaped[j] <= 'F' {
+					lowerEscaped[j] += 'a' - 'A'
+				}
+			}
+			i += 2
+		}
+		add(lowerEscaped)
+		rawBytes := []byte(raw)
+		add([]byte(base64.StdEncoding.EncodeToString(rawBytes)))
+		add([]byte(base64.RawStdEncoding.EncodeToString(rawBytes)))
+		add([]byte(base64.URLEncoding.EncodeToString(rawBytes)))
+		add([]byte(base64.RawURLEncoding.EncodeToString(rawBytes)))
+		encodedHex := hex.EncodeToString(rawBytes)
+		add([]byte(encodedHex))
+		add([]byte(strings.ToUpper(encodedHex)))
 		if quoted, err := json.Marshal(raw); err == nil && len(quoted) >= 2 {
 			add(quoted[1 : len(quoted)-1])
 		}
@@ -716,16 +740,33 @@ func projectResponse(inj grantInjection, secret []byte, upstream http.Header, bo
 		Body:      redactForms(append([]byte(nil), body...), forms, truncated),
 		Truncated: truncated,
 	}
-	for _, form := range forms {
-		if bytes.Contains(out.Body, form) {
+	if len(out.Body) > maxAgentBody {
+		wipe(out.Body[maxAgentBody:])
+		out.Body = out.Body[:maxAgentBody]
+		out.Truncated = true
+		if n := partialTail(out.Body, forms); n > 0 {
+			wipe(out.Body[len(out.Body)-n:])
+			out.Body = out.Body[:len(out.Body)-n]
+		}
+	}
+	if containsCredentialForm(out.Body, forms) {
+		wipe(out.Body)
+		return HTTPResponse{}, ErrBrokerUpstream
+	}
+	for _, value := range out.Headers {
+		if containsCredentialForm([]byte(value), forms) {
 			wipe(out.Body)
 			return HTTPResponse{}, ErrBrokerUpstream
 		}
-		for _, value := range out.Headers {
-			if strings.Contains(value, string(form)) {
-				wipe(out.Body)
-				return HTTPResponse{}, ErrBrokerUpstream
-			}
+	}
+	if len(out.Body) > 0 && (!utf8.Valid(out.Body) || bytes.Contains(out.Body, []byte{0})) {
+		encoded := make([]byte, base64.StdEncoding.EncodedLen(len(out.Body)))
+		base64.StdEncoding.Encode(encoded, out.Body)
+		leaked := containsCredentialForm(encoded, forms)
+		wipe(encoded)
+		if leaked {
+			wipe(out.Body)
+			return HTTPResponse{}, ErrBrokerUpstream
 		}
 	}
 	return out, nil
@@ -761,8 +802,7 @@ func allowedResponseHeader(name string) bool {
 			return true
 		}
 	}
-	folded := strings.ToLower(name)
-	return len(folded) > len(rateLimitPrefix) && strings.HasPrefix(folded, rateLimitPrefix)
+	return false
 }
 
 // redactForms rewrites buf with every credential form replaced by the fixed
@@ -796,11 +836,59 @@ func redactForms(buf []byte, forms [][]byte, truncated bool) []byte {
 // matchFormAt returns the length of the longest form starting at i.
 func matchFormAt(buf []byte, i int, forms [][]byte) int {
 	for _, form := range forms {
-		if bytes.HasPrefix(buf[i:], form) {
+		if len(buf)-i >= len(form) && formPrefixEqual(buf[i:i+len(form)], form) {
 			return len(form)
 		}
 	}
 	return 0
+}
+
+func containsCredentialForm(buf []byte, forms [][]byte) bool {
+	for i := range buf {
+		if matchFormAt(buf, i, forms) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// formPrefixEqual compares percent-escape hex digits case-insensitively and
+// every other byte exactly.
+func formPrefixEqual(got, form []byte) bool {
+	if len(got) > len(form) {
+		return false
+	}
+	for i := range got {
+		if got[i] == form[i] {
+			continue
+		}
+		if !percentHexDigit(form, i) || foldHex(got[i]) != foldHex(form[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func percentHexDigit(form []byte, i int) bool {
+	switch {
+	case i > 0 && form[i-1] == '%' && i+1 < len(form):
+		return isHex(form[i]) && isHex(form[i+1])
+	case i > 1 && form[i-2] == '%':
+		return isHex(form[i-1]) && isHex(form[i])
+	default:
+		return false
+	}
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func foldHex(c byte) byte {
+	if c >= 'A' && c <= 'F' {
+		return c + 'a' - 'A'
+	}
+	return c
 }
 
 // partialTail is the longest proper prefix of any form that ends buf.
@@ -808,7 +896,7 @@ func partialTail(buf []byte, forms [][]byte) int {
 	best := 0
 	for _, form := range forms {
 		for k := len(form) - 1; k > best; k-- {
-			if k <= len(buf) && bytes.HasSuffix(buf, form[:k]) {
+			if k <= len(buf) && formPrefixEqual(buf[len(buf)-k:], form) {
 				best = k
 				break
 			}

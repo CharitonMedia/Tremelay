@@ -599,13 +599,15 @@ func TestMCPCredentialFixtureProcess(t *testing.T) {
 			out := toolObject(t, result)
 			headers, _ := out["headers"].(map[string]any)
 			body, _ := out["body"].(string)
+			formCount := len(secretForms(nil))
+			redactedForms := strings.TrimSpace(strings.Repeat(redacted+" ", formCount))
 			if result.IsError || out["status_code"] != float64(200) || out["truncated"] != false || len(out) != 4 {
 				t.Fatal("fixture broker response violated its closed projection")
 			}
-			if headers["Set-Cookie"] != nil || headers["Content-Type"] != "text/plain" || headers["Etag"] != strings.Repeat(redacted+" ", 4)+redacted {
+			if headers["Set-Cookie"] != nil || headers["Content-Type"] != "text/plain" || headers["Etag"] != redactedForms {
 				t.Fatal("fixture broker response disclosed a cookie or an unredacted header")
 			}
-			if !strings.HasPrefix(body, "state=open echo=") || strings.Count(body, redacted) != 5 {
+			if !strings.HasPrefix(body, "state=open echo=") || strings.Count(body, redacted) != formCount {
 				t.Fatal("fixture broker body was not fully redacted")
 			}
 		default:

@@ -13,13 +13,54 @@ import (
 // encoded copy.
 func secretForms(secret []byte) []string {
 	raw := string(secret)
+	escaped := url.QueryEscape(raw)
+	encodedHex := hex.EncodeToString(secret)
 	return []string{
 		raw,
 		jsonEscape(raw),
-		url.QueryEscape(raw),
-		hex.EncodeToString(secret),
+		escaped,
+		lowerPercentHex(escaped),
+		mixedPercentHex(escaped),
+		encodedHex,
+		strings.ToUpper(encodedHex),
 		base64.StdEncoding.EncodeToString(secret),
+		base64.RawStdEncoding.EncodeToString(secret),
+		base64.URLEncoding.EncodeToString(secret),
+		base64.RawURLEncoding.EncodeToString(secret),
 	}
+}
+
+func lowerPercentHex(s string) string {
+	out := []byte(s)
+	for i := 0; i+2 < len(out); i++ {
+		if out[i] != '%' {
+			continue
+		}
+		for j := i + 1; j <= i+2; j++ {
+			if out[j] >= 'A' && out[j] <= 'F' {
+				out[j] += 'a' - 'A'
+			}
+		}
+		i += 2
+	}
+	return string(out)
+}
+
+func mixedPercentHex(s string) string {
+	out := []byte(s)
+	for i := 0; i+2 < len(out); i++ {
+		if out[i] != '%' {
+			continue
+		}
+		for j := i + 1; j <= i+2; j++ {
+			if out[j] >= 'A' && out[j] <= 'F' {
+				out[j] += 'a' - 'A'
+				return string(out)
+			}
+		}
+		i += 2
+	}
+	return string(out)
 }
 
 func containsForm(s string, forms []string) bool {
