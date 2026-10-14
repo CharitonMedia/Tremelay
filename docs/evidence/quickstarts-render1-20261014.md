@@ -48,3 +48,18 @@ Codex prompts for approval instead). 6 PASS: grant create/revoke (the revoked gr
 `lock` → fails closed. The real `~/.hermes/config.yaml` was not modified (mtime unchanged).
 Note: the Hermes model turn used the OpenAI API key from `~/.hermes/.env` (copied into the isolated
 home), i.e. a paid API key; this is disclosed in the orchestrator report.
+
+## Install line, after the v1.0.0 tag (2026-10-14, orchestrator)
+
+The one deviation above is closed. On render-1, with `go env GOPROXY` =
+`https://proxy.golang.org,direct`:
+
+- `go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0` downloaded
+  `v1.0.0`, switched to go1.26.9 as the pages say it would, and wrote the binary;
+  `tremelay -h` printed the control-plane usage.
+- `go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest` resolved to
+  `v1.0.0` and produced a byte-identical binary (`cmp` clean), so the pages'
+  `@latest` line now installs this code rather than `v0.9.0-dryrun.1`.
+- The published `tremelay_v1.0.0_linux_amd64.tar.gz`, downloaded from the release
+  and checked by name against `SHA256SUMS`, verified OK, and the extracted binary
+  printed the same usage.

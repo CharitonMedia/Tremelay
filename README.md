@@ -86,17 +86,16 @@ from `TREMELAY_PASSPHRASE`; interactively you get a no-echo prompt instead.
 
 ## Install
 
-Tremelay is pre-release security software and no stable release is published yet,
-so building from source is the only install path. It needs the pinned Go toolchain
-(1.26.9, see [go.mod](go.mod)).
+Tremelay needs the pinned Go toolchain (1.26.9, see [go.mod](go.mod)); `go install`
+switches to it for you.
 
 ```
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 ```
 
 From a clone, `make build` or `go build ./cmd/tremelay` does the same thing.
-Releases will carry per-platform archives, a CycloneDX SBOM and a `SHA256SUMS`
-file — a checksum detects a corrupt download, not a substituted release. Signed
+The [v1.0.0 release](https://github.com/CharitonMedia/Tremelay/releases/tag/v1.0.0)
+carries per-platform archives, a CycloneDX SBOM and a `SHA256SUMS` file — a checksum detects a corrupt download, not a substituted release. Signed
 releases are not in v1. `make release-dry` builds those artifacts locally; see
 [ADR 0027](docs/adr/0027-release-artifacts.md). Download the archive you want
 and `SHA256SUMS` into one directory, then check that archive by name:
