@@ -316,6 +316,10 @@ func TestSessionReloadUnderConcurrentCalls(t *testing.T) {
 	for range 5 {
 		// A commit from the other holder is what forces the reload.
 		if _, err := control.CreateAgent("remote-" + randHex(t, 8)); err != nil && !errors.Is(err, ErrStale) {
+			// Stop the callers first, so cleanup's Lock does not show up as
+			// their own spurious "vault unlock failed".
+			close(stop)
+			callers.Wait()
 			t.Fatalf("concurrent control-plane commit: %v", err)
 		}
 	}
