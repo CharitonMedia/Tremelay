@@ -4,6 +4,8 @@ Drafts for the GitHub-side half of [V1.md](../../V1.md) item 8. Applied on
 2026-10-14 from Patrick's account (not by the orchestrator): description and topics
 set, Discussions enabled, roadmap issues #55–#63 opened with these labels.
 
+Item 9's announcement drafts are in [announcements.md](announcements.md).
+
 ## Repo description
 
 Settings → General → Description. 336 characters, under GitHub's 350 limit.

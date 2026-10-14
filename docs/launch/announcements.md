@@ -44,7 +44,7 @@ Accepted limits from V1:
 
 Status and scope:
 - Single-user only (no multi-user/shared vault model in v1).
-- Pre-1.0 and audit-free in the external sense: no independent security audit.
+- Pre-1.0, no independent security audit.
 - Local-only transport for MCP in v1 (stdio plus local daemon endpoint).
 
 Install:
