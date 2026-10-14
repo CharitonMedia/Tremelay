@@ -358,16 +358,25 @@ func loadVaultMode(path string, readonly, legacyAudit bool) (*sql.DB, fileHeader
 // control plane share a live vault, and a header taken on one side of such a
 // commit with a chain taken on the other describes no state that ever
 // existed. That must not be reported as tampering.
-func readVaultSnapshot(db *sql.DB, legacyAudit bool) (fileHeader, []auditEvent, error) {
-	tx, err := db.Begin()
+//
+// _txlock=immediate makes this BEGIN take the reserved lock like a writer, so
+// it queues with the writers; outside the queue a back-to-back writer starves it.
+func readVaultSnapshot(db *sql.DB, legacyAudit bool) (header fileHeader, events []auditEvent, err error) {
+	err = vaultWriteRun(func() error {
+		tx, err := beginWriteTx(db)
+		if err != nil {
+			return err
+		}
+		header, events, err = readVaultState(tx, legacyAudit)
+		if rollback := tx.Rollback(); rollback != nil && err == nil {
+			return ErrIO
+		}
+		return err
+	})
 	if err != nil {
-		return fileHeader{}, nil, ErrIO
+		return fileHeader{}, nil, err
 	}
-	header, events, err := readVaultState(tx, legacyAudit)
-	if rollback := tx.Rollback(); rollback != nil && err == nil {
-		return fileHeader{}, nil, ErrIO
-	}
-	return header, events, err
+	return header, events, nil
 }
 
 // readVaultState reads and verifies the durable state of an open vault: the

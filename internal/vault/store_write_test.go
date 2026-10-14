@@ -94,7 +94,7 @@ func TestSQLiteConcurrentSessionCommitsNoErrIO(t *testing.T) {
 	t.Cleanup(control.Lock)
 
 	const (
-		workers    = 12
+		workers     = 12
 		commitsEach = 15
 	)
 	var wg sync.WaitGroup
