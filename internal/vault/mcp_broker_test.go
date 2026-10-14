@@ -25,17 +25,43 @@ import (
 // These tests use private pipes, random disposable credentials, and a synthetic
 // upstream. No DNS resolver, network listener, or external account is used.
 type mcpNetworkEnv struct {
-	s        *Session
-	path     string
-	pass     []byte
-	logs     bytes.Buffer
-	secret   []byte
-	cred     Credential
-	agent    Agent
-	resource string
-	grants   map[string]Grant
-	calls    int
-	lookups  int
+	s      *Session
+	path   string
+	pass   []byte
+	logs   bytes.Buffer
+	secret []byte
+	cred   Credential
+	agent  Agent
+	// resource is the exact http_request scope. brokerResource is the
+	// http_broker origin and prefix, and path/query are the request the agent
+	// supplies under it.
+	resource       string
+	brokerResource string
+	reqPath        string
+	query          string
+	grants         map[string]Grant
+	calls          int
+	lookups        int
+}
+
+func (e *mcpNetworkEnv) resourceOf(op string) string {
+	if op == OpHTTPBroker {
+		return e.brokerResource
+	}
+	return e.resource
+}
+
+// invokeArgs is the tool argument object for one operation's handle. An
+// http_broker handle carries the request shape; an http_request handle has
+// no arguments beyond its handle.
+func (e *mcpNetworkEnv) invokeArgs(op, handle string) map[string]any {
+	args := map[string]any{"handle": handle}
+	if op == OpHTTPBroker {
+		args["method"] = http.MethodGet
+		args["path"] = e.reqPath
+		args["query"] = e.query
+	}
+	return args
 }
 
 func newMCPNetworkEnv(t *testing.T) *mcpNetworkEnv {
@@ -52,12 +78,12 @@ func newMCPNetworkEnv(t *testing.T) *mcpNetworkEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.resource, err = GitHubIssueResource("octocat", "Hello-World", "17")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, op := range []string{OpHTTPRequest, OpGitHubIssueState} {
-		e.grants[op] = e.grant(t, e.agent.ID, op, e.resource, time.Now().Add(time.Hour))
+	e.resource = "GET https://api.github.com/repos/octocat/Hello-World/issues/17"
+	e.brokerResource = "https://api.github.com/repos/octocat/Hello-World"
+	e.reqPath = "/repos/octocat/Hello-World/issues/17"
+	e.query = "per_page=1"
+	for _, op := range []string{OpHTTPRequest, OpHTTPBroker} {
+		e.grants[op] = e.grant(t, e.agent.ID, op, e.resourceOf(op), time.Now().Add(time.Hour))
 	}
 	e.s.resolve = func(_ context.Context, host string) ([]net.IP, error) {
 		e.lookups++
@@ -73,10 +99,15 @@ func newMCPNetworkEnv(t *testing.T) *mcpNetworkEnv {
 
 func (e *mcpNetworkEnv) grant(t *testing.T, agentID, op, resource string, expiry time.Time) Grant {
 	t.Helper()
-	g, err := e.s.IssueGrant(GrantSpec{
+	spec := GrantSpec{
 		AgentID: agentID, CredentialID: e.cred.ID, Operations: []string{op},
 		Resource: resource, ExpiresAt: expiry,
-	})
+	}
+	if op == OpHTTPBroker {
+		spec.HTTPMethods = []string{http.MethodGet}
+		spec.HTTPInject = InjectBearer
+	}
+	g, err := e.s.IssueGrant(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,19 +122,20 @@ func (e *mcpNetworkEnv) upstream(t *testing.T) func(*http.Request) (*http.Respon
 			t.Error("synthetic upstream did not receive the protected credential")
 			return nil, errors.New("unauthorized")
 		}
-		if req.Method != http.MethodGet || req.URL.String() != strings.TrimPrefix(e.resource, "GET ") || req.Body != nil {
+		op := OpHTTPRequest
+		if req.URL.RawQuery != "" {
+			op = OpHTTPBroker
+		}
+		want := strings.TrimPrefix(e.resource, "GET ")
+		if op == OpHTTPBroker {
+			want = "https://api.github.com" + e.reqPath + "?" + e.query
+		}
+		if req.Method != http.MethodGet || req.URL.String() != want || req.Body != nil {
 			t.Error("broker changed the bound request")
 			return nil, errors.New("unexpected request")
 		}
-		op := OpHTTPRequest
-		if req.Header.Get("Accept") != "" {
-			op = OpGitHubIssueState
-			if req.Header.Get("Accept") != githubAccept || req.Header.Get("X-GitHub-Api-Version") != githubAPIVersion || req.Header.Get("User-Agent") != githubUserAgent || len(req.Header) != 4 {
-				t.Error("GitHub request did not retain its fixed headers")
-				return nil, errors.New("unexpected headers")
-			}
-		} else if len(req.Header) != 1 {
-			t.Error("HTTP request gained a caller-controlled header")
+		if len(req.Header) != 1 {
+			t.Error("request gained a caller-controlled header")
 			return nil, errors.New("unexpected headers")
 		}
 		if len(e.s.audit) == 0 {
@@ -115,13 +147,29 @@ func (e *mcpNetworkEnv) upstream(t *testing.T) func(*http.Request) (*http.Respon
 			t.Error("credential use preceded its exact allowed audit row")
 			return nil, errors.New("missing audit")
 		}
-		reflection, _ := json.Marshal(strings.Join(secretForms(e.secret), " "))
-		body := githubIssueDoc("octocat", "Hello-World", "17", "open", false, 3, `"title":`+string(reflection)+`,"body":`+string(reflection))
+		// The upstream echoes every spelling of the credential back, in the
+		// body, in an allowlisted response header, and in a dropped one.
+		echo := strings.Join(secretForms(e.secret), " ")
 		return &http.Response{
-			StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)),
-			Header: http.Header{"X-Reflection": []string{string(e.secret)}},
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("state=open echo=" + echo)),
+			Header: http.Header{
+				"X-Reflection": []string{string(e.secret)},
+				"Content-Type": []string{"text/plain"},
+				"Etag":         []string{echo},
+			},
 		}, nil
 	}
+}
+
+// redactedEcho is the fixture echo after the broker removes every credential
+// spelling. Each spelling becomes the fixed marker.
+func redactedEcho(e *mcpNetworkEnv) string {
+	marks := make([]string, len(secretForms(e.secret)))
+	for i := range marks {
+		marks[i] = redacted
+	}
+	return strings.Join(marks, " ")
 }
 
 func mcpNetworkClient(t *testing.T, cap *AgentCapability, revision string) *mcpSession {
@@ -141,11 +189,18 @@ func mcpNetworkHandles(t *testing.T, client *mcpSession) map[string]string {
 	handles := make(map[string]string)
 	for _, entry := range entries {
 		op, ok := entry["operation"].(string)
-		if !ok || (op != OpHTTPRequest && op != OpGitHubIssueState) {
+		if !ok || (op != OpHTTPRequest && op != OpHTTPBroker) {
 			t.Fatal("network catalogue contains an unexpected operation")
 		}
 		handle, ok := entry["handle"].(string)
-		if !ok || len(mustB64(t, handle)) != 32 || len(entry) != 5 || entry["status"] != GrantActive {
+		want := 5
+		if op == OpHTTPBroker {
+			want = 7
+			if entry["methods"] != http.MethodGet || entry["injection"] != InjectBearer {
+				t.Fatal("broker catalogue lost or changed its disclosed scope")
+			}
+		}
+		if !ok || len(mustB64(t, handle)) != 32 || len(entry) != want || entry["status"] != GrantActive {
 			t.Fatal("network catalogue violated its exact public projection")
 		}
 		if _, hasKeyID := entry["key_id"]; hasKeyID {
@@ -159,14 +214,20 @@ func mcpNetworkHandles(t *testing.T, client *mcpSession) map[string]string {
 	return handles
 }
 
-func assertMCPNetworkProjection(t *testing.T, result *mcp.CallToolResult, op string) {
+func assertMCPNetworkProjection(t *testing.T, e *mcpNetworkEnv, result *mcp.CallToolResult, op string) {
 	t.Helper()
 	if result.IsError || result.StructuredContent == nil {
 		t.Fatal("authorized network invocation did not produce a structured result")
 	}
 	want := map[string]any{"status_code": float64(200)}
-	if op == OpGitHubIssueState {
-		want = map[string]any{"number": float64(17), "state": "open", "locked": false, "comments": float64(3)}
+	if op == OpHTTPBroker {
+		marks := redactedEcho(e)
+		want = map[string]any{
+			"status_code": float64(200),
+			"headers":     map[string]any{"Content-Type": "text/plain", "Etag": marks},
+			"body":        "state=open echo=" + marks,
+			"truncated":   false,
+		}
 	}
 	if !reflect.DeepEqual(toolObject(t, result), want) {
 		t.Fatal("network invocation violated its operation-specific result projection")
@@ -277,15 +338,19 @@ func TestMCPNetworkBrokerProtectedUse(t *testing.T) {
 			handles := mcpNetworkHandles(t, client)
 			var outputs []any
 			outputs = append(outputs, tools, handles)
-			for _, op := range []string{OpHTTPRequest, OpGitHubIssueState} {
+			for _, op := range []string{OpHTTPRequest, OpHTTPBroker} {
 				described := mustCall(t, client, toolDescribe, map[string]any{"handle": handles[op]})
 				desc := toolObject(t, described)
-				if len(desc) != 5 || desc["operation"] != op || desc["handle"] != handles[op] || desc["resource"] != e.resource || desc["status"] != GrantActive {
+				wantFields := 5
+				if op == OpHTTPBroker {
+					wantFields = 7
+				}
+				if len(desc) != wantFields || desc["operation"] != op || desc["handle"] != handles[op] || desc["resource"] != e.resourceOf(op) || desc["status"] != GrantActive {
 					t.Fatal("describe changed the handle's operation or resource")
 				}
 				before := len(mcpAuditSnapshot(e.s))
-				result := mustCall(t, client, toolInvoke, map[string]any{"handle": handles[op]})
-				assertMCPNetworkProjection(t, result, op)
+				result := mustCall(t, client, toolInvoke, e.invokeArgs(op, handles[op]))
+				assertMCPNetworkProjection(t, e, result, op)
 				rows := mcpNetworkBrokerRows(t, e.s, before)
 				if len(rows) != 2 || rows[0].Result != resultAllowed || rows[1].Result != resultCompleted {
 					t.Fatal("credential use did not record exactly allowed then completed")
@@ -302,7 +367,7 @@ func TestMCPNetworkBrokerProtectedUse(t *testing.T) {
 			}
 			for _, output := range outputs {
 				encoded := mustJSON(t, output)
-				for _, hidden := range []string{e.cred.ID, e.cred.Label, e.agent.ID, e.agent.Label, e.grants[OpHTTPRequest].ID, e.grants[OpGitHubIssueState].ID} {
+				for _, hidden := range []string{e.cred.ID, e.cred.Label, e.agent.ID, e.agent.Label, e.grants[OpHTTPRequest].ID, e.grants[OpHTTPBroker].ID} {
 					if bytes.Contains(encoded, []byte(hidden)) {
 						t.Fatal("MCP disclosed non-public authority metadata")
 					}
@@ -323,14 +388,22 @@ func TestMCPNetworkBrokerCatalogScope(t *testing.T) {
 	e.grant(t, other.ID, OpHTTPRequest, foreignResource, time.Now().Add(time.Hour))
 	for _, spec := range []GrantSpec{
 		{AgentID: e.agent.ID, CredentialClass: "api_key", Operations: []string{OpHTTPRequest}, Resource: "GET https://class.example/private", ExpiresAt: time.Now().Add(time.Hour)},
-		{AgentID: e.agent.ID, CredentialID: e.cred.ID, Operations: []string{OpHTTPRequest, OpGitHubIssueState}, Resource: e.resource, ExpiresAt: time.Now().Add(time.Hour)},
+		{AgentID: e.agent.ID, CredentialID: e.cred.ID, Operations: []string{OpHTTPRequest, OpHTTPBroker}, Resource: e.resource, ExpiresAt: time.Now().Add(time.Hour)},
 		{AgentID: e.agent.ID, CredentialID: e.cred.ID, Operations: []string{OpSign}, Resource: "hidden-signing", ExpiresAt: time.Now().Add(time.Hour)},
 		{AgentID: e.agent.ID, CredentialID: e.cred.ID, Operations: []string{OpHTTPRequest}, Resource: "GET https://API.github.com/repos/octocat/Hello-World/issues/17", ExpiresAt: time.Now().Add(time.Hour)},
-		{AgentID: e.agent.ID, CredentialID: e.cred.ID, Operations: []string{OpGitHubIssueState}, Resource: "GET https://api.github.com/repos/octocat/Hello-World/issues/017", ExpiresAt: time.Now().Add(time.Hour)},
 	} {
 		if _, err := e.s.IssueGrant(spec); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// A broker origin that is not already canonical is refused at issuance, so
+	// it cannot be normalized into a usable destination later.
+	if _, err := e.s.IssueGrant(GrantSpec{
+		AgentID: e.agent.ID, CredentialID: e.cred.ID, Operations: []string{OpHTTPBroker},
+		Resource: "https://API.github.com/repos/octocat/Hello-World/017", ExpiresAt: time.Now().Add(time.Hour),
+		HTTPMethods: []string{http.MethodGet}, HTTPInject: InjectBearer,
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatal("non-canonical broker origin was issued")
 	}
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -355,7 +428,11 @@ func TestMCPNetworkBrokerCatalogScope(t *testing.T) {
 	seen := map[string]bool{}
 	for _, entry := range entries {
 		op, _ := entry["operation"].(string)
-		if seen[op] || (op != OpHTTPRequest && op != OpGitHubIssueState && op != OpSSHUserAuth) || len(entry) != 5 || entry["key_id"] != nil {
+		want := 5
+		if op == OpHTTPBroker {
+			want = 7
+		}
+		if seen[op] || (op != OpHTTPRequest && op != OpHTTPBroker && op != OpSSHUserAuth) || len(entry) != want || entry["key_id"] != nil {
 			t.Fatal("catalogue broadened authority or identity disclosure")
 		}
 		seen[op] = true
@@ -363,7 +440,7 @@ func TestMCPNetworkBrokerCatalogScope(t *testing.T) {
 			t.Fatal("SSH catalogue retargeted resource")
 		}
 	}
-	if len(entries) != 3 || !seen[OpHTTPRequest] || !seen[OpGitHubIssueState] || !seen[OpSSHUserAuth] || e.calls != 0 || e.lookups != 0 {
+	if len(entries) != 3 || !seen[OpHTTPRequest] || !seen[OpHTTPBroker] || !seen[OpSSHUserAuth] || e.calls != 0 || e.lookups != 0 {
 		t.Fatal("catalogue included unbound authority or performed credential use")
 	}
 	list := mustCall(t, client, toolList, map[string]any{})
@@ -382,7 +459,7 @@ func TestMCPNetworkBrokerRejectsRetargeting(t *testing.T) {
 			client := mcpNetworkClient(t, bindCap(t, e.s, e.agent.ID), revision)
 			handles := mcpNetworkHandles(t, client)
 			var outputs []any
-			for _, op := range []string{OpHTTPRequest, OpGitHubIssueState} {
+			for _, op := range []string{OpHTTPRequest, OpHTTPBroker} {
 				for _, extra := range []struct {
 					name  string
 					value any
@@ -473,7 +550,7 @@ func TestMCPNetworkBrokerForeignHandles(t *testing.T) {
 }
 
 func TestMCPNetworkBrokerLifecycle(t *testing.T) {
-	for _, op := range []string{OpHTTPRequest, OpGitHubIssueState} {
+	for _, op := range []string{OpHTTPRequest, OpHTTPBroker} {
 		for _, state := range []string{"revoked", "expired", "suspended"} {
 			t.Run(op+"/"+state, func(t *testing.T) {
 				e := newMCPNetworkEnv(t)
@@ -497,7 +574,7 @@ func TestMCPNetworkBrokerLifecycle(t *testing.T) {
 					want = capDeniedAgent
 				}
 				before := len(mcpAuditSnapshot(e.s))
-				result := mustCall(t, client, toolInvoke, map[string]any{"handle": handle})
+				result := mustCall(t, client, toolInvoke, e.invokeArgs(op, handle))
 				if !result.IsError || result.StructuredContent != nil || toolObject(t, result)["code"] != want {
 					t.Fatal("stale authority produced a result or the wrong fixed denial")
 				}
@@ -518,11 +595,11 @@ func TestMCPNetworkBrokerLifecycle(t *testing.T) {
 }
 
 func TestMCPNetworkBrokerExactGrantNoFallback(t *testing.T) {
-	for _, op := range []string{OpHTTPRequest, OpGitHubIssueState} {
+	for _, op := range []string{OpHTTPRequest, OpHTTPBroker} {
 		for _, state := range []string{"revoked", "expired"} {
 			t.Run(op+"/"+state, func(t *testing.T) {
 				e := newMCPNetworkEnv(t)
-				keep := e.grant(t, e.agent.ID, op, e.resource, time.Now().Add(2*time.Hour))
+				keep := e.grant(t, e.agent.ID, op, e.resourceOf(op), time.Now().Add(2*time.Hour))
 				cap := bindCap(t, e.s, e.agent.ID)
 				client := startMCP(t, cap)
 				if len(entriesOf(t, mustCall(t, client, toolList, map[string]any{}))) != 3 {
@@ -537,13 +614,13 @@ func TestMCPNetworkBrokerExactGrantNoFallback(t *testing.T) {
 					t.Fatal(err)
 				}
 				before := len(mcpAuditSnapshot(e.s))
-				denied := mustCall(t, client, toolInvoke, map[string]any{"handle": base64.StdEncoding.EncodeToString(oldH[:])})
+				denied := mustCall(t, client, toolInvoke, e.invokeArgs(op, base64.StdEncoding.EncodeToString(oldH[:])))
 				rows := mcpNetworkBrokerRows(t, e.s, before)
 				if !denied.IsError || toolObject(t, denied)["code"] != want || e.calls != 0 || e.lookups != 0 || len(rows) != 1 || rows[0].GrantID != e.grants[op].ID || rows[0].Result != want {
 					t.Fatal("inactive handle fell back to a different matching grant")
 				}
-				result := mustCall(t, client, toolInvoke, map[string]any{"handle": base64.StdEncoding.EncodeToString(keepH[:])})
-				assertMCPNetworkProjection(t, result, op)
+				result := mustCall(t, client, toolInvoke, e.invokeArgs(op, base64.StdEncoding.EncodeToString(keepH[:])))
+				assertMCPNetworkProjection(t, e, result, op)
 				rows = mcpNetworkBrokerRows(t, e.s, before)
 				if e.calls != 1 || rows[len(rows)-1].GrantID != keep.ID || rows[len(rows)-1].Result != resultCompleted {
 					t.Fatal("remaining exact grant was not usable on its own handle")
@@ -555,7 +632,7 @@ func TestMCPNetworkBrokerExactGrantNoFallback(t *testing.T) {
 }
 
 func TestMCPNetworkBrokerCredentialReplacement(t *testing.T) {
-	for _, op := range []string{OpHTTPRequest, OpGitHubIssueState} {
+	for _, op := range []string{OpHTTPRequest, OpHTTPBroker} {
 		t.Run(op, func(t *testing.T) {
 			e := newMCPNetworkEnv(t)
 			client := startMCP(t, bindCap(t, e.s, e.agent.ID))
@@ -570,7 +647,7 @@ func TestMCPNetworkBrokerCredentialReplacement(t *testing.T) {
 			found := false
 			for _, entry := range relisted {
 				if entry["handle"] == handle {
-					found = entry["operation"] == op && entry["resource"] == e.resource && entry["status"] == GrantRevoked
+					found = entry["operation"] == op && entry["resource"] == e.resourceOf(op) && entry["status"] == GrantRevoked
 				}
 			}
 			if !found {
@@ -581,7 +658,7 @@ func TestMCPNetworkBrokerCredentialReplacement(t *testing.T) {
 				t.Fatal("describe hid a replaced credential generation")
 			}
 			before := len(mcpAuditSnapshot(e.s))
-			denied := mustCall(t, client, toolInvoke, map[string]any{"handle": handle})
+			denied := mustCall(t, client, toolInvoke, e.invokeArgs(op, handle))
 			rows := mcpNetworkBrokerRows(t, e.s, before)
 			if !denied.IsError || denied.StructuredContent != nil || e.calls != 0 || e.lookups != 0 || len(rows) != 1 || rows[0].Result != resultDeniedCredential || rows[0].Operation != op || rows[0].GrantID != e.grants[op].ID {
 				t.Fatal("old handle moved to the replacement credential generation")
@@ -591,8 +668,8 @@ func TestMCPNetworkBrokerCredentialReplacement(t *testing.T) {
 			if newHandle == handle {
 				t.Fatal("new adapter reused another adapter's handle")
 			}
-			result := mustCall(t, fresh, toolInvoke, map[string]any{"handle": newHandle})
-			assertMCPNetworkProjection(t, result, op)
+			result := mustCall(t, fresh, toolInvoke, e.invokeArgs(op, newHandle))
+			assertMCPNetworkProjection(t, e, result, op)
 			if e.calls != 1 {
 				t.Fatal("new adapter did not use the replacement exactly once")
 			}
@@ -605,7 +682,7 @@ func TestMCPNetworkBrokerCredentialReplacement(t *testing.T) {
 }
 
 func TestMCPNetworkBrokerDestinationDenials(t *testing.T) {
-	for _, op := range []string{OpHTTPRequest, OpGitHubIssueState} {
+	for _, op := range []string{OpHTTPRequest, OpHTTPBroker} {
 		for _, mode := range []string{"private-dns", "mixed-dns", "redirect", "reflected-error"} {
 			t.Run(op+"/"+mode, func(t *testing.T) {
 				e := newMCPNetworkEnv(t)
@@ -640,7 +717,7 @@ func TestMCPNetworkBrokerDestinationDenials(t *testing.T) {
 					}
 				}
 				before := len(mcpAuditSnapshot(e.s))
-				result := mustCall(t, client, toolInvoke, map[string]any{"handle": handle})
+				result := mustCall(t, client, toolInvoke, e.invokeArgs(op, handle))
 				if !result.IsError || result.StructuredContent != nil || e.calls != calls {
 					t.Fatal("destination denial released a result or followed a redirect")
 				}
@@ -655,7 +732,7 @@ func TestMCPNetworkBrokerDestinationDenials(t *testing.T) {
 }
 
 func TestMCPNetworkBrokerAuditFailClosed(t *testing.T) {
-	for _, op := range []string{OpHTTPRequest, OpGitHubIssueState} {
+	for _, op := range []string{OpHTTPRequest, OpHTTPBroker} {
 		for _, stage := range []string{"allowed", "completed", "denied"} {
 			t.Run(op+"/"+stage, func(t *testing.T) {
 				e := newMCPNetworkEnv(t)
@@ -681,7 +758,7 @@ func TestMCPNetworkBrokerAuditFailClosed(t *testing.T) {
 					e.s.commitFault = fault
 				}
 				before := len(mcpAuditSnapshot(e.s))
-				result, err := client.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolInvoke, Arguments: map[string]any{"handle": handle}})
+				result, err := client.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolInvoke, Arguments: e.invokeArgs(op, handle)})
 				if err == nil || (result != nil && !result.IsError) || e.calls != wantCalls {
 					t.Fatal("failed required audit still released a network result")
 				}

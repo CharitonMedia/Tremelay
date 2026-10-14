@@ -13,7 +13,7 @@ import (
 
 const (
 	// OpSSHUserAuth authorizes one host-bound SSH user authentication signature.
-	// It is not an alias of sign, local_artifact_attest, http_request, or github_issue_state.
+	// It is not an alias of sign, local_artifact_attest, http_request, or http_broker.
 	OpSSHUserAuth = "ssh_userauth"
 
 	// SSH userauth limits. The frame cap is the SSH agent length field, not

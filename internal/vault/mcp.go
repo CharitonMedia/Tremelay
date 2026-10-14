@@ -162,7 +162,7 @@ func bindMCPEndpoint(cap *AgentCapability, stdio bool) (*MCPEndpoint, error) {
 	}, ep.onTool)
 	ep.server.AddTool(&mcp.Tool{
 		Name:         toolInvoke,
-		Description:  "Invoke the exact capability named by handle. HTTP and GitHub accept only handle; attestation requires a base64 payload; SSH requires one unframed base64 SSH-agent message (1–4096 bytes) after host session binding. Never replay an ambiguous or cancelled invocation.",
+		Description:  "Invoke the exact capability named by handle. http_request accepts only handle; http_broker takes method and path, plus optional query, headers and body_base64, all under the handle's granted origin and prefix; attestation requires a base64 payload; SSH requires one unframed base64 SSH-agent message (1–4096 bytes) after host session binding. Never replay an ambiguous or cancelled invocation.",
 		InputSchema:  json.RawMessage(mcpInvokeInSchema),
 		OutputSchema: json.RawMessage(mcpInvokeOutSchema),
 	}, ep.onTool)
@@ -457,9 +457,13 @@ func (e *MCPEndpoint) capMessage(name string, args json.RawMessage) ([]byte, []b
 		msg, err := encodeCapDescribe(handle)
 		return msg, nil, err
 	case toolInvoke:
-		handle, payload, err := toolInvokeArgs(args)
+		handle, payload, broker, err := toolInvokeArgs(args)
 		if err != nil {
 			return nil, nil, err
+		}
+		if broker != nil {
+			msg, err := encodeBrokerInvoke(handle, *broker)
+			return msg, broker.Body, err
 		}
 		msg, err := encodeCapInvoke(handle, payload)
 		return msg, payload, err
@@ -492,20 +496,24 @@ func toolHandle(args json.RawMessage, withPayload bool) ([32]byte, error) {
 	return handle, nil
 }
 
-func toolInvokeArgs(args json.RawMessage) ([32]byte, []byte, error) {
+func toolInvokeArgs(args json.RawMessage) ([32]byte, []byte, *HTTPRequest, error) {
 	var handle [32]byte
 	v, err := parseJSONValue(args)
 	if err != nil || !invokeArgsOK(v) {
-		return handle, nil, errMCPSyntax
+		return handle, nil, nil, errMCPSyntax
 	}
 	h, _ := v.field("handle")
 	buf, _ := canonicalB64(h.s, 32)
 	copy(handle[:], buf)
+	if _, isBroker := v.field("method"); isBroker {
+		req, _ := brokerArgs(v)
+		return handle, nil, &req, nil
+	}
 	if p, ok := v.field("payload"); ok {
 		payload, _ := canonicalB64Range(p.s, 1, MaxAttestPayload)
-		return handle, payload, nil
+		return handle, payload, nil, nil
 	}
-	return handle, nil, nil
+	return handle, nil, nil, nil
 }
 
 func canonicalB64(s string, n int) ([]byte, bool) {
@@ -556,8 +564,8 @@ func projectCap(raw []byte, err error) (*mcp.CallToolResult, error) {
 			return toolValue(struct {
 				Status int `json:"status_code"`
 			}{resp.network.status})
-		case OpGitHubIssueState:
-			return toolValue(resp.network.issue)
+		case OpHTTPBroker:
+			return toolValue(brokerBody(resp.network.response))
 		}
 		body := mcpInvokeBody{
 			Resource:  resp.att.Resource,
@@ -581,6 +589,8 @@ func entryBody(e capEntry) mcpEntryBody {
 		Operation: e.operation,
 		Resource:  e.resource,
 		KeyID:     e.keyID,
+		Methods:   e.methods,
+		Injection: e.injection,
 		Status:    e.status,
 		Expiry:    e.expires.UTC().Format(timeRFC3339Nano),
 	}
@@ -630,8 +640,36 @@ type mcpEntryBody struct {
 	Operation string `json:"operation"`
 	Resource  string `json:"resource"`
 	KeyID     string `json:"key_id,omitempty"`
+	Methods   string `json:"methods,omitempty"`
+	Injection string `json:"injection,omitempty"`
 	Status    string `json:"status"`
 	Expiry    string `json:"expiry"`
+}
+
+// mcpBrokerBody is the agent-visible projection of one brokered response.
+// Body carries the already-redacted bytes as text when they are valid UTF-8
+// without NUL, and as base64 otherwise. Exactly one of the two is present.
+type mcpBrokerBody struct {
+	Status     int               `json:"status_code"`
+	Headers    map[string]string `json:"headers"`
+	Body       string            `json:"body,omitempty"`
+	BodyBase64 string            `json:"body_base64,omitempty"`
+	Truncated  bool              `json:"truncated"`
+}
+
+func brokerBody(resp HTTPResponse) mcpBrokerBody {
+	out := mcpBrokerBody{Status: resp.StatusCode, Headers: resp.Headers, Truncated: resp.Truncated}
+	if out.Headers == nil {
+		out.Headers = map[string]string{}
+	}
+	switch {
+	case len(resp.Body) == 0:
+	case utf8.Valid(resp.Body) && !bytes.Contains(resp.Body, []byte{0}):
+		out.Body = string(resp.Body)
+	default:
+		out.BodyBase64 = base64.StdEncoding.EncodeToString(resp.Body)
+	}
+	return out
 }
 
 type mcpInvokeBody struct {
@@ -1538,7 +1576,7 @@ func describeArgsOK(v jv) bool {
 }
 
 func invokeArgsOK(v jv) bool {
-	if v.kind != 'o' || (len(v.obj) != 1 && len(v.obj) != 2) {
+	if v.kind != 'o' {
 		return false
 	}
 	h, ok := v.field("handle")
@@ -1547,6 +1585,10 @@ func invokeArgsOK(v jv) bool {
 	}
 	if _, good := canonicalB64(h.s, 32); !good {
 		return false
+	}
+	if _, isBroker := v.field("method"); isBroker {
+		_, good := brokerArgs(v)
+		return good
 	}
 	p, pok := v.field("payload")
 	if !pok {
@@ -1557,6 +1599,54 @@ func invokeArgsOK(v jv) bool {
 	}
 	_, good := canonicalB64Range(p.s, 1, MaxAttestPayload)
 	return good
+}
+
+// brokerArgs reads the http_broker request shape off the tool arguments.
+// It validates only the JSON shape; scope and header policy are decided
+// inside the session.
+func brokerArgs(v jv) (HTTPRequest, bool) {
+	method, mok := v.field("method")
+	path, pok := v.field("path")
+	if !mok || !pok || method.kind != 's' || path.kind != 's' || !brokerMethod(method.s) {
+		return HTTPRequest{}, false
+	}
+	req := HTTPRequest{Method: method.s, Path: path.s}
+	want := 3
+	if q, ok := v.field("query"); ok {
+		if q.kind != 's' || q.s == "" || len(q.s) > maxAgentQuery {
+			return HTTPRequest{}, false
+		}
+		req.Query = q.s
+		want++
+	}
+	if h, ok := v.field("headers"); ok {
+		if h.kind != 'o' || len(h.obj) == 0 || len(h.obj) > maxAgentHeaders {
+			return HTTPRequest{}, false
+		}
+		req.Headers = make(map[string]string, len(h.obj))
+		for _, member := range h.obj {
+			if member.v.kind != 's' {
+				return HTTPRequest{}, false
+			}
+			if _, dup := req.Headers[member.k]; dup {
+				return HTTPRequest{}, false
+			}
+			req.Headers[member.k] = member.v.s
+		}
+		want++
+	}
+	if b, ok := v.field("body_base64"); ok {
+		if b.kind != 's' {
+			return HTTPRequest{}, false
+		}
+		buf, good := canonicalB64Range(b.s, 1, maxAgentBody)
+		if !good {
+			return HTTPRequest{}, false
+		}
+		req.Body = buf
+		want++
+	}
+	return req, len(v.obj) == want
 }
 
 func cancelledParams(v jv) (callKey, bool) {
@@ -1815,7 +1905,7 @@ func (h *mcpLog) text() string {
 	return h.buf.String()
 }
 
-const mcpEntrySchema = `{"type":"object","additionalProperties":false,"required":["handle","operation","resource","status","expiry"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"operation":{"type":"string","enum":["local_artifact_attest","http_request","github_issue_state","ssh_userauth"]},"resource":{"type":"string"},"key_id":{"type":"string","minLength":64,"maxLength":64},"status":{"type":"string","enum":["active","revoked","expired"]},"expiry":{"type":"string"}},"oneOf":[{"properties":{"operation":{"const":"local_artifact_attest"}},"required":["key_id"]},{"properties":{"operation":{"enum":["http_request","github_issue_state","ssh_userauth"]}},"not":{"required":["key_id"]}}]}`
+const mcpEntrySchema = `{"type":"object","additionalProperties":false,"required":["handle","operation","resource","status","expiry"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"operation":{"type":"string","enum":["local_artifact_attest","http_request","http_broker","ssh_userauth"]},"resource":{"type":"string"},"key_id":{"type":"string","minLength":64,"maxLength":64},"methods":{"type":"string"},"injection":{"type":"string"},"status":{"type":"string","enum":["active","revoked","expired"]},"expiry":{"type":"string"}},"oneOf":[{"properties":{"operation":{"const":"local_artifact_attest"}},"required":["key_id"]},{"properties":{"operation":{"const":"http_broker"}},"required":["methods","injection"]},{"properties":{"operation":{"enum":["http_request","ssh_userauth"]}},"not":{"anyOf":[{"required":["key_id"]},{"required":["methods"]}]}}]}`
 
 const mcpListInSchema = `{"type":"object","additionalProperties":false,"properties":{}}`
 
@@ -1823,12 +1913,12 @@ const mcpListOutSchema = `{"type":"object","additionalProperties":false,"require
 
 const mcpDescribeInSchema = `{"type":"object","additionalProperties":false,"required":["handle"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"}}}`
 
-const mcpInvokeInSchema = `{"type":"object","additionalProperties":false,"required":["handle"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"payload":{"type":"string","minLength":4,"maxLength":87384,"contentEncoding":"base64"}}}`
+const mcpInvokeInSchema = `{"type":"object","additionalProperties":false,"required":["handle"],"properties":{"handle":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"payload":{"type":"string","minLength":4,"maxLength":87384,"contentEncoding":"base64"},"method":{"type":"string","enum":["GET","HEAD","POST","PUT","PATCH","DELETE"]},"path":{"type":"string","maxLength":1024},"query":{"type":"string","minLength":1,"maxLength":1024},"headers":{"type":"object","maxProperties":16,"additionalProperties":{"type":"string","minLength":1,"maxLength":1024}},"body_base64":{"type":"string","minLength":4,"maxLength":43692,"contentEncoding":"base64"}},"dependentRequired":{"method":["path"],"path":["method"],"query":["method"],"headers":["method"],"body_base64":["method"]},"not":{"required":["payload","method"]}}`
 
 const mcpAttestOutSchema = `{"type":"object","additionalProperties":false,"required":["resource","signature","public_key","domain","purpose"],"properties":{"resource":{"type":"string"},"signature":{"type":"string","minLength":88,"maxLength":88,"contentEncoding":"base64"},"public_key":{"type":"string","minLength":44,"maxLength":44,"contentEncoding":"base64"},"domain":{"type":"string","const":"tremelay/local-artifact-attestation/v1"},"purpose":{"type":"string","const":"local-artifact-attestation"}}}`
 
 const mcpHTTPOutSchema = `{"type":"object","additionalProperties":false,"required":["status_code"],"properties":{"status_code":{"type":"integer","minimum":200,"maximum":599,"not":{"minimum":300,"maximum":399}}}}`
-const mcpGitHubOutSchema = `{"type":"object","additionalProperties":false,"required":["number","state","locked","comments"],"properties":{"number":{"type":"integer","minimum":1,"maximum":999999999},"state":{"type":"string","enum":["open","closed"]},"locked":{"type":"boolean"},"comments":{"type":"integer","minimum":0,"maximum":1000000}}}`
+const mcpBrokerOutSchema = `{"type":"object","additionalProperties":false,"required":["status_code","headers","truncated"],"properties":{"status_code":{"type":"integer","minimum":200,"maximum":599,"not":{"minimum":300,"maximum":399}},"headers":{"type":"object","maxProperties":16,"additionalProperties":{"type":"string"}},"body":{"type":"string"},"body_base64":{"type":"string","contentEncoding":"base64"},"truncated":{"type":"boolean"}},"not":{"required":["body","body_base64"]}}`
 const mcpSSHOutSchema = `{"type":"object","additionalProperties":false,"required":["ssh_response"],"properties":{"ssh_response":{"type":"string","minLength":4,"maxLength":120,"contentEncoding":"base64"}}}`
 
-const mcpInvokeOutSchema = `{"type":"object","oneOf":[` + mcpAttestOutSchema + `,` + mcpHTTPOutSchema + `,` + mcpGitHubOutSchema + `,` + mcpSSHOutSchema + `]}`
+const mcpInvokeOutSchema = `{"type":"object","oneOf":[` + mcpAttestOutSchema + `,` + mcpHTTPOutSchema + `,` + mcpBrokerOutSchema + `,` + mcpSSHOutSchema + `]}`

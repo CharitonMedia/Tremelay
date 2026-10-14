@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -136,21 +137,32 @@ func runMCPCredentialFixture() error {
 	if err != nil {
 		return err
 	}
-	const githubResource = "GET https://api.github.com/repos/octocat/Hello-World/issues/17"
-	grantForResource := map[string]string{}
+	const (
+		githubHost     = "api.github.com"
+		brokerResource = "https://" + githubHost + "/repos/octocat/Hello-World"
+		brokerPath     = "/repos/octocat/Hello-World/issues/17"
+	)
+	// grantForRequest maps the canonical upstream request to the grant that
+	// must already be audited as allowed when that request is made.
+	grantForRequest := map[string]string{}
 	for _, spec := range []struct {
-		op, resource string
-		revoked      bool
+		op, resource, request string
+		revoked               bool
 	}{
-		{OpHTTPRequest, "GET https://protected.example/v1/ping", false},
-		{OpGitHubIssueState, githubResource, false},
-		{OpHTTPRequest, "GET https://protected.example/v1/denied", true},
+		{OpHTTPRequest, "GET https://protected.example/v1/ping", "GET https://protected.example/v1/ping", false},
+		{OpHTTPBroker, brokerResource, "GET https://" + githubHost + brokerPath, false},
+		{OpHTTPRequest, "GET https://protected.example/v1/denied", "GET https://protected.example/v1/denied", true},
 	} {
-		g, err := s.IssueGrant(GrantSpec{AgentID: agent.ID, CredentialID: cred.ID, Operations: []string{spec.op}, Resource: spec.resource, ExpiresAt: time.Now().Add(time.Hour)})
+		grantSpec := GrantSpec{AgentID: agent.ID, CredentialID: cred.ID, Operations: []string{spec.op}, Resource: spec.resource, ExpiresAt: time.Now().Add(time.Hour)}
+		if spec.op == OpHTTPBroker {
+			grantSpec.HTTPMethods = []string{http.MethodGet}
+			grantSpec.HTTPInject = InjectBearer
+		}
+		g, err := s.IssueGrant(grantSpec)
 		if err != nil {
 			return err
 		}
-		grantForResource[spec.resource] = g.ID
+		grantForRequest[spec.request] = g.ID
 		if spec.revoked {
 			if err := s.RevokeGrant(g.ID); err != nil {
 				return err
@@ -158,22 +170,25 @@ func runMCPCredentialFixture() error {
 		}
 	}
 	var authenticated, rejected, unexpected atomic.Int64
-	reflection, _ := json.Marshal(strings.Join(secretForms(secret), " "))
-	defer wipe(reflection)
+	// The fixture service echoes every spelling of the credential it was sent,
+	// in the body and in an allowlisted response header.
+	reflection := strings.Join(secretForms(secret), " ")
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), append([]byte("Bearer "), secret...)) != 1 {
 			rejected.Add(1)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if r.Method != http.MethodGet || (r.URL.Path != "/v1/ping" && r.URL.Path != "/repos/octocat/Hello-World/issues/17") || r.URL.RawQuery != "" {
+		if r.Method != http.MethodGet || (r.URL.Path != "/v1/ping" && r.URL.Path != brokerPath) || r.URL.RawQuery != "" {
 			unexpected.Add(1)
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
 		authenticated.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, githubIssueDoc("octocat", "Hello-World", "17", "open", false, 3, `"body":`+string(reflection)))
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("ETag", reflection)
+		w.Header().Set("Set-Cookie", "session="+reflection)
+		_, _ = io.WriteString(w, "state=open echo="+reflection)
 	}))
 	defer server.Close()
 	client := server.Client()
@@ -204,7 +219,7 @@ func runMCPCredentialFixture() error {
 		return err
 	}
 	s.resolve = func(_ context.Context, host string) ([]net.IP, error) {
-		if host != "protected.example" && host != githubAPIHost {
+		if host != "protected.example" && host != githubHost {
 			return nil, ErrDeniedDestination
 		}
 		return []net.IP{net.ParseIP("1.1.1.1")}, nil
@@ -213,11 +228,11 @@ func runMCPCredentialFixture() error {
 	allowedBefore.Store(true)
 	s.httpDo = func(req *http.Request) (*http.Response, error) {
 		op := OpHTTPRequest
-		if req.Header.Get("Accept") == githubAccept {
-			op = OpGitHubIssueState
+		if req.URL.Host == githubHost {
+			op = OpHTTPBroker
 		}
 		resource := req.Method + " " + req.URL.String()
-		expectedGrant, known := grantForResource[resource]
+		expectedGrant, known := grantForRequest[resource]
 		var last auditEvent
 		for _, row := range mcpAuditSnapshot(s) {
 			if row.Action == actionBroker {
@@ -359,8 +374,8 @@ func runMCPCredentialFixture() error {
 	// a revoked handle once. An empty/replayed/reconnected session is not proof.
 	exact := len(evidence.BrokerResults) == 2
 	for op, want := range map[string]map[string]int{
-		OpHTTPRequest:      {resultAllowed: 1, resultCompleted: 1, resultDeniedRevoked: 1},
-		OpGitHubIssueState: {resultAllowed: 1, resultCompleted: 1},
+		OpHTTPRequest: {resultAllowed: 1, resultCompleted: 1, resultDeniedRevoked: 1},
+		OpHTTPBroker:  {resultAllowed: 1, resultCompleted: 1},
 	} {
 		got := evidence.BrokerResults[op]
 		if len(got) != len(want) {
@@ -569,13 +584,34 @@ func TestMCPCredentialFixtureProcess(t *testing.T) {
 	observations = append(observations, entries)
 	for _, entry := range entries {
 		described := call(toolDescribe, map[string]any{"handle": entry["handle"]})
-		result := call(toolInvoke, map[string]any{"handle": entry["handle"]})
-		if entry["status"] == GrantRevoked {
+		args := map[string]any{"handle": entry["handle"]}
+		if entry["operation"] == OpHTTPBroker {
+			args["method"] = http.MethodGet
+			args["path"] = "/repos/octocat/Hello-World/issues/17"
+		}
+		result := call(toolInvoke, args)
+		switch {
+		case entry["status"] == GrantRevoked:
 			if !result.IsError || toolObject(t, result)["code"] != capDeniedRevoked {
 				t.Fatal("fixture revoked operation was not denied")
 			}
-		} else {
-			assertMCPNetworkProjection(t, result, entry["operation"].(string))
+		case entry["operation"] == OpHTTPBroker:
+			out := toolObject(t, result)
+			headers, _ := out["headers"].(map[string]any)
+			body, _ := out["body"].(string)
+			if result.IsError || out["status_code"] != float64(200) || out["truncated"] != false || len(out) != 4 {
+				t.Fatal("fixture broker response violated its closed projection")
+			}
+			if headers["Set-Cookie"] != nil || headers["Content-Type"] != "text/plain" || headers["Etag"] != strings.Repeat(redacted+" ", 4)+redacted {
+				t.Fatal("fixture broker response disclosed a cookie or an unredacted header")
+			}
+			if !strings.HasPrefix(body, "state=open echo=") || strings.Count(body, redacted) != 5 {
+				t.Fatal("fixture broker body was not fully redacted")
+			}
+		default:
+			if result.IsError || !reflect.DeepEqual(toolObject(t, result), map[string]any{"status_code": float64(200)}) {
+				t.Fatal("fixture http_request response violated its status-only projection")
+			}
 		}
 		observations = append(observations, described, result)
 	}

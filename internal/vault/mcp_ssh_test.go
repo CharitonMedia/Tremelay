@@ -362,7 +362,7 @@ func TestMCPSSHResponseAndStateBounds(t *testing.T) {
 	h := base64.StdEncoding.EncodeToString(make([]byte, 32))
 	for _, p := range []string{"Cw", "Cw==\n", "Cw== "} {
 		raw, _ := json.Marshal(map[string]any{"handle": h, "payload": p})
-		if _, _, err := toolInvokeArgs(raw); err == nil {
+		if _, _, _, err := toolInvokeArgs(raw); err == nil {
 			t.Fatal("noncanonical SSH payload accepted")
 		}
 	}

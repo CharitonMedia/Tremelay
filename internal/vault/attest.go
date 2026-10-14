@@ -11,7 +11,7 @@ import (
 
 const (
 	// OpLocalArtifactAttest authorizes one local Ed25519 attestation.
-	// It does not authorize BrokerHTTP, GitHubIssueState, or the sign placeholder.
+	// It does not authorize BrokerHTTP, BrokerRequest, or the sign placeholder.
 	OpLocalArtifactAttest = "local_artifact_attest"
 
 	// CredTypeEd25519 is the only credential type this operation will sign with.

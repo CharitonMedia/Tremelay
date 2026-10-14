@@ -275,12 +275,15 @@ func TestSSHUserAuthLegacyAndIssuance(t *testing.T) {
 			t.Fatalf("issuance %d %v", i, err)
 		}
 	}
-	legacy := []string{OpSign, OpHTTPRequest, OpGitHubIssueState, OpLocalArtifactAttest}
+	legacy := []string{OpSign, OpHTTPRequest, OpHTTPBroker, OpLocalArtifactAttest}
 	var legacyIDs []string
 	for _, op := range legacy {
 		spec := GrantSpec{AgentID: env.agent.ID, CredentialID: env.cred.ID, Operations: []string{op}, Resource: env.resource, ExpiresAt: exp}
 		if op == OpLocalArtifactAttest {
 			spec.Resource = "artifact:" + env.resource
+		}
+		if op == OpHTTPBroker {
+			spec.Resource, spec.HTTPMethods, spec.HTTPInject = "https://legacy.example/v1", []string{"GET"}, InjectBearer
 		}
 		g, err := env.session.IssueGrant(spec)
 		if err != nil {

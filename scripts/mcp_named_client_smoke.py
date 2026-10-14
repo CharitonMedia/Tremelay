@@ -129,18 +129,27 @@ def exercise(call):
     catalogue = content(call("list_capabilities", {}))
     entries = catalogue.get("entries")
     require(isinstance(entries, list) and len(entries) == 3, "expected three fixture grants")
+    broker_resource = "https://api.github.com/repos/octocat/Hello-World"
+    broker_path = "/repos/octocat/Hello-World/issues/17"
     wanted = {"GET https://protected.example/v1/ping", "GET https://protected.example/v1/denied",
-              "GET https://api.github.com/repos/octocat/Hello-World/issues/17"}
+              broker_resource}
     require({entry["resource"] for entry in entries} == wanted, "unexpected fixture resources")
     results = []
     for entry in sorted(entries, key=lambda row: row["resource"]):
-        require(set(entry) == {"handle", "operation", "resource", "status", "expiry"},
-                "network metadata exposed unexpected fields")
+        fields = {"handle", "operation", "resource", "status", "expiry"}
+        if entry["operation"] == "http_broker":
+            fields |= {"methods", "injection"}
+            require(entry["methods"] == "GET" and entry["injection"] == "bearer",
+                    "broker capability lost its disclosed scope")
+        require(set(entry) == fields, "network metadata exposed unexpected fields")
         require(entry["status"] == ("revoked" if entry["resource"].endswith("/denied") else "active"),
                 "unexpected grant lifecycle state")
         described = content(call("describe_capability", {"handle": entry["handle"]}))
         require(described == entry, "capability description mismatch")
-        result = call("invoke_capability", {"handle": entry["handle"]})
+        args = {"handle": entry["handle"]}
+        if entry["operation"] == "http_broker":
+            args |= {"method": "GET", "path": broker_path}
+        result = call("invoke_capability", args)
         if entry["resource"].endswith("/denied"):
             require(result.get("isError") or "error" in result, "revoked operation was not denied")
             results.append({"operation": "http_request", "result": "denied"})
@@ -148,10 +157,21 @@ def exercise(call):
             require(exact_json(content(result), {"status_code": 200}), "unexpected HTTP disclosure")
             results.append({"operation": "http_request", "result": "completed"})
         else:
-            require(entry["operation"] == "github_issue_state", "unexpected operation")
-            require(exact_json(content(result), {"number": 17, "state": "open", "locked": False, "comments": 3}),
-                    "unexpected GitHub disclosure")
-            results.append({"operation": "github_issue_state", "result": "completed"})
+            require(entry["operation"] == "http_broker", "unexpected operation")
+            body = content(result)
+            require(set(body) == {"status_code", "headers", "body", "truncated"},
+                    "broker response exposed unexpected fields")
+            require(body["status_code"] == 200 and body["truncated"] is False,
+                    "unexpected broker status")
+            require("Set-Cookie" not in body["headers"] and body["headers"].get("Content-Type") == "text/plain",
+                    "broker response disclosed a cookie or lost its allowlisted headers")
+            # The fixture upstream echoes five spellings of the credential in
+            # the body and in ETag. Every one must arrive redacted.
+            require(body["body"].startswith("state=open echo=") and body["body"].count("[redacted]") == 5,
+                    "broker body was not fully redacted")
+            require(body["headers"].get("Etag") == " ".join(["[redacted]"] * 5),
+                    "broker response header was not fully redacted")
+            results.append({"operation": "http_broker", "result": "completed"})
     return {"tool_calls": 7, "credential_invocations": 3, "results": results, "driver_retries": 0}
 
 
@@ -325,7 +345,7 @@ def checked_fixture(root):
     result = {"fixture": evidence}
     require(exact_json(evidence["broker_results"], {
         "http_request": {"allowed": 1, "completed": 1, "denied_revoked": 1},
-        "github_issue_state": {"allowed": 1, "completed": 1}}), "unexpected broker audit counts")
+        "http_broker": {"allowed": 1, "completed": 1}}), "unexpected broker audit counts")
     require(evidence["authenticated_requests"] == 2 and evidence["unauthenticated_self_checks"] == 2,
             "unexpected protected-service counts")
     require(evidence["unexpected_requests"] == 0, "unexpected upstream request")

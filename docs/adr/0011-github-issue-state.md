@@ -1,6 +1,12 @@
 # ADR 0011: Scoped GitHub issue-state read
 
-Status: Accepted
+Status: Superseded by [ADR 0025](0025-http-broker-v1.md)
+
+The `github_issue_state` operation, its resource builder, its decoder and its
+tests were removed in V1 item 4. An ordinary `http_broker` grant for
+`https://api.github.com` with prefix `/repos/OWNER/REPO` and `bearer` injection
+covers the same use. See [docs/m7-github-issue.md](../m7-github-issue.md) for
+the replacement how-to. The rest of this record describes the removed design.
 
 ## Context
 

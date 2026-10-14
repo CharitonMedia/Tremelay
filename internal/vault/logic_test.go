@@ -227,8 +227,8 @@ func TestNoGetSecretMethod(t *testing.T) {
 	if _, ok := sessionType.MethodByName("BrokerHTTP"); ok {
 		t.Fatal("human session exports the broker")
 	}
-	if _, ok := sessionType.MethodByName("GitHubIssueState"); ok {
-		t.Fatal("human session exports the github issue read")
+	if _, ok := sessionType.MethodByName("BrokerRequest"); ok {
+		t.Fatal("human session exports the prefix-scoped broker")
 	}
 	if _, ok := sessionType.MethodByName("LocalAttest"); ok {
 		t.Fatal("human session exports local attestation")
@@ -291,36 +291,37 @@ func TestNoGetSecretMethod(t *testing.T) {
 			if field.Name != "StatusCode" || field.Type.Kind() != reflect.Int {
 				t.Fatalf("broker response field %s", field.Name)
 			}
-		case "GitHubIssueState":
+		case "BrokerRequest":
 			if m.Type.NumIn() != 2 || m.Type.NumOut() != 2 {
-				t.Fatalf("GitHubIssueState signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
+				t.Fatalf("BrokerRequest signature in %d out %d", m.Type.NumIn(), m.Type.NumOut())
 			}
-			ghReq := m.Type.In(1)
-			if ghReq != reflect.TypeOf(GitHubIssueRequest{}) || ghReq.NumField() != 4 {
-				t.Fatalf("github request %s", ghReq)
+			req := m.Type.In(1)
+			if req != reflect.TypeOf(HTTPRequest{}) || req.NumField() != 7 {
+				t.Fatalf("broker request %s", req)
 			}
-			for j := 0; j < ghReq.NumField(); j++ {
-				f := ghReq.Field(j)
-				if f.Type.Kind() != reflect.String {
-					t.Fatal(f.Name)
+			// The request cannot name a credential value, an authorization
+			// header, a redirect policy, or a destination outside the grant.
+			wantReq := map[string]reflect.Kind{
+				"CredentialID": reflect.String, "Origin": reflect.String, "Method": reflect.String,
+				"Path": reflect.String, "Query": reflect.String, "Headers": reflect.Map, "Body": reflect.Slice,
+			}
+			for j := 0; j < req.NumField(); j++ {
+				f := req.Field(j)
+				if wantReq[f.Name] != f.Type.Kind() {
+					t.Fatalf("broker request field %s", f.Name)
 				}
-				switch f.Name {
-				case "CredentialID", "Owner", "Repository", "Number":
-				default:
-					t.Fatal(f.Name)
-				}
 			}
-			ghResp := m.Type.Out(0)
-			if ghResp != reflect.TypeOf(GitHubIssueState{}) || ghResp.NumField() != 4 {
-				t.Fatalf("github response %s", ghResp)
+			resp := m.Type.Out(0)
+			if resp != reflect.TypeOf(HTTPResponse{}) || resp.NumField() != 4 {
+				t.Fatalf("broker response %s", resp)
 			}
-			want := map[string]reflect.Kind{
-				"Number": reflect.Int64, "State": reflect.String, "Locked": reflect.Bool, "Comments": reflect.Int64,
+			wantResp := map[string]reflect.Kind{
+				"StatusCode": reflect.Int, "Headers": reflect.Map, "Body": reflect.Slice, "Truncated": reflect.Bool,
 			}
-			for j := 0; j < ghResp.NumField(); j++ {
-				f := ghResp.Field(j)
-				if want[f.Name] != f.Type.Kind() {
-					t.Fatalf("github field %s", f.Name)
+			for j := 0; j < resp.NumField(); j++ {
+				f := resp.Field(j)
+				if wantResp[f.Name] != f.Type.Kind() {
+					t.Fatalf("broker response field %s", f.Name)
 				}
 			}
 		case "LocalAttest":
