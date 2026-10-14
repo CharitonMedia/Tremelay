@@ -69,12 +69,13 @@ var refusedAgentHeaders = []string{
 // brokerResponseHeaders is the closed set of upstream response headers an
 // agent may see. Set-Cookie, authentication and transport headers are absent
 // by construction, not by subtraction.
+// Rate-limit headers are named one by one: an open X-RateLimit-* prefix let
+// an upstream put the credential in a header name, which is never scanned.
 var brokerResponseHeaders = []string{
 	"Content-Type", "Content-Length", "ETag", "Last-Modified", "Link", "Retry-After",
+	"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset",
+	"X-RateLimit-Used", "X-RateLimit-Resource",
 }
-
-// rateLimitPrefix is the one allowlisted response-header family.
-const rateLimitPrefix = "x-ratelimit-"
 
 // HTTPRequest is the agent-facing brokered request. It names the credential
 // and the granted origin, and supplies the method, the path under the grant's
@@ -801,8 +802,7 @@ func allowedResponseHeader(name string) bool {
 			return true
 		}
 	}
-	folded := strings.ToLower(name)
-	return len(folded) > len(rateLimitPrefix) && strings.HasPrefix(folded, rateLimitPrefix)
+	return false
 }
 
 // redactForms rewrites buf with every credential form replaced by the fixed

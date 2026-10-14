@@ -130,7 +130,7 @@ The agent receives the status code, an allowlist of response headers, and the
 capped body with a `truncated` flag.
 
 The header allowlist is `Content-Type`, `Content-Length`, `ETag`,
-`Last-Modified`, `Link`, `Retry-After`, and the `X-RateLimit-*` family. It is
+`Last-Modified`, `Link`, `Retry-After`, and the `X-RateLimit-{Limit,Remaining,Reset,Used,Resource}` family. It is
 closed by construction: `Set-Cookie`, `WWW-Authenticate`, `Authorization` and
 every transport header are absent because they are not on the list, not because
 they were subtracted from one.

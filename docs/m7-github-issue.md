@@ -36,8 +36,8 @@ plus the request:
 
 It receives the status code, the allowlisted response headers
 (`Content-Type`, `Content-Length`, `ETag`, `Last-Modified`, `Link`,
-`Retry-After`, `X-RateLimit-*`), and the body up to 32 KiB with a `truncated`
-flag. `Link` and `X-RateLimit-*` are what make paging and rate-limit backoff
+`Retry-After`, `X-RateLimit-{Limit,Remaining,Reset,Used,Resource}`), and the body up to 32 KiB with a `truncated`
+flag. `Link` and `X-RateLimit-{Limit,Remaining,Reset,Used,Resource}` are what make paging and rate-limit backoff
 work.
 
 The agent cannot send `Authorization`, `Cookie`, `Host`, `Content-Length`,

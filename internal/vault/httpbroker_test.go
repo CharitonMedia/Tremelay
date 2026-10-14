@@ -820,3 +820,19 @@ func TestBrokerPathUnderPrefix(t *testing.T) {
 		}
 	}
 }
+
+// TestBrokerHeaderNameCannotCarryCredential: header names are not scanned for
+// credential forms, so no allowlisted name may be upstream-chosen.
+func TestBrokerHeaderNameCannotCarryCredential(t *testing.T) {
+	secret := []byte(strings.Repeat("7", 32))
+	upstream := http.Header{}
+	upstream.Set("X-RateLimit-"+string(secret), "1")
+	upstream.Set("X-RateLimit-Remaining", "9")
+	resp, err := projectResponse(grantInjection{style: InjectBearer}, secret, upstream, []byte("ok"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Headers) != 1 || resp.Headers["X-Ratelimit-Remaining"] != "9" {
+		t.Fatalf("headers %v, want only X-Ratelimit-Remaining", resp.Headers)
+	}
+}
