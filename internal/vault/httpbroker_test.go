@@ -2,6 +2,7 @@ package vault
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -347,6 +348,11 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 		{name: "host", inject: InjectBearer, headers: map[string]string{"Host": "attacker.example"}},
 		{name: "content-length", inject: InjectBearer, headers: map[string]string{"Content-Length": "0"}},
 		{name: "transfer-encoding", inject: InjectBearer, headers: map[string]string{"Transfer-Encoding": "chunked"}},
+		{name: "accept-encoding", inject: InjectBearer, headers: map[string]string{"Accept-Encoding": "gzip"}},
+		{name: "accept-encoding-folded", inject: InjectBearer, headers: map[string]string{"accept-ENCODING": "br, deflate"}},
+		{name: "range", inject: InjectBearer, headers: map[string]string{"Range": "bytes=0-9"}},
+		{name: "if-range", inject: InjectBearer, headers: map[string]string{"If-Range": `"etag"`}},
+		{name: "expect", inject: InjectBearer, headers: map[string]string{"Expect": "100-continue"}},
 		{name: "connection", inject: InjectBearer, headers: map[string]string{"Connection": "close"}},
 		{name: "upgrade", inject: InjectBearer, headers: map[string]string{"Upgrade": "websocket"}},
 		{name: "te", inject: InjectBearer, headers: map[string]string{"TE": "trailers"}},
@@ -366,8 +372,8 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 			if err == nil || resp.StatusCode != 0 {
 				t.Fatalf("header smuggling was accepted: %d %v", resp.StatusCode, err)
 			}
-			if e.requests != 0 {
-				t.Fatal("refused request still reached the upstream")
+			if e.requests != 0 || e.lookups != 0 {
+				t.Fatalf("refused request resolved or reached the upstream: lookups %d requests %d", e.lookups, e.requests)
 			}
 			// A collision with the grant's own slot is a policy refusal and is
 			// attributed; a forbidden name is refused before attribution.
@@ -382,6 +388,95 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 			}
 			if e.lastResult(t) != wantResult {
 				t.Fatalf("audit result %s, want %s", e.lastResult(t), wantResult)
+			}
+			e.assertNoLeak(t, err.Error())
+		})
+	}
+}
+
+func gzipBytes(t *testing.T, text string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := io.WriteString(zw, text); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestBrokerTransparentGzipIsRedacted is the case redaction must keep
+// handling: the broker never sends Accept-Encoding itself, so the transport
+// negotiates gzip and decodes the body before the broker sees it. The echoed
+// credential is then an ordinary literal match.
+func TestBrokerTransparentGzipIsRedacted(t *testing.T) {
+	e := newHTTPBrokerEnv(t, InjectBearer, "")
+	e.handler = func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gzipBytes(t, "token: "+r.Header.Get("Authorization")))
+	}
+	resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
+	if err != nil {
+		t.Fatalf("transparently decoded response failed: %v", err)
+	}
+	if e.seen == nil || e.seen.Header.Get("Accept-Encoding") != "gzip" {
+		t.Fatal("the transport did not negotiate gzip, so this is not the transparent case")
+	}
+	if !strings.HasPrefix(string(resp.Body), "token: Bearer ") || !bytes.Contains(resp.Body, []byte(redacted)) {
+		t.Fatalf("decoded body was not redacted: %q", resp.Body)
+	}
+	e.assertNoLeak(t, string(resp.Body), mustHeaderText(resp.Headers))
+}
+
+// TestBrokerWithholdsUndecodedOrPartialBody covers the two ways an upstream
+// can hand back bytes the literal redaction scan cannot match: a content
+// coding the transport did not decode, and a byte-range fragment carrying a
+// slice of the credential shorter than any whole form. Both fail closed on
+// the same upstream_error path as a surviving credential form.
+func TestBrokerWithholdsUndecodedOrPartialBody(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		headers map[string]string
+	}{
+		{"unsolicited-gzip", http.StatusOK, map[string]string{"Content-Encoding": "gzip"}},
+		{"brotli", http.StatusOK, map[string]string{"Content-Encoding": "BR"}},
+		{"partial-content", http.StatusPartialContent, map[string]string{"Content-Range": "bytes 0-15/4096"}},
+		{"content-range-without-206", http.StatusOK, map[string]string{"Content-Range": "bytes 0-15/4096"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newHTTPBrokerEnv(t, InjectBearer, "")
+			// The upstream is written straight onto the wire-level response:
+			// a real transport decodes the gzip it asked for, so only this
+			// seam can present a coding it did not negotiate.
+			e.s.httpDo = func(req *http.Request) (*http.Response, error) {
+				e.requests++
+				auth := req.Header.Get("Authorization")
+				raw := gzipBytes(t, "token: "+auth)
+				if tc.headers["Content-Encoding"] == "" {
+					raw = []byte(auth[:16])
+				}
+				header := http.Header{"Content-Type": {"text/plain"}}
+				for name, value := range tc.headers {
+					header.Set(name, value)
+				}
+				return &http.Response{
+					StatusCode: tc.status,
+					Header:     header,
+					Body:       io.NopCloser(bytes.NewReader(raw)),
+				}, nil
+			}
+			resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
+			if !errors.Is(err, ErrBrokerUpstream) || resp.StatusCode != 0 || resp.Body != nil || resp.Headers != nil {
+				t.Fatalf("unreadable body was projected: %+v %v", resp, err)
+			}
+			if e.requests != 1 || e.lastResult(t) != resultUpstreamError {
+				t.Fatalf("requests %d result %s", e.requests, e.lastResult(t))
 			}
 			e.assertNoLeak(t, err.Error())
 		})

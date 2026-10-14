@@ -307,6 +307,14 @@ func (s *Session) finishCaptured(partial auditEvent, upstream *http.Request, pin
 		}
 		return s.finishKind(partial, method, status, kind)
 	}
+	// An undecoded coding or a byte-range fragment hides a credential from
+	// the literal scan, so it is withheld whole, like a surviving form.
+	if bodyNotRedactable(code, resp.Header) {
+		if resp.Body != nil {
+			discardBody(resp.Body)
+		}
+		return s.finishKind(partial, method, 0, brokerBodyBad)
+	}
 	body, truncated, readErr := readTruncating(resp.Body, maxAgentBody)
 	defer wipe(body)
 	status, kind := responseClass(code, readErr)

@@ -52,9 +52,16 @@ func InjectionStyles() []string {
 
 // refusedAgentHeaders are names an agent may never set. They choose the
 // credential, the destination, or the framing of the brokered request.
+//
+// Accept-Encoding, Range and If-Range choose the *form* of the response
+// bytes, which is the same thing: an encoding the transport did not negotiate
+// is never decoded, and a byte range is shorter than any credential form, so
+// either one hands redaction bytes it cannot match. Expect changes the
+// framing handshake.
 var refusedAgentHeaders = []string{
 	"authorization", "proxy-authorization", "cookie", "host",
-	"content-length", "transfer-encoding",
+	"content-length", "transfer-encoding", "expect",
+	"accept-encoding", "range", "if-range",
 	"connection", "keep-alive", "proxy-connection", "te", "trailer", "trailers", "upgrade",
 }
 
@@ -685,6 +692,17 @@ func wipeForms(forms [][]byte) {
 	for i := range forms {
 		wipe(forms[i])
 	}
+}
+
+// bodyNotRedactable reports an upstream response whose bytes redaction cannot
+// read: a content coding the transport did not transparently decode, or a
+// partial-content fragment, which can carry a slice of a credential shorter
+// than any whole form. Transparent gzip is unaffected: the transport strips
+// Content-Encoding when it decodes the body itself.
+func bodyNotRedactable(status int, h http.Header) bool {
+	coding := strings.ToLower(strings.TrimSpace(h.Get("Content-Encoding")))
+	return (coding != "" && coding != "identity") ||
+		status == http.StatusPartialContent || h.Get("Content-Range") != ""
 }
 
 // projectResponse builds the agent-visible response: the allowlisted headers

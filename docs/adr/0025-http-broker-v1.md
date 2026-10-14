@@ -97,10 +97,22 @@ and no destination field beyond the granted origin.
 
 Refused, before DNS and before any secret is copied: `Authorization`,
 `Proxy-Authorization`, `Cookie`, `Host`, `Content-Length`,
-`Transfer-Encoding`, the hop-by-hop names (`Connection`, `Keep-Alive`,
-`Proxy-Connection`, `TE`, `Trailer`, `Trailers`, `Upgrade`), the grant's own
-named injection header, and — for query injection — any query parameter with the
-grant's parameter name. Header names and query parameter names are compared
+`Transfer-Encoding`, `Expect`, `Accept-Encoding`, `Range`, `If-Range`, the
+hop-by-hop names (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`,
+`Trailer`, `Trailers`, `Upgrade`), the grant's own named injection header,
+and — for query injection — any query parameter with the grant's parameter
+name.
+
+`Accept-Encoding`, `Range` and `If-Range` are refused for the same reason as
+the framing headers: they choose the *form* of the response bytes, and
+redaction is a literal scan over those bytes. Go's transport only decodes a
+content coding it negotiated itself, so an agent-chosen `Accept-Encoding:
+gzip` against an upstream that echoes the credential would return compressed
+bytes the scan cannot match and the agent can decompress. A `Range` request
+returns a fragment shorter than any credential form, which the scan also
+cannot match, and a few of them reassemble the credential. The broker sets no
+`Accept-Encoding` of its own, so the transport keeps negotiating and decoding
+gzip transparently. Header names and query parameter names are compared
 case-insensitively, because HTTP treats them that way. Header values are
 restricted to printable ASCII and tab, so a value cannot carry CR or LF.
 
@@ -134,6 +146,17 @@ rescanned. Truncation can cut a credential in half, so a truncated buffer also
 loses its longest trailing proper prefix of any spelling. After projection the
 broker re-checks containment and withholds the whole response as
 `upstream_error` if any spelling survived; a leak fails the call, not the check.
+
+The request-side refusals above cannot bind an upstream, which may send a
+content coding or a partial response nobody asked for. So the response is
+also checked before its body is read: if it still carries a `Content-Encoding`
+other than empty or `identity` — meaning the transport did not transparently
+decode it — or its status is `206 Partial Content`, or it carries a
+`Content-Range`, the body is discarded unread and the call takes the same
+fail-closed `upstream_error` path as a surviving credential form. A
+transparently decoded gzip body is unaffected: the transport removes
+`Content-Encoding` when it does the decoding, and the decoded bytes are an
+ordinary literal match.
 
 ### 6. Defences kept unchanged
 
@@ -197,9 +220,20 @@ without NUL, and `body_base64` otherwise. Exactly one of the two is present.
   can be fed anything the upstream says, including prompt-injection text. The
   broker guarantees the credential is not in it, not that it is trustworthy.
 - Redaction is a closed list of literal spellings, not an encoding-aware scan.
-  An upstream that re-encodes the credential some other way (gzip, a custom
-  cipher) would defeat it; the containment re-check cannot see that either.
-  Marked `ponytail:` in `credentialForms` with the upgrade path.
+  An upstream that re-encodes the credential some other way (a custom cipher,
+  a chunked JSON string built from pieces) would defeat it; the containment
+  re-check cannot see that either. Marked `ponytail:` in `credentialForms`
+  with the upgrade path. Transport content codings and byte ranges are the two
+  re-encodings an agent could *choose*, so those are closed by refusal on the
+  request and by withholding on the response rather than by teaching the scan
+  to decode.
+- The response gate is on the coding, not on the bytes: any `Content-Encoding`
+  the transport did not decode fails the call, even where the body is
+  harmless. A `HEAD` request is the visible cost — the transport does not
+  negotiate gzip for it, so an upstream that advertises `Content-Encoding:
+  gzip` on an empty `HEAD` response is withheld. Deny-by-default is the right
+  side to err on, and a decoder per coding is the upgrade path if a real
+  upstream needs it.
 - Percent-encoding is refused everywhere in the path and query, inherited from
   ADR 0006. An API that requires a percent-encoded path or query value cannot be
   reached yet. That is a known, deliberate gap.
@@ -238,8 +272,18 @@ Synthetic only. No live API is called by the test suite.
   slashes and backslashes, percent-encoded dots, double slashes, fragments,
   userinfo, control bytes and whitespace are refused with no DNS lookup and no
   connection.
-- `TestBrokerRefusesHeaderSmuggling` — every refused header name, CR/LF in a
-  name or value, and the grant's own injection slot under any case spelling.
+- `TestBrokerRefusesHeaderSmuggling` — every refused header name including
+  `Accept-Encoding`, `Range`, `If-Range` and `Expect`, CR/LF in a name or
+  value, and the grant's own injection slot under any case spelling. Each is
+  refused with no DNS lookup and no request to the upstream.
+- `TestBrokerTransparentGzipIsRedacted` — the transport negotiates gzip, the
+  upstream gzips an echoed bearer token, and the agent receives the decoded
+  body with the token redacted.
+- `TestBrokerWithholdsUndecodedOrPartialBody` — a response the transport did
+  not decode (`Content-Encoding: gzip` the client never asked for, and `br`),
+  a `206`, and a `Content-Range` without a `206` are each withheld whole as
+  `upstream_error`; neither the compressed bytes, the decompressed token nor a
+  range fragment reaches the agent.
 - `TestBrokerRefusesRedirect` — a 3xx is refused, its `Location` and body are
   not projected, and the credential is not forwarded.
 - `TestBrokerGrantMatching` — positive and negative origin, prefix and method
