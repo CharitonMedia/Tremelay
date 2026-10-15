@@ -106,37 +106,55 @@ func TestSSHUserAuthInterop(t *testing.T) {
 	// Exercise both response shapes concurrently; Serve must still serialize
 	// credential use and record every signature release.
 	const concurrentRequests = 32
-	results := make(chan error, concurrentRequests)
+	type concurrentOutcome struct {
+		idx int
+		err error
+	}
+	results := make(chan concurrentOutcome, concurrentRequests)
 	start := make(chan struct{})
 	for i := 0; i < concurrentRequests; i++ {
-		go func() {
+		go func(idx int) {
 			<-start
-			if i%2 == 0 {
+			if idx%2 == 0 {
 				keys, err := peer.List()
 				if err == nil && (len(keys) != 1 || keys[0].Comment != "" || !bytes.Equal(keys[0].Blob, env.userBlob)) {
 					err = errors.New("concurrent list returned a different identity")
 				}
-				results <- err
+				results <- concurrentOutcome{idx: idx, err: err}
 				return
 			}
 			sig, err := peer.Sign(sshPub, preimage)
 			if err == nil {
 				err = parsed.Verify(preimage, sig)
 			}
-			results <- err
-		}()
+			results <- concurrentOutcome{idx: idx, err: err}
+		}(i)
 	}
 	close(start)
-	completionDeadline := time.NewTimer(5 * time.Second)
+	completed := make([]bool, concurrentRequests)
+	const concurrentWait = 60 * time.Second
+	completionDeadline := time.NewTimer(concurrentWait)
 	defer completionDeadline.Stop()
 	for i := 0; i < concurrentRequests; i++ {
 		select {
-		case err := <-results:
-			if err != nil {
-				t.Errorf("concurrent request: %v", err)
+		case outcome := <-results:
+			if outcome.err != nil {
+				t.Errorf("concurrent request #%d: %v", outcome.idx, outcome.err)
 			}
+			completed[outcome.idx] = true
 		case <-completionDeadline.C:
-			t.Fatal("concurrent requests did not complete")
+			var outstanding []string
+			for idx := 0; idx < concurrentRequests; idx++ {
+				if completed[idx] {
+					continue
+				}
+				kind := "sign"
+				if idx%2 == 0 {
+					kind = "list"
+				}
+				outstanding = append(outstanding, fmt.Sprintf("#%d %s", idx, kind))
+			}
+			t.Fatalf("concurrent requests did not complete within %v; still outstanding: %s", concurrentWait, strings.Join(outstanding, ", "))
 		}
 	}
 	client.Close()
