@@ -78,8 +78,10 @@ other repo, host or method. See [ADR 0025](../adr/0025-http-broker-v1.md).
 tremelay daemon --vault "$HOME/.tremelay/vault.db" --idle-timeout 8h
 ```
 
-It prompts for the passphrase, prints its endpoint path, and serves until you
-lock it. Keep it in its own terminal, `tmux` window or user service: the key
+With a terminal it prompts for the passphrase; a user service needs
+`TREMELAY_PASSPHRASE` instead ([headless daemon](../headless-daemon.md#run-the-daemon-as-a-user-service)).
+It prints its endpoint path and serves until you lock it. Keep it in its own
+terminal, `tmux` window or user service: the key
 lives nowhere else. Control-plane commands keep working while it runs — it
 re-reads the vault in place with the key it already holds.
 

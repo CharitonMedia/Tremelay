@@ -74,7 +74,9 @@ to reconnect for that to happen.
 tremelay daemon --vault /absolute/vault.db --idle-timeout 8h
 ```
 
-It prompts for the passphrase on your terminal, then prints the endpoint path
+If stdin is a terminal, it prompts for the passphrase with no echo; otherwise
+unlock needs `TREMELAY_PASSPHRASE` (see [Run the daemon as a user
+service](#run-the-daemon-as-a-user-service)). It then prints the endpoint path
 and serves. `--idle-timeout` accepts `1s` through `24h`, defaults to `1h`, and
 counts only time with no agent connected. Keep this terminal, a `tmux` window,
 or a user service running — the key lives nowhere else, so closing the process
@@ -92,6 +94,83 @@ The daemon still locks and exits when it cannot verify the file — a tampered
 document, a broken audit chain, a rolled-back audit head, or a chain that no
 longer contains the audit event the daemon last served, which is what an
 older copy of the vault restored underneath it looks like.
+
+## Run the daemon as a user service
+
+A user service has no terminal. `tremelay daemon` uses the same unlock
+passphrase rules as the rest of the CLI: if `TREMELAY_PASSPHRASE` is
+non-empty in the process environment, that value is used and **no prompt is
+shown**; if the variable is unset or empty and stdin is a TTY, you get a
+no-echo prompt; otherwise unlock fails. After a successful unlock the
+passphrase bytes are wiped from memory, but **the variable is not removed from
+the environment** — anything running as your uid that can read
+`/proc/<pid>/environ` (Linux) or inspect another process's environment (macOS)
+can still see it for the lifetime of the daemon. `tremelay mcp --daemon` and
+`tremelay mcp serve` never read `TREMELAY_PASSPHRASE`; `vault change-passphrase`
+never reads it either (terminal only).
+
+**Risk, stated plainly:** putting the vault passphrase in a unit file, a
+launchd plist, an `EnvironmentFile`, or `export` in your shell gives every
+program running as you the same secret, leaves it in service-manager state and
+backups of those files, and may surface in journal or logging if something
+dumps the environment. Tremelay accepts this same-user exposure for
+non-interactive unlock ([ADR 0002](adr/0002-single-user-vault-key-hierarchy.md));
+prefer an interactive prompt when you have a TTY. There is no separate
+passphrase file or credential API in the binary — only the environment variable
+or the prompt.
+
+**Slightly less bad, still not safe:** keep the passphrase out of the unit or
+plist body. On systemd, use `EnvironmentFile=` pointing at a mode-`0600` file
+(as in [examples/tremelay-daemon.service](examples/tremelay-daemon.service));
+the daemon still receives it as a normal environment variable. Do not commit
+the real env file.
+
+### systemd (Linux)
+
+Sample user unit: [examples/tremelay-daemon.service](examples/tremelay-daemon.service).
+Env template: [examples/tremelay-daemon.env.example](examples/tremelay-daemon.env.example).
+
+```sh
+mkdir -p ~/.config/systemd/user ~/.config/tremelay
+cp docs/examples/tremelay-daemon.service ~/.config/systemd/user/
+cp docs/examples/tremelay-daemon.env.example ~/.config/tremelay/daemon.env
+chmod 0600 ~/.config/tremelay/daemon.env
+# Edit paths in the unit and set TREMELAY_PASSPHRASE in daemon.env
+systemctl --user daemon-reload
+systemctl --user enable --now tremelay-daemon.service
+journalctl --user -u tremelay-daemon.service -f
+```
+
+Optional socket override: if the default path under `$XDG_RUNTIME_DIR` is too
+long, set `TREMELAY_DAEMON_SOCKET` to a shorter absolute path in the same
+`daemon.env` (or in the unit). `tremelay daemon`, `tremelay mcp --daemon`,
+`tremelay lock`, and `tremelay ssh-agent` must all see the **same** value.
+
+Under a normal user session, systemd sets `XDG_RUNTIME_DIR` for the daemon.
+MCP clients must use the same runtime directory (or the same
+`TREMELAY_DAEMON_SOCKET`) or they will not find the socket.
+
+### launchd (macOS)
+
+Sample agent: [examples/tremelay-daemon.plist](examples/tremelay-daemon.plist).
+Replace paths, label, and passphrase placeholder; install to
+`~/Library/LaunchAgents/`, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.tremelay.daemon.plist`.
+A passphrase in `EnvironmentVariables` is visible in the plist on disk and via
+`launchctl`; treat it like an inline unit `Environment=`.
+
+Set `TREMELAY_DAEMON_SOCKET` in the plist when the default socket path would
+exceed the macOS path limit (see [Endpoint custody](#endpoint-custody)).
+
+### Windows
+
+The daemon listens on a per-user named pipe (`\\.\pipe\tremelay-<SID>`, optional
+`TREMELAY_DAEMON_INSTANCE` suffix). You can unlock once with
+`TREMELAY_PASSPHRASE` and no console the same way as on Unix, but **there is
+no supported documented user-service recipe** (no sample Task Scheduler unit in
+this repo). A scheduled task could start `tremelay daemon` with the variable
+set, with the same environment exposure and without the custody checks systemd
+gives you on Linux; pinentry and `mcp serve` remain the supported interactive
+path on Windows. `tremelay ssh-agent` is not available on Windows.
 
 ## Register the stdio command with a client
 

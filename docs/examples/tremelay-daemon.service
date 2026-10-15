@@ -1,0 +1,22 @@
+# Example systemd user unit. Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp tremelay-daemon.service ~/.config/systemd/user/
+#   $EDITOR ~/.config/tremelay/daemon.env   # see docs/headless-daemon.md
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now tremelay-daemon.service
+#
+# Replace /usr/local/bin/tremelay and the vault path with your paths.
+
+[Unit]
+Description=Tremelay vault daemon (unlocked user session)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tremelay daemon --vault %h/.tremelay/vault.db --idle-timeout 8h
+EnvironmentFile=-%h/.config/tremelay/daemon.env
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
