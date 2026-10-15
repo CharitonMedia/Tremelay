@@ -106,9 +106,9 @@ locally; see [ADR 0027](docs/adr/0027-release-artifacts.md). Download the archiv
 you want and `SHA256SUMS` into one directory, then check that archive by name:
 
 ```sh
-grep tremelay_v1.0.0_linux_amd64.tar.gz SHA256SUMS | sha256sum -c -
-tar -xzf tremelay_v1.0.0_linux_amd64.tar.gz
-./tremelay version
+grep tremelay_v1.0.0_linux_amd64.tar.gz SHA256SUMS | sha256sum -c - &&
+  tar -xzf tremelay_v1.0.0_linux_amd64.tar.gz &&
+  ./tremelay version
 ```
 
 On macOS, `shasum -a 256 -c -` in place of `sha256sum -c -`.

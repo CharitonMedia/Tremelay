@@ -50,7 +50,9 @@ the publish step that would follow it.
 
 ```text
 GOTOOLCHAIN=go1.26.9 CGO_ENABLED=0 GOFLAGS=-mod=readonly GOAMD64=v1 GOARM64=v8.0
-go build -trimpath -buildvcs=false -pgo=off -o OUTPUT ./cmd/tremelay
+go build -trimpath -buildvcs=false -pgo=off \
+  -ldflags "-X main.versionOverride=VERSION -X main.vcsRevisionOverride=COMMIT_OR_EMPTY" \
+  -o OUTPUT ./cmd/tremelay
 ```
 
 This is the M11a candidate profile (docs/m11a-unsigned-linux-candidate.md)
@@ -63,8 +65,9 @@ and default architecture baselines so two builders agree.
 makes a local `make release-dry` and the CI run comparable. The version is
 carried by the artifact names and, since #113, by `-ldflags -X` into
 `tremelay version`. The commit is embedded the same way only when the checkout
-is clean (`git status --porcelain` empty); otherwise the binary names no
-commit. Two builds of the same commit and version still agree. `go version -m`
+is clean (`git status --porcelain --untracked-files=all` empty); otherwise the
+binary names no commit. Git-ignored files are not seen by that check; CI builds
+from a fresh checkout, where there are none. Two builds of the same commit and version still agree. `go version -m`
 still reports the module graph.
 
 Archives use fixed member names, zeroed ownership and a fixed 1980-01-01

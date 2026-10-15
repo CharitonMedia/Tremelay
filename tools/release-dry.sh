@@ -51,9 +51,9 @@ cd "$root"
 
 # The commit is embedded only from a clean checkout, so a binary never names a
 # commit it was not built from. The version always is: it is already in every
-# artifact name.
+# artifact name. Git-ignored files are not seen here; CI builds a fresh checkout.
 revision=
-if [ -z "$(git -C "$root" status --porcelain 2>/dev/null || echo x)" ]; then
+if [ -z "$(git -C "$root" status --porcelain --untracked-files=all 2>/dev/null || echo x)" ]; then
 	revision=$(git -C "$root" rev-parse HEAD)
 fi
 ldflags="-X main.versionOverride=$version -X main.vcsRevisionOverride=$revision"
