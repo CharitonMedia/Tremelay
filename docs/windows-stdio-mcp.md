@@ -1,10 +1,20 @@
-# Windows stdio MCP custody
+# Windows `mcp serve` (pinentry) custody
 
-Windows process custody follows [ADR 0022](adr/0022-windows-mcp-custody.md).
-The native component suite passed on the Windows custody candidate. The
-[official-GUI fixture](windows-gui-custody.md) records its separate shipping-CLI
-evidence. The combined broker/Windows candidate still requires fresh gates;
-neither compilation nor a component test is a production-credential release.
+This page documents the **pinentry stdio** path: `tremelay mcp serve` with a
+native GUI pinentry helper and an inherited Windows byte-stream pipe. It is not
+the recommended Windows integration for named MCP clients.
+
+For Claude Code, Codex, Hermes, and other stdio clients, use the headless
+daemon plus `tremelay mcp --daemon` instead. That route is documented in the
+[quickstarts](quickstarts/README.md) and was exercised on a Windows laptop in
+[windows-daemon-laptop-20261013.md](evidence/windows-daemon-laptop-20261013.md).
+
+Windows process custody for `mcp serve` follows
+[ADR 0022](adr/0022-windows-mcp-custody.md). The native component suite passed
+on the Windows custody candidate. The [official-GUI fixture](windows-gui-custody.md)
+records its separate shipping-CLI evidence. The combined broker/Windows candidate
+still requires fresh gates; neither compilation nor a component test is a
+production-credential release.
 
 The minimum contract is a client launching Tremelay with ordinary inherited
 Windows byte-stream pipe stdin/stdout and a directly invoked, trusted local
@@ -65,14 +75,17 @@ official archive, builds the shipping CLI, and requires the GUI test to run.
 The acquisition and acceptance contract are in the
 [official-GUI fixture](windows-gui-custody.md).
 
-Actual native Windows Codex, Claude Code, and Hermes sessions remain a separate
-requirement. Their measured [Linux integrations](named-client-mcp-tests.md) do
-not satisfy it. Each Windows client needs versioned runtime evidence, including
-actual inherited handle behavior and shutdown; do not infer compatibility from
-its implementation language. Arbitrary externally configured overlapped handles
-and completion-port associations are outside the validated contract.
+Native Windows Codex, Claude Code, and Hermes on **`mcp serve`** passed the
+narrowed synthetic acceptance recorded in
+[windows-named-client-custody.md](windows-named-client-custody.md); the
+**`mcp --daemon`** quickstart path has its own evidence (linked above). The
+measured [Linux integrations](named-client-mcp-tests.md) do not stand in for
+either Windows path. Each Windows client needs versioned runtime evidence,
+including actual inherited handle behavior and shutdown; do not infer
+compatibility from its implementation language. Arbitrary externally configured
+overlapped handles and completion-port associations are outside the validated
+contract.
 
 Full-output/blocked-output process cancellation is not established by this slice.
 Successful ordinary cases and cross-compilation do not demonstrate that process
-behavior. The existing security requirements remain unchanged. Named-client
-native Windows evidence and final integrated runtime evidence remain pending.
+behavior. The existing security requirements remain unchanged.

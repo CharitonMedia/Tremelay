@@ -10,7 +10,7 @@ path. Windows differences are at the bottom.
 ## 1. Install
 
 ```sh
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest   # Go toolchain per go.mod
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 "$(go env GOPATH)"/bin/tremelay --help
 ```
 
@@ -116,7 +116,16 @@ Two things your client has to get right:
   `XDG_RUNTIME_DIR` on Linux, falling back to `$TMPDIR/tremelay-<uid>`. A
   client that scrubs the environment of its MCP servers has to pass that
   variable through, or every call reports `no unlocked daemon is reachable`.
-  [Codex is one of those](codex.md#4-register-the-server-with-codex).
+  [Codex is one of those](codex.md#4-register-the-server-with-codex). When the
+  daemon uses a non-default Unix socket (`TREMELAY_DAEMON_SOCKET` needs v1.0.1 or later; v1.0.0 ignores it), export the same `TREMELAY_DAEMON_SOCKET`
+  before `tremelay daemon` and in the server config:
+
+```json
+"env": {"TREMELAY_DAEMON_SOCKET": "/run/user/1000/my/daemon.sock"}
+```
+
+On Windows, when the daemon sets `TREMELAY_DAEMON_INSTANCE`, pass the same
+label in `env` so the client reaches that pipe.
 
 ## 5. First call
 
@@ -183,7 +192,7 @@ the same path). You never have to recreate an agent. See
 Same commands in PowerShell, with Windows paths and no `umask`:
 
 ```powershell
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 & "$(go env GOPATH)\bin\tremelay.exe" --help
 
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
@@ -191,7 +200,12 @@ New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
 ```
 
 `WriteAllText` writes no trailing newline, which is the point of `printf '%s'`
-above. The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
+above. In Windows PowerShell 5.1, capturing or redirecting command output (for
+example `2>$null`) turns the CLI's stderr audit lines into red
+`NativeCommandError` records. That is normal; check `$LASTEXITCODE` instead of
+the error stream color.
+
+The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
 instead of a socket, so there is no `XDG_RUNTIME_DIR` to forward; `daemon`,
 `lock` and `mcp --daemon` are otherwise identical. In JSON, double every
 backslash:
@@ -199,9 +213,13 @@ backslash:
 ```json
 {"mcpServers": {"tremelay": {
   "command": "C:\\Users\\you\\go\\bin\\tremelay.exe",
-  "args": ["mcp", "--daemon", "--token-file", "C:\\Users\\you\\.tremelay\\myagent.token"]
+  "args": ["mcp", "--daemon", "--token-file", "C:\\Users\\you\\.tremelay\\myagent.token"],
+  "env": {"TREMELAY_DAEMON_INSTANCE": "myinstance"}
 }}}
 ```
+
+(`env` is only needed when the daemon uses a non-default instance label; omit
+the key for the default pipe.)
 
 Both protocol ends must be inherited pipes: do not launch the command with a
 console stdin or redirect its stdout to a file. `tremelay ssh-agent` is

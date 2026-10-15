@@ -9,7 +9,7 @@ path. Windows differences are at the bottom.
 ## 1. Install
 
 ```sh
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest   # Go toolchain per go.mod
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 "$(go env GOPATH)"/bin/tremelay --help
 ```
 
@@ -98,6 +98,18 @@ claude mcp add --transport stdio --scope local tremelay -- \
 `claude mcp list` should report it connected. This command never prompts and
 runs no KDF, so the default startup timeout is plenty.
 
+When the daemon listens on a non-default Unix socket (`TREMELAY_DAEMON_SOCKET` needs v1.0.1 or later; v1.0.0 ignores it), export the same
+`TREMELAY_DAEMON_SOCKET` before `tremelay daemon` and pass it into the MCP
+server (for example `claude mcp add ... --env TREMELAY_DAEMON_SOCKET=/run/user/1000/my/daemon.sock -- ...`).
+In hand-edited JSON the shape is:
+
+```json
+"env": {"TREMELAY_DAEMON_SOCKET": "/run/user/1000/my/daemon.sock"}
+```
+
+On Windows, when the daemon uses `TREMELAY_DAEMON_INSTANCE`, pass the same
+label in the server `env` block so `mcp --daemon` opens the matching pipe.
+
 ## 5. First call
 
 With the daemon unlocked, ask Claude Code:
@@ -161,7 +173,7 @@ the same path). You never have to recreate an agent. See
 Same commands in PowerShell, with Windows paths and no `umask`:
 
 ```powershell
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 & "$(go env GOPATH)\bin\tremelay.exe" --help
 
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
@@ -169,7 +181,12 @@ New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
 ```
 
 `WriteAllText` writes no trailing newline, which is the point of `printf '%s'`
-above. The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
+above. In Windows PowerShell 5.1, capturing or redirecting command output (for
+example `2>$null`) turns the CLI's stderr audit lines into red
+`NativeCommandError` records. That is normal; check `$LASTEXITCODE` instead of
+the error stream color.
+
+The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
 instead of a socket; `daemon`, `lock` and `mcp --daemon` are otherwise
 identical. Use full `C:\...` paths in `claude mcp add`, and double the
 backslashes if you edit the JSON by hand. `tremelay ssh-agent` is Unix-only
