@@ -84,7 +84,8 @@ its endpoint path and serves until you lock it or the idle timeout ends it. Keep
 `tmux`/`screen` window ([keeping the daemon
 running](../headless-daemon.md#keeping-the-daemon-running)): the key lives
 nowhere else. Control-plane commands keep working while it runs; it re-reads the
-vault in place with the key it already holds.
+vault in place with the key it already holds (a passphrase change instead
+makes it lock and exit on its next agent call).
 
 ## 4. Register the server with Hermes
 

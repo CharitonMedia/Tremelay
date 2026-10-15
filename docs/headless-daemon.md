@@ -118,10 +118,10 @@ next agent call. The vault stays locked until you start it again.
 ## Keeping the daemon running
 
 On Linux and macOS, run `tremelay daemon` in a terminal you leave open, or in
-`tmux` or `screen` (no passphrase stored). A `tmux` or `screen` session keeps
-the daemon, and its unlocked key, running after you log out. MCP clients must
-resolve the same socket as the daemon: the same `TREMELAY_DAEMON_SOCKET` if the
-daemon uses it, otherwise the same `XDG_RUNTIME_DIR` (or both unset).
+`tmux` or `screen` (no passphrase stored). MCP clients must resolve the same
+socket as the daemon (see [Endpoint custody](#endpoint-custody)); when their
+environments may differ, set the same absolute `TREMELAY_DAEMON_SOCKET` for the
+daemon and every client.
 
 On Windows, start `tremelay daemon` in its own console window you leave open on
 the desktop. A daemon started inside an SSH session (Windows OpenSSH) is killed
@@ -235,6 +235,7 @@ daemon on its own pipe; the label is appended to your SID, never instead of it.
 
 Your account is the boundary. Code already running as you, while the daemon is
 unlocked, can use your agents' granted capabilities — it still cannot read a
-credential, change a grant, or learn your passphrase (unless you set
-`TREMELAY_PASSPHRASE` for the daemon; see above), and everything it does is
-in the audit chain.
+credential, change a grant, or learn your passphrase, and everything it does is
+in the audit chain. That holds only if you type the passphrase: with
+`TREMELAY_PASSPHRASE` set for the daemon, same-uid code can read it from the
+daemon's environment and then unlock the vault itself.
