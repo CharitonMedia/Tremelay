@@ -755,6 +755,61 @@ func bodyNotRedactable(status int, h http.Header) bool {
 	return status == http.StatusPartialContent || h.Get("Content-Range") != ""
 }
 
+// brokerReadableBody is the prefix of a capped upstream body used for UTF-8
+// text checks and projection. When truncated, a trailing incomplete multi-byte
+// UTF-8 rune is dropped; an illegal tail byte is not.
+func brokerReadableBody(body []byte, truncated bool) []byte {
+	if !truncated {
+		return body
+	}
+	return stripTruncatedIncompleteRune(body)
+}
+
+func stripTruncatedIncompleteRune(body []byte) []byte {
+	for drop := 1; drop < utf8.UTFMax && drop <= len(body); drop++ {
+		tail := body[len(body)-drop:]
+		if !isIncompleteMultiByteUTF8Prefix(tail) {
+			continue
+		}
+		prefix := body[:len(body)-drop]
+		if utf8.Valid(prefix) {
+			return prefix
+		}
+	}
+	return body
+}
+
+func isIncompleteMultiByteUTF8Prefix(tail []byte) bool {
+	if len(tail) == 0 {
+		return false
+	}
+	want := utf8RuneLen(tail[0])
+	if want < 2 || len(tail) >= want || utf8.FullRune(tail) {
+		return false
+	}
+	for _, b := range tail[1:] {
+		if b < 0x80 || b >= 0xC0 {
+			return false
+		}
+	}
+	return true
+}
+
+func utf8RuneLen(lead byte) int {
+	switch {
+	case lead < 0xC2:
+		return 0
+	case lead < 0xE0:
+		return 2
+	case lead < 0xF0:
+		return 3
+	case lead <= 0xF4:
+		return 4
+	default:
+		return 0
+	}
+}
+
 // bodyNotText reports a body the credential scan cannot read: bytes that are
 // not valid UTF-8, or that carry a NUL. Redaction looks for spellings of a
 // credential in text, so anything else — a compressed stream the upstream did
@@ -762,17 +817,10 @@ func bodyNotRedactable(status int, h http.Header) bool {
 // is withheld rather than projected unscanned. An upstream that still wants to
 // hand the agent the credential can encode it as text; that residual is ADR
 // 0025's, and no byte-level check closes it.
-//
-// A truncated body can end mid-rune, which says nothing about the bytes before
-// it, so up to three trailing bytes are dropped before the verdict.
 func bodyNotText(body []byte, truncated bool) bool {
+	body = brokerReadableBody(body, truncated)
 	if bytes.IndexByte(body, 0) >= 0 {
 		return true
-	}
-	if truncated {
-		for i := 0; i < utf8.UTFMax-1 && len(body) > 0 && !utf8.Valid(body); i++ {
-			body = body[:len(body)-1]
-		}
 	}
 	return !utf8.Valid(body)
 }

@@ -365,6 +365,11 @@ func (s *Session) finishCaptured(partial auditEvent, upstream *http.Request, pin
 	}
 	body, truncated, readErr := readTruncating(resp.Body, maxAgentBody)
 	defer wipe(body)
+	readable := brokerReadableBody(body, truncated)
+	if len(readable) < len(body) {
+		wipe(body[len(readable):])
+		body = readable
+	}
 	status, kind := responseClass(code, readErr)
 	if kind == brokerBodyOK && bodyNotText(body, truncated) {
 		kind = brokerBodyBad

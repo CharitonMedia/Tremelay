@@ -175,6 +175,9 @@ whole, and the agent recovered the credential with `gunzip`. Two changes:
   A response listing `identity, deflate` — in two fields or one — is coded.
 - After the body is read, it is projected only if it is text the scan can
   actually read: valid UTF-8 with no NUL. Anything else is withheld whole.
+  When the body was cut at the 32 KiB cap, a trailing incomplete multi-byte
+  UTF-8 rune is dropped before that check and before projection; an illegal
+  tail byte is not forgiven.
 
 The second rule is deliberately a property of the bytes rather than a list of
 container magics. A list is a denylist, and the first draft of this amendment
@@ -182,8 +185,8 @@ enumerated gzip, zstd, xz and bzip2 while a review got the credential out
 through zlib, raw deflate, a ZIP member, a zstd skippable frame, one leading
 newline before the gzip magic, and zlib nested inside a declared gzip the
 transport had already decoded. UTF-8 validity covers that class in one check.
-A truncated body may end mid-rune, so up to three trailing bytes are dropped
-before the verdict.
+The truncated-rune exception applies only to a valid incomplete prefix of a
+multi-byte rune at the cap boundary, not to arbitrary illegal bytes.
 
 Residual, unchanged in kind and now stated plainly: an upstream that wants to
 hand the agent the credential can encode it as text — base64, hex with a
