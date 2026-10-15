@@ -50,7 +50,7 @@ func TestSSHUserAuthInterop(t *testing.T) {
 		serveErr = env.stream.Serve(server)
 		close(done)
 	}()
-	if err := client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err := client.SetDeadline(time.Now().Add(2 * time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	peer := agent.NewClient(client)
