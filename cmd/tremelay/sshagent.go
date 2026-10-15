@@ -20,7 +20,10 @@ import (
 
 const sshAgentUsage = "usage: tremelay ssh-agent --token-file PATH [--socket /absolute/path]"
 
-var errSSHAgentRelay = errors.New("ssh-agent connection refused; the daemon holds the reason in its audit chain")
+var (
+	errSSHAgentForeignPeer = errors.New("ssh-agent connection refused")
+	errSSHAgentHandshake   = errors.New("ssh-agent handshake refused; the daemon holds the reason in its audit chain")
+)
 
 func cmdSSHAgent(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ssh-agent", flag.ContinueOnError)
@@ -100,7 +103,7 @@ func serveSSHAgentSocket(ctx context.Context, getenv func(string) string, tokenF
 // protocol bytes are copied, never inspected, rewritten, or logged.
 func relaySSHAgent(getenv func(string) string, conn net.Conn, token []byte) error {
 	if !daemonPeerAllowed(conn) {
-		return errSSHAgentRelay // A foreign peer gets no answer and no bytes.
+		return errSSHAgentForeignPeer // A foreign peer gets no answer and no bytes.
 	}
 	up, err := daemonDial(getenv)
 	if err != nil {
@@ -111,7 +114,10 @@ func relaySSHAgent(getenv func(string) string, conn net.Conn, token []byte) erro
 	err = daemonRequest(up, string(hello))
 	vault.Wipe(hello)
 	if err != nil {
-		return errSSHAgentRelay
+		if errors.Is(err, errDaemonRefused) {
+			return errSSHAgentHandshake
+		}
+		return err
 	}
 	done := make(chan struct{})
 	go func() {
@@ -125,7 +131,7 @@ func relaySSHAgent(getenv func(string) string, conn net.Conn, token []byte) erro
 	conn.Close()
 	<-done
 	if copyErr != nil {
-		return errSSHAgentRelay
+		return fmt.Errorf("ssh-agent relay: %w", copyErr)
 	}
 	return nil
 }
