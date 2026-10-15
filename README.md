@@ -93,15 +93,22 @@ switches to it for you.
 go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 ```
 
-From a clone, `make build` or `go build ./cmd/tremelay` does the same thing.
+From a clone, `make build` or `go build -o tremelay ./cmd/tremelay` does the same
+thing. Check the build with `tremelay version` (or `tremelay --version`).
+
 The [v1.0.0 release](https://github.com/CharitonMedia/Tremelay/releases/tag/v1.0.0)
-carries per-platform archives, a CycloneDX SBOM and a `SHA256SUMS` file — a checksum detects a corrupt download, not a substituted release. Signed
-releases are not in v1. `make release-dry` builds those artifacts locally; see
-[ADR 0027](docs/adr/0027-release-artifacts.md). Download the archive you want
-and `SHA256SUMS` into one directory, then check that archive by name:
+carries per-platform archives named `tremelay_<version>_<os>_<arch>.tar.gz` (or
+`.zip` on Windows). Each archive unpacks to a binary named `tremelay`
+(`tremelay.exe` on Windows) plus `LICENSE`, along with a CycloneDX SBOM and a
+`SHA256SUMS` file — a checksum detects a corrupt download, not a substituted
+release. Signed releases are not in v1. `make release-dry` builds those artifacts
+locally; see [ADR 0027](docs/adr/0027-release-artifacts.md). Download the archive
+you want and `SHA256SUMS` into one directory, then check that archive by name:
 
 ```sh
-grep tremelay_v1.0.0_linux_amd64.tar.gz SHA256SUMS | sha256sum -c -
+grep tremelay_v1.0.0_linux_amd64.tar.gz SHA256SUMS | sha256sum -c - &&
+  tar -xzf tremelay_v1.0.0_linux_amd64.tar.gz &&
+  ./tremelay version
 ```
 
 On macOS, `shasum -a 256 -c -` in place of `sha256sum -c -`.
