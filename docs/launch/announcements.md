@@ -1,6 +1,9 @@
 # Announcement drafts for Patrick to post himself
 
-Drafts for `V1.md` item 9. Nothing here has been posted.
+Drafts for `V1.md` item 9. The GitHub Discussions announcement is posted at
+https://github.com/CharitonMedia/Tremelay/discussions/102. An MCP directory
+listing PR is open at https://github.com/punkpeye/awesome-mcp-servers/pull/16456.
+Hacker News and Reddit posts are not yet posted.
 
 Core links to include in each post:
 
@@ -44,11 +47,11 @@ Accepted limits from V1:
 
 Status and scope:
 - Single-user only (no multi-user/shared vault model in v1).
-- Pre-1.0, no independent security audit.
+- v1.0.0, no independent security audit.
 - Local-only transport for MCP in v1 (stdio plus local daemon endpoint).
 
 Install:
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 
 Repo: https://github.com/CharitonMedia/Tremelay
 Landing page: https://charitonmedia.github.io/Tremelay/
@@ -87,7 +90,7 @@ Accepted limits (from V1):
 
 Important status:
 - Single-user only in v1.
-- Pre-1.0, no independent security audit.
+- v1.0.0, no independent security audit.
 - Local-only MCP transport in v1.
 
 Repo: https://github.com/CharitonMedia/Tremelay
@@ -127,7 +130,7 @@ Accepted limits from V1:
 Scope and maturity:
 - single-user only,
 - local-only MCP transport in v1,
-- pre-1.0 and no independent security audit.
+- v1.0.0, no independent security audit.
 
 Repo: https://github.com/CharitonMedia/Tremelay
 Landing page: https://charitonmedia.github.io/Tremelay/
@@ -138,7 +141,7 @@ Landing page: https://charitonmedia.github.io/Tremelay/
 ### Short description
 
 ```
-Local credential broker for AI agents: scoped capability calls over MCP without exposing raw credentials. Single-user, pre-1.0.
+Local credential broker for AI agents: scoped capability calls over MCP without exposing raw credentials. Single-user, v1.0.0.
 ```
 
 ### Long description
@@ -165,7 +168,7 @@ Accepted limits from V1:
 Current scope and status:
 - single-user model in v1,
 - local-only MCP transport in v1,
-- pre-1.0, no independent security audit.
+- v1.0.0, no independent security audit.
 
 Repository: https://github.com/CharitonMedia/Tremelay
 Landing page: https://charitonmedia.github.io/Tremelay/
@@ -174,7 +177,7 @@ Landing page: https://charitonmedia.github.io/Tremelay/
 ### Install line
 
 ```
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 ```
 
 ### Tags
