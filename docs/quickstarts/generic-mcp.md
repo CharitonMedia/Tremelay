@@ -112,7 +112,7 @@ Two things your client has to get right:
   client that scrubs the environment of its MCP servers has to pass that
   variable through, or every call reports `no unlocked daemon is reachable`.
   [Codex is one of those](codex.md#4-register-the-server-with-codex). When the
-  daemon uses a non-default Unix socket, export the same `TREMELAY_DAEMON_SOCKET`
+  daemon uses a non-default Unix socket (`TREMELAY_DAEMON_SOCKET` needs v1.0.1 or later; v1.0.0 ignores it), export the same `TREMELAY_DAEMON_SOCKET`
   before `tremelay daemon` and in the server config:
 
 ```json

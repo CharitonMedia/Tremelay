@@ -103,7 +103,7 @@ tool_timeout_sec = 30
 XDG_RUNTIME_DIR = "/run/user/1000"
 ```
 
-When the daemon listens on a non-default Unix socket, set the same absolute
+When the daemon listens on a non-default Unix socket (`TREMELAY_DAEMON_SOCKET` needs v1.0.1 or later; v1.0.0 ignores it), set the same absolute
 path before `tremelay daemon` and in the client env block:
 
 ```toml
@@ -209,8 +209,9 @@ example `2>$null`) turns the CLI's stderr audit lines into red
 the error stream color.
 
 The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
-instead of a socket, so there is no `XDG_RUNTIME_DIR` and no `env` block to
-add; `daemon`, `lock` and `mcp --daemon` are otherwise identical. TOML
+instead of a socket, so there is no `XDG_RUNTIME_DIR`; you need an `env` block
+only for `TREMELAY_DAEMON_INSTANCE` (below). `daemon`, `lock` and
+`mcp --daemon` are otherwise identical. TOML
 single-quoted strings take Windows paths without escaping:
 
 ```toml

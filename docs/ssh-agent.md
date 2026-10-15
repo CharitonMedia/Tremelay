@@ -168,10 +168,12 @@ granted key, and the signature is produced inside the daemon.
 ### Force only the Tremelay key
 
 To keep other keys out of the attempt, `IdentitiesOnly=yes` is right, but
-`IdentityFile=none` makes OpenSSH offer no identities and the Tremelay agent
-never gets a signing request. Point `IdentityFile` at a one-line public key file
+paired with `IdentityFile=none` (or with no `IdentityFile` naming the Tremelay
+key) it leaves OpenSSH no agent key it may offer, and the Tremelay agent never
+gets a signing request. Point `IdentityFile` at a one-line public key file
 instead. Reuse the `KEY_ID` line from [Install the public key on the
-server](#install-the-public-key-on-the-server):
+server](#install-the-public-key-on-the-server) (on macOS, replace `base64 -w0`
+with `base64 | tr -d '\n'`):
 
 ```sh
 KEY_ID=$(tremelay capability list --path /absolute/vault.db --agent AGENT_ID |

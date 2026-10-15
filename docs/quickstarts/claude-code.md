@@ -93,7 +93,7 @@ claude mcp add --transport stdio --scope local tremelay -- \
 `claude mcp list` should report it connected. This command never prompts and
 runs no KDF, so the default startup timeout is plenty.
 
-When the daemon listens on a non-default Unix socket, export the same
+When the daemon listens on a non-default Unix socket (`TREMELAY_DAEMON_SOCKET` needs v1.0.1 or later; v1.0.0 ignores it), export the same
 `TREMELAY_DAEMON_SOCKET` before `tremelay daemon` and pass it into the MCP
 server (for example `claude mcp add ... --env TREMELAY_DAEMON_SOCKET=/run/user/1000/my/daemon.sock -- ...`).
 In hand-edited JSON the shape is:

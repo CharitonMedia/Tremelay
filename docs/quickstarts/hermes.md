@@ -96,7 +96,7 @@ mcp_servers:
     supports_parallel_tool_calls: false
 ```
 
-When the daemon listens on a non-default Unix socket, export the same
+When the daemon listens on a non-default Unix socket (`TREMELAY_DAEMON_SOCKET` needs v1.0.1 or later; v1.0.0 ignores it), export the same
 `TREMELAY_DAEMON_SOCKET` before `tremelay daemon` and add:
 
 ```yaml
