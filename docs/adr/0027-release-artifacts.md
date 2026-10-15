@@ -131,10 +131,24 @@ download-and-verify-checksum one-liner for linux/macOS.
 - **Embed the version with `-ldflags -X`.** Rejected at first (no version
   variable existed); adopted for #113 as described above.
 
+## Amendment: MCP Bundles
+
+`tools/release-dry.sh` also builds six MCP Bundle archives
+(`tremelay-mcp_<version>_<os>_<arch>.mcpb`), one per release target, because
+MCPB has no per-architecture selector inside a single bundle. Each bundle
+contains `manifest.json`, the same `tremelay` binary as the matching `.tar.gz` /
+`.zip`, and `LICENSE`. A CycloneDX SBOM is copied per bundle
+(`tremelay-mcp_*.cdx.json`); both bundle and SBOM are listed in `SHA256SUMS`.
+`dist/release/server.json` is rendered from the committed root `server.json`
+template with the release version and each bundle's SHA-256. Publishing that
+file to the official MCP registry remains a manual, owner-gated step outside this
+workflow.
+
 ## Consequences
 
 - The item 6 acceptance line is demonstrable: a tag push on `v1`, or a manual
-  dispatch, produces all 13 artifacts and uploads them without publishing.
+  dispatch, produces all release artifacts (archives, MCP bundles, SBOMs,
+  checksums, `server.json`) and uploads them without publishing.
 - Users on a release get an unsigned artifact verified by a checksum file that
   is published the same way. That is the v1 state; signing is out of v1 and the
   production-credential warning in `SECURITY.md` still applies.

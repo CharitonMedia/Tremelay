@@ -1,0 +1,49 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.CharitonMedia/tremelay",
+  "title": "Tremelay",
+  "description": "Local MCP broker: agents call credentials through a daemon without seeing secrets.",
+  "repository": {
+    "url": "https://github.com/CharitonMedia/Tremelay",
+    "source": "github"
+  },
+  "version": "__VERSION_SEMVER__",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/CharitonMedia/Tremelay/releases/download/__VERSION_TAG__/tremelay-mcp___VERSION_TAG___linux_amd64.mcpb",
+      "fileSha256": "__SHA256_LINUX_AMD64__",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/CharitonMedia/Tremelay/releases/download/__VERSION_TAG__/tremelay-mcp___VERSION_TAG___linux_arm64.mcpb",
+      "fileSha256": "__SHA256_LINUX_ARM64__",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/CharitonMedia/Tremelay/releases/download/__VERSION_TAG__/tremelay-mcp___VERSION_TAG___darwin_amd64.mcpb",
+      "fileSha256": "__SHA256_DARWIN_AMD64__",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/CharitonMedia/Tremelay/releases/download/__VERSION_TAG__/tremelay-mcp___VERSION_TAG___darwin_arm64.mcpb",
+      "fileSha256": "__SHA256_DARWIN_ARM64__",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/CharitonMedia/Tremelay/releases/download/__VERSION_TAG__/tremelay-mcp___VERSION_TAG___windows_amd64.mcpb",
+      "fileSha256": "__SHA256_WINDOWS_AMD64__",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/CharitonMedia/Tremelay/releases/download/__VERSION_TAG__/tremelay-mcp___VERSION_TAG___windows_arm64.mcpb",
+      "fileSha256": "__SHA256_WINDOWS_ARM64__",
+      "transport": { "type": "stdio" }
+    }
+  ]
+}
