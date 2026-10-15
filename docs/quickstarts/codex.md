@@ -77,12 +77,14 @@ other repo, host or method. See [ADR 0025](../adr/0025-http-broker-v1.md).
 tremelay daemon --vault "$HOME/.tremelay/vault.db" --idle-timeout 8h
 ```
 
-With a terminal it prompts for the passphrase; a user service needs
-`TREMELAY_PASSPHRASE` instead ([headless daemon](../headless-daemon.md#run-the-daemon-as-a-user-service)).
-It prints its endpoint path and serves until you lock it. Keep it in its own
-terminal, `tmux` window or user service: the key
-lives nowhere else. Control-plane commands keep working while it runs — it
-re-reads the vault in place with the key it already holds.
+At a terminal it prompts for the passphrase. Non-empty `TREMELAY_PASSPHRASE`
+works without a prompt but is not recommended ([passphrase from the
+environment](../headless-daemon.md#passphrase-from-the-environment)). It prints
+its endpoint path and serves until you lock it. Keep it in its own terminal or
+`tmux`/`screen` window ([keeping the daemon
+running](../headless-daemon.md#keeping-the-daemon-running)): the key lives
+nowhere else. Control-plane commands keep working while it runs; it re-reads the
+vault in place with the key it already holds.
 
 ## 4. Register the server with Codex
 

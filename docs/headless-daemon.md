@@ -74,13 +74,13 @@ to reconnect for that to happen.
 tremelay daemon --vault /absolute/vault.db --idle-timeout 8h
 ```
 
-If stdin is a terminal, it prompts for the passphrase with no echo; otherwise
-unlock needs `TREMELAY_PASSPHRASE` (see [Run the daemon as a user
-service](#run-the-daemon-as-a-user-service)). It then prints the endpoint path
-and serves. `--idle-timeout` accepts `1s` through `24h`, defaults to `1h`, and
-counts only time with no agent connected. Keep this terminal, a `tmux` window,
-or a user service running — the key lives nowhere else, so closing the process
-or rebooting locks the vault.
+At a terminal it prompts for the passphrase with no echo (see [Passphrase from
+the environment](#passphrase-from-the-environment) for `TREMELAY_PASSPHRASE`,
+which is not recommended). It then prints the endpoint path and serves.
+`--idle-timeout` accepts `1s` through `24h`, defaults to `1h`, and counts only
+time with no agent connected. There is no unattended reboot or auto-unlock: after
+a reboot or logout you start `tremelay daemon` again and type the passphrase;
+see [Keeping the daemon running](#keeping-the-daemon-running).
 
 The control plane stays usable while it runs. Creating an agent, issuing a
 grant or revoking one commits to the same vault; the daemon re-reads and
@@ -95,87 +95,40 @@ document, a broken audit chain, a rolled-back audit head, or a chain that no
 longer contains the audit event the daemon last served, which is what an
 older copy of the vault restored underneath it looks like.
 
-## Run the daemon as a user service
+## Passphrase from the environment
 
-A user service has no terminal. `tremelay daemon` uses the same unlock
-passphrase rules as the rest of the CLI: if `TREMELAY_PASSPHRASE` is
-non-empty in the process environment, that value is used and **no prompt is
-shown**; if the variable is unset or empty and stdin is a TTY, you get a
-no-echo prompt; otherwise unlock fails. After a successful unlock the
-passphrase bytes are wiped from memory, but **the variable is not removed from
-the environment** — anything running as your uid that can read
-`/proc/<pid>/environ` (Linux) or inspect another process's environment (macOS)
-can still see it for the lifetime of the daemon. `tremelay mcp --daemon` and
-`tremelay mcp serve` never read `TREMELAY_PASSPHRASE`; `vault change-passphrase`
-never reads it either (terminal only).
+`tremelay daemon` reads `TREMELAY_PASSPHRASE` from the process environment.
+Unlock order: a **non-empty**
+`TREMELAY_PASSPHRASE` wins and **no prompt is shown**, even when stdin is a
+terminal; if the variable is unset or empty and stdin is a TTY, you get a
+no-echo prompt; otherwise unlock fails. It works, but it is **not
+recommended**: the value stays readable in the daemon's process environment
+(for example `/proc/<pid>/environ` on Linux) for the daemon's lifetime, visible
+to other processes running as your uid, and anything that stores it (shell rc,
+env file, unit, plist) puts the passphrase on disk. After unlock the passphrase
+bytes are wiped from memory; the environment variable is not removed.
+`tremelay mcp --daemon` and `tremelay mcp serve` never read
+`TREMELAY_PASSPHRASE`; `vault change-passphrase` never reads it either
+(terminal only).
 
-**Risk, stated plainly:** putting the vault passphrase in a unit file, a
-launchd plist, an `EnvironmentFile`, or `export` in your shell gives every
-program running as you the same secret, leaves it in service-manager state and
-backups of those files, and may surface in journal or logging if something
-dumps the environment. Tremelay accepts this same-user exposure for
-non-interactive unlock ([ADR 0002](adr/0002-single-user-vault-key-hierarchy.md));
-prefer an interactive prompt when you have a TTY. There is no separate
-passphrase file or credential API in the binary — only the environment variable
-or the prompt.
+There is **no** unattended-reboot or auto-unlock mode. After a reboot or logout
+you run `tremelay daemon` once and type the passphrase. `tremelay lock`, the
+idle timeout, and a passphrase change all end the daemon; the vault stays
+locked until you start it again.
 
-**Slightly less bad, still not safe:** keep the passphrase out of the unit or
-plist body. On systemd, use `EnvironmentFile=` pointing at a mode-`0600` file
-(as in [examples/tremelay-daemon.service](examples/tremelay-daemon.service));
-the daemon still receives it as a normal environment variable. Do not commit
-the real env file.
+## Keeping the daemon running
 
-### systemd (Linux)
+On Linux and macOS, run `tremelay daemon` in a terminal you leave open, or in
+`tmux` or `screen` (no passphrase stored). MCP clients must share
+`XDG_RUNTIME_DIR` or `TREMELAY_DAEMON_SOCKET` with the daemon or they will not
+find the socket.
 
-Sample user unit: [examples/tremelay-daemon.service](examples/tremelay-daemon.service).
-Env template: [examples/tremelay-daemon.env.example](examples/tremelay-daemon.env.example).
-
-```sh
-mkdir -p ~/.config/systemd/user ~/.config/tremelay
-cp docs/examples/tremelay-daemon.service ~/.config/systemd/user/
-cp docs/examples/tremelay-daemon.env.example ~/.config/tremelay/daemon.env
-chmod 0600 ~/.config/tremelay/daemon.env
-# Edit paths in the unit and set TREMELAY_PASSPHRASE in daemon.env
-systemctl --user daemon-reload
-systemctl --user enable --now tremelay-daemon.service
-journalctl --user -u tremelay-daemon.service -f
-```
-
-`tremelay lock`, the idle timeout and a passphrase change all exit 0, so
-`Restart=on-failure` leaves the service stopped and the vault locked; unlock
-again with `systemctl --user start tremelay-daemon.service`. Never use
-`Restart=always` (or launchd `KeepAlive` true): the service would restart and
-unlock itself from the stored passphrase, and locking would do nothing.
-
-Optional socket override: if the default path under `$XDG_RUNTIME_DIR` is too
-long, set `TREMELAY_DAEMON_SOCKET` to a shorter absolute path in the same
-`daemon.env` (or in the unit). `tremelay daemon`, `tremelay mcp --daemon`,
-`tremelay lock`, and `tremelay ssh-agent` must all see the **same** value.
-
-Under a normal user session, systemd sets `XDG_RUNTIME_DIR` for the daemon.
-MCP clients must use the same runtime directory (or the same
-`TREMELAY_DAEMON_SOCKET`) or they will not find the socket.
-
-### launchd (macOS)
-
-Sample agent: [examples/tremelay-daemon.plist](examples/tremelay-daemon.plist).
-Replace paths, label, and passphrase placeholder; install to
-`~/Library/LaunchAgents/`, then `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.tremelay.daemon.plist`.
-A passphrase in `EnvironmentVariables` is visible in the plist on disk and via
-`launchctl`; treat it like an inline unit `Environment=`.
-
-Set `TREMELAY_DAEMON_SOCKET` in the plist when the default socket path would
-exceed the macOS path limit (see [Endpoint custody](#endpoint-custody)).
-
-### Windows
-
-The daemon listens on a per-user named pipe (`\\.\pipe\tremelay-<SID>`, optional
-`TREMELAY_DAEMON_INSTANCE` suffix). You can unlock once with
-`TREMELAY_PASSPHRASE` and no console the same way as on Unix, but **there is
-no supported user-service recipe** and no sample Task Scheduler task in this
-repo. A scheduled task could start `tremelay daemon` with the variable set; it
-has the same environment exposure, and is untested. Run the daemon in a
-terminal you keep open, or use `mcp serve` with pinentry. `tremelay ssh-agent` is not available on Windows.
+On Windows, start `tremelay daemon` in its own console window you leave open on
+the desktop. A daemon started inside an SSH session (Windows OpenSSH) is killed
+when that session ends. There is no supported Windows service or Task Scheduler
+recipe because that would need a stored passphrase. `tremelay ssh-agent` is not
+available on Windows; use `mcp serve` with pinentry if you cannot keep a
+console open.
 
 ## Register the stdio command with a client
 

@@ -122,9 +122,11 @@ and some other listed file is present.
 Copy-paste setup from install to first successful call, one page per client:
 [docs/quickstarts/](docs/quickstarts/) (Claude Code, Codex, Hermes, generic MCP).
 
-The shape is the same everywhere. `tremelay daemon --vault PATH` asks for your
-passphrase once in your terminal and then serves agents on a user-only local
-socket; `tremelay agent create --token-file FILE` gives each agent its own bearer
+The shape is the same everywhere. `tremelay daemon --vault PATH` prompts for
+your passphrase at a terminal (non-empty `TREMELAY_PASSPHRASE` works without a
+prompt but is not recommended; see [passphrase from the
+environment](docs/headless-daemon.md#passphrase-from-the-environment)) and then
+serves agents on a user-only local socket; `tremelay agent create --token-file FILE` gives each agent its own bearer
 token file, and `tremelay agent token issue|rotate|revoke` manage it later without
 recreating the agent; `tremelay mcp --daemon --token-file FILE` is the stdio command the
 client launches. `tremelay lock`, the idle timeout, or losing the process
