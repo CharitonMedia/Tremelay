@@ -169,6 +169,15 @@ connection the client already has: the running daemon re-reads the vault and
 picks the revocation up without a restart. `tremelay lock`, the idle timeout,
 losing the daemon, or stopping `tremelay ssh-agent` each stop it as well.
 
+## Slow or loaded hosts
+
+The relay waits up to ninety seconds for the daemon to finish token
+authentication and answer `OK` on a new connection. That covers SQLite
+`busy_timeout` and audit I/O when the machine is CPU- or disk-saturated. If the
+daemon still does not answer in time, the client reports a timeout — not an audit
+denial. A refused token still has no detail on the wire; inspect `daemon_auth`
+rows for the reason.
+
 ## What is audited
 
 Every signing attempt, allowed or refused, is an `ssh_userauth` row. Each SSH

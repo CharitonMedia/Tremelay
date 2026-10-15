@@ -37,22 +37,30 @@ const (
 	daemonErr          = "ERR\n"
 	maxDaemonHello     = 96
 	maxDaemonAnswer    = 8
-	daemonHelloWait    = 10 * time.Second
+	// Bounds only the first handshake line (slowloris defence).
+	daemonHelloReadWait = 10 * time.Second
 
 	minIdleTimeout = time.Second
 	maxIdleTimeout = 24 * time.Hour
 )
 
+// Client wait for daemon OK after sending the hello. Must cover one
+// AuthenticateAgentToken audit commit under SQLite busy_timeout (5s) and
+// heavy CPU contention; issue #110 saw multi-second handshakes on a loaded host.
+var daemonHandshakeWait = 90 * time.Second
+
 var (
-	errDaemonEndpoint = errors.New("daemon endpoint must be a user-only directory and socket this user owns")
-	errDaemonRunning  = errors.New("a daemon is already serving this endpoint")
-	errDaemonReach    = errors.New("no unlocked daemon is reachable")
-	errDaemonRefused  = errors.New("daemon refused the agent token")
-	errDaemonSession  = errors.New("daemon agent session failed; inspect the vault audit before retrying an operation")
-	errDaemonTerminal = errors.New("daemon can no longer serve this vault and has locked; inspect the vault audit, then restart it")
-	errDaemonRekeyed  = errors.New("vault passphrase changed; daemon locked. Run tremelay daemon again and unlock with the new passphrase")
-	errAgentToken     = errors.New("agent token file must be a regular user-only file holding one hex token")
-	errTokenFileACL   = errors.New("agent token file needs a filesystem that supports ACLs; the owner-only security descriptor was not applied")
+	errDaemonEndpoint         = errors.New("daemon endpoint must be a user-only directory and socket this user owns")
+	errDaemonRunning          = errors.New("a daemon is already serving this endpoint")
+	errDaemonReach            = errors.New("no unlocked daemon is reachable")
+	errDaemonRefused          = errors.New("daemon refused the agent token")
+	errDaemonHandshakeTimeout = errors.New("daemon handshake timed out")
+	errDaemonHandshakeIO      = errors.New("daemon handshake failed")
+	errDaemonSession          = errors.New("daemon agent session failed; inspect the vault audit before retrying an operation")
+	errDaemonTerminal         = errors.New("daemon can no longer serve this vault and has locked; inspect the vault audit, then restart it")
+	errDaemonRekeyed          = errors.New("vault passphrase changed; daemon locked. Run tremelay daemon again and unlock with the new passphrase")
+	errAgentToken             = errors.New("agent token file must be a regular user-only file holding one hex token")
+	errTokenFileACL           = errors.New("agent token file needs a filesystem that supports ACLs; the owner-only security descriptor was not applied")
 )
 
 func cmdDaemon(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -196,13 +204,17 @@ func (d *daemon) handle(conn net.Conn) {
 	if !daemonPeerAllowed(conn) {
 		return // A foreign peer gets no answer and no audit attribution.
 	}
-	if conn.SetDeadline(time.Now().Add(daemonHelloWait)) != nil {
+	if conn.SetDeadline(time.Now().Add(daemonHelloReadWait)) != nil {
 		return
 	}
 	verb, token, err := readDaemonHello(conn)
 	defer vault.Wipe(token)
 	if err != nil {
 		_, _ = io.WriteString(conn, daemonErr)
+		return
+	}
+	// Post-hello authentication and audit must not inherit the hello read deadline.
+	if conn.SetDeadline(time.Time{}) != nil {
 		return
 	}
 	if verb == daemonVerbLock {
@@ -296,7 +308,7 @@ func (d *daemon) checkTerminal(err error) {
 func readDaemonHello(conn net.Conn) (string, []byte, error) {
 	line, err := readDaemonLine(conn, maxDaemonHello)
 	if err != nil {
-		return "", nil, err
+		return "", nil, errDaemonRefused
 	}
 	rest, ok := strings.CutPrefix(line, daemonHello)
 	if !ok {
@@ -333,15 +345,17 @@ func readDaemonLine(conn net.Conn, limit int) (string, error) {
 	var one [1]byte
 	for len(buf) < limit {
 		if _, err := io.ReadFull(conn, one[:]); err != nil {
-			return "", errDaemonRefused
+			return "", err
 		}
 		if one[0] == '\n' {
 			return string(buf), nil
 		}
 		buf = append(buf, one[0])
 	}
-	return "", errDaemonRefused
+	return "", errDaemonLineTooLong
 }
+
+var errDaemonLineTooLong = errors.New("daemon handshake line too long")
 
 func cmdLock(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("lock", flag.ContinueOnError)
@@ -357,7 +371,7 @@ func cmdLock(args []string, getenv func(string) string, stdout, stderr io.Writer
 	}
 	defer conn.Close()
 	if err := daemonRequest(conn, daemonHello+daemonVerbLock+"\n"); err != nil {
-		fmt.Fprintln(stderr, errDaemonReach.Error())
+		fmt.Fprintln(stderr, daemonHandshakeDiagnostic(err))
 		return 1
 	}
 	if _, err := fmt.Fprintln(stdout, "locked"); err != nil {
@@ -388,7 +402,7 @@ func relayDaemonMCP(getenv func(string) string, tokenFile string, stdin io.Reade
 	vault.Wipe(hello)
 	vault.Wipe(token)
 	if err != nil {
-		fmt.Fprintln(stderr, errDaemonRefused.Error())
+		fmt.Fprintln(stderr, daemonHandshakeDiagnostic(err))
 		return 1
 	}
 	// Protocol bytes only. Nothing here inspects, logs, or rewrites them.
@@ -416,19 +430,35 @@ func relayDaemonMCP(getenv func(string) string, tokenFile string, stdin io.Reade
 }
 
 // daemonRequest writes one handshake line and requires the fixed acceptance.
-// A refusal carries no detail: the daemon's audit chain holds the reason.
+// errDaemonRefused means the daemon answered ERR or rejected the hello; its
+// audit chain holds the reason. Timeouts and transport errors are distinct.
 func daemonRequest(conn net.Conn, line string) error {
-	if conn.SetDeadline(time.Now().Add(daemonHelloWait)) != nil {
-		return errDaemonRefused
+	wait := daemonHandshakeWait
+	if conn.SetDeadline(time.Now().Add(wait)) != nil {
+		return errDaemonHandshakeIO
 	}
 	if _, err := io.WriteString(conn, line); err != nil {
-		return errDaemonRefused
+		return errDaemonHandshakeIO
 	}
 	answer, err := readDaemonLine(conn, maxDaemonAnswer)
-	if err != nil || answer+"\n" != daemonOK {
+	if err != nil {
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			return fmt.Errorf("%w (%s)", errDaemonHandshakeTimeout, wait)
+		}
+		return errDaemonHandshakeIO
+	}
+	if answer+"\n" != daemonOK {
 		return errDaemonRefused
 	}
 	return conn.SetDeadline(time.Time{})
+}
+
+// daemonHandshakeDiagnostic maps handshake errors to operator-facing text.
+func daemonHandshakeDiagnostic(err error) string {
+	if errors.Is(err, errDaemonRefused) {
+		return errDaemonRefused.Error() + "; the audit chain holds the reason"
+	}
+	return err.Error()
 }
 
 // readAgentToken reads one user-only token file. A file any other principal
