@@ -54,10 +54,24 @@ func TestBrokerDNSDoesNotHoldSessionMutex(t *testing.T) {
 		t.Fatal("invoke did not reach DNS resolution")
 	}
 
-	start := time.Now()
-	capCall(t, capB, okBytes(t)(encodeCapList()))
-	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
-		t.Fatalf("agent B list blocked for %v while agent A was in DNS", elapsed)
+	// release is closed only after both checks, so a held mutex would block B
+	// and Lock until the deadline; the bound is generous for slow runners.
+	listMsg := okBytes(t)(encodeCapList())
+	listDone := make(chan []byte, 1)
+	go func() {
+		raw, err := capB.Exchange(listMsg)
+		if err != nil {
+			raw = nil
+		}
+		listDone <- raw
+	}()
+	select {
+	case raw := <-listDone:
+		if _, err := decodeCapResponse(raw); raw == nil || err != nil {
+			t.Fatalf("agent B list failed while agent A was in DNS: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent B list blocked while agent A was in DNS")
 	}
 
 	lockDone := make(chan struct{})
@@ -67,7 +81,7 @@ func TestBrokerDNSDoesNotHoldSessionMutex(t *testing.T) {
 	}()
 	select {
 	case <-lockDone:
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		t.Fatal("owner Lock blocked while agent A was in DNS")
 	}
 
