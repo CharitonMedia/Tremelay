@@ -75,9 +75,11 @@ official archive, builds the shipping CLI, and requires the GUI test to run.
 The acquisition and acceptance contract are in the
 [official-GUI fixture](windows-gui-custody.md).
 
-Actual native Windows Codex, Claude Code, and Hermes sessions on **`mcp serve`**
-remain a separate requirement from the proven **`mcp --daemon`** quickstart path.
-Their measured [Linux integrations](named-client-mcp-tests.md) do not satisfy
+Native Windows Codex, Claude Code, and Hermes on **`mcp serve`** passed the
+narrowed synthetic acceptance recorded in
+[windows-named-client-custody.md](windows-named-client-custody.md); the
+**`mcp --daemon`** quickstart path has its own evidence (linked above). The
+measured [Linux integrations](named-client-mcp-tests.md) do not stand in for
 either Windows path. Each Windows client needs versioned runtime evidence,
 including actual inherited handle behavior and shutdown; do not infer
 compatibility from its implementation language. Arbitrary externally configured
@@ -86,6 +88,4 @@ contract.
 
 Full-output/blocked-output process cancellation is not established by this slice.
 Successful ordinary cases and cross-compilation do not demonstrate that process
-behavior. The existing security requirements remain unchanged. Named-client
-native Windows evidence for **`mcp serve`** remains pending; use **`mcp --daemon`**
-for integrated client evidence instead.
+behavior. The existing security requirements remain unchanged.

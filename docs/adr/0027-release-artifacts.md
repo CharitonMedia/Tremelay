@@ -4,8 +4,8 @@ Status: Accepted pending owner veto
 
 Amendment 2026-10-15 (#120): tag `v1.0.1` on the `main` merge commit after
 merging `v1` into `main`, not on `v1`. `v1.0.0` exists only on `main`, so only
-there is it an ancestor of the new tag; `v1` builds keep reporting
-`v0.9.0-dryrun` pseudo-versions until `main` is merged back into `v1`.
+there is it an ancestor of the new tag; `v1` builds keep describing themselves
+from `v0.9.0-dryrun.1` until `main` is merged back into `v1`.
 
 ## Context
 

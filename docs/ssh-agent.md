@@ -217,9 +217,9 @@ losing the daemon, or stopping `tremelay ssh-agent` each stop it as well.
 
 `tremelay lock` tells the running daemon to zeroise and exit; it does not stop
 `tremelay ssh-agent`. The ssh-agent process keeps listening on its socket until
-you interrupt it. Each signing attempt opens a fresh relay to the daemon; after
-a lock there is no unlocked daemon to dial, so the relay fails with `no unlocked
-daemon is reachable` on the ssh-agent process stderr and OpenSSH reports a
+you interrupt it. Each new SSH client connection opens its own relay to the
+daemon; after a lock there is no unlocked daemon to dial, so the relay fails
+with `no unlocked daemon is reachable` on the ssh-agent process stderr and OpenSSH reports a
 signing or permission failure (for example `Permission denied (publickey)`). Any
 relay already in progress is closed when the daemon shuts down. Restart
 `tremelay daemon`, unlock again, and leave `tremelay ssh-agent` running or
