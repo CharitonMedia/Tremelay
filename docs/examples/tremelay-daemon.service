@@ -15,6 +15,7 @@ After=default.target
 Type=simple
 ExecStart=/usr/local/bin/tremelay daemon --vault %h/.tremelay/vault.db --idle-timeout 8h
 EnvironmentFile=-%h/.config/tremelay/daemon.env
+# Not always: lock and the idle timeout exit 0 and must stay locked.
 Restart=on-failure
 RestartSec=10
 

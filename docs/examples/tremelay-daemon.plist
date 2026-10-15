@@ -20,7 +20,12 @@
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>
+	<!-- Restart only after a crash. KeepAlive=true would restart after
+	     `tremelay lock` or the idle timeout (exit 0) and unlock again. -->
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
 </dict>
 </plist>

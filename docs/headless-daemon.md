@@ -141,6 +141,12 @@ systemctl --user enable --now tremelay-daemon.service
 journalctl --user -u tremelay-daemon.service -f
 ```
 
+`tremelay lock`, the idle timeout and a passphrase change all exit 0, so
+`Restart=on-failure` leaves the service stopped and the vault locked; unlock
+again with `systemctl --user start tremelay-daemon.service`. Never use
+`Restart=always` (or launchd `KeepAlive` true): the service would restart and
+unlock itself from the stored passphrase, and locking would do nothing.
+
 Optional socket override: if the default path under `$XDG_RUNTIME_DIR` is too
 long, set `TREMELAY_DAEMON_SOCKET` to a shorter absolute path in the same
 `daemon.env` (or in the unit). `tremelay daemon`, `tremelay mcp --daemon`,
@@ -166,11 +172,10 @@ exceed the macOS path limit (see [Endpoint custody](#endpoint-custody)).
 The daemon listens on a per-user named pipe (`\\.\pipe\tremelay-<SID>`, optional
 `TREMELAY_DAEMON_INSTANCE` suffix). You can unlock once with
 `TREMELAY_PASSPHRASE` and no console the same way as on Unix, but **there is
-no supported documented user-service recipe** (no sample Task Scheduler unit in
-this repo). A scheduled task could start `tremelay daemon` with the variable
-set, with the same environment exposure and without the custody checks systemd
-gives you on Linux; pinentry and `mcp serve` remain the supported interactive
-path on Windows. `tremelay ssh-agent` is not available on Windows.
+no supported user-service recipe** and no sample Task Scheduler task in this
+repo. A scheduled task could start `tremelay daemon` with the variable set; it
+has the same environment exposure, and is untested. Run the daemon in a
+terminal you keep open, or use `mcp serve` with pinentry. `tremelay ssh-agent` is not available on Windows.
 
 ## Register the stdio command with a client
 
