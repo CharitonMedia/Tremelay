@@ -57,8 +57,11 @@ func daemonEndpoint(getenv func(string) string) (string, error) {
 }
 
 // sshAgentDefaultSocket sits beside the daemon endpoint, in the same
-// already-verified user-only directory.
+// already-verified user-only directory, including a TREMELAY_DAEMON_SOCKET one.
 func sshAgentDefaultSocket(getenv func(string) string) string {
+	if path, err := daemonEndpoint(getenv); err == nil {
+		return filepath.Join(filepath.Dir(path), sshAgentSocketName)
+	}
 	return filepath.Join(daemonDir(getenv), sshAgentSocketName)
 }
 

@@ -54,7 +54,14 @@ The endpoint is the only thing standing between an unlocked DEK and the rest of
 the machine, so it is checked rather than assumed.
 
 - Unix socket under `$XDG_RUNTIME_DIR/tremelay`, or `tremelay-<uid>` in
-  `os.TempDir()` when that variable is unset. The directory is created 0700 and
+  `os.TempDir()` when that variable is unset, or the absolute path in
+  `TREMELAY_DAEMON_SOCKET` (amendment 2026-10-15, #112; Unix only). The
+  override changes where the socket lives, not its checks: every rule below
+  applies to its directory and socket, and a client sends its token only after
+  the peer-uid check. Same-uid code that sets a client's environment could
+  already redirect it with `XDG_RUNTIME_DIR`, so the override adds no new
+  principal. A path over the kernel's `sun_path` limit is refused as too long.
+  The directory is created 0700 and
   then verified: owned by the daemon's uid, actually a directory, and no
   group/other permission bits. The socket itself is chmod 0600 after bind.
 - Startup refuses when the directory or an existing socket path is owned by

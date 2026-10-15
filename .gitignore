@@ -11,6 +11,8 @@
 
 # Build/editor
 bin/
+/tremelay
+/tremelay.exe
 dist/
 __pycache__/
 node_modules/

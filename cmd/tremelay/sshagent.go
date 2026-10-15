@@ -66,6 +66,9 @@ func serveSSHAgentSocket(ctx context.Context, getenv func(string) string, tokenF
 	}
 	probe.Close()
 	listener, err := listenUserSocket(socket)
+	if tooLong := (*daemonSocketTooLongError)(nil); errors.As(err, &tooLong) {
+		return fail(fmt.Sprintf("ssh-agent socket path is too long (%d bytes, limit %d); pass a shorter --socket", tooLong.n, tooLong.limit))
+	}
 	if err != nil {
 		return fail(err.Error())
 	}

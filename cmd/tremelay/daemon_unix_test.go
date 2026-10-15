@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -258,7 +259,8 @@ func TestSSHAgentSocketPathTooLong(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected refusal")
 	}
-	if !strings.Contains(err.Error(), "daemon socket path is too long") {
+	var tooLongErr *daemonSocketTooLongError
+	if !errors.As(err, &tooLongErr) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -266,9 +268,25 @@ func TestSSHAgentSocketPathTooLong(t *testing.T) {
 // TestDaemonUnusableEndpointRefusesPassphrase blocks the endpoint directory
 // with a regular file.
 func TestDaemonUnusableEndpointRefusesPassphrase(t *testing.T) {
-	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	// /tmp, not t.TempDir: macOS's long TMPDIR would trip the length check first.
+	short, err := os.MkdirTemp("/tmp", "tm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(short) })
+	blocked := filepath.Join(short, "not-a-directory")
 	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	assertEndpointRefusesPassphrase(t, map[string]string{"XDG_RUNTIME_DIR": blocked})
+}
+
+// TestSSHAgentDefaultSocketFollowsOverride keeps ssh-agent beside a
+// TREMELAY_DAEMON_SOCKET daemon rather than under a too-long XDG dir.
+func TestSSHAgentDefaultSocketFollowsOverride(t *testing.T) {
+	env := map[string]string{"XDG_RUNTIME_DIR": "/run/user/1", daemonSocketEnv: "/tmp/tm/d.sock"}
+	got := sshAgentDefaultSocket(func(k string) string { return env[k] })
+	if got != filepath.Join("/tmp/tm", sshAgentSocketName) {
+		t.Fatalf("default agent socket %q does not follow the override", got)
+	}
 }
