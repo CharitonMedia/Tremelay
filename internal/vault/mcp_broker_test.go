@@ -475,6 +475,9 @@ func TestMCPNetworkBrokerRejectsRetargeting(t *testing.T) {
 					before := len(mcpAuditSnapshot(e.s))
 					result, err := client.cs.CallTool(t.Context(), &mcp.CallToolParams{Name: toolInvoke, Arguments: map[string]any{"handle": handles[op], extra.name: extra.value}})
 					waitMCPIdle(t, client.ep)
+					if err != nil && mcpTransportFailure(err) {
+						t.Fatalf("%s retargeting %q=%v: MCP transport failed: %v", op, extra.name, extra.value, err)
+					}
 					if err == nil && (result == nil || !result.IsError) {
 						t.Fatalf("%s accepted a network %s argument", op, extra.name)
 					}
@@ -483,7 +486,7 @@ func TestMCPNetworkBrokerRejectsRetargeting(t *testing.T) {
 					}
 					rows := mcpAuditSnapshot(e.s)[before:]
 					if len(rows) != 1 || rows[0].Result != resultDenied || rows[0].AgentID != e.agent.ID {
-						t.Fatal("retargeting did not produce exactly one denial for the bound agent")
+						t.Fatalf("%s retargeting %q=%v: want exactly one denial for bound agent, got %d audit row(s)", op, extra.name, extra.value, len(rows))
 					}
 					outputs = append(outputs, result)
 					if err != nil {
