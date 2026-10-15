@@ -165,6 +165,41 @@ Both work for `git clone`, `git fetch` and plain `ssh`. Nothing else changes:
 the client sends the agent its host binding, the agent answers with the
 granted key, and the signature is produced inside the daemon.
 
+### Force only the Tremelay key
+
+To keep other keys out of the attempt, `IdentitiesOnly=yes` is right, but
+`IdentityFile=none` makes OpenSSH offer no identities and the Tremelay agent
+never gets a signing request. Point `IdentityFile` at a one-line public key file
+instead. Reuse the `KEY_ID` line from [Install the public key on the
+server](#install-the-public-key-on-the-server):
+
+```sh
+KEY_ID=$(tremelay capability list --path /absolute/vault.db --agent AGENT_ID |
+  grep ssh_userauth | sed 's/.*"key_id":"\([0-9a-f]*\)".*/\1/')
+printf 'ssh-ed25519 %s tremelay\n' \
+  "$({ printf '\0\0\0\vssh-ed25519\0\0\0\040'; printf %s "$KEY_ID" | xxd -r -p; } | base64 -w0)" \
+  > "$HOME/.ssh/tremelay-agent.pub"
+chmod 600 "$HOME/.ssh/tremelay-agent.pub"
+```
+
+Then:
+
+```sh
+export SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/tremelay/ssh-agent.sock
+ssh -o IdentitiesOnly=yes -o IdentityFile="$HOME/.ssh/tremelay-agent.pub" git@github.com
+```
+
+For one git command:
+
+```sh
+GIT_SSH_COMMAND='ssh -o IdentitiesOnly=yes -o IdentityFile=$HOME/.ssh/tremelay-agent.pub -o IdentityAgent=$XDG_RUNTIME_DIR/tremelay/ssh-agent.sock' \
+  git push origin main
+```
+
+`ssh-add -L` against the Tremelay socket does not help here: a grant offers its
+key only on a connection already bound to its pinned host, so build the file
+from `KEY_ID` as above.
+
 ## Stopping it
 
 ```sh
@@ -175,6 +210,18 @@ The next signature is refused, and the key stops being listed, on the
 connection the client already has: the running daemon re-reads the vault and
 picks the revocation up without a restart. `tremelay lock`, the idle timeout,
 losing the daemon, or stopping `tremelay ssh-agent` each stop it as well.
+
+## While the daemon is locked
+
+`tremelay lock` tells the running daemon to zeroise and exit; it does not stop
+`tremelay ssh-agent`. The ssh-agent process keeps listening on its socket until
+you interrupt it. Each signing attempt opens a fresh relay to the daemon; after
+a lock there is no unlocked daemon to dial, so the relay fails with `no unlocked
+daemon is reachable` on the ssh-agent process stderr and OpenSSH reports a
+signing or permission failure (for example `Permission denied (publickey)`). Any
+relay already in progress is closed when the daemon shuts down. Restart
+`tremelay daemon`, unlock again, and leave `tremelay ssh-agent` running or
+start it again.
 
 ## Slow or loaded hosts
 

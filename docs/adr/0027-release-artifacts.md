@@ -2,6 +2,10 @@
 
 Status: Accepted pending owner veto
 
+Amendment 2026-10-15 (#120): tag `v1.0.1` on `main` after merging `v1` into
+`main`, so `v1.0.0` is an ancestor of later commits. Until then, builds from
+`v1` report `v0.9.0-dryrun` pseudo-versions.
+
 ## Context
 
 V1.md item 6 is "install in one line": a release workflow that builds

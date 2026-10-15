@@ -9,7 +9,7 @@ path. Windows differences are at the bottom.
 ## 1. Install
 
 ```sh
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest   # Go toolchain per go.mod
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 "$(go env GOPATH)"/bin/tremelay --help
 ```
 
@@ -96,6 +96,17 @@ mcp_servers:
     supports_parallel_tool_calls: false
 ```
 
+When the daemon listens on a non-default Unix socket, export the same
+`TREMELAY_DAEMON_SOCKET` before `tremelay daemon` and add:
+
+```yaml
+    env:
+      TREMELAY_DAEMON_SOCKET: /run/user/1000/my/daemon.sock
+```
+
+On Windows, when the daemon uses `TREMELAY_DAEMON_INSTANCE`, set the same label
+under `env` so `mcp --daemon` opens the matching pipe.
+
 `protocol: legacy` selects the initialize-based lifecycle this server speaks.
 Leave parallel tool calls off: exact grants are the control, and the endpoint
 admits one call at a time. `connect_timeout` can be short because this command
@@ -173,7 +184,7 @@ the same path). You never have to recreate an agent. See
 Same commands in PowerShell, with Windows paths and no `umask`:
 
 ```powershell
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 & "$(go env GOPATH)\bin\tremelay.exe" --help
 
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
@@ -181,7 +192,12 @@ New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
 ```
 
 `WriteAllText` writes no trailing newline, which is the point of `printf '%s'`
-above. The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
+above. In Windows PowerShell 5.1, capturing or redirecting command output (for
+example `2>$null`) turns the CLI's stderr audit lines into red
+`NativeCommandError` records. That is normal; check `$LASTEXITCODE` instead of
+the error stream color.
+
+The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
 instead of a socket; `daemon`, `lock` and `mcp --daemon` are otherwise
 identical. In YAML, single-quote Windows paths so the backslashes stay
 literal:

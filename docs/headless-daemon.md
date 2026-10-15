@@ -177,11 +177,13 @@ limit). When the default path would exceed that limit — for example a very lon
 misleading permissions error. Set `TREMELAY_DAEMON_SOCKET` to a shorter absolute
 path; `tremelay daemon`, `tremelay mcp --daemon`, `tremelay lock`, and
 `tremelay ssh-agent` all read the same variable when connecting to the daemon.
-Relative values are refused. The directory is 0700 and the socket is 0600, both
-verified at startup:
-a path owned by another user, of the wrong type, or readable by group or other
-refuses to start, and a socket that still answers a dial is treated as a live
-daemon rather than replaced. Every connection's peer uid must equal the
+Relative values are refused. At startup the daemon creates the socket's parent
+directory with `MkdirAll` mode 0700 when it is missing; an existing parent that
+you do not own exclusively, or that grants group or other access, refuses to
+start. The socket file is 0600, both verified at startup: a path owned by
+another user, of the wrong type, or readable by group or other refuses to start,
+and a socket that still answers a dial is treated as a live daemon rather than
+replaced. Every connection's peer uid must equal the
 daemon's before any byte is read.
 
 `TREMELAY_DAEMON_SOCKET` is Unix-only; Windows always uses the named pipe below.

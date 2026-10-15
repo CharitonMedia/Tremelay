@@ -9,7 +9,7 @@ path. Windows differences are at the bottom.
 ## 1. Install
 
 ```sh
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest   # Go toolchain per go.mod
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 "$(go env GOPATH)"/bin/tremelay --help
 ```
 
@@ -103,6 +103,17 @@ tool_timeout_sec = 30
 XDG_RUNTIME_DIR = "/run/user/1000"
 ```
 
+When the daemon listens on a non-default Unix socket, set the same absolute
+path before `tremelay daemon` and in the client env block:
+
+```toml
+[mcp_servers.tremelay.env]
+TREMELAY_DAEMON_SOCKET = "/run/user/1000/my/daemon.sock"
+```
+
+On Windows, when the daemon uses `TREMELAY_DAEMON_INSTANCE`, add the same label
+to `[mcp_servers.tremelay.env]` so `mcp --daemon` dials the matching pipe.
+
 **On Linux the `env` entry is required.** Codex launches MCP servers with a
 scrubbed environment — `HOME`, `LANG`, `LOGNAME`, `PATH`, `PWD`, `SHELL`,
 `TERM`, `TMPDIR`, `USER` — and `XDG_RUNTIME_DIR` is not in it. Without it
@@ -184,7 +195,7 @@ the same path). You never have to recreate an agent. See
 Same commands in PowerShell, with Windows paths and no `umask`:
 
 ```powershell
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 & "$(go env GOPATH)\bin\tremelay.exe" --help
 
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
@@ -192,7 +203,12 @@ New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
 ```
 
 `WriteAllText` writes no trailing newline, which is the point of `printf '%s'`
-above. The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
+above. In Windows PowerShell 5.1, capturing or redirecting command output (for
+example `2>$null`) turns the CLI's stderr audit lines into red
+`NativeCommandError` records. That is normal; check `$LASTEXITCODE` instead of
+the error stream color.
+
+The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
 instead of a socket, so there is no `XDG_RUNTIME_DIR` and no `env` block to
 add; `daemon`, `lock` and `mcp --daemon` are otherwise identical. TOML
 single-quoted strings take Windows paths without escaping:
@@ -201,7 +217,12 @@ single-quoted strings take Windows paths without escaping:
 [mcp_servers.tremelay]
 command = 'C:\Users\you\go\bin\tremelay.exe'
 args = ['mcp', '--daemon', '--token-file', 'C:\Users\you\.tremelay\codex.token']
+
+[mcp_servers.tremelay.env]
+TREMELAY_DAEMON_INSTANCE = "myinstance"
 ```
+
+(Omit the `env` block when you use the default pipe name.)
 
 `tremelay ssh-agent` is Unix-only and fails closed on Windows; nothing on this
 page depends on it.
