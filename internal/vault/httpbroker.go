@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"slices"
@@ -605,20 +607,143 @@ func injectionCollides(headers map[string]string, query string, inj grantInjecti
 	return false
 }
 
-// queryParamNamed reports a form-encoded parameter with this name. It reads a
-// query string and a form request body alike: Rack and Spring take `_method`
-// from either, and retarget the method of a POST with it.
+// queryParamNamed reports a form-encoded parameter with this name in a query
+// string. The query has already been refused if it carries percent-encoding or
+// spaces, so names are compared literally aside from & and ; separators.
 func queryParamNamed(query, want string) bool {
-	for _, pair := range strings.Split(query, "&") {
+	found, _ := formParamNamed(query, want, false)
+	return found
+}
+
+// bodyParamNamed reports a _method-style override in a request body the way
+// Rack, Tomcat and Spring read form fields: names are split on & and ;,
+// whitespace-trimmed, then +- and percent-decoded before comparison; multipart
+// part names use the same normalisation. For a form body (no Content-Type, or
+// application/x-www-form-urlencoded) an undecodable name is malformed, as is
+// an unparseable Content-Type or multipart body. Any other body is not read as
+// form data downstream, so only a name that decodes to want is refused there:
+// a JSON body with a stray "%" still passes.
+func bodyParamNamed(body []byte, contentType, want string) (found, malformed bool) {
+	if len(body) == 0 {
+		return false, false
+	}
+	var mediaType string
+	var params map[string]string
+	if contentType != "" {
+		var err error
+		if mediaType, params, err = mime.ParseMediaType(contentType); err != nil {
+			return false, true
+		}
+	}
+	if strings.HasPrefix(mediaType, "multipart/") {
+		return multipartParamNamed(body, params["boundary"], want)
+	}
+	if lower := strings.ToLower(contentType); strings.Contains(lower, "/json") || strings.Contains(lower, "+json") {
+		// Laravel reads a JSON body's top-level keys as request parameters
+		// whenever the raw Content-Type contains /json or +json.
+		var keys map[string]json.RawMessage
+		if json.Unmarshal(body, &keys) == nil {
+			for name := range keys {
+				if paramNameIs(name, want) {
+					return true, false
+				}
+			}
+		}
+	}
+	found, malformed = formParamNamed(string(body), want, true)
+	if mediaType != "" && mediaType != "application/x-www-form-urlencoded" {
+		malformed = false
+	}
+	return found, malformed
+}
+
+// formParamNamed scans every pair; a name that does not decode sets malformed
+// and the scan continues, so a later match is still found.
+func formParamNamed(form, want string, decodeNames bool) (found, malformed bool) {
+	for _, pair := range strings.FieldsFunc(form, func(r rune) bool { return r == '&' || r == ';' }) {
 		name := pair
 		if i := strings.IndexByte(pair, '='); i >= 0 {
 			name = pair[:i]
 		}
-		if strings.EqualFold(name, want) {
-			return true
+		if !decodeNames {
+			// The query keeps percent-encoding out, but PHP still reads + as a space.
+			name = strings.ReplaceAll(name, "+", " ")
+		}
+		name = strings.TrimSpace(name)
+		if decodeNames {
+			var ok bool
+			if name, ok = decodeFormParamName(name); !ok {
+				malformed = true
+				continue
+			}
+		}
+		if paramNameIs(name, want) {
+			return true, malformed
 		}
 	}
-	return false
+	return false, malformed
+}
+
+// phpParamName is the name PHP registers: cut at the first NUL, leading spaces
+// dropped, then space and dot turned into underscores.
+var phpParamName = strings.NewReplacer(" ", "_", ".", "_")
+
+// paramNameIs compares a parameter name case-insensitively, both as written
+// and as PHP (and so Laravel and Symfony) would register it.
+func paramNameIs(name, want string) bool {
+	if strings.EqualFold(name, want) {
+		return true
+	}
+	if i := strings.IndexByte(name, 0); i >= 0 {
+		name = name[:i]
+	}
+	return strings.EqualFold(phpParamName.Replace(strings.TrimLeft(name, " ")), want)
+}
+
+func decodeFormParamName(raw string) (string, bool) {
+	decoded, err := url.QueryUnescape(strings.TrimSpace(raw))
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(decoded), true
+}
+
+func multipartParamNamed(body []byte, boundary, want string) (found, malformed bool) {
+	if boundary == "" {
+		return false, true
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return false, true
+		}
+		// Not FormName: it drops the name of a non-form-data disposition
+		// (PHP reads it) and of a duplicated name parameter (PHP and Tomcat
+		// take the last one).
+		dispositions := p.Header.Values("Content-Disposition")
+		if len(dispositions) == 0 {
+			continue
+		}
+		_, dparams, err := mime.ParseMediaType(dispositions[0])
+		if len(dispositions) > 1 || err != nil {
+			return false, true
+		}
+		// Go drops an RFC 2231 name* in a charset it does not know; Tomcat
+		// decodes it. A part whose name we could not read is malformed.
+		name := dparams["name"]
+		if name == "" && strings.Contains(dispositions[0], "*") {
+			return false, true
+		}
+		// Multipart names are not form-urlencoded: no parser decodes them.
+		if paramNameIs(name, want) {
+			return true, false
+		}
+	}
+	return false, false
 }
 
 func applyAgentHeaders(r *http.Request, headers map[string]string) {

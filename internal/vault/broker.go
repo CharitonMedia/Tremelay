@@ -163,7 +163,12 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		}
 		call.injection = grantInjectionOf(g)
 		if injectionCollides(call.headers, call.query, call.injection) ||
-			queryParamNamed(call.query, "_method") || queryParamNamed(string(call.body), "_method") {
+			queryParamNamed(call.query, "_method") {
+			partial.Result = resultDeniedMalformed
+			return s.failExchange(partial, call.method, ErrDeniedMalformed)
+		}
+		found, malformed := bodyParamNamed(call.body, call.headers["Content-Type"], "_method")
+		if found || malformed {
 			partial.Result = resultDeniedMalformed
 			return s.failExchange(partial, call.method, ErrDeniedMalformed)
 		}
