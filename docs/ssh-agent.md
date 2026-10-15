@@ -130,11 +130,18 @@ tremelay ssh-agent --token-file ~/.tremelay/codex.token        # terminal 2
 ```
 
 `ssh-agent` prints the socket path it is serving, by default
-`$XDG_RUNTIME_DIR/tremelay/ssh-agent.sock`. Use `--socket /absolute/path` to
+`$XDG_RUNTIME_DIR/tremelay/ssh-agent.sock`, or beside the daemon socket when
+`TREMELAY_DAEMON_SOCKET` is set. Use `--socket /absolute/path` to
 put it elsewhere, which you need when more than one agent token is in use —
-one process serves one agent. The directory must be yours and 0700; the socket
-is created 0600, every connection's peer uid is checked, and a socket that is
-already answering is never replaced.
+one process serves one agent. Unix domain socket paths are limited to about 107
+bytes on Linux (104 on macOS); paths that are too long are refused with an
+explicit error. The same limit applies to `--socket` and to the default path.
+To reach the daemon when `XDG_RUNTIME_DIR` makes the default daemon socket path
+too long, set `TREMELAY_DAEMON_SOCKET` to a shorter absolute path (see
+[headless unlock](headless-daemon.md)); `ssh-agent` honours it. An `ssh-agent`
+socket that is too long needs a shorter `--socket`. The directory must be yours and 0700; the socket is created 0600, every
+connection's peer uid is checked, and a socket that is already answering is
+never replaced.
 
 It refuses to start without a reachable daemon, with a token file that group
 or other can read, or on a directory anyone else can enter.

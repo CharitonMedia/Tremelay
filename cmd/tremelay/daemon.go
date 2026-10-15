@@ -64,7 +64,35 @@ var (
 	errDaemonRekeyed          = errors.New("vault passphrase changed; daemon locked. Run tremelay daemon again and unlock with the new passphrase")
 	errAgentToken             = errors.New("agent token file must be a regular user-only file holding one hex token")
 	errTokenFileACL           = errors.New("agent token file needs a filesystem that supports ACLs; the owner-only security descriptor was not applied")
+	errDaemonSocketRelative   = errors.New("TREMELAY_DAEMON_SOCKET must be an absolute path")
+
+	// Unix-only; ignored on Windows named pipes.
+	daemonSocketEnv = "TREMELAY_DAEMON_SOCKET"
 )
+
+type daemonSocketTooLongError struct {
+	n, limit int
+}
+
+func (e *daemonSocketTooLongError) Error() string {
+	return fmt.Sprintf(
+		"daemon socket path is too long (%d bytes, limit %d); set %s to a shorter absolute path",
+		e.n, e.limit, daemonSocketEnv,
+	)
+}
+
+// daemonDialDiagnostic keeps configuration refusals visible; reachability
+// failures stay generic so callers cannot probe endpoint custody remotely.
+func daemonDialDiagnostic(err error) string {
+	if err == nil {
+		return ""
+	}
+	var tooLong *daemonSocketTooLongError
+	if errors.As(err, &tooLong) || errors.Is(err, errDaemonSocketRelative) {
+		return err.Error()
+	}
+	return errDaemonReach.Error()
+}
 
 func cmdDaemon(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
@@ -369,7 +397,7 @@ func cmdLock(args []string, getenv func(string) string, stdout, stderr io.Writer
 	}
 	conn, err := daemonDial(getenv)
 	if err != nil {
-		fmt.Fprintln(stderr, errDaemonReach.Error())
+		fmt.Fprintln(stderr, daemonDialDiagnostic(err))
 		return 1
 	}
 	defer conn.Close()
@@ -396,7 +424,7 @@ func relayDaemonMCP(getenv func(string) string, tokenFile string, stdin io.Reade
 	defer vault.Wipe(token)
 	conn, err := daemonDial(getenv)
 	if err != nil {
-		fmt.Fprintln(stderr, errDaemonReach.Error())
+		fmt.Fprintln(stderr, daemonDialDiagnostic(err))
 		return 1
 	}
 	defer conn.Close()

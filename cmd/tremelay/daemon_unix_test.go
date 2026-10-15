@@ -3,9 +3,12 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
@@ -174,12 +177,116 @@ func TestAgentTokenFileMode(t *testing.T) {
 	}
 }
 
+// TestDaemonSocketPathTooLong reports the Unix sun_path limit instead of the
+// generic custody refusal when the default endpoint path cannot fit.
+func TestDaemonSocketPathTooLong(t *testing.T) {
+	longRun := socketDir(t)
+	for len(filepath.Join(longRun, "tremelay", daemonSocketName)) <= len(syscall.RawSockaddrUnix{}.Path)-1 {
+		longRun = filepath.Join(longRun, "x")
+		if err := os.MkdirAll(longRun, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _, err := daemonListen(envGet(map[string]string{"XDG_RUNTIME_DIR": longRun}))
+	if err == nil {
+		t.Fatal("expected refusal for an overlong default socket path")
+	}
+	if !strings.Contains(err.Error(), "daemon socket path is too long") ||
+		!strings.Contains(err.Error(), daemonSocketEnv) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), errDaemonEndpoint.Error()) {
+		t.Fatalf("custody error masks path length: %v", err)
+	}
+}
+
+// TestDaemonSocketEnvOverride uses a short absolute socket when the default
+// path would be too long.
+func TestDaemonSocketEnvOverride(t *testing.T) {
+	longRun := socketDir(t)
+	for len(filepath.Join(longRun, "tremelay", daemonSocketName)) <= len(syscall.RawSockaddrUnix{}.Path)-1 {
+		longRun = filepath.Join(longRun, "x")
+		if err := os.MkdirAll(longRun, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	short := filepath.Join(socketDir(t), "daemon.sock")
+	env := map[string]string{
+		"XDG_RUNTIME_DIR": longRun,
+		daemonSocketEnv:   short,
+	}
+	getenv := envGet(env)
+	listener, endpoint, err := daemonListen(getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if endpoint != short {
+		t.Fatalf("endpoint %q, want %q", endpoint, short)
+	}
+	conn, err := daemonDial(getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+}
+
+// TestDaemonSocketEnvRelativeRefused rejects a non-absolute override before listen.
+func TestDaemonSocketEnvRelativeRefused(t *testing.T) {
+	_, _, err := daemonListen(envGet(map[string]string{daemonSocketEnv: "relative.sock"}))
+	if err != errDaemonSocketRelative {
+		t.Fatalf("relative override: %v", err)
+	}
+}
+
+// TestDaemonSocketEnvInsecureDir still applies custody checks to the override path.
+func TestDaemonSocketEnvInsecureDir(t *testing.T) {
+	open := socketDir(t)
+	if err := os.Chmod(open, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(open, "daemon.sock")
+	_, _, err := daemonListen(envGet(map[string]string{daemonSocketEnv: socket}))
+	if err != errDaemonEndpoint {
+		t.Fatalf("insecure override directory: %v", err)
+	}
+}
+
+// TestSSHAgentSocketPathTooLong applies the same limit to --socket paths.
+func TestSSHAgentSocketPathTooLong(t *testing.T) {
+	tooLong := "/" + strings.Repeat("a", len(syscall.RawSockaddrUnix{}.Path))
+	_, err := listenUserSocket(tooLong)
+	if err == nil {
+		t.Fatal("expected refusal")
+	}
+	var tooLongErr *daemonSocketTooLongError
+	if !errors.As(err, &tooLongErr) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestDaemonUnusableEndpointRefusesPassphrase blocks the endpoint directory
 // with a regular file.
 func TestDaemonUnusableEndpointRefusesPassphrase(t *testing.T) {
-	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	// /tmp, not t.TempDir: macOS's long TMPDIR would trip the length check first.
+	short, err := os.MkdirTemp("/tmp", "tm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(short) })
+	blocked := filepath.Join(short, "not-a-directory")
 	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	assertEndpointRefusesPassphrase(t, map[string]string{"XDG_RUNTIME_DIR": blocked})
+}
+
+// TestSSHAgentDefaultSocketFollowsOverride keeps ssh-agent beside a
+// TREMELAY_DAEMON_SOCKET daemon rather than under a too-long XDG dir.
+func TestSSHAgentDefaultSocketFollowsOverride(t *testing.T) {
+	env := map[string]string{"XDG_RUNTIME_DIR": "/run/user/1", daemonSocketEnv: "/tmp/tm/d.sock"}
+	got := sshAgentDefaultSocket(func(k string) string { return env[k] })
+	if got != filepath.Join("/tmp/tm", sshAgentSocketName) {
+		t.Fatalf("default agent socket %q does not follow the override", got)
+	}
 }
