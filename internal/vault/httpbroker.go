@@ -755,6 +755,25 @@ func bodyNotRedactable(status int, h http.Header) bool {
 	return status == http.StatusPartialContent || h.Get("Content-Range") != ""
 }
 
+// brokerReadableBody is the capped upstream body that is both checked and
+// projected. A body cut at the cap can end inside a rune, so a trailing valid
+// but incomplete multi-byte sequence is dropped; an illegal byte is a full
+// (error) rune to utf8.FullRune, so it stays and bodyNotText withholds it.
+func brokerReadableBody(body []byte, truncated bool) []byte {
+	if !truncated {
+		return body
+	}
+	for drop := 1; drop < utf8.UTFMax && drop <= len(body); drop++ {
+		if tail := body[len(body)-drop:]; utf8.RuneStart(tail[0]) {
+			if !utf8.FullRune(tail) {
+				return body[:len(body)-drop]
+			}
+			break
+		}
+	}
+	return body
+}
+
 // bodyNotText reports a body the credential scan cannot read: bytes that are
 // not valid UTF-8, or that carry a NUL. Redaction looks for spellings of a
 // credential in text, so anything else — a compressed stream the upstream did
@@ -763,16 +782,12 @@ func bodyNotRedactable(status int, h http.Header) bool {
 // hand the agent the credential can encode it as text; that residual is ADR
 // 0025's, and no byte-level check closes it.
 //
-// A truncated body can end mid-rune, which says nothing about the bytes before
-// it, so up to three trailing bytes are dropped before the verdict.
-func bodyNotText(body []byte, truncated bool) bool {
+// The caller passes the bytes it will project, already through
+// brokerReadableBody; trimming again here would judge fewer bytes than the
+// agent receives.
+func bodyNotText(body []byte) bool {
 	if bytes.IndexByte(body, 0) >= 0 {
 		return true
-	}
-	if truncated {
-		for i := 0; i < utf8.UTFMax-1 && len(body) > 0 && !utf8.Valid(body); i++ {
-			body = body[:len(body)-1]
-		}
 	}
 	return !utf8.Valid(body)
 }
@@ -789,8 +804,11 @@ func projectResponse(inj grantInjection, secret []byte, upstream http.Header, bo
 		Truncated: truncated,
 	}
 	if len(out.Body) > maxAgentBody {
-		wipe(out.Body[maxAgentBody:])
-		out.Body = out.Body[:maxAgentBody]
+		// Redaction can grow a body past the cap, so this cut can split a rune
+		// too; drop it before partialTail looks for a credential prefix.
+		readable := brokerReadableBody(out.Body[:maxAgentBody], true)
+		wipe(out.Body[len(readable):])
+		out.Body = readable
 		out.Truncated = true
 		if n := partialTail(out.Body, forms); n > 0 {
 			wipe(out.Body[len(out.Body)-n:])

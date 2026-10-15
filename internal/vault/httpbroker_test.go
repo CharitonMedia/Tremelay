@@ -299,6 +299,80 @@ func TestBrokerTruncatesOversizedBody(t *testing.T) {
 	e.assertNoLeak(t, string(resp.Body))
 }
 
+// TestBrokerWithholdsTruncatedIllegalTailByte covers an upstream that fills
+// the cap with a credential prefix and an illegal tail byte the old verdict
+// trim forgave but projection still leaked.
+func TestBrokerWithholdsTruncatedIllegalTailByte(t *testing.T) {
+	e := newHTTPBrokerEnv(t, InjectBearer, "")
+	prefix := e.secret[:len(e.secret)-1]
+	lead := maxAgentBody - len(prefix) - 1
+	e.handler = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bytes.Repeat([]byte("x"), lead))
+		_, _ = w.Write(prefix)
+		_, _ = w.Write([]byte{0xff, 'z'}) // cap holds prefix+0xFF; extra byte sets truncated
+	}
+	resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
+	if !errors.Is(err, ErrBrokerUpstream) || resp.StatusCode != 0 || resp.Body != nil || resp.Headers != nil {
+		t.Fatalf("illegal truncated tail was projected: %+v %v", resp, err)
+	}
+	if e.lastResult(t) != resultUpstreamError {
+		t.Fatalf("result %s", e.lastResult(t))
+	}
+	e.assertNoLeak(t, err.Error())
+}
+
+// TestBrokerWithholdsTruncatedDoubleCutTail: only one cut rune is forgiven, so
+// a credential prefix followed by two incomplete sequences is withheld.
+func TestBrokerWithholdsTruncatedDoubleCutTail(t *testing.T) {
+	for _, tail := range [][]byte{{0xe2, 0xe2}, {0xe2, 0x82, 0xe2}, {0xf0, 0x9f, 0x98, 0xe2}} {
+		e := newHTTPBrokerEnv(t, InjectBearer, "")
+		prefix := e.secret[:len(e.secret)-1]
+		lead := maxAgentBody - len(prefix) - len(tail)
+		e.handler = func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(bytes.Repeat([]byte("x"), lead))
+			_, _ = w.Write(prefix)
+			_, _ = w.Write(tail)
+			_, _ = w.Write([]byte("z"))
+		}
+		resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
+		if !errors.Is(err, ErrBrokerUpstream) || resp.Body != nil {
+			t.Fatalf("tail % x projected: %+v %v", tail, resp, err)
+		}
+		e.assertNoLeak(t, err.Error())
+	}
+}
+
+// TestBrokerProjectsTruncatedMidRuneBody drops only an incomplete UTF-8 rune
+// at the cap, not arbitrary illegal bytes.
+func TestBrokerProjectsTruncatedMidRuneBody(t *testing.T) {
+	e := newHTTPBrokerEnv(t, InjectBearer, "")
+	// U+20AC euro is E2 82 AC; send two lead bytes after the cap-sized prefix.
+	suffix := []byte{0xe2, 0x82}
+	lead := maxAgentBody - len(suffix)
+	e.handler = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bytes.Repeat([]byte("y"), lead))
+		_, _ = w.Write(suffix)
+		_, _ = w.Write([]byte("z")) // extra byte so the cap cut is truncated
+	}
+	resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Truncated || len(resp.Body) != lead {
+		t.Fatalf("truncated %v len %d want %d", resp.Truncated, len(resp.Body), lead)
+	}
+	if !utf8.Valid(resp.Body) {
+		t.Fatal("projected body is not valid UTF-8")
+	}
+	e.assertNoLeak(t, string(resp.Body))
+}
+
 // TestBrokerDeniesMalformedPathsBeforeDNS covers traversal, encoded slashes
 // and backslashes, percent-encoded dots, double slashes, fragments, userinfo
 // and control bytes. None of them may resolve a name or open a connection.
@@ -1059,5 +1133,32 @@ func TestBrokerHeaderNameCannotCarryCredential(t *testing.T) {
 	}
 	if len(resp.Headers) != 1 || resp.Headers["X-Ratelimit-Remaining"] != "9" {
 		t.Fatalf("headers %v, want only X-Ratelimit-Remaining", resp.Headers)
+	}
+}
+
+// TestProjectResponseExpansionCutDropsRune: redacting a secret shorter than the
+// marker grows the body past the cap; that second cut can split a rune behind a
+// hex prefix, and the prefix must still be stripped.
+func TestProjectResponseExpansionCutDropsRune(t *testing.T) {
+	secret := []byte("!!!!!!!!!")
+	hexForm := hex.EncodeToString(secret)
+	// Each copy redacts to the 10-byte marker; size the copies so the cap
+	// falls one byte into the trailing euro sign, after the hex prefix.
+	const marker = len("[redacted]")
+	if (maxAgentBody-len(hexForm))%marker != 0 {
+		t.Skip("fixture assumes the cap aligns with the marker")
+	}
+	body := bytes.Repeat(secret, (maxAgentBody-len(hexForm))/marker)
+	body = append(body, hexForm[:len(hexForm)-1]...)
+	body = append(body, "€"...)
+	out, err := projectResponse(grantInjection{style: InjectBearer}, secret, http.Header{}, body, false)
+	if err != nil && !errors.Is(err, ErrBrokerUpstream) {
+		t.Fatal(err)
+	}
+	if err == nil && !out.Truncated {
+		t.Fatal("fixture did not exercise the expansion cut")
+	}
+	if bytes.Contains(out.Body, []byte(hexForm[:8])) || !utf8.Valid(out.Body) {
+		t.Fatalf("credential hex prefix or cut rune projected: % x", out.Body[max(0, len(out.Body)-24):])
 	}
 }
