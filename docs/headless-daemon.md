@@ -127,8 +127,7 @@ On Windows, start `tremelay daemon` in its own console window you leave open on
 the desktop. A daemon started inside an SSH session (Windows OpenSSH) is killed
 when that session ends. There is no supported Windows service or Task Scheduler
 recipe because that would need a stored passphrase. `tremelay ssh-agent` is not
-available on Windows; use `mcp serve` with pinentry if you cannot keep a
-console open.
+available on Windows; agents there use `tremelay mcp --daemon`.
 
 ## Register the stdio command with a client
 
