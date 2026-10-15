@@ -49,11 +49,14 @@ rm -rf "$out"
 mkdir -p "$stage"
 cd "$root"
 
-revision=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
-ldflags=
-if [ -n "$revision" ]; then
-	ldflags="-X main.versionOverride=$version -X main.vcsRevisionOverride=$revision"
+# The commit is embedded only from a clean checkout, so a binary never names a
+# commit it was not built from. The version always is: it is already in every
+# artifact name.
+revision=
+if [ -z "$(git -C "$root" status --porcelain 2>/dev/null || echo x)" ]; then
+	revision=$(git -C "$root" rev-parse HEAD)
 fi
+ldflags="-X main.versionOverride=$version -X main.vcsRevisionOverride=$revision"
 
 for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
 	os=${target%/*}
@@ -63,11 +66,7 @@ for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 wi
 	name="tremelay_${version}_${os}_${arch}"
 	bin="tremelay$exe"
 
-	if [ -n "$ldflags" ]; then
-		GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false -pgo=off -ldflags "$ldflags" -o "$stage/$bin" ./cmd/tremelay
-	else
-		GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false -pgo=off -o "$stage/$bin" ./cmd/tremelay
-	fi
+	GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false -pgo=off -ldflags "$ldflags" -o "$stage/$bin" ./cmd/tremelay
 	cp LICENSE "$stage/LICENSE"
 	# bin mode reads the executable's build information; it does not run it.
 	(cd tools && go tool cyclonedx-gomod bin -json -output-version 1.6 -std \

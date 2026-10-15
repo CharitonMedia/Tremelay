@@ -61,8 +61,11 @@ and default architecture baselines so two builders agree.
 
 `-buildvcs=false` keeps the executable independent of git state, which is what
 makes a local `make release-dry` and the CI run comparable. The version is
-carried by the artifact names instead of the binary. `go version -m` still
-reports the module graph.
+carried by the artifact names and, since #113, by `-ldflags -X` into
+`tremelay version`. The commit is embedded the same way only when the checkout
+is clean (`git status --porcelain` empty); otherwise the binary names no
+commit. Two builds of the same commit and version still agree. `go version -m`
+still reports the module graph.
 
 Archives use fixed member names, zeroed ownership and a fixed 1980-01-01
 timestamp so the archive bytes, not just the binaries, are reproducible.
@@ -117,8 +120,8 @@ download-and-verify-checksum one-liner for linux/macOS.
 - **Generate the SBOM from source (`cyclonedx-gomod mod`).** Rejected. That is
   the module graph, not what is in the shipped binary. The candidate already
   draws this distinction.
-- **Embed the version with `-ldflags -X`.** Rejected. There is no version
-  variable in `cmd/tremelay`, and adding one is out of scope for this slice.
+- **Embed the version with `-ldflags -X`.** Rejected at first (no version
+  variable existed); adopted for #113 as described above.
 
 ## Consequences
 
