@@ -1135,3 +1135,30 @@ func TestBrokerHeaderNameCannotCarryCredential(t *testing.T) {
 		t.Fatalf("headers %v, want only X-Ratelimit-Remaining", resp.Headers)
 	}
 }
+
+// TestProjectResponseExpansionCutDropsRune: redacting a secret shorter than the
+// marker grows the body past the cap; that second cut can split a rune behind a
+// hex prefix, and the prefix must still be stripped.
+func TestProjectResponseExpansionCutDropsRune(t *testing.T) {
+	secret := []byte("!!!!!!!!!")
+	hexForm := hex.EncodeToString(secret)
+	// Each copy redacts to the 10-byte marker; size the copies so the cap
+	// falls one byte into the trailing euro sign, after the hex prefix.
+	const marker = len("[redacted]")
+	if (maxAgentBody-len(hexForm))%marker != 0 {
+		t.Skip("fixture assumes the cap aligns with the marker")
+	}
+	body := bytes.Repeat(secret, (maxAgentBody-len(hexForm))/marker)
+	body = append(body, hexForm[:len(hexForm)-1]...)
+	body = append(body, "€"...)
+	out, err := projectResponse(grantInjection{style: InjectBearer}, secret, http.Header{}, body, false)
+	if err != nil && !errors.Is(err, ErrBrokerUpstream) {
+		t.Fatal(err)
+	}
+	if err == nil && !out.Truncated {
+		t.Fatal("fixture did not exercise the expansion cut")
+	}
+	if bytes.Contains(out.Body, []byte(hexForm[:8])) || !utf8.Valid(out.Body) {
+		t.Fatalf("credential hex prefix or cut rune projected: % x", out.Body[max(0, len(out.Body)-24):])
+	}
+}

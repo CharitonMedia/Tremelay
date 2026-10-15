@@ -804,8 +804,11 @@ func projectResponse(inj grantInjection, secret []byte, upstream http.Header, bo
 		Truncated: truncated,
 	}
 	if len(out.Body) > maxAgentBody {
-		wipe(out.Body[maxAgentBody:])
-		out.Body = out.Body[:maxAgentBody]
+		// Redaction can grow a body past the cap, so this cut can split a rune
+		// too; drop it before partialTail looks for a credential prefix.
+		readable := brokerReadableBody(out.Body[:maxAgentBody], true)
+		wipe(out.Body[len(readable):])
+		out.Body = readable
 		out.Truncated = true
 		if n := partialTail(out.Body, forms); n > 0 {
 			wipe(out.Body[len(out.Body)-n:])
