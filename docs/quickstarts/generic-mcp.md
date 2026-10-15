@@ -81,7 +81,7 @@ tremelay daemon --vault "$HOME/.tremelay/vault.db" --idle-timeout 8h
 At a terminal it prompts for the passphrase. Non-empty `TREMELAY_PASSPHRASE`
 works without a prompt but is not recommended ([passphrase from the
 environment](../headless-daemon.md#passphrase-from-the-environment)). It prints
-its endpoint path and serves until you lock it. Keep it in its own terminal or
+its endpoint path and serves until you lock it or the idle timeout ends it. Keep it in its own terminal or
 `tmux`/`screen` window ([keeping the daemon
 running](../headless-daemon.md#keeping-the-daemon-running)): the key lives
 nowhere else. Control-plane commands keep working while it runs; it re-reads the

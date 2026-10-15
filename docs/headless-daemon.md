@@ -79,8 +79,7 @@ the environment](#passphrase-from-the-environment) for `TREMELAY_PASSPHRASE`,
 which is not recommended). It then prints the endpoint path and serves.
 `--idle-timeout` accepts `1s` through `24h`, defaults to `1h`, and counts only
 time with no agent connected. There is no unattended reboot or auto-unlock: after
-a reboot or logout you start `tremelay daemon` again and type the passphrase;
-see [Keeping the daemon running](#keeping-the-daemon-running).
+a reboot you start `tremelay daemon` again and type the passphrase; see [Keeping the daemon running](#keeping-the-daemon-running).
 
 The control plane stays usable while it runs. Creating an agent, issuing a
 grant or revoking one commits to the same vault; the daemon re-reads and
@@ -105,28 +104,29 @@ no-echo prompt; otherwise unlock fails. It works, but it is **not
 recommended**: the value stays readable in the daemon's process environment
 (for example `/proc/<pid>/environ` on Linux) for the daemon's lifetime, visible
 to other processes running as your uid, and anything that stores it (shell rc,
-env file, unit, plist) puts the passphrase on disk. After unlock the passphrase
-bytes are wiped from memory; the environment variable is not removed.
+env file, unit, plist) puts the passphrase on disk. After unlock the daemon
+zeroes its own copy of the passphrase; the environment variable is not removed.
 `tremelay mcp --daemon` and `tremelay mcp serve` never read
 `TREMELAY_PASSPHRASE`; `vault change-passphrase` never reads it either
 (terminal only).
 
-There is **no** unattended-reboot or auto-unlock mode. After a reboot or logout
-you run `tremelay daemon` once and type the passphrase. `tremelay lock`, the
-idle timeout, and a passphrase change all end the daemon; the vault stays
-locked until you start it again.
+There is **no** unattended-reboot or auto-unlock mode. After a reboot you run
+`tremelay daemon` once and type the passphrase. `tremelay lock` and the idle
+timeout end the daemon; after a passphrase change it locks and exits on its
+next agent call. The vault stays locked until you start it again.
 
 ## Keeping the daemon running
 
 On Linux and macOS, run `tremelay daemon` in a terminal you leave open, or in
-`tmux` or `screen` (no passphrase stored). MCP clients must share
-`XDG_RUNTIME_DIR` or `TREMELAY_DAEMON_SOCKET` with the daemon or they will not
-find the socket.
+`tmux` or `screen` (no passphrase stored). A `tmux` or `screen` session keeps
+the daemon, and its unlocked key, running after you log out. MCP clients must
+resolve the same socket as the daemon: the same `TREMELAY_DAEMON_SOCKET` if the
+daemon uses it, otherwise the same `XDG_RUNTIME_DIR` (or both unset).
 
 On Windows, start `tremelay daemon` in its own console window you leave open on
 the desktop. A daemon started inside an SSH session (Windows OpenSSH) is killed
 when that session ends. There is no supported Windows service or Task Scheduler
-recipe because that would need a stored passphrase. `tremelay ssh-agent` is not
+recipe. `tremelay ssh-agent` is not
 available on Windows; agents there use `tremelay mcp --daemon`.
 
 ## Register the stdio command with a client
@@ -235,5 +235,6 @@ daemon on its own pipe; the label is appended to your SID, never instead of it.
 
 Your account is the boundary. Code already running as you, while the daemon is
 unlocked, can use your agents' granted capabilities — it still cannot read a
-credential, change a grant, or learn your passphrase, and everything it does is
+credential, change a grant, or learn your passphrase (unless you set
+`TREMELAY_PASSPHRASE` for the daemon; see above), and everything it does is
 in the audit chain.
