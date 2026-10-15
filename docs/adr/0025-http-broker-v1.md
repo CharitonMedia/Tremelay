@@ -108,12 +108,18 @@ body. In the query the name is compared literally (percent-encoding and
 spaces are already refused on the query string). In the body, names are
 split on `&` and `;`, separator whitespace is trimmed, and each name is `+`-
 and percent-decoded before the case-insensitive compare; in any
-`multipart/*` body each part name is compared the same way. A form body (no
+`multipart/*` body each part's `Content-Disposition` `name` is compared the
+same way, whatever the disposition type, and a part with a disposition that
+does not parse (a duplicated `name`, say) or with two dispositions is
+malformed. A JSON body (`/json` or `+json`) is refused when a top-level key is
+`_method`, because Laravel reads those keys as parameters. Every compare also
+tries the name as PHP registers it (cut at NUL, leading spaces dropped, space
+and `.` turned into `_`), so `.method` is refused in the query and the body. A form body (no
 `Content-Type`, or `application/x-www-form-urlencoded`) with a name that does
 not decode, an unparseable `Content-Type`, and an unparseable multipart body
 are all `denied_malformed`. Other bodies (JSON, say) are not read as form
 data downstream, so there only a name that decodes to `_method` is refused.
-Rack, Tomcat and Spring read `_method` from the query or the body and
+Rack, Tomcat, Spring and PHP/Laravel read `_method` from the query or the body and
 retarget the method of a POST with it. For query injection, any query
 parameter with the grant's parameter name is refused too.
 

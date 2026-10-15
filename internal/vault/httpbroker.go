@@ -638,6 +638,17 @@ func bodyParamNamed(body []byte, contentType, want string) (found, malformed boo
 	if strings.HasPrefix(mediaType, "multipart/") {
 		return multipartParamNamed(body, params["boundary"], want)
 	}
+	if strings.Contains(mediaType, "/json") || strings.HasSuffix(mediaType, "+json") {
+		// Laravel reads a JSON body's top-level keys as request parameters.
+		var keys map[string]json.RawMessage
+		if json.Unmarshal(body, &keys) == nil {
+			for name := range keys {
+				if paramNameIs(name, want) {
+					return true, false
+				}
+			}
+		}
+	}
 	found, malformed = formParamNamed(string(body), want, true)
 	if mediaType != "" && mediaType != "application/x-www-form-urlencoded" {
 		malformed = false
@@ -661,11 +672,27 @@ func formParamNamed(form, want string, decodeNames bool) (found, malformed bool)
 				continue
 			}
 		}
-		if strings.EqualFold(name, want) {
+		if paramNameIs(name, want) {
 			return true, malformed
 		}
 	}
 	return false, malformed
+}
+
+// phpParamName is the name PHP registers: cut at the first NUL, leading spaces
+// dropped, then space and dot turned into underscores.
+var phpParamName = strings.NewReplacer(" ", "_", ".", "_")
+
+// paramNameIs compares a parameter name case-insensitively, both as written
+// and as PHP (and so Laravel and Symfony) would register it.
+func paramNameIs(name, want string) bool {
+	if strings.EqualFold(name, want) {
+		return true
+	}
+	if i := strings.IndexByte(name, 0); i >= 0 {
+		name = name[:i]
+	}
+	return strings.EqualFold(phpParamName.Replace(strings.TrimLeft(name, " ")), want)
 }
 
 func decodeFormParamName(raw string) (string, bool) {
@@ -689,15 +716,22 @@ func multipartParamNamed(body []byte, boundary, want string) (found, malformed b
 		if err != nil {
 			return false, true
 		}
-		name := p.FormName()
-		if name == "" {
+		// Not FormName: it drops the name of a non-form-data disposition
+		// (PHP reads it) and of a duplicated name parameter (PHP and Tomcat
+		// take the last one).
+		dispositions := p.Header.Values("Content-Disposition")
+		if len(dispositions) == 0 {
 			continue
 		}
-		decoded, ok := decodeFormParamName(name)
+		_, dparams, err := mime.ParseMediaType(dispositions[0])
+		if len(dispositions) > 1 || err != nil {
+			return false, true
+		}
+		decoded, ok := decodeFormParamName(dparams["name"])
 		if !ok {
 			return false, true
 		}
-		if strings.EqualFold(decoded, want) {
+		if paramNameIs(decoded, want) {
 			return true, false
 		}
 	}
