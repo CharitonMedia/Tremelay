@@ -15,8 +15,9 @@ const (
 	sshAgentSocketName = "ssh-agent.sock"
 )
 
+// checkUnixSocketPathLen applies the kernel's sun_path limit, NUL included.
 func checkUnixSocketPathLen(path string) error {
-	max := unixSunPathBytes - 1
+	max := len(syscall.RawSockaddrUnix{}.Path) - 1
 	if n := len(path); n > max {
 		return &daemonSocketTooLongError{n: n, limit: max}
 	}

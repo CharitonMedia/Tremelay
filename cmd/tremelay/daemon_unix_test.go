@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
@@ -179,7 +180,7 @@ func TestAgentTokenFileMode(t *testing.T) {
 // generic custody refusal when the default endpoint path cannot fit.
 func TestDaemonSocketPathTooLong(t *testing.T) {
 	longRun := socketDir(t)
-	for len(filepath.Join(longRun, "tremelay", daemonSocketName)) <= unixSunPathBytes-1 {
+	for len(filepath.Join(longRun, "tremelay", daemonSocketName)) <= len(syscall.RawSockaddrUnix{}.Path)-1 {
 		longRun = filepath.Join(longRun, "x")
 		if err := os.MkdirAll(longRun, 0o700); err != nil {
 			t.Fatal(err)
@@ -202,7 +203,7 @@ func TestDaemonSocketPathTooLong(t *testing.T) {
 // path would be too long.
 func TestDaemonSocketEnvOverride(t *testing.T) {
 	longRun := socketDir(t)
-	for len(filepath.Join(longRun, "tremelay", daemonSocketName)) <= unixSunPathBytes-1 {
+	for len(filepath.Join(longRun, "tremelay", daemonSocketName)) <= len(syscall.RawSockaddrUnix{}.Path)-1 {
 		longRun = filepath.Join(longRun, "x")
 		if err := os.MkdirAll(longRun, 0o700); err != nil {
 			t.Fatal(err)
@@ -252,7 +253,7 @@ func TestDaemonSocketEnvInsecureDir(t *testing.T) {
 
 // TestSSHAgentSocketPathTooLong applies the same limit to --socket paths.
 func TestSSHAgentSocketPathTooLong(t *testing.T) {
-	tooLong := "/" + strings.Repeat("a", unixSunPathBytes)
+	tooLong := "/" + strings.Repeat("a", len(syscall.RawSockaddrUnix{}.Path))
 	_, err := listenUserSocket(tooLong)
 	if err == nil {
 		t.Fatal("expected refusal")
