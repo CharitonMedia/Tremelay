@@ -104,14 +104,16 @@ Refused, before DNS and before any secret is copied: `Authorization`,
 hop-by-hop names (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`,
 `Trailer`, `Trailers`, `Upgrade`), the grant's own named injection header,
 any `_method` parameter (case-insensitive) in the query or in the request
-body. In the query the name is compared literally (percent-encoding and
-spaces are already refused on the query string). In the body, names are
+body. In the query the name is compared with only `+` read as a space
+(percent-encoding and spaces are already refused on the query string). In the body, names are
 split on `&` and `;`, separator whitespace is trimmed, and each name is `+`-
 and percent-decoded before the case-insensitive compare; in any
-`multipart/*` body each part's `Content-Disposition` `name` is compared the
-same way, whatever the disposition type, and a part with a disposition that
-does not parse (a duplicated `name`, say) or with two dispositions is
-malformed. A JSON body (`/json` or `+json`) is refused when a top-level key is
+`multipart/*` body each part's `Content-Disposition` `name` is compared as
+written (no parser decodes it), whatever the disposition type; a part with a
+disposition that does not parse (a duplicated `name`, say), with two
+dispositions, or with an RFC 2231 `name*` Go cannot decode (Tomcat decodes
+any charset) is malformed. A body whose raw `Content-Type` contains `/json` or
+`+json` is refused when a top-level key is
 `_method`, because Laravel reads those keys as parameters. Every compare also
 tries the name as PHP registers it (cut at NUL, leading spaces dropped, space
 and `.` turned into `_`), so `.method` is refused in the query and the body. A form body (no

@@ -638,8 +638,9 @@ func bodyParamNamed(body []byte, contentType, want string) (found, malformed boo
 	if strings.HasPrefix(mediaType, "multipart/") {
 		return multipartParamNamed(body, params["boundary"], want)
 	}
-	if strings.Contains(mediaType, "/json") || strings.HasSuffix(mediaType, "+json") {
-		// Laravel reads a JSON body's top-level keys as request parameters.
+	if lower := strings.ToLower(contentType); strings.Contains(lower, "/json") || strings.Contains(lower, "+json") {
+		// Laravel reads a JSON body's top-level keys as request parameters
+		// whenever the raw Content-Type contains /json or +json.
 		var keys map[string]json.RawMessage
 		if json.Unmarshal(body, &keys) == nil {
 			for name := range keys {
@@ -663,6 +664,10 @@ func formParamNamed(form, want string, decodeNames bool) (found, malformed bool)
 		name := pair
 		if i := strings.IndexByte(pair, '='); i >= 0 {
 			name = pair[:i]
+		}
+		if !decodeNames {
+			// The query keeps percent-encoding out, but PHP still reads + as a space.
+			name = strings.ReplaceAll(name, "+", " ")
 		}
 		name = strings.TrimSpace(name)
 		if decodeNames {
@@ -727,11 +732,14 @@ func multipartParamNamed(body []byte, boundary, want string) (found, malformed b
 		if len(dispositions) > 1 || err != nil {
 			return false, true
 		}
-		decoded, ok := decodeFormParamName(dparams["name"])
-		if !ok {
+		// Go drops an RFC 2231 name* in a charset it does not know; Tomcat
+		// decodes it. A part whose name we could not read is malformed.
+		name := dparams["name"]
+		if name == "" && strings.Contains(dispositions[0], "*") {
 			return false, true
 		}
-		if paramNameIs(decoded, want) {
+		// Multipart names are not form-urlencoded: no parser decodes them.
+		if paramNameIs(name, want) {
 			return true, false
 		}
 	}

@@ -393,6 +393,11 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 		{name: "method-override-form-body-multipart-dup-name", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name=\"safe\"; name=\"_method\"\r\n\r\nDELETE\r\n--b--\r\n"},
 		{name: "method-override-form-body-multipart-attachment", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: attachment; name=\"_method\"\r\n\r\nDELETE\r\n--b--\r\n"},
 		{name: "method-override-form-body-multipart-php-dot", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name=\".method\"\r\n\r\nDELETE\r\n--b--\r\n"},
+		{name: "method-override-query-php-plus", inject: InjectBearer, query: "+_method=DELETE"},
+		{name: "method-override-query-php-plus-dot", inject: InjectBearer, query: "a=1&+.method=DELETE"},
+		{name: "method-override-form-body-json-suffix-type", inject: InjectBearer, headers: map[string]string{"Content-Type": "application/foo+json+xml"}, body: `{"_method":"DELETE"}`},
+		{name: "method-override-form-body-json-param-type", inject: InjectBearer, headers: map[string]string{"Content-Type": `text/plain; x="/json"`}, body: `{"_method":"DELETE"}`},
+		{name: "method-override-form-body-multipart-rfc2231-latin1", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name*=iso-8859-1''_method\r\n\r\nDELETE\r\n--b--\r\n"},
 		{name: "method-override-form-body-after-bad-escape", inject: InjectBearer, body: "a%zz=1&_method=DELETE"},
 		{name: "method-override-form-body-json-type", inject: InjectBearer, headers: map[string]string{"Content-Type": "application/json"}, body: "%5F%6D%65%74%68%6F%64=DELETE"},
 		{name: "method-override-form-body-bad-content-type", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=a; boundary=b"}, body: "x"},
@@ -479,6 +484,7 @@ func TestBrokerAllowsOrdinaryFormBody(t *testing.T) {
 	for _, tc := range []struct{ contentType, body string }{
 		{"application/x-www-form-urlencoded", "foo=1&bar=2"},
 		{"application/json", `{"discount":"50%","note":"a&b"}`},
+		{"multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"100%\"; filename*=UTF-8''r%C3%A9sum%C3%A9.txt\r\n\r\nx\r\n--b--\r\n"},
 	} {
 		req.Body = []byte(tc.body)
 		req.Headers = map[string]string{"Content-Type": tc.contentType}
