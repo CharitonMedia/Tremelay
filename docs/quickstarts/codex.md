@@ -9,7 +9,7 @@ path. Windows differences are at the bottom.
 ## 1. Install
 
 ```sh
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest   # Go toolchain per go.mod
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 "$(go env GOPATH)"/bin/tremelay --help
 ```
 
@@ -48,6 +48,10 @@ tremelay agent create --path "$HOME/.tremelay/vault.db" --label codex \
 That prints the agent id and then the token path, on two lines — note the id.
 The token itself is never printed, and the file is created 0600.
 
+An `http_broker` resource must be `https` with a public DNS hostname (at least
+two labels, lowercase). IP literals, loopback, and private or special-use names
+such as `localhost` or `*.internal` are refused.
+
 ```sh
 tremelay grant create --path "$HOME/.tremelay/vault.db" \
   --agent AGENT_ID --credential "$CRED" \
@@ -73,10 +77,15 @@ other repo, host or method. See [ADR 0025](../adr/0025-http-broker-v1.md).
 tremelay daemon --vault "$HOME/.tremelay/vault.db" --idle-timeout 8h
 ```
 
-It prompts for the passphrase, prints its endpoint path, and serves until you
-lock it. Keep it in its own terminal, `tmux` window or user service: the key
-lives nowhere else. Control-plane commands keep working while it runs — it
-re-reads the vault in place with the key it already holds.
+At a terminal it prompts for the passphrase. Non-empty `TREMELAY_PASSPHRASE`
+works without a prompt but is not recommended ([passphrase from the
+environment](../headless-daemon.md#passphrase-from-the-environment)). It prints
+its endpoint path and serves until you lock it or the idle timeout ends it. Keep it in its own terminal or
+`tmux`/`screen` window ([keeping the daemon
+running](../headless-daemon.md#keeping-the-daemon-running)): the key lives
+nowhere else. Control-plane commands keep working while it runs; it re-reads the
+vault in place with the key it already holds (a passphrase change instead
+makes it lock and exit on its next agent call).
 
 ## 4. Register the server with Codex
 
@@ -98,6 +107,17 @@ tool_timeout_sec = 30
 [mcp_servers.tremelay.env]
 XDG_RUNTIME_DIR = "/run/user/1000"
 ```
+
+When the daemon listens on a non-default Unix socket (`TREMELAY_DAEMON_SOCKET` needs v1.0.1 or later; v1.0.0 ignores it), set the same absolute
+path before `tremelay daemon` and in the client env block:
+
+```toml
+[mcp_servers.tremelay.env]
+TREMELAY_DAEMON_SOCKET = "/run/user/1000/my/daemon.sock"
+```
+
+On Windows, when the daemon uses `TREMELAY_DAEMON_INSTANCE`, add the same label
+to `[mcp_servers.tremelay.env]` so `mcp --daemon` dials the matching pipe.
 
 **On Linux the `env` entry is required.** Codex launches MCP servers with a
 scrubbed environment — `HOME`, `LANG`, `LOGNAME`, `PATH`, `PWD`, `SHELL`,
@@ -180,7 +200,7 @@ the same path). You never have to recreate an agent. See
 Same commands in PowerShell, with Windows paths and no `umask`:
 
 ```powershell
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@latest
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 & "$(go env GOPATH)\bin\tremelay.exe" --help
 
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
@@ -188,16 +208,27 @@ New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
 ```
 
 `WriteAllText` writes no trailing newline, which is the point of `printf '%s'`
-above. The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
-instead of a socket, so there is no `XDG_RUNTIME_DIR` and no `env` block to
-add; `daemon`, `lock` and `mcp --daemon` are otherwise identical. TOML
+above. In Windows PowerShell 5.1, capturing or redirecting command output (for
+example `2>$null`) turns the CLI's stderr audit lines into red
+`NativeCommandError` records. That is normal; check `$LASTEXITCODE` instead of
+the error stream color.
+
+The daemon serves on the named pipe `\\.\pipe\tremelay-<your SID>`
+instead of a socket, so there is no `XDG_RUNTIME_DIR`; you need an `env` block
+only for `TREMELAY_DAEMON_INSTANCE` (below). `daemon`, `lock` and
+`mcp --daemon` are otherwise identical. TOML
 single-quoted strings take Windows paths without escaping:
 
 ```toml
 [mcp_servers.tremelay]
 command = 'C:\Users\you\go\bin\tremelay.exe'
 args = ['mcp', '--daemon', '--token-file', 'C:\Users\you\.tremelay\codex.token']
+
+[mcp_servers.tremelay.env]
+TREMELAY_DAEMON_INSTANCE = "myinstance"
 ```
+
+(Omit the `env` block when you use the default pipe name.)
 
 `tremelay ssh-agent` is Unix-only and fails closed on Windows; nothing on this
 page depends on it.

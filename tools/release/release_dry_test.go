@@ -183,9 +183,8 @@ func assertArchivesHoldTheBinary(t *testing.T, out string) {
 		default:
 			continue
 		}
-		base := strings.TrimSuffix(strings.TrimSuffix(name, ".zip"), ".tar.gz")
-		want := base
-		if strings.Contains(base, "windows") {
+		want := "tremelay"
+		if strings.Contains(name, "windows") {
 			want += ".exe"
 		}
 		if !slices.Contains(members, want) || !slices.Contains(members, "LICENSE") {

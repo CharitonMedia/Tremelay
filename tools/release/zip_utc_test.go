@@ -27,7 +27,7 @@ func TestReleaseDryZipUsesUTC(t *testing.T) {
 		t.Skip("the timezone demonstration needs Info-ZIP on Linux")
 	}
 	stage := t.TempDir()
-	exe := filepath.Join(stage, "tremelay_v0.0.0-test_windows_amd64.exe")
+	exe := filepath.Join(stage, "tremelay.exe")
 	lic := filepath.Join(stage, "LICENSE")
 	if err := os.WriteFile(exe, []byte("sentinel-exe-not-a-real-binary"), 0o644); err != nil {
 		t.Fatal(err)

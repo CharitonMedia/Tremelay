@@ -30,6 +30,8 @@ func run(args []string, getenv func(string) string, stdin io.Reader, stdout, std
 	case "help", "-h", "--help":
 		usage(stdout)
 		return 0
+	case "version", "--version":
+		return cmdVersion(stdout)
 	case "vault":
 		return cmdVault(args[1:], getenv, stdin, stdout, stderr)
 	case "credential":
@@ -88,6 +90,7 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay audit verify --path PATH
   tremelay audit list --path PATH [--credential ID] [--agent ID] [--action ACTION] [--class CLASS] [--since RFC3339] [--until RFC3339] [--after SEQ] [--limit N]
   tremelay audit get --path PATH --seq SEQ
+  tremelay version
 
 Types: %s
 Grant operations: %s

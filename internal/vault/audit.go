@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	auditVersion           = 1
-	auditCapabilityVersion = 2
-	auditNoticeVersion     = 3
-	auditHealthVersion     = 4
+	auditVersion            = 1
+	auditCapabilityVersion  = 2
+	auditNoticeVersion      = 3
+	auditHealthVersion      = 4
+	auditGrantDenialVersion = 5
 
 	actionCreate      = "vault_create"
 	actionUnlock      = "vault_unlock"
@@ -174,6 +175,12 @@ func eventHashV4(prev []byte, seq uint64, timeStr, action, vaultID, credID, cred
 	return hashPartsTail(prev, seq, []string{timeStr, action, vaultID, credID, credType, result, reasons}, gen[:])
 }
 
+// eventHashV5 extends the version-2 preimage with a fixed grant_create denial
+// reason. Version-1 through 4 preimages do not include it.
+func eventHashV5(prev []byte, seq uint64, timeStr, action, vaultID, credID, credType, result, agentID, grantID, operation, reasons string) []byte {
+	return hashParts(prev, seq, timeStr, action, vaultID, credID, credType, result, agentID, grantID, operation, reasons)
+}
+
 func hashParts(prev []byte, seq uint64, parts ...string) []byte {
 	return hashPartsTail(prev, seq, parts, nil)
 }
@@ -217,7 +224,7 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 		seq = last.Seq + 1
 	}
 	ev := partial
-	ev.V = auditVersionFor(ev.Action)
+	ev.V = auditVersionForEvent(ev)
 	ev.Seq = seq
 	ev.Time = time.Now().UTC().Format(time.RFC3339Nano)
 	ev.VaultID = vaultID
@@ -239,6 +246,12 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 			return auditEvent{}, ErrAudit
 		}
 		sum = eventHashV2(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation)
+	case auditGrantDenialVersion:
+		if ev.Action != actionGrantCreate || ev.Result != resultDenied || !knownGrantCreateReason(ev.Reasons) ||
+			ev.Class != "" || ev.RefSeq != 0 || ev.CredGen != 0 || !sharedColumnsClear(ev) {
+			return auditEvent{}, ErrAudit
+		}
+		sum = eventHashV5(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Reasons)
 	default:
 		if ev.AgentID != "" || ev.GrantID != "" || ev.Operation != "" || ev.Class != "" || ev.RefSeq != 0 || ev.Reasons != "" || ev.CredGen != 0 || !sharedColumnsClear(ev) {
 			return auditEvent{}, ErrAudit
@@ -247,6 +260,13 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 	}
 	ev.Hash = hex.EncodeToString(sum)
 	return ev, nil
+}
+
+func auditVersionForEvent(ev auditEvent) int {
+	if ev.Action == actionGrantCreate && ev.Reasons != "" {
+		return auditGrantDenialVersion
+	}
+	return auditVersionFor(ev.Action)
 }
 
 func auditVersionFor(action string) int {
@@ -263,7 +283,7 @@ func auditVersionFor(action string) int {
 }
 
 func knownAuditVersion(v int) bool {
-	return v == auditVersion || v == auditCapabilityVersion || v == auditNoticeVersion || v == auditHealthVersion
+	return v == auditVersion || v == auditCapabilityVersion || v == auditNoticeVersion || v == auditHealthVersion || v == auditGrantDenialVersion
 }
 
 func sharedColumnsClear(ev auditEvent) bool {
@@ -287,6 +307,8 @@ func hashEvent(prev []byte, ev auditEvent) []byte {
 		return eventHashV3(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Class, ev.RefSeq)
 	case auditCapabilityVersion:
 		return eventHashV2(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation)
+	case auditGrantDenialVersion:
+		return eventHashV5(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result, ev.AgentID, ev.GrantID, ev.Operation, ev.Reasons)
 	default:
 		return eventHash(prev, ev.Seq, ev.Time, ev.Action, ev.VaultID, ev.CredID, ev.CredType, ev.Result)
 	}
@@ -324,7 +346,7 @@ func verifyLinked(events []auditEvent) error {
 		if !knownAuditVersion(ev.V) {
 			return ErrAudit
 		}
-		if ev.V != auditVersionFor(ev.Action) || ev.Seq != first.Seq+uint64(i) {
+		if ev.V != auditVersionForEvent(ev) || ev.Seq != first.Seq+uint64(i) {
 			return ErrAudit
 		}
 		// events[:i] are already contiguous from first.Seq, so the referenced
@@ -389,8 +411,13 @@ func validAuditShape(ev auditEvent) error {
 	if !sharedColumnsClear(ev) {
 		return ErrAudit
 	}
-	if ev.Class != "" || ev.RefSeq != 0 || ev.Reasons != "" || ev.CredGen != 0 {
+	if ev.Class != "" || ev.RefSeq != 0 || ev.CredGen != 0 {
 		return ErrAudit
+	}
+	if ev.Reasons != "" {
+		if ev.V != auditGrantDenialVersion || ev.Action != actionGrantCreate || ev.Result != resultDenied || !knownGrantCreateReason(ev.Reasons) {
+			return ErrAudit
+		}
 	}
 	if ev.Result == resultDeniedSecret && ev.Operation != "" {
 		return ErrAudit
@@ -468,6 +495,11 @@ func validAuditShape(ev auditEvent) error {
 	case actionGrantCreate:
 		if ev.Result == resultAllowed && (ev.AgentID == "" || ev.GrantID == "" || ev.CredType == "" || ev.Operation == "") {
 			return ErrAudit
+		}
+		if ev.Result == resultDenied && ev.Reasons != "" {
+			if ev.GrantID != "" || ev.Operation != "" || ev.CredID != "" || ev.CredType != "" {
+				return ErrAudit
+			}
 		}
 	case actionGrantRevoke:
 		if ev.Result == resultAllowed && (ev.AgentID == "" || ev.GrantID == "" || ev.Operation == "") {

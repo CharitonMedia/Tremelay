@@ -93,15 +93,22 @@ switches to it for you.
 go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.0
 ```
 
-From a clone, `make build` or `go build ./cmd/tremelay` does the same thing.
+From a clone, `make build` or `go build -o tremelay ./cmd/tremelay` does the same
+thing. Check the build with `tremelay version` (or `tremelay --version`).
+
 The [v1.0.0 release](https://github.com/CharitonMedia/Tremelay/releases/tag/v1.0.0)
-carries per-platform archives, a CycloneDX SBOM and a `SHA256SUMS` file — a checksum detects a corrupt download, not a substituted release. Signed
-releases are not in v1. `make release-dry` builds those artifacts locally; see
-[ADR 0027](docs/adr/0027-release-artifacts.md). Download the archive you want
-and `SHA256SUMS` into one directory, then check that archive by name:
+carries per-platform archives named `tremelay_<version>_<os>_<arch>.tar.gz` (or
+`.zip` on Windows). Each archive unpacks to a binary named `tremelay`
+(`tremelay.exe` on Windows) plus `LICENSE`, along with a CycloneDX SBOM and a
+`SHA256SUMS` file — a checksum detects a corrupt download, not a substituted
+release. Signed releases are not in v1. `make release-dry` builds those artifacts
+locally; see [ADR 0027](docs/adr/0027-release-artifacts.md). Download the archive
+you want and `SHA256SUMS` into one directory, then check that archive by name:
 
 ```sh
-grep tremelay_v1.0.0_linux_amd64.tar.gz SHA256SUMS | sha256sum -c -
+grep tremelay_v1.0.0_linux_amd64.tar.gz SHA256SUMS | sha256sum -c - &&
+  tar -xzf tremelay_v1.0.0_linux_amd64.tar.gz &&
+  ./tremelay version
 ```
 
 On macOS, `shasum -a 256 -c -` in place of `sha256sum -c -`.
@@ -115,9 +122,11 @@ and some other listed file is present.
 Copy-paste setup from install to first successful call, one page per client:
 [docs/quickstarts/](docs/quickstarts/) (Claude Code, Codex, Hermes, generic MCP).
 
-The shape is the same everywhere. `tremelay daemon --vault PATH` asks for your
-passphrase once in your terminal and then serves agents on a user-only local
-socket; `tremelay agent create --token-file FILE` gives each agent its own bearer
+The shape is the same everywhere. `tremelay daemon --vault PATH` prompts for
+your passphrase at a terminal (non-empty `TREMELAY_PASSPHRASE` works without a
+prompt but is not recommended; see [passphrase from the
+environment](docs/headless-daemon.md#passphrase-from-the-environment)) and then
+serves agents on a user-only local socket; `tremelay agent create --token-file FILE` gives each agent its own bearer
 token file, and `tremelay agent token issue|rotate|revoke` manage it later without
 recreating the agent; `tremelay mcp --daemon --token-file FILE` is the stdio command the
 client launches. `tremelay lock`, the idle timeout, or losing the process

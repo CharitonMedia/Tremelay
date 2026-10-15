@@ -18,6 +18,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// Stdio harness sessions outlive slow hosts; a short deadline flakes when CPU is starved.
+const mcpStdioHarnessTimeout = 5 * time.Minute
+
 func stdioEndpoint(t *testing.T, cap *AgentCapability) *MCPEndpoint {
 	t.Helper()
 	ep, err := BindStdioMCPEndpoint(cap)
@@ -32,7 +35,7 @@ func startStdioSDK(t *testing.T, cap *AgentCapability, revision string) *mcpSess
 	ep := stdioEndpoint(t, cap)
 	clientRead, serverWrite := io.Pipe()
 	serverRead, clientWrite := io.Pipe()
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), mcpStdioHarnessTimeout)
 	errc := make(chan error, 1)
 	go func() { errc <- ep.Serve(ctx, serverRead, serverWrite) }()
 	t.Cleanup(func() {

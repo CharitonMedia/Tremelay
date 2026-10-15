@@ -104,9 +104,26 @@ Refused, before DNS and before any secret is copied: `Authorization`,
 hop-by-hop names (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`,
 `Trailer`, `Trailers`, `Upgrade`), the grant's own named injection header,
 any `_method` parameter (case-insensitive) in the query or in the request
-body, because Rack and Spring read it from either and retarget the method of
-a POST with it, and — for query injection — any query parameter with the
-grant's parameter name.
+body. In the query the name is compared with only `+` read as a space
+(percent-encoding and spaces are already refused on the query string). In the body, names are
+split on `&` and `;`, separator whitespace is trimmed, and each name is `+`-
+and percent-decoded before the case-insensitive compare; in any
+`multipart/*` body each part's `Content-Disposition` `name` is compared as
+written (no parser decodes it), whatever the disposition type; a part with a
+disposition that does not parse (a duplicated `name`, say), with two
+dispositions, or with an RFC 2231 `name*` Go cannot decode (Tomcat decodes
+any charset) is malformed. A body whose raw `Content-Type` contains `/json` or
+`+json` is refused when a top-level key is
+`_method`, because Laravel reads those keys as parameters. Every compare also
+tries the name as PHP registers it (cut at NUL, leading spaces dropped, space
+and `.` turned into `_`), so `.method` is refused in the query and the body. A form body (no
+`Content-Type`, or `application/x-www-form-urlencoded`) with a name that does
+not decode, an unparseable `Content-Type`, and an unparseable multipart body
+are all `denied_malformed`. Other bodies (JSON, say) are not read as form
+data downstream, so there only a name that decodes to `_method` is refused.
+Rack, Tomcat, Spring and PHP/Laravel read `_method` from the query or the body and
+retarget the method of a POST with it. For query injection, any query
+parameter with the grant's parameter name is refused too.
 
 `Accept-Encoding`, `Range` and `If-Range` are refused for the same reason as
 the framing headers: they choose the *form* of the response bytes, and
@@ -175,6 +192,9 @@ whole, and the agent recovered the credential with `gunzip`. Two changes:
   A response listing `identity, deflate` — in two fields or one — is coded.
 - After the body is read, it is projected only if it is text the scan can
   actually read: valid UTF-8 with no NUL. Anything else is withheld whole.
+  When the body was cut at the 32 KiB cap, a trailing incomplete multi-byte
+  UTF-8 rune is dropped before that check and before projection; an illegal
+  tail byte is not forgiven.
 
 The second rule is deliberately a property of the bytes rather than a list of
 container magics. A list is a denylist, and the first draft of this amendment
@@ -182,8 +202,8 @@ enumerated gzip, zstd, xz and bzip2 while a review got the credential out
 through zlib, raw deflate, a ZIP member, a zstd skippable frame, one leading
 newline before the gzip magic, and zlib nested inside a declared gzip the
 transport had already decoded. UTF-8 validity covers that class in one check.
-A truncated body may end mid-rune, so up to three trailing bytes are dropped
-before the verdict.
+The truncated-rune exception applies only to a valid incomplete prefix of a
+multi-byte rune at the cap boundary, not to arbitrary illegal bytes.
 
 Residual, unchanged in kind and now stated plainly: an upstream that wants to
 hand the agent the credential can encode it as text — base64, hex with a

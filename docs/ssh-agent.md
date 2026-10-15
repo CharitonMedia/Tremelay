@@ -130,11 +130,18 @@ tremelay ssh-agent --token-file ~/.tremelay/codex.token        # terminal 2
 ```
 
 `ssh-agent` prints the socket path it is serving, by default
-`$XDG_RUNTIME_DIR/tremelay/ssh-agent.sock`. Use `--socket /absolute/path` to
+`$XDG_RUNTIME_DIR/tremelay/ssh-agent.sock`, or beside the daemon socket when
+`TREMELAY_DAEMON_SOCKET` is set. Use `--socket /absolute/path` to
 put it elsewhere, which you need when more than one agent token is in use —
-one process serves one agent. The directory must be yours and 0700; the socket
-is created 0600, every connection's peer uid is checked, and a socket that is
-already answering is never replaced.
+one process serves one agent. Unix domain socket paths are limited to about 107
+bytes on Linux (104 on macOS); paths that are too long are refused with an
+explicit error. The same limit applies to `--socket` and to the default path.
+To reach the daemon when `XDG_RUNTIME_DIR` makes the default daemon socket path
+too long, set `TREMELAY_DAEMON_SOCKET` to a shorter absolute path (see
+[headless unlock](headless-daemon.md)); `ssh-agent` honours it. An `ssh-agent`
+socket that is too long needs a shorter `--socket`. The directory must be yours and 0700; the socket is created 0600, every
+connection's peer uid is checked, and a socket that is already answering is
+never replaced.
 
 It refuses to start without a reachable daemon, with a token file that group
 or other can read, or on a directory anyone else can enter.
@@ -158,6 +165,43 @@ Both work for `git clone`, `git fetch` and plain `ssh`. Nothing else changes:
 the client sends the agent its host binding, the agent answers with the
 granted key, and the signature is produced inside the daemon.
 
+### Force only the Tremelay key
+
+To keep other keys out of the attempt, `IdentitiesOnly=yes` is right, but
+paired with `IdentityFile=none` (or with no `IdentityFile` naming the Tremelay
+key) it leaves OpenSSH no agent key it may offer, and the Tremelay agent never
+gets a signing request. Point `IdentityFile` at a one-line public key file
+instead. Reuse the `KEY_ID` line from [Install the public key on the
+server](#install-the-public-key-on-the-server) (on macOS, replace `base64 -w0`
+with `base64 | tr -d '\n'`):
+
+```sh
+KEY_ID=$(tremelay capability list --path /absolute/vault.db --agent AGENT_ID |
+  grep ssh_userauth | sed 's/.*"key_id":"\([0-9a-f]*\)".*/\1/')
+printf 'ssh-ed25519 %s tremelay\n' \
+  "$({ printf '\0\0\0\vssh-ed25519\0\0\0\040'; printf %s "$KEY_ID" | xxd -r -p; } | base64 -w0)" \
+  > "$HOME/.ssh/tremelay-agent.pub"
+chmod 600 "$HOME/.ssh/tremelay-agent.pub"
+```
+
+Then:
+
+```sh
+export SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/tremelay/ssh-agent.sock
+ssh -o IdentitiesOnly=yes -o IdentityFile="$HOME/.ssh/tremelay-agent.pub" git@github.com
+```
+
+For one git command:
+
+```sh
+GIT_SSH_COMMAND='ssh -o IdentitiesOnly=yes -o IdentityFile=$HOME/.ssh/tremelay-agent.pub -o IdentityAgent=$XDG_RUNTIME_DIR/tremelay/ssh-agent.sock' \
+  git push origin main
+```
+
+`ssh-add -L` against the Tremelay socket does not help here: a grant offers its
+key only on a connection already bound to its pinned host, so build the file
+from `KEY_ID` as above.
+
 ## Stopping it
 
 ```sh
@@ -168,6 +212,27 @@ The next signature is refused, and the key stops being listed, on the
 connection the client already has: the running daemon re-reads the vault and
 picks the revocation up without a restart. `tremelay lock`, the idle timeout,
 losing the daemon, or stopping `tremelay ssh-agent` each stop it as well.
+
+## While the daemon is locked
+
+`tremelay lock` tells the running daemon to zeroise and exit; it does not stop
+`tremelay ssh-agent`. The ssh-agent process keeps listening on its socket until
+you interrupt it. Each new SSH client connection opens its own relay to the
+daemon; after a lock there is no unlocked daemon to dial, so the relay fails
+with `no unlocked daemon is reachable` on the ssh-agent process stderr and OpenSSH reports a
+signing or permission failure (for example `Permission denied (publickey)`). Any
+relay already in progress is closed when the daemon shuts down. Restart
+`tremelay daemon`, unlock again, and leave `tremelay ssh-agent` running or
+start it again.
+
+## Slow or loaded hosts
+
+The relay waits up to ninety seconds for the daemon to finish token
+authentication and answer `OK` on a new connection. That covers SQLite
+`busy_timeout` and audit I/O when the machine is CPU- or disk-saturated. If the
+daemon still does not answer in time, the client reports a timeout — not an audit
+denial. A refused token still has no detail on the wire; inspect `daemon_auth`
+rows for the reason.
 
 ## What is audited
 

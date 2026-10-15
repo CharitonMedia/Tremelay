@@ -2,6 +2,11 @@
 
 Status: Accepted pending owner veto
 
+Amendment 2026-10-15 (#120): tag `v1.0.1` on the `main` merge commit after
+merging `v1` into `main`, not on `v1`. `v1.0.0` exists only on `main`, so only
+there is it an ancestor of the new tag; `v1` builds keep describing themselves
+from `v0.9.0-dryrun.1` until `main` is merged back into `v1`.
+
 ## Context
 
 V1.md item 6 is "install in one line": a release workflow that builds
@@ -25,7 +30,7 @@ For each of `linux`, `darwin`, `windows` × `amd64`, `arm64` it produces:
 
 | Artifact | Notes |
 | --- | --- |
-| `tremelay_<version>_<os>_<arch>[.exe]` | Inside `tar.gz`, or `zip` for windows, with `LICENSE` |
+| `tremelay_<version>_<os>_<arch>.tar.gz` / `.zip` | Contains `tremelay` (`tremelay.exe` on windows) and `LICENSE` |
 | `tremelay_<version>_<os>_<arch>.cdx.json` | CycloneDX 1.6 JSON, one per binary |
 | `SHA256SUMS` | Over all archives and SBOMs. Not a signature |
 
@@ -50,7 +55,9 @@ the publish step that would follow it.
 
 ```text
 GOTOOLCHAIN=go1.26.9 CGO_ENABLED=0 GOFLAGS=-mod=readonly GOAMD64=v1 GOARM64=v8.0
-go build -trimpath -buildvcs=false -pgo=off -o OUTPUT ./cmd/tremelay
+go build -trimpath -buildvcs=false -pgo=off \
+  -ldflags "-X main.versionOverride=VERSION -X main.vcsRevisionOverride=COMMIT_OR_EMPTY" \
+  -o OUTPUT ./cmd/tremelay
 ```
 
 This is the M11a candidate profile (docs/m11a-unsigned-linux-candidate.md)
@@ -61,8 +68,12 @@ and default architecture baselines so two builders agree.
 
 `-buildvcs=false` keeps the executable independent of git state, which is what
 makes a local `make release-dry` and the CI run comparable. The version is
-carried by the artifact names instead of the binary. `go version -m` still
-reports the module graph.
+carried by the artifact names and, since #113, by `-ldflags -X` into
+`tremelay version`. The commit is embedded the same way only when the checkout
+is clean (`git status --porcelain --untracked-files=all` empty); otherwise the
+binary names no commit. Git-ignored files are not seen by that check; CI builds
+from a fresh checkout, where there are none. Two builds of the same commit and version still agree. `go version -m`
+still reports the module graph.
 
 Archives use fixed member names, zeroed ownership and a fixed 1980-01-01
 timestamp so the archive bytes, not just the binaries, are reproducible.
@@ -117,8 +128,8 @@ download-and-verify-checksum one-liner for linux/macOS.
 - **Generate the SBOM from source (`cyclonedx-gomod mod`).** Rejected. That is
   the module graph, not what is in the shipped binary. The candidate already
   draws this distinction.
-- **Embed the version with `-ldflags -X`.** Rejected. There is no version
-  variable in `cmd/tremelay`, and adding one is out of scope for this slice.
+- **Embed the version with `-ldflags -X`.** Rejected at first (no version
+  variable existed); adopted for #113 as described above.
 
 ## Consequences
 

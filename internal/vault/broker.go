@@ -163,7 +163,12 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		}
 		call.injection = grantInjectionOf(g)
 		if injectionCollides(call.headers, call.query, call.injection) ||
-			queryParamNamed(call.query, "_method") || queryParamNamed(string(call.body), "_method") {
+			queryParamNamed(call.query, "_method") {
+			partial.Result = resultDeniedMalformed
+			return s.failExchange(partial, call.method, ErrDeniedMalformed)
+		}
+		found, malformed := bodyParamNamed(call.body, call.headers["Content-Type"], "_method")
+		if found || malformed {
 			partial.Result = resultDeniedMalformed
 			return s.failExchange(partial, call.method, ErrDeniedMalformed)
 		}
@@ -365,8 +370,13 @@ func (s *Session) finishCaptured(partial auditEvent, upstream *http.Request, pin
 	}
 	body, truncated, readErr := readTruncating(resp.Body, maxAgentBody)
 	defer wipe(body)
+	readable := brokerReadableBody(body, truncated)
+	if len(readable) < len(body) {
+		wipe(body[len(readable):])
+		body = readable
+	}
 	status, kind := responseClass(code, readErr)
-	if kind == brokerBodyOK && bodyNotText(body, truncated) {
+	if kind == brokerBodyOK && bodyNotText(body) {
 		kind = brokerBodyBad
 	}
 	if kind == brokerBodyOK && call.capture(call.injection, secret, resp.Header, body, truncated) != nil {
