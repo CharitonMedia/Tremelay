@@ -755,59 +755,23 @@ func bodyNotRedactable(status int, h http.Header) bool {
 	return status == http.StatusPartialContent || h.Get("Content-Range") != ""
 }
 
-// brokerReadableBody is the prefix of a capped upstream body used for UTF-8
-// text checks and projection. When truncated, a trailing incomplete multi-byte
-// UTF-8 rune is dropped; an illegal tail byte is not.
+// brokerReadableBody is the capped upstream body that is both checked and
+// projected. A body cut at the cap can end inside a rune, so a trailing valid
+// but incomplete multi-byte sequence is dropped; an illegal byte is a full
+// (error) rune to utf8.FullRune, so it stays and bodyNotText withholds it.
 func brokerReadableBody(body []byte, truncated bool) []byte {
 	if !truncated {
 		return body
 	}
-	return stripTruncatedIncompleteRune(body)
-}
-
-func stripTruncatedIncompleteRune(body []byte) []byte {
 	for drop := 1; drop < utf8.UTFMax && drop <= len(body); drop++ {
-		tail := body[len(body)-drop:]
-		if !isIncompleteMultiByteUTF8Prefix(tail) {
-			continue
-		}
-		prefix := body[:len(body)-drop]
-		if utf8.Valid(prefix) {
-			return prefix
+		if tail := body[len(body)-drop:]; utf8.RuneStart(tail[0]) {
+			if !utf8.FullRune(tail) {
+				return body[:len(body)-drop]
+			}
+			break
 		}
 	}
 	return body
-}
-
-func isIncompleteMultiByteUTF8Prefix(tail []byte) bool {
-	if len(tail) == 0 {
-		return false
-	}
-	want := utf8RuneLen(tail[0])
-	if want < 2 || len(tail) >= want || utf8.FullRune(tail) {
-		return false
-	}
-	for _, b := range tail[1:] {
-		if b < 0x80 || b >= 0xC0 {
-			return false
-		}
-	}
-	return true
-}
-
-func utf8RuneLen(lead byte) int {
-	switch {
-	case lead < 0xC2:
-		return 0
-	case lead < 0xE0:
-		return 2
-	case lead < 0xF0:
-		return 3
-	case lead <= 0xF4:
-		return 4
-	default:
-		return 0
-	}
 }
 
 // bodyNotText reports a body the credential scan cannot read: bytes that are
