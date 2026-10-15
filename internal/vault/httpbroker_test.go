@@ -384,6 +384,10 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 		{name: "method-override-form-body-percent", inject: InjectBearer, body: "%5F%6D%65%74%68%6F%64=DELETE"},
 		{name: "method-override-form-body-space-before", inject: InjectBearer, body: "foo=1& _method=DELETE"},
 		{name: "method-override-form-body-plus-prefix", inject: InjectBearer, body: "+_method=DELETE"},
+		{name: "method-override-form-body-after-bad-escape", inject: InjectBearer, body: "a%zz=1&_method=DELETE"},
+		{name: "method-override-form-body-json-type", inject: InjectBearer, headers: map[string]string{"Content-Type": "application/json"}, body: "%5F%6D%65%74%68%6F%64=DELETE"},
+		{name: "method-override-form-body-bad-content-type", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=a; boundary=b"}, body: "x"},
+		{name: "method-override-form-body-multipart-mixed", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/mixed; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name=\"_method\"\r\n\r\nDELETE\r\n--b--\r\n"},
 		{name: "x-forwarded-prefix", inject: InjectBearer, headers: map[string]string{"X-Forwarded-Prefix": "/admin"}},
 		{name: "x-forwarded-proto", inject: InjectBearer, headers: map[string]string{"X-Forwarded-Proto": "http"}},
 		{name: "x-forwarded-for", inject: InjectBearer, headers: map[string]string{"X-Forwarded-For": "203.0.113.5"}},
@@ -463,16 +467,21 @@ func TestBrokerAllowsOrdinaryFormBody(t *testing.T) {
 	e := newHTTPBrokerEnv(t, InjectBearer, "", http.MethodPost)
 	req := e.request(brokerTestPrefix + "/issues")
 	req.Method = http.MethodPost
-	req.Body = []byte("foo=1&bar=2")
-	req.Headers = map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
-	resp, err := e.principal.BrokerRequest(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("ordinary form body denied: %d %v", resp.StatusCode, err)
+	for _, tc := range []struct{ contentType, body string }{
+		{"application/x-www-form-urlencoded", "foo=1&bar=2"},
+		{"application/json", `{"discount":"50%","note":"a&b"}`},
+	} {
+		req.Body = []byte(tc.body)
+		req.Headers = map[string]string{"Content-Type": tc.contentType}
+		resp, err := e.principal.BrokerRequest(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("ordinary %s body denied: %d %v", tc.contentType, resp.StatusCode, err)
+		}
+		if e.seen == nil || e.seen.Method != http.MethodPost || e.seen.ContentLength != int64(len(req.Body)) {
+			t.Fatalf("upstream saw %+v", e.seen)
+		}
+		e.assertNoLeak(t)
 	}
-	if e.seen == nil || e.seen.Method != http.MethodPost || e.seen.ContentLength != int64(len(req.Body)) {
-		t.Fatalf("upstream saw %+v", e.seen)
-	}
-	e.assertNoLeak(t)
 }
 
 func gzipBytes(t *testing.T, text string) []byte {

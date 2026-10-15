@@ -616,29 +616,39 @@ func queryParamNamed(query, want string) bool {
 }
 
 // bodyParamNamed reports a _method-style override in a request body the way
-// Rack, Tomcat and Spring read form fields: urlencoded names are split on &
-// and ;, whitespace-trimmed, then +- and percent-decoded before comparison;
-// multipart/form-data part names use the same normalisation. An undecodable
-// name or an unparseable multipart body is malformed.
+// Rack, Tomcat and Spring read form fields: names are split on & and ;,
+// whitespace-trimmed, then +- and percent-decoded before comparison; multipart
+// part names use the same normalisation. For a form body (no Content-Type, or
+// application/x-www-form-urlencoded) an undecodable name is malformed, as is
+// an unparseable Content-Type or multipart body. Any other body is not read as
+// form data downstream, so only a name that decodes to want is refused there:
+// a JSON body with a stray "%" still passes.
 func bodyParamNamed(body []byte, contentType, want string) (found, malformed bool) {
 	if len(body) == 0 {
 		return false, false
 	}
-	mediaType, params, err := mime.ParseMediaType(contentType)
-	if err == nil && strings.EqualFold(mediaType, "multipart/form-data") {
+	var mediaType string
+	var params map[string]string
+	if contentType != "" {
+		var err error
+		if mediaType, params, err = mime.ParseMediaType(contentType); err != nil {
+			return false, true
+		}
+	}
+	if strings.HasPrefix(mediaType, "multipart/") {
 		return multipartParamNamed(body, params["boundary"], want)
 	}
-	return formParamNamed(string(body), want, true)
+	found, malformed = formParamNamed(string(body), want, true)
+	if mediaType != "" && mediaType != "application/x-www-form-urlencoded" {
+		malformed = false
+	}
+	return found, malformed
 }
 
+// formParamNamed scans every pair; a name that does not decode sets malformed
+// and the scan continues, so a later match is still found.
 func formParamNamed(form, want string, decodeNames bool) (found, malformed bool) {
-	if form == "" {
-		return false, false
-	}
 	for _, pair := range strings.FieldsFunc(form, func(r rune) bool { return r == '&' || r == ';' }) {
-		if pair == "" {
-			continue
-		}
 		name := pair
 		if i := strings.IndexByte(pair, '='); i >= 0 {
 			name = pair[:i]
@@ -646,16 +656,16 @@ func formParamNamed(form, want string, decodeNames bool) (found, malformed bool)
 		name = strings.TrimSpace(name)
 		if decodeNames {
 			var ok bool
-			name, ok = decodeFormParamName(name)
-			if !ok {
-				return false, true
+			if name, ok = decodeFormParamName(name); !ok {
+				malformed = true
+				continue
 			}
 		}
 		if strings.EqualFold(name, want) {
-			return true, false
+			return true, malformed
 		}
 	}
-	return false, false
+	return false, malformed
 }
 
 func decodeFormParamName(raw string) (string, bool) {
