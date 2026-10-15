@@ -618,10 +618,15 @@ func queryParamNamed(query, want string) bool {
 // bodyParamNamed reports a _method-style override in a request body the way
 // Rack, Tomcat and Spring read form fields: names are split on & and ;,
 // whitespace-trimmed, then +- and percent-decoded before comparison; multipart
-// part names use the same normalisation. For a form body (no Content-Type, or
-// application/x-www-form-urlencoded) an undecodable name is malformed, as is
-// an unparseable Content-Type or multipart body. Any other body is not read as
-// form data downstream, so only a name that decodes to want is refused there:
+// part names use the same normalisation. A multipart part whose
+// Content-Disposition carries RFC 2231 extended or continued parameters (any
+// "*" in the value) or an RFC 2047 encoded-word ("=?") is malformed: Go's
+// mime parser does not decode those, but Tomcat, Spring and others may, so the
+// effective field name can disagree with what we see. For a form body (no
+// Content-Type, or application/x-www-form-urlencoded) an undecodable name is
+// malformed, as is an unparseable Content-Type or multipart body. Any other
+// body is not read as form data downstream, so only a name that decodes to
+// want is refused there:
 // a JSON body with a stray "%" still passes.
 func bodyParamNamed(body []byte, contentType, want string) (found, malformed bool) {
 	if len(body) == 0 {
@@ -708,6 +713,11 @@ func decodeFormParamName(raw string) (string, bool) {
 	return strings.TrimSpace(decoded), true
 }
 
+// multipartParamNamed scans multipart parts for want. Any part whose
+// Content-Disposition value contains "*" (RFC 2231 extended or continued
+// name/filename parameters) or "=?" (RFC 2047 encoded-words) is malformed
+// before name comparison: we do not decode those forms, but upstream servers
+// may, so the effective name can spell want while Go sees a decoy or nothing.
 func multipartParamNamed(body []byte, boundary, want string) (found, malformed bool) {
 	if boundary == "" {
 		return false, true
@@ -728,16 +738,15 @@ func multipartParamNamed(body []byte, boundary, want string) (found, malformed b
 		if len(dispositions) == 0 {
 			continue
 		}
-		_, dparams, err := mime.ParseMediaType(dispositions[0])
+		raw := dispositions[0]
+		if strings.Contains(raw, "*") || strings.Contains(raw, "=?") {
+			return false, true
+		}
+		_, dparams, err := mime.ParseMediaType(raw)
 		if len(dispositions) > 1 || err != nil {
 			return false, true
 		}
-		// Go drops an RFC 2231 name* in a charset it does not know; Tomcat
-		// decodes it. A part whose name we could not read is malformed.
 		name := dparams["name"]
-		if name == "" && strings.Contains(dispositions[0], "*") {
-			return false, true
-		}
 		// Multipart names are not form-urlencoded: no parser decodes them.
 		if paramNameIs(name, want) {
 			return true, false

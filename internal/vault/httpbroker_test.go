@@ -472,6 +472,13 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 		{name: "method-override-form-body-json-suffix-type", inject: InjectBearer, headers: map[string]string{"Content-Type": "application/foo+json+xml"}, body: `{"_method":"DELETE"}`},
 		{name: "method-override-form-body-json-param-type", inject: InjectBearer, headers: map[string]string{"Content-Type": `text/plain; x="/json"`}, body: `{"_method":"DELETE"}`},
 		{name: "method-override-form-body-multipart-rfc2231-latin1", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name*=iso-8859-1''_method\r\n\r\nDELETE\r\n--b--\r\n"},
+		{name: "method-override-form-body-multipart-rfc2231-decoy-name", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name=\"x\"; name*=UTF-8''_method\r\n\r\nDELETE\r\n--b--\r\n"},
+		{name: "method-override-form-body-multipart-rfc2231-unknown-charset", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name*=x-unknown''_method\r\n\r\nDELETE\r\n--b--\r\n"},
+		{name: "method-override-form-body-multipart-rfc2231-continuation-star", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name*0*=UTF-8''%5F; name*1*=method\r\n\r\nDELETE\r\n--b--\r\n"},
+		{name: "method-override-form-body-multipart-rfc2231-continuation", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name*0=safe; name*1=_method\r\n\r\nDELETE\r\n--b--\r\n"},
+		{name: "method-override-form-body-multipart-rfc2047-q", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name=\"=?UTF-8?Q?=5Fmethod?=\"\r\n\r\nDELETE\r\n--b--\r\n"},
+		{name: "method-override-form-body-multipart-rfc2047-b", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name=\"=?UTF-8?B?X21ldGhvZA==?=\"\r\n\r\nDELETE\r\n--b--\r\n"},
+		{name: "method-override-form-body-multipart-rfc2231-filename-only", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=b"}, body: "--b\r\nContent-Disposition: form-data; name=\"field\"; filename*=UTF-8''a.txt\r\n\r\nx\r\n--b--\r\n"},
 		{name: "method-override-form-body-after-bad-escape", inject: InjectBearer, body: "a%zz=1&_method=DELETE"},
 		{name: "method-override-form-body-json-type", inject: InjectBearer, headers: map[string]string{"Content-Type": "application/json"}, body: "%5F%6D%65%74%68%6F%64=DELETE"},
 		{name: "method-override-form-body-bad-content-type", inject: InjectBearer, headers: map[string]string{"Content-Type": "multipart/form-data; boundary=a; boundary=b"}, body: "x"},
@@ -558,7 +565,7 @@ func TestBrokerAllowsOrdinaryFormBody(t *testing.T) {
 	for _, tc := range []struct{ contentType, body string }{
 		{"application/x-www-form-urlencoded", "foo=1&bar=2"},
 		{"application/json", `{"discount":"50%","note":"a&b"}`},
-		{"multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"100%\"; filename*=UTF-8''r%C3%A9sum%C3%A9.txt\r\n\r\nx\r\n--b--\r\n"},
+		{"multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"field\"; filename=\"a.txt\"\r\n\r\nx\r\n--b--\r\n"},
 	} {
 		req.Body = []byte(tc.body)
 		req.Headers = map[string]string{"Content-Type": tc.contentType}
