@@ -32,7 +32,12 @@ func grantCreateAuditReason(err error) string {
 
 func knownGrantCreateReason(s string) bool {
 	switch s {
-	case ReasonResourceHTTPS, ReasonResourcePublicHost, ReasonResourcePrivateHost:
+	case ReasonResourceHTTPS, ReasonResourcePublicHost, ReasonResourcePrivateHost,
+		ReasonAgentRequired, ReasonCredentialRequired, ReasonCredentialConflict,
+		ReasonOperationRequired, ReasonUnknownOperation, ReasonDuplicateOperation, ReasonOperationInvalid,
+		ReasonResourceRequired, ReasonResourceInvalid,
+		ReasonExpiresRequired, ReasonExpiresInvalid, ReasonExpiresNotFuture,
+		ReasonUnknownClass, ReasonInvalidCredentialID, ReasonSSHHostKeyInvalid, ReasonGrantExtraArgs:
 		return true
 	default:
 		return false
