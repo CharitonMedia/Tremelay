@@ -1229,6 +1229,21 @@ func TestMCPReviewFixes(t *testing.T) {
 	})
 }
 
+// mcpTransportFailure reports client/session teardown before a tool call finished.
+// A missing denial under transport death is not a policy failure.
+func mcpTransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection closed") ||
+		strings.Contains(msg, "client is closing") ||
+		strings.Contains(msg, "EOF")
+}
+
 // Sequential success fixtures wait for the host-side delivery transition.
 // A generic writer can return after the client sees the bytes. These helpers
 // never replay a request; the dedicated lifecycle tests exercise that interval.
