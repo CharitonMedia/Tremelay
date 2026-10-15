@@ -17,8 +17,12 @@ import (
 // does not cut off token authentication and audit under load (issue #110).
 func TestDaemonHandshakeCompletesWhenAuthSlow(t *testing.T) {
 	const slow = 12 * time.Second
-	vault.SetAuthenticateAgentTokenDelay(slow)
-	t.Cleanup(func() { vault.SetAuthenticateAgentTokenDelay(0) })
+	auth := daemonAuthenticate
+	daemonAuthenticate = func(s *vault.Session, token []byte) (*vault.AgentPrincipal, error) {
+		time.Sleep(slow)
+		return auth(s, token)
+	}
+	t.Cleanup(func() { daemonAuthenticate = auth })
 
 	f := startDaemon(t, time.Hour)
 	worker := f.agents[0]

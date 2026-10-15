@@ -49,6 +49,9 @@ const (
 // heavy CPU contention; issue #110 saw multi-second handshakes on a loaded host.
 var daemonHandshakeWait = 90 * time.Second
 
+// daemonAuthenticate is a seam so tests can make authentication slow.
+var daemonAuthenticate = (*vault.Session).AuthenticateAgentToken
+
 var (
 	errDaemonEndpoint         = errors.New("daemon endpoint must be a user-only directory and socket this user owns")
 	errDaemonRunning          = errors.New("a daemon is already serving this endpoint")
@@ -224,7 +227,7 @@ func (d *daemon) handle(conn net.Conn) {
 		d.requestLock()
 		return
 	}
-	principal, err := d.session.AuthenticateAgentToken(token)
+	principal, err := daemonAuthenticate(d.session, token)
 	vault.Wipe(token)
 	if err != nil {
 		// Accepted, wrong-token, and inactive-agent attempts are all audited

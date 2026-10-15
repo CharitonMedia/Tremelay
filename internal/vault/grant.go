@@ -365,9 +365,6 @@ func (s *Session) AuthenticateAgentToken(token []byte) (*AgentPrincipal, error) 
 		return nil, err
 	}
 	defer s.end()
-	if authenticateAgentTokenDelay > 0 {
-		time.Sleep(authenticateAgentTokenDelay)
-	}
 	sum := sha256.Sum256(token)
 	defer wipe(sum[:])
 	matched, active, gen := "", false, uint64(0)
