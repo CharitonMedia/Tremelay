@@ -16,6 +16,18 @@ go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.1
 
 Note that absolute path. MCP configs expand nothing and rarely search `PATH`.
 
+### Install as an MCP Bundle
+
+Releases also ship `tremelay-mcp_<version>_<os>_<arch>.mcpb` (one bundle per
+platform; MCP Bundles do not pick CPU architecture for you). Download the file
+for your machine from the [GitHub
+Release](https://github.com/CharitonMedia/Tremelay/releases), verify it against
+`SHA256SUMS` on the same release, then open the bundle in a client that supports
+MCP Bundles (for example Claude Desktop). The installer asks only for the agent
+token file path (`tremelay agent create --token-file`); it never asks for your
+vault passphrase or any other secret. Unlock the vault yourself first in a
+separate terminal: `tremelay daemon --vault PATH`.
+
 ## 2. Vault, credential, agent, grant
 
 Each command asks for your vault passphrase and prints one audit line to
