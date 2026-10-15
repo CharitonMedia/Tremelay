@@ -25,7 +25,7 @@ For each of `linux`, `darwin`, `windows` × `amd64`, `arm64` it produces:
 
 | Artifact | Notes |
 | --- | --- |
-| `tremelay_<version>_<os>_<arch>[.exe]` | Inside `tar.gz`, or `zip` for windows, with `LICENSE` |
+| `tremelay_<version>_<os>_<arch>.tar.gz` / `.zip` | Contains `tremelay` (`tremelay.exe` on windows) and `LICENSE` |
 | `tremelay_<version>_<os>_<arch>.cdx.json` | CycloneDX 1.6 JSON, one per binary |
 | `SHA256SUMS` | Over all archives and SBOMs. Not a signature |
 

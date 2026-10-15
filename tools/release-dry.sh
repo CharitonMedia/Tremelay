@@ -49,40 +49,51 @@ rm -rf "$out"
 mkdir -p "$stage"
 cd "$root"
 
+revision=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
+ldflags=
+if [ -n "$revision" ]; then
+	ldflags="-X main.versionOverride=$version -X main.vcsRevisionOverride=$revision"
+fi
+
 for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
 	os=${target%/*}
 	arch=${target#*/}
 	exe=
 	case $os in windows) exe=.exe ;; esac
 	name="tremelay_${version}_${os}_${arch}"
+	bin="tremelay$exe"
 
-	GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false -pgo=off -o "$stage/$name$exe" ./cmd/tremelay
+	if [ -n "$ldflags" ]; then
+		GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false -pgo=off -ldflags "$ldflags" -o "$stage/$bin" ./cmd/tremelay
+	else
+		GOOS=$os GOARCH=$arch go build -trimpath -buildvcs=false -pgo=off -o "$stage/$bin" ./cmd/tremelay
+	fi
 	cp LICENSE "$stage/LICENSE"
 	# bin mode reads the executable's build information; it does not run it.
 	(cd tools && go tool cyclonedx-gomod bin -json -output-version 1.6 -std \
 		-noserial -notimestamp -version "$version" \
-		-output "$out/$name.cdx.json" "$stage/$name$exe")
+		-output "$out/$name.cdx.json" "$stage/$bin")
 
 	# Fixed names, owners, modes and timestamps keep the archives
 	# byte-identical: zip stores the unix mode, which follows the umask.
-	chmod 0755 "$stage/$name$exe"
+	chmod 0755 "$stage/$bin"
 	chmod 0644 "$stage/LICENSE"
-	TZ=UTC touch -t 198001010000 "$stage/$name$exe" "$stage/LICENSE"
+	TZ=UTC touch -t 198001010000 "$stage/$bin" "$stage/LICENSE"
 	case $os in
 	windows)
-		(cd "$stage" && TZ=UTC zip -qX9 "$out/$name.zip" "$name$exe" LICENSE)
+		(cd "$stage" && TZ=UTC zip -qX9 "$out/$name.zip" "$bin" LICENSE)
 		;;
 	*)
 		# Inside $out, so a failed run leaves nothing behind in TMPDIR and
 		# the next run's rm -rf clears it.
 		tar_tmp=$out/.tar.tmp
 		tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@315532800 \
-			-C "$stage" -cf "$tar_tmp" "$name$exe" LICENSE
+			-C "$stage" -cf "$tar_tmp" "$bin" LICENSE
 		gzip -n9 -c "$tar_tmp" >"$out/$name.tar.gz"
 		rm -f "$tar_tmp"
 		;;
 	esac
-	rm -f "$stage/$name$exe" "$stage/LICENSE"
+	rm -f "$stage/$bin" "$stage/LICENSE"
 done
 
 rmdir "$stage"
