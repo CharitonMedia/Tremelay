@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
@@ -171,6 +172,93 @@ func TestAgentTokenFileMode(t *testing.T) {
 	}
 	if _, err := readAgentToken(path); err != errAgentToken {
 		t.Fatalf("group-readable token file accepted: %v", err)
+	}
+}
+
+// TestDaemonSocketPathTooLong reports the Unix sun_path limit instead of the
+// generic custody refusal when the default endpoint path cannot fit.
+func TestDaemonSocketPathTooLong(t *testing.T) {
+	longRun := socketDir(t)
+	for len(filepath.Join(longRun, "tremelay", daemonSocketName)) <= unixSunPathBytes-1 {
+		longRun = filepath.Join(longRun, "x")
+		if err := os.MkdirAll(longRun, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _, err := daemonListen(envGet(map[string]string{"XDG_RUNTIME_DIR": longRun}))
+	if err == nil {
+		t.Fatal("expected refusal for an overlong default socket path")
+	}
+	if !strings.Contains(err.Error(), "daemon socket path is too long") ||
+		!strings.Contains(err.Error(), daemonSocketEnv) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), errDaemonEndpoint.Error()) {
+		t.Fatalf("custody error masks path length: %v", err)
+	}
+}
+
+// TestDaemonSocketEnvOverride uses a short absolute socket when the default
+// path would be too long.
+func TestDaemonSocketEnvOverride(t *testing.T) {
+	longRun := socketDir(t)
+	for len(filepath.Join(longRun, "tremelay", daemonSocketName)) <= unixSunPathBytes-1 {
+		longRun = filepath.Join(longRun, "x")
+		if err := os.MkdirAll(longRun, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	short := filepath.Join(socketDir(t), "daemon.sock")
+	env := map[string]string{
+		"XDG_RUNTIME_DIR": longRun,
+		daemonSocketEnv:   short,
+	}
+	getenv := envGet(env)
+	listener, endpoint, err := daemonListen(getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if endpoint != short {
+		t.Fatalf("endpoint %q, want %q", endpoint, short)
+	}
+	conn, err := daemonDial(getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+}
+
+// TestDaemonSocketEnvRelativeRefused rejects a non-absolute override before listen.
+func TestDaemonSocketEnvRelativeRefused(t *testing.T) {
+	_, _, err := daemonListen(envGet(map[string]string{daemonSocketEnv: "relative.sock"}))
+	if err != errDaemonSocketRelative {
+		t.Fatalf("relative override: %v", err)
+	}
+}
+
+// TestDaemonSocketEnvInsecureDir still applies custody checks to the override path.
+func TestDaemonSocketEnvInsecureDir(t *testing.T) {
+	open := socketDir(t)
+	if err := os.Chmod(open, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(open, "daemon.sock")
+	_, _, err := daemonListen(envGet(map[string]string{daemonSocketEnv: socket}))
+	if err != errDaemonEndpoint {
+		t.Fatalf("insecure override directory: %v", err)
+	}
+}
+
+// TestSSHAgentSocketPathTooLong applies the same limit to --socket paths.
+func TestSSHAgentSocketPathTooLong(t *testing.T) {
+	tooLong := "/" + strings.Repeat("a", unixSunPathBytes)
+	_, err := listenUserSocket(tooLong)
+	if err == nil {
+		t.Fatal("expected refusal")
+	}
+	if !strings.Contains(err.Error(), "daemon socket path is too long") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

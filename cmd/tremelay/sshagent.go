@@ -62,7 +62,7 @@ func serveSSHAgentSocket(ctx context.Context, getenv func(string) string, tokenF
 	// daemon this socket can never sign anything.
 	probe, err := daemonDial(getenv)
 	if err != nil {
-		return fail(errDaemonReach.Error())
+		return fail(daemonDialDiagnostic(err))
 	}
 	probe.Close()
 	listener, err := listenUserSocket(socket)

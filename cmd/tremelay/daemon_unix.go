@@ -15,6 +15,14 @@ const (
 	sshAgentSocketName = "ssh-agent.sock"
 )
 
+func checkUnixSocketPathLen(path string) error {
+	max := unixSunPathBytes - 1
+	if n := len(path); n > max {
+		return &daemonSocketTooLongError{n: n, limit: max}
+	}
+	return nil
+}
+
 // daemonDir is the user-only directory that holds the endpoint. XDG_RUNTIME_DIR
 // is already a per-user directory the OS clears on logout; the fallback is a
 // uid-named directory this process creates and checks itself.
@@ -27,8 +35,24 @@ func daemonDir(getenv func(string) string) string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("tremelay-%d", os.Getuid()))
 }
 
-func daemonEndpoint(getenv func(string) string) string {
-	return filepath.Join(daemonDir(getenv), daemonSocketName)
+// daemonEndpoint is the Unix domain socket both daemon and clients use.
+func daemonEndpoint(getenv func(string) string) (string, error) {
+	if getenv != nil {
+		if override := getenv(daemonSocketEnv); override != "" {
+			if !filepath.IsAbs(override) {
+				return "", errDaemonSocketRelative
+			}
+			if err := checkUnixSocketPathLen(override); err != nil {
+				return "", err
+			}
+			return override, nil
+		}
+	}
+	path := filepath.Join(daemonDir(getenv), daemonSocketName)
+	if err := checkUnixSocketPathLen(path); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // sshAgentDefaultSocket sits beside the daemon endpoint, in the same
@@ -38,7 +62,10 @@ func sshAgentDefaultSocket(getenv func(string) string) string {
 }
 
 func daemonListen(getenv func(string) string) (net.Listener, string, error) {
-	path := daemonEndpoint(getenv)
+	path, err := daemonEndpoint(getenv)
+	if err != nil {
+		return nil, "", err
+	}
 	listener, err := listenUserSocket(path)
 	if err != nil {
 		return nil, "", err
@@ -52,6 +79,9 @@ func daemonListen(getenv func(string) string) (net.Listener, string, error) {
 func listenUserSocket(path string) (net.Listener, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errDaemonEndpoint
+	}
+	if err := checkUnixSocketPathLen(path); err != nil {
+		return nil, err
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -89,10 +119,17 @@ func listenUserSocket(path string) (net.Listener, error) {
 // this uid. Without XDG_RUNTIME_DIR the endpoint is under the shared temp dir,
 // where another user can create the path first.
 func daemonDial(getenv func(string) string) (net.Conn, error) {
-	return dialSelf(daemonEndpoint(getenv), os.Getuid())
+	path, err := daemonEndpoint(getenv)
+	if err != nil {
+		return nil, err
+	}
+	return dialSelf(path, os.Getuid())
 }
 
 func dialSelf(path string, self int) (net.Conn, error) {
+	if err := checkUnixSocketPathLen(path); err != nil {
+		return nil, err
+	}
 	conn, err := net.Dial("unix", path)
 	if err != nil {
 		return nil, err

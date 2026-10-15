@@ -168,13 +168,23 @@ nothing else: no credential, no grant, and nothing derived from the token.
 
 ## Endpoint custody
 
-On Linux and macOS the socket lives in `$XDG_RUNTIME_DIR/tremelay`, or
-`tremelay-<uid>` under the system temporary directory when that variable is
-unset. The directory is 0700 and the socket is 0600, both verified at startup:
+On Linux and macOS the socket lives in `$XDG_RUNTIME_DIR/tremelay/daemon.sock`,
+or `tremelay-<uid>/daemon.sock` under the system temporary directory when that
+variable is unset. Unix domain sockets cannot use paths longer than about 107
+bytes on Linux (104 bytes on macOS, counting the terminating NUL in the kernel
+limit). When the default path would exceed that limit — for example a very long
+`XDG_RUNTIME_DIR` — startup reports that the path is too long instead of a
+misleading permissions error. Set `TREMELAY_DAEMON_SOCKET` to a shorter absolute
+path; `tremelay daemon`, `tremelay mcp --daemon`, `tremelay lock`, and
+`tremelay ssh-agent` all read the same variable when connecting to the daemon.
+Relative values are refused. The directory is 0700 and the socket is 0600, both
+verified at startup:
 a path owned by another user, of the wrong type, or readable by group or other
 refuses to start, and a socket that still answers a dial is treated as a live
 daemon rather than replaced. Every connection's peer uid must equal the
 daemon's before any byte is read.
+
+`TREMELAY_DAEMON_SOCKET` is Unix-only; Windows always uses the named pipe below.
 
 On Windows the endpoint is the named pipe `\\.\pipe\tremelay-<your SID>`. It is
 created with a descriptor you own that grants read and write to your SID and to
