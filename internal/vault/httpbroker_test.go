@@ -323,6 +323,29 @@ func TestBrokerWithholdsTruncatedIllegalTailByte(t *testing.T) {
 	e.assertNoLeak(t, err.Error())
 }
 
+// TestBrokerWithholdsTruncatedDoubleCutTail: only one cut rune is forgiven, so
+// a credential prefix followed by two incomplete sequences is withheld.
+func TestBrokerWithholdsTruncatedDoubleCutTail(t *testing.T) {
+	for _, tail := range [][]byte{{0xe2, 0xe2}, {0xe2, 0x82, 0xe2}, {0xf0, 0x9f, 0x98, 0xe2}} {
+		e := newHTTPBrokerEnv(t, InjectBearer, "")
+		prefix := e.secret[:len(e.secret)-1]
+		lead := maxAgentBody - len(prefix) - len(tail)
+		e.handler = func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(bytes.Repeat([]byte("x"), lead))
+			_, _ = w.Write(prefix)
+			_, _ = w.Write(tail)
+			_, _ = w.Write([]byte("z"))
+		}
+		resp, err := e.principal.BrokerRequest(e.request(brokerTestPrefix))
+		if !errors.Is(err, ErrBrokerUpstream) || resp.Body != nil {
+			t.Fatalf("tail % x projected: %+v %v", tail, resp, err)
+		}
+		e.assertNoLeak(t, err.Error())
+	}
+}
+
 // TestBrokerProjectsTruncatedMidRuneBody drops only an incomplete UTF-8 rune
 // at the cap, not arbitrary illegal bytes.
 func TestBrokerProjectsTruncatedMidRuneBody(t *testing.T) {

@@ -781,8 +781,11 @@ func brokerReadableBody(body []byte, truncated bool) []byte {
 // is withheld rather than projected unscanned. An upstream that still wants to
 // hand the agent the credential can encode it as text; that residual is ADR
 // 0025's, and no byte-level check closes it.
-func bodyNotText(body []byte, truncated bool) bool {
-	body = brokerReadableBody(body, truncated)
+//
+// The caller passes the bytes it will project, already through
+// brokerReadableBody; trimming again here would judge fewer bytes than the
+// agent receives.
+func bodyNotText(body []byte) bool {
 	if bytes.IndexByte(body, 0) >= 0 {
 		return true
 	}

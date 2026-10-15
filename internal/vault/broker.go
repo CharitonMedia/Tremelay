@@ -371,7 +371,7 @@ func (s *Session) finishCaptured(partial auditEvent, upstream *http.Request, pin
 		body = readable
 	}
 	status, kind := responseClass(code, readErr)
-	if kind == brokerBodyOK && bodyNotText(body, truncated) {
+	if kind == brokerBodyOK && bodyNotText(body) {
 		kind = brokerBodyBad
 	}
 	if kind == brokerBodyOK && call.capture(call.injection, secret, resp.Header, body, truncated) != nil {
