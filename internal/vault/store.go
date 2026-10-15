@@ -725,7 +725,7 @@ func readAuditRowsMode(db queryer, legacy bool) ([]auditEvent, error) {
 			return nil, ErrCorrupt
 		}
 		if inferVersion {
-			ev.V = auditVersionFor(ev.Action)
+			ev.V = auditVersionForEvent(ev)
 		}
 		if seq <= 0 || ref < 0 || gen < 0 || !knownAuditVersion(ev.V) {
 			return nil, ErrAudit
@@ -926,7 +926,7 @@ func readAuditTip(tx *sql.Tx) (auditEvent, error) {
 	err := tx.QueryRow(`SELECT seq, time, action, vault_id, credential_id, credential_type, result, prev_hash, hash, agent_id, grant_id, operation, v, class, ref_seq, reasons, cred_gen, actor_id, org_id, target_id, request_id, decision FROM audit ORDER BY seq DESC LIMIT 1`).Scan(
 		&seq, &ev.Time, &ev.Action, &ev.VaultID, &ev.CredID, &ev.CredType, &ev.Result, &ev.Prev, &ev.Hash, &ev.AgentID, &ev.GrantID, &ev.Operation, &ev.V, &ev.Class, &ref, &ev.Reasons, &gen, &ev.ActorID, &ev.OrgID, &ev.TargetID, &ev.RequestID, &ev.Decision,
 	)
-	if err != nil || seq <= 0 || ref < 0 || gen < 0 || ev.V != auditVersionFor(ev.Action) {
+	if err != nil || seq <= 0 || ref < 0 || gen < 0 || ev.V != auditVersionForEvent(ev) {
 		return auditEvent{}, ErrAudit
 	}
 	ev.Seq = uint64(seq)

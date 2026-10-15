@@ -48,6 +48,10 @@ tremelay agent create --path "$HOME/.tremelay/vault.db" --label claude-code \
 That prints the agent id and then the token path, on two lines — note the id.
 The token itself is never printed, and the file is created 0600.
 
+An `http_broker` resource must be `https` with a public DNS hostname (at least
+two labels, lowercase). IP literals, loopback, and private or special-use names
+such as `localhost` or `*.internal` are refused.
+
 ```sh
 tremelay grant create --path "$HOME/.tremelay/vault.db" \
   --agent AGENT_ID --credential "$CRED" \
