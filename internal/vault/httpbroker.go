@@ -349,8 +349,8 @@ func brokerGrantOK(ops []string, spec GrantSpec) error {
 	if spec.CredentialClass != "" || spec.CredentialID == "" || spec.SSHUsername != "" || len(spec.SSHHostKey) != 0 {
 		return ErrInvalid
 	}
-	if _, _, _, ok := brokerScope(spec.Resource); !ok {
-		return ErrInvalid
+	if err := brokerGrantResourcePolicy(spec.Resource); err != nil {
+		return err
 	}
 	if _, ok := canonicalMethods(spec.HTTPMethods); !ok {
 		return ErrInvalid

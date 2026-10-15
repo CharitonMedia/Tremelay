@@ -439,6 +439,9 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 	}
 	deny := func(cause error) (Grant, error) {
 		partial := auditEvent{Action: actionGrantCreate, Result: resultDenied, AgentID: agentID}
+		if reason := grantCreateAuditReason(cause); reason != "" {
+			partial.Reasons = reason
+		}
 		if err := s.writeAudit(partial, s.creds, s.agents, s.grants); err != nil {
 			return Grant{}, err
 		}
