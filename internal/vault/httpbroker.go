@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"slices"
@@ -605,20 +607,91 @@ func injectionCollides(headers map[string]string, query string, inj grantInjecti
 	return false
 }
 
-// queryParamNamed reports a form-encoded parameter with this name. It reads a
-// query string and a form request body alike: Rack and Spring take `_method`
-// from either, and retarget the method of a POST with it.
+// queryParamNamed reports a form-encoded parameter with this name in a query
+// string. The query has already been refused if it carries percent-encoding or
+// spaces, so names are compared literally aside from & and ; separators.
 func queryParamNamed(query, want string) bool {
-	for _, pair := range strings.Split(query, "&") {
+	found, _ := formParamNamed(query, want, false)
+	return found
+}
+
+// bodyParamNamed reports a _method-style override in a request body the way
+// Rack, Tomcat and Spring read form fields: urlencoded names are split on &
+// and ;, whitespace-trimmed, then +- and percent-decoded before comparison;
+// multipart/form-data part names use the same normalisation. An undecodable
+// name or an unparseable multipart body is malformed.
+func bodyParamNamed(body []byte, contentType, want string) (found, malformed bool) {
+	if len(body) == 0 {
+		return false, false
+	}
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err == nil && strings.EqualFold(mediaType, "multipart/form-data") {
+		return multipartParamNamed(body, params["boundary"], want)
+	}
+	return formParamNamed(string(body), want, true)
+}
+
+func formParamNamed(form, want string, decodeNames bool) (found, malformed bool) {
+	if form == "" {
+		return false, false
+	}
+	for _, pair := range strings.FieldsFunc(form, func(r rune) bool { return r == '&' || r == ';' }) {
+		if pair == "" {
+			continue
+		}
 		name := pair
 		if i := strings.IndexByte(pair, '='); i >= 0 {
 			name = pair[:i]
 		}
+		name = strings.TrimSpace(name)
+		if decodeNames {
+			var ok bool
+			name, ok = decodeFormParamName(name)
+			if !ok {
+				return false, true
+			}
+		}
 		if strings.EqualFold(name, want) {
-			return true
+			return true, false
 		}
 	}
-	return false
+	return false, false
+}
+
+func decodeFormParamName(raw string) (string, bool) {
+	decoded, err := url.QueryUnescape(strings.TrimSpace(raw))
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(decoded), true
+}
+
+func multipartParamNamed(body []byte, boundary, want string) (found, malformed bool) {
+	if boundary == "" {
+		return false, true
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return false, true
+		}
+		name := p.FormName()
+		if name == "" {
+			continue
+		}
+		decoded, ok := decodeFormParamName(name)
+		if !ok {
+			return false, true
+		}
+		if strings.EqualFold(decoded, want) {
+			return true, false
+		}
+	}
+	return false, false
 }
 
 func applyAgentHeaders(r *http.Request, headers map[string]string) {

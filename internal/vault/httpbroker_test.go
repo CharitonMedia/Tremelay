@@ -13,6 +13,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -380,6 +381,9 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 		{name: "method-override-query-folded", inject: InjectBearer, query: "a=1&_METHOD=PATCH"},
 		{name: "method-override-form-body", inject: InjectBearer, body: "foo=1&_method=DELETE"},
 		{name: "method-override-form-body-folded", inject: InjectBearer, body: "_Method=PATCH"},
+		{name: "method-override-form-body-percent", inject: InjectBearer, body: "%5F%6D%65%74%68%6F%64=DELETE"},
+		{name: "method-override-form-body-space-before", inject: InjectBearer, body: "foo=1& _method=DELETE"},
+		{name: "method-override-form-body-plus-prefix", inject: InjectBearer, body: "+_method=DELETE"},
 		{name: "x-forwarded-prefix", inject: InjectBearer, headers: map[string]string{"X-Forwarded-Prefix": "/admin"}},
 		{name: "x-forwarded-proto", inject: InjectBearer, headers: map[string]string{"X-Forwarded-Proto": "http"}},
 		{name: "x-forwarded-for", inject: InjectBearer, headers: map[string]string{"X-Forwarded-For": "203.0.113.5"}},
@@ -422,6 +426,53 @@ func TestBrokerRefusesHeaderSmuggling(t *testing.T) {
 			e.assertNoLeak(t, err.Error())
 		})
 	}
+}
+
+// TestBrokerRefusesMethodOverrideMultipartBody refuses a multipart part named
+// _method before DNS or upstream, the way Tomcat and Spring read it.
+func TestBrokerRefusesMethodOverrideMultipartBody(t *testing.T) {
+	e := newHTTPBrokerEnv(t, InjectBearer, "", http.MethodPost)
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	if err := w.WriteField("_method", "DELETE"); err != nil {
+		t.Fatal(err)
+	}
+	contentType := w.FormDataContentType()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := e.request(brokerTestPrefix + "/issues")
+	req.Method = http.MethodPost
+	req.Body = buf.Bytes()
+	req.Headers = map[string]string{"Content-Type": contentType}
+	resp, err := e.principal.BrokerRequest(req)
+	if err == nil || resp.StatusCode != 0 {
+		t.Fatalf("multipart _method was accepted: %d %v", resp.StatusCode, err)
+	}
+	if e.requests != 0 || e.lookups != 0 {
+		t.Fatalf("multipart _method resolved or reached upstream: lookups %d requests %d", e.lookups, e.requests)
+	}
+	if !errors.Is(err, ErrDeniedMalformed) || e.lastResult(t) != resultDeniedMalformed {
+		t.Fatalf("error %v audit %s", err, e.lastResult(t))
+	}
+	e.assertNoLeak(t, err.Error())
+}
+
+// TestBrokerAllowsOrdinaryFormBody keeps a normal urlencoded POST body.
+func TestBrokerAllowsOrdinaryFormBody(t *testing.T) {
+	e := newHTTPBrokerEnv(t, InjectBearer, "", http.MethodPost)
+	req := e.request(brokerTestPrefix + "/issues")
+	req.Method = http.MethodPost
+	req.Body = []byte("foo=1&bar=2")
+	req.Headers = map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
+	resp, err := e.principal.BrokerRequest(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("ordinary form body denied: %d %v", resp.StatusCode, err)
+	}
+	if e.seen == nil || e.seen.Method != http.MethodPost || e.seen.ContentLength != int64(len(req.Body)) {
+		t.Fatalf("upstream saw %+v", e.seen)
+	}
+	e.assertNoLeak(t)
 }
 
 func gzipBytes(t *testing.T, text string) []byte {

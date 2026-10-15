@@ -104,9 +104,17 @@ Refused, before DNS and before any secret is copied: `Authorization`,
 hop-by-hop names (`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`,
 `Trailer`, `Trailers`, `Upgrade`), the grant's own named injection header,
 any `_method` parameter (case-insensitive) in the query or in the request
-body, because Rack and Spring read it from either and retarget the method of
-a POST with it, and — for query injection — any query parameter with the
-grant's parameter name.
+body — in the query as a literal name (percent-encoding and spaces are
+already refused on the query string); in an
+`application/x-www-form-urlencoded` body or any other non-multipart body
+the broker scans as form data, by splitting on `&` and `;`, trimming
+separator whitespace, `+`- and percent-decoding each parameter name (an
+undecodable name is `denied_malformed`), then comparing; in
+`multipart/form-data`, by the same case-insensitive name match on each part
+name (an unparseable multipart body is `denied_malformed`) — because Rack,
+Tomcat and Spring read it from either and retarget the method of a POST with
+it, and — for query injection — any query parameter with the grant's
+parameter name.
 
 `Accept-Encoding`, `Range` and `If-Range` are refused for the same reason as
 the framing headers: they choose the *form* of the response bytes, and
