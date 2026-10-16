@@ -1,6 +1,6 @@
 # M11a — unsigned Linux CLI candidate
 
-M11a builds one unsigned linux/amd64 `tremelay` human CLI and a local evidence directory. It does not publish a release, sign a binary, or complete M9, M10, or M11. Tremelay is pre-release security software and should not yet be trusted with production credentials.
+M11a builds one unsigned linux/amd64 `tremelay` human CLI and a local evidence directory. It does not publish a release, sign a binary, or complete M9, M10, or M11.
 
 The profile is Go 1.26.9, `GOOS=linux`, `GOARCH=amd64`, `GOAMD64=v1`, `CGO_ENABLED=0`, and:
 

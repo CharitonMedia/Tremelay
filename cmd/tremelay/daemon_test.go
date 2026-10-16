@@ -305,7 +305,10 @@ func (r *agentRelay) finish(t *testing.T) int {
 	case code := <-r.exit:
 		r.rest = <-drained
 		return code
-	case <-time.After(15 * time.Second):
+	// Only a hang waits this long. TestDaemonHandshakeCompletesWhenAuthSlow
+	// spends 12s in auth inside this window, so 15s left a loaded Windows
+	// runner 3s for everything else (#131).
+	case <-time.After(45 * time.Second):
 		t.Fatal("relay did not exit")
 	}
 	return -1

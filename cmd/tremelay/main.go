@@ -17,6 +17,7 @@ import (
 )
 
 func main() {
+	vault.ServerVersion, _, _ = versionFromBuildInfo()
 	os.Exit(run(os.Args[1:], os.Getenv, os.Stdin, os.Stdout, os.Stderr))
 }
 
