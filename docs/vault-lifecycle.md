@@ -1,7 +1,6 @@
 # Human vault lifecycle commands
 
-Tremelay is pre-release security software. Use disposable local test vaults;
-do not put production credentials in it yet. These commands are human host-custody
+These commands are human host-custody
 operations. They do not add agent raw-secret access or lost-passphrase recovery.
 
 ## Change a passphrase
