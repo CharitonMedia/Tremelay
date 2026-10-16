@@ -94,6 +94,9 @@ func TestMCPSyntheticDemo(t *testing.T) {
 	if sess.cs.InitializeResult() == nil || sess.cs.InitializeResult().ProtocolVersion != mcpProtocolRevision {
 		t.Fatalf("negotiated %+v", sess.cs.InitializeResult())
 	}
+	if info := sess.cs.InitializeResult().ServerInfo; info == nil || info.Name != "tremelay-local-mcp" || info.Version != ServerVersion {
+		t.Fatalf("serverInfo %+v", info)
+	}
 	caps := sess.cs.InitializeResult().Capabilities
 	if caps == nil || caps.Tools == nil || caps.Tools.ListChanged || caps.Logging != nil || caps.Prompts != nil || caps.Resources != nil || caps.Completions != nil {
 		t.Fatalf("capabilities %+v", caps)

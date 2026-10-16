@@ -125,6 +125,10 @@ func (k callKey) matches(o callKey) bool {
 	return k.isNum == o.isNum && k.num == o.num && k.str == o.str
 }
 
+// ServerVersion is reported as serverInfo.version on MCP initialize.
+// The binary sets it at startup to the version `tremelay version` prints.
+var ServerVersion = "(devel)"
+
 // BindMCPEndpoint builds one peer around an adapter the host already bound.
 // A nil adapter is refused. The peer does not open a socket or a listener.
 func BindMCPEndpoint(cap *AgentCapability) (*MCPEndpoint, error) {
@@ -141,7 +145,7 @@ func bindMCPEndpoint(cap *AgentCapability, stdio bool) (*MCPEndpoint, error) {
 	if stdio {
 		versions = []string{mcpStdio20251125, mcpStdio20250618}
 	}
-	ep.server = mcp.NewServer(&mcp.Implementation{Name: "tremelay-local-mcp", Version: "m10b"}, &mcp.ServerOptions{
+	ep.server = mcp.NewServer(&mcp.Implementation{Name: "tremelay-local-mcp", Version: ServerVersion}, &mcp.ServerOptions{
 		Capabilities: &mcp.ServerCapabilities{
 			Tools: &mcp.ToolCapabilities{},
 		},
