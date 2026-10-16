@@ -107,23 +107,29 @@ any `_method` parameter (case-insensitive) in the query or in the request
 body. In the query the name is compared with only `+` read as a space
 (percent-encoding and spaces are already refused on the query string). In the body, names are
 split on `&` and `;`, separator whitespace is trimmed, and each name is `+`-
-and percent-decoded before the case-insensitive compare; in any
-`multipart/*` body each part's `Content-Disposition` `name` is compared as
-written (no parser decodes it), whatever the disposition type; a part with a
-disposition that does not parse (a duplicated `name`, say), with two
-dispositions, or with an RFC 2231 `name*` Go cannot decode (Tomcat decodes
-any charset) is malformed. A body whose raw `Content-Type` contains `/json` or
+and percent-decoded before the case-insensitive compare. A body whose raw `Content-Type` contains `/json` or
 `+json` is refused when a top-level key is
 `_method`, because Laravel reads those keys as parameters. Every compare also
 tries the name as PHP registers it (cut at NUL, leading spaces dropped, space
 and `.` turned into `_`), so `.method` is refused in the query and the body. A form body (no
 `Content-Type`, or `application/x-www-form-urlencoded`) with a name that does
-not decode, an unparseable `Content-Type`, and an unparseable multipart body
-are all `denied_malformed`. Other bodies (JSON, say) are not read as form
+not decode and an unparseable `Content-Type` are `denied_malformed`. Other bodies (JSON, say) are not read as form
 data downstream, so there only a name that decodes to `_method` is refused.
 Rack, Tomcat, Spring and PHP/Laravel read `_method` from the query or the body and
 retarget the method of a POST with it. For query injection, any query
 parameter with the grant's parameter name is refused too.
+
+**Multipart is not brokered (#96, Patrick N18 2026-10-15).** Any request with a
+`multipart/*` `Content-Type` (any case, with or without parameters, even with
+an empty body), or with a body that looks multipart (a `--` boundary line and a
+`Content-Disposition` part header) under a missing or unrecognised type, is
+`denied_malformed` before DNS and before the credential is attached. Matching
+`_method` inside multipart part names failed three review rounds and one
+structural rule: servers decode RFC 2231 and RFC 2047 names, trim whitespace
+inside quoted names, and accept a space before a header's colon, each in ways
+Go's parser does not. So agents cannot upload files or send multipart forms
+through the broker. A per-grant opt-in is a possible later feature, not part
+of v1.
 
 `Accept-Encoding`, `Range` and `If-Range` are refused for the same reason as
 the framing headers: they choose the *form* of the response bytes, and
@@ -370,6 +376,9 @@ Synthetic only. No live API is called by the test suite.
 - `TestBrokerRefusesHeaderSmuggling` also covers method/path override headers,
   `Forwarded`, the `X-Forwarded-*` set, and a `_method` parameter in the query
   or in a form body (each denied before upstream).
+- `TestBrokerRefusesMultipartBodies` — every multipart body, including the
+  part-name spellings that escaped matching and multipart sniffed under a
+  missing or odd `Content-Type`, is `denied_malformed` before DNS or upstream.
 - `TestBrokerRefusesRedirect` — a 3xx is refused, its `Location` and body are
   not projected, and the credential is not forwarded.
 - `TestBrokerGrantMatching` — positive and negative origin, prefix and method

@@ -154,6 +154,9 @@ Read this before you trust it with anything.
   data that credential unlocks — and anything in that body can be prompt
   injection (H1). A hostile upstream that deliberately re-encodes or splits the
   credential is not caught; grant only origins you trust with the credential.
+- **No file uploads through the broker.** A brokered request with a multipart
+  body (`multipart/form-data`, file uploads) is refused as `denied_malformed`.
+  Send JSON or a urlencoded form instead.
 - **An unlocked daemon trusts your uid.** While it is unlocked, any code running
   as you can use your agents' granted capabilities. It still cannot read a
   credential, change a grant, or learn your passphrase, and everything it does is

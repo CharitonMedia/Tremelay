@@ -550,6 +550,50 @@ func TestBrokerRefusesMethodOverrideMultipartBody(t *testing.T) {
 	e.assertNoLeak(t, err.Error())
 }
 
+// TestBrokerRefusesMultipartBodies refuses every multipart body (#96, ADR 0025)
+// before DNS and before the credential is attached, including spellings that
+// once slipped past part-name matching and multipart bodies under a missing or
+// unrecognised Content-Type.
+func TestBrokerRefusesMultipartBodies(t *testing.T) {
+	const part = "--b\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nx\r\n--b--\r\n"
+	for _, tc := range []struct{ name, contentType, body string }{
+		{"ordinary-upload", "multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\nx\r\n--b--\r\n"},
+		{"upper-case-type", "Multipart/Form-Data; boundary=b", part},
+		{"no-params", "multipart/form-data", part},
+		{"mixed", "multipart/mixed; boundary=b", part},
+		{"empty-body", "multipart/form-data; boundary=b", ""},
+		{"name-trailing-space", "multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"_method \"\r\n\r\nDELETE\r\n--b--\r\n"},
+		{"name-leading-tab", "multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"\t_method\"\r\n\r\nDELETE\r\n--b--\r\n"},
+		{"space-before-colon", "multipart/form-data; boundary=b", "--b\r\nContent-Disposition : form-data; name=\"_method\"\r\n\r\nDELETE\r\n--b--\r\n"},
+		{"rfc2231", "multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"x\"; name*=UTF-8''_method\r\n\r\nDELETE\r\n--b--\r\n"},
+		{"rfc2047", "multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"=?UTF-8?Q?=5Fmethod?=\"\r\n\r\nDELETE\r\n--b--\r\n"},
+		{"sniffed-no-type", "", part},
+		{"sniffed-text-plain", "text/plain", part},
+		{"sniffed-preamble", "application/octet-stream", "preamble\r\n--b\r\ncontent-disposition: form-data; name=\"_method\"\r\n\r\nDELETE\r\n--b--\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newHTTPBrokerEnv(t, InjectBearer, "", http.MethodPost)
+			req := e.request(brokerTestPrefix + "/issues")
+			req.Method = http.MethodPost
+			req.Body = []byte(tc.body)
+			if tc.contentType != "" {
+				req.Headers = map[string]string{"Content-Type": tc.contentType}
+			}
+			resp, err := e.principal.BrokerRequest(req)
+			if err == nil || resp.StatusCode != 0 {
+				t.Fatalf("multipart body was accepted: %d %v", resp.StatusCode, err)
+			}
+			if e.requests != 0 || e.lookups != 0 {
+				t.Fatalf("multipart body resolved or reached upstream: lookups %d requests %d", e.lookups, e.requests)
+			}
+			if !errors.Is(err, ErrDeniedMalformed) || e.lastResult(t) != resultDeniedMalformed {
+				t.Fatalf("error %v audit %s", err, e.lastResult(t))
+			}
+			e.assertNoLeak(t, err.Error())
+		})
+	}
+}
+
 // TestBrokerAllowsOrdinaryFormBody keeps a normal urlencoded POST body.
 func TestBrokerAllowsOrdinaryFormBody(t *testing.T) {
 	e := newHTTPBrokerEnv(t, InjectBearer, "", http.MethodPost)
@@ -558,7 +602,8 @@ func TestBrokerAllowsOrdinaryFormBody(t *testing.T) {
 	for _, tc := range []struct{ contentType, body string }{
 		{"application/x-www-form-urlencoded", "foo=1&bar=2"},
 		{"application/json", `{"discount":"50%","note":"a&b"}`},
-		{"multipart/form-data; boundary=b", "--b\r\nContent-Disposition: form-data; name=\"100%\"; filename*=UTF-8''r%C3%A9sum%C3%A9.txt\r\n\r\nx\r\n--b--\r\n"},
+		{"application/json", `{"note":"--\nContent-Disposition is just text in JSON"}`},
+		{"text/plain", "-- not multipart, no part header"},
 	} {
 		req.Body = []byte(tc.body)
 		req.Headers = map[string]string{"Content-Type": tc.contentType}

@@ -53,6 +53,7 @@ tremelay audit list --path /home/you/.tremelay/vault.db --action daemon_auth
 | `daemon refused the agent token` | wrong token file, or the token was rotated or revoked |
 | `request denied` on every call, `upstream_error` in the audit | the stored secret has a trailing newline; rewrite it with `printf '%s'` and `tremelay credential replace --path PATH --id ID --secret-file FILE` |
 | `denied_origin`, `denied_path`, `denied_method` | the request left the grant's origin, path prefix or method set |
+| `denied_malformed` on a POST/PUT | the body is multipart (file upload or `multipart/form-data`): the broker does not send multipart bodies; send JSON or a urlencoded form instead |
 | `denied_revoked` | the grant was revoked; create a new one, no restart needed |
 
 ## Background
