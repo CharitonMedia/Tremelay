@@ -90,24 +90,27 @@ Tremelay needs the pinned Go toolchain (1.26.9, see [go.mod](go.mod)); `go insta
 switches to it for you.
 
 ```
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.1
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.2
 ```
 
 From a clone, `make build` or `go build -o tremelay ./cmd/tremelay` does the same
 thing. Check the build with `tremelay version` (or `tremelay --version`).
 
-The [v1.0.1 release](https://github.com/CharitonMedia/Tremelay/releases/tag/v1.0.1)
+The [v1.0.2 release](https://github.com/CharitonMedia/Tremelay/releases/tag/v1.0.2)
 carries per-platform archives named `tremelay_<version>_<os>_<arch>.tar.gz` (or
 `.zip` on Windows). Each archive unpacks to a binary named `tremelay`
 (`tremelay.exe` on Windows) plus `LICENSE`, along with a CycloneDX SBOM and a
 `SHA256SUMS` file — a checksum detects a corrupt download, not a substituted
-release. Signed releases are not in v1. `make release-dry` builds those artifacts
+release. It also carries one MCP Bundle per platform,
+`tremelay-mcp_<version>_<os>_<arch>.mcpb`, for clients that install MCP Bundles
+(see the [generic MCP quickstart](docs/quickstarts/generic-mcp.md#install-as-an-mcp-bundle)).
+Signed releases are not in v1. `make release-dry` builds those artifacts
 locally; see [ADR 0027](docs/adr/0027-release-artifacts.md). Download the archive
 you want and `SHA256SUMS` into one directory, then check that archive by name:
 
 ```sh
-grep tremelay_v1.0.1_linux_amd64.tar.gz SHA256SUMS | sha256sum -c - &&
-  tar -xzf tremelay_v1.0.1_linux_amd64.tar.gz &&
+grep tremelay_v1.0.2_linux_amd64.tar.gz SHA256SUMS | sha256sum -c - &&
+  tar -xzf tremelay_v1.0.2_linux_amd64.tar.gz &&
   ./tremelay version
 ```
 
