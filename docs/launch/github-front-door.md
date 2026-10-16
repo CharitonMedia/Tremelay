@@ -11,7 +11,7 @@ Item 9's announcement drafts are in [announcements.md](announcements.md).
 Settings → General → Description. 336 characters, under GitHub's 350 limit.
 
 ```
-Local credential broker for AI agents. Keep API keys and SSH keys in an encrypted vault on your own machine; give each agent its own scoped, expiring, revocable grants; let it use a credential over MCP or ssh-agent without ever seeing it. Deny by default, every attempt in a hash-chained audit log. Single user, local only, pre-release.
+Local credential broker for AI agents. Keep API keys and SSH keys in an encrypted vault on your own machine; give each agent its own scoped, expiring, revocable grants; let it use a credential over MCP or ssh-agent without ever seeing it. Deny by default, every attempt in a hash-chained audit log. Single user, local only.
 ```
 
 Website field: leave empty until there is a docs site.
