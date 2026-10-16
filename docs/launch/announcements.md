@@ -42,8 +42,6 @@ Accepted limits from V1:
 - H1: HTTP response content is not screened for prompt injection. The broker
   keeps credentials out of the response. It does not make response instructions
   trustworthy.
-- H2: If a vault still has a legacy `github_issue_state` grant, that vault will
-  not unlock until the grant is revoked with the pre-v1 binary.
 
 Status and scope:
 - Single-user only (no multi-user/shared vault model in v1).
@@ -85,8 +83,6 @@ attempt is auditable.
 
 Accepted limits (from V1):
 - H1: response content is not screened for prompt injection.
-- H2: vaults with legacy `github_issue_state` grants must revoke that grant
-  using the pre-v1 binary before unlocking.
 
 Important status:
 - Single-user only in v1.
@@ -124,8 +120,6 @@ grants (Linux/macOS path; MCP path is Linux/macOS/Windows).
 
 Accepted limits from V1:
 - H1: HTTP response content is not screened for prompt injection.
-- H2: a vault that still contains a legacy `github_issue_state` grant will not
-  unlock until that grant is revoked with the pre-v1 binary.
 
 Scope and maturity:
 - single-user only,
@@ -162,8 +156,6 @@ expiry. Allowed/denied attempts are written to a hash-chained audit log.
 
 Accepted limits from V1:
 - H1: HTTP response content is not screened for prompt injection.
-- H2: vaults with legacy `github_issue_state` grants do not unlock until those
-  grants are revoked with the pre-v1 binary.
 
 Current scope and status:
 - single-user model in v1,
