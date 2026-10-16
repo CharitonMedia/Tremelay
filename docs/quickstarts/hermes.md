@@ -9,7 +9,7 @@ path. Windows differences are at the bottom.
 ## 1. Install
 
 ```sh
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.2
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.3
 "$(go env GOPATH)"/bin/tremelay --help
 ```
 
@@ -189,7 +189,7 @@ the same path). You never have to recreate an agent. See
 Same commands in PowerShell, with Windows paths and no `umask`:
 
 ```powershell
-go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.2
+go install github.com/CharitonMedia/Tremelay/cmd/tremelay@v1.0.3
 & "$(go env GOPATH)\bin\tremelay.exe" --help
 
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.tremelay" | Out-Null
