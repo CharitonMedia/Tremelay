@@ -449,7 +449,7 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 	}
 	if agentID == "" {
 		if safeID(spec.AgentID) == "" {
-			return deny(ErrInvalid)
+			return deny(errGrantAgentRequired())
 		}
 		return deny(ErrAgentNotFound)
 	}
@@ -457,12 +457,18 @@ func (s *Session) IssueGrant(spec GrantSpec) (Grant, error) {
 	if err != nil {
 		return deny(err)
 	}
+	if spec.Resource == "" {
+		return deny(errGrantResourceRequired())
+	}
 	if err := validateResource(spec.Resource); err != nil {
-		return deny(err)
+		return deny(errGrantResourceInvalid())
 	}
 	expires, err := requireTime(spec.ExpiresAt)
-	if err != nil || !expires.After(now) {
-		return deny(ErrInvalid)
+	if err != nil {
+		return deny(errGrantExpiresInvalid())
+	}
+	if !expires.After(now) {
+		return deny(errGrantExpiresNotFuture())
 	}
 	credID, credType, err := s.bindGrantCredential(spec.CredentialID, spec.CredentialClass)
 	if err != nil {
@@ -702,13 +708,24 @@ func (s *Session) RejectAgentCreate(cause error) error {
 	return s.denyAction(actionAgentCreate, cause)
 }
 
-// RejectGrantCreate records a metadata-free grant_create denial.
-func (s *Session) RejectGrantCreate(cause error) error {
+// RejectGrantCreate records a grant_create denial with a fixed reason when cause carries one.
+func (s *Session) RejectGrantCreate(agentFlag string, cause error) error {
 	if err := s.begin(); err != nil {
 		return err
 	}
 	defer s.end()
-	return s.denyAction(actionGrantCreate, cause)
+	agentID := ""
+	if safeID(agentFlag) != "" && s.agentExists(agentFlag) {
+		agentID = agentFlag
+	}
+	partial := auditEvent{Action: actionGrantCreate, Result: resultDenied, AgentID: agentID}
+	if reason := grantCreateAuditReason(cause); reason != "" {
+		partial.Reasons = reason
+	}
+	if err := s.writeAudit(partial, s.creds, s.agents, s.grants); err != nil {
+		return err
+	}
+	return cause
 }
 
 // RejectGrantRevoke records a metadata-free grant_revoke denial.
@@ -884,16 +901,19 @@ func (s *Session) bindGrantCredential(credID, class string) (string, string, err
 	idSet := credID != ""
 	classSet := class != ""
 	if idSet == classSet {
-		return "", "", ErrInvalid
+		if !idSet {
+			return "", "", errGrantCredentialRequired()
+		}
+		return "", "", errGrantCredentialConflict()
 	}
 	if classSet {
 		if err := validateType(class); err != nil {
-			return "", "", err
+			return "", "", errGrantUnknownClass()
 		}
 		return "", class, nil
 	}
 	if safeID(credID) == "" {
-		return "", "", ErrInvalid
+		return "", "", errGrantInvalidCredentialID()
 	}
 	id, typ, ok := s.lookupCred(credID)
 	if !ok {
@@ -1107,15 +1127,21 @@ func denialError(result string) error {
 }
 
 func normalizeOps(ops []string) ([]string, string, error) {
-	if len(ops) == 0 || len(ops) > len(grantOperations) {
-		return nil, "", ErrInvalid
+	if len(ops) == 0 {
+		return nil, "", errGrantOperationRequired()
+	}
+	if len(ops) > len(grantOperations) {
+		return nil, "", errGrantOperationInvalid()
 	}
 	cp := append([]string(nil), ops...)
 	slices.Sort(cp)
 	prev := ""
 	for _, op := range cp {
-		if !allowedOperation(op) || op == prev {
-			return nil, "", ErrInvalid
+		if op == prev {
+			return nil, "", errGrantDuplicateOperation()
+		}
+		if !allowedOperation(op) {
+			return nil, "", errGrantUnknownOperation()
 		}
 		prev = op
 	}

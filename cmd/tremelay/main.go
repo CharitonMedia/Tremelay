@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -926,7 +925,7 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 	fs.Var(&methods, "method", "http_broker allowed method (repeatable)")
 	if err := parseHumanFlags(fs, grantCreateUsage, stderr, args); err != nil {
 		return denyKnownVault(*path, getenv, stdin, stderr, func(session *vault.Session) error {
-			return session.RejectGrantCreate(vault.ErrInvalid)
+			return session.RejectGrantCreate("", vault.ErrInvalid)
 		})
 	}
 	if *path == "" {
@@ -934,20 +933,16 @@ func cmdGrantCreate(args []string, getenv func(string) string, stdin io.Reader, 
 		return 2
 	}
 	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
-		if fs.NArg() != 0 || *agent == "" || *resource == "" || *expires == "" || len(ops) == 0 || (*cred == "") == (*class == "") {
-			return session.RejectGrantCreate(vault.ErrInvalid)
+		if err := vault.ValidateGrantCreateCLI(*agent, *cred, *class, *resource, *expires, ops, fs.NArg()); err != nil {
+			return session.RejectGrantCreate(*agent, err)
 		}
-		exp, err := time.Parse(time.RFC3339, *expires)
+		exp, err := vault.GrantCreateExpiresCLI(*expires)
 		if err != nil {
-			return session.RejectGrantCreate(vault.ErrInvalid)
+			return session.RejectGrantCreate(*agent, err)
 		}
-		var hostKey []byte
-		if *sshHost != "" {
-			var err error
-			hostKey, err = hex.DecodeString(*sshHost)
-			if err != nil {
-				return session.RejectGrantCreate(vault.ErrInvalid)
-			}
+		hostKey, err := vault.GrantCreateSSHHostKeyCLI(*sshHost)
+		if err != nil {
+			return session.RejectGrantCreate(*agent, err)
 		}
 		grant, err := session.IssueGrant(vault.GrantSpec{
 			AgentID:         *agent,
