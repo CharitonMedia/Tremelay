@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"io"
 	"mime"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"slices"
@@ -617,28 +616,37 @@ func queryParamNamed(query, want string) bool {
 
 // bodyParamNamed reports a _method-style override in a request body the way
 // Rack, Tomcat and Spring read form fields: names are split on & and ;,
-// whitespace-trimmed, then +- and percent-decoded before comparison; multipart
-// part names use the same normalisation. For a form body (no Content-Type, or
-// application/x-www-form-urlencoded) an undecodable name is malformed, as is
-// an unparseable Content-Type or multipart body. Any other body is not read as
-// form data downstream, so only a name that decodes to want is refused there:
-// a JSON body with a stray "%" still passes.
+// whitespace-trimmed, then +- and percent-decoded before comparison. For a form
+// body (no Content-Type, or application/x-www-form-urlencoded) an undecodable
+// name is malformed, as is an unparseable Content-Type. Any other body is not
+// read as form data downstream, so only a name that decodes to want is refused
+// there: a JSON body with a stray "%" still passes.
+//
+// Multipart is not brokered at all (#96, ADR 0025): a multipart/* Content-Type,
+// or a body that looks multipart under a missing or unrecognised type, is
+// malformed. Servers disagree on how they read part names (RFC 2231, RFC 2047,
+// whitespace trimming, header-name spacing), and every rule we tried to match
+// them left another spelling open.
 func bodyParamNamed(body []byte, contentType, want string) (found, malformed bool) {
-	if len(body) == 0 {
-		return false, false
-	}
 	var mediaType string
-	var params map[string]string
 	if contentType != "" {
 		var err error
-		if mediaType, params, err = mime.ParseMediaType(contentType); err != nil {
+		if mediaType, _, err = mime.ParseMediaType(contentType); err != nil {
 			return false, true
 		}
 	}
 	if strings.HasPrefix(mediaType, "multipart/") {
-		return multipartParamNamed(body, params["boundary"], want)
+		return false, true
 	}
-	if lower := strings.ToLower(contentType); strings.Contains(lower, "/json") || strings.Contains(lower, "+json") {
+	if len(body) == 0 {
+		return false, false
+	}
+	lower := strings.ToLower(contentType)
+	isJSON := strings.Contains(lower, "/json") || strings.Contains(lower, "+json")
+	if mediaType != "application/x-www-form-urlencoded" && !isJSON && looksMultipart(body) {
+		return false, true
+	}
+	if isJSON {
 		// Laravel reads a JSON body's top-level keys as request parameters
 		// whenever the raw Content-Type contains /json or +json.
 		var keys map[string]json.RawMessage
@@ -655,6 +663,13 @@ func bodyParamNamed(body []byte, contentType, want string) (found, malformed boo
 		malformed = false
 	}
 	return found, malformed
+}
+
+// looksMultipart reports a body with a boundary-style line and a part header,
+// so a multipart body cannot slip through under a missing or odd Content-Type.
+func looksMultipart(body []byte) bool {
+	return (bytes.HasPrefix(body, []byte("--")) || bytes.Contains(body, []byte("\n--"))) &&
+		bytes.Contains(bytes.ToLower(body), []byte("content-disposition"))
 }
 
 // formParamNamed scans every pair; a name that does not decode sets malformed
@@ -706,44 +721,6 @@ func decodeFormParamName(raw string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(decoded), true
-}
-
-func multipartParamNamed(body []byte, boundary, want string) (found, malformed bool) {
-	if boundary == "" {
-		return false, true
-	}
-	mr := multipart.NewReader(bytes.NewReader(body), boundary)
-	for {
-		p, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return false, true
-		}
-		// Not FormName: it drops the name of a non-form-data disposition
-		// (PHP reads it) and of a duplicated name parameter (PHP and Tomcat
-		// take the last one).
-		dispositions := p.Header.Values("Content-Disposition")
-		if len(dispositions) == 0 {
-			continue
-		}
-		_, dparams, err := mime.ParseMediaType(dispositions[0])
-		if len(dispositions) > 1 || err != nil {
-			return false, true
-		}
-		// Go drops an RFC 2231 name* in a charset it does not know; Tomcat
-		// decodes it. A part whose name we could not read is malformed.
-		name := dparams["name"]
-		if name == "" && strings.Contains(dispositions[0], "*") {
-			return false, true
-		}
-		// Multipart names are not form-urlencoded: no parser decodes them.
-		if paramNameIs(name, want) {
-			return true, false
-		}
-	}
-	return false, false
 }
 
 func applyAgentHeaders(r *http.Request, headers map[string]string) {
