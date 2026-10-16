@@ -156,7 +156,7 @@ func Verify(evidenceDir, schemaDir string) error {
 		id.SourceCommit,
 		binHash,
 		"unsigned",
-		"should not yet be trusted with production credentials",
+		"It is not a published release",
 		"not a claim that the candidate has no vulnerabilities",
 		"does not prove that every module function remains linked or reachable",
 		"one builder",
