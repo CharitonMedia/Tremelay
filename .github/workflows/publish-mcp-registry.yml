@@ -1,0 +1,52 @@
+name: Publish to MCP Registry
+
+# Publishes a release's rendered server.json to the official MCP registry
+# (registry.modelcontextprotocol.io) as io.github.CharitonMedia/tremelay.
+# Auth is GitHub Actions OIDC: the registry trusts this repository's
+# workflow identity for the io.github.CharitonMedia namespace, so no personal
+# token or org third-party-app approval is involved. It only reads the
+# release's server.json asset; it never builds, tags or uploads anything.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (for example v1.0.3)
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: mcp-registry
+  cancel-in-progress: false
+
+env:
+  PUBLISHER_VERSION: v1.8.1
+  PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+
+jobs:
+  publish:
+    name: Publish server.json
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    steps:
+      - name: Download server.json from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p server.json
+          jq -e --arg v "${TAG#v}" '.version == $v' server.json >/dev/null
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL -o p.tar.gz "https://github.com/modelcontextprotocol/registry/releases/download/${PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          echo "${PUBLISHER_SHA256}  p.tar.gz" | sha256sum -c -
+          tar xzf p.tar.gz mcp-publisher
+      - name: Log in with GitHub OIDC
+        run: ./mcp-publisher login github-oidc
+      - name: Publish
+        run: ./mcp-publisher publish server.json
