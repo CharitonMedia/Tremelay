@@ -31,7 +31,7 @@ Artifact SHA-256: %s
 Go: %s
 Target: %s GOAMD64=%s CGO_ENABLED=%s
 
-The executable was built with -buildvcs=false, so it does not carry VCS metadata. The commit and tree above are the authoritative source identity. Tremelay is pre-release security software and should not yet be trusted with production credentials. M9, M10, and M11 remain open. This candidate does not complete them.
+The executable was built with -buildvcs=false, so it does not carry VCS metadata. The commit and tree above are the authoritative source identity.
 
 Two builds used separate absolute workspaces and separate compilation caches on one builder. A shared module download cache may have been reused and is named in the two-build receipt. Matching executable bytes support only this toolchain, target, flag set, and observed builder. They do not prove independent-builder or cross-platform reproducibility.
 
