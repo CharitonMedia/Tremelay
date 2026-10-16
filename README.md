@@ -171,7 +171,6 @@ Read this before you trust it with anything.
 - **Legacy GitHub issue grants block unlock (H2).** A vault that still holds a
   pre-v1 `github_issue_state` grant will not unlock until that grant is revoked
   with the pre-v1 binary.
-- **Pre-release.** Do not put production credentials in it yet.
 
 ## Security
 
