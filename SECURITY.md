@@ -1,6 +1,6 @@
 # Security Policy
 
-Tremelay is pre-release security software and should not yet be trusted with production credentials.
+Tremelay is released security software (v1). Its limits are stated as facts in the README: no independent security audit yet, releases are checksummed but not signed, and brokered response content is not screened for prompt injection (H1).
 
 ## Reporting vulnerabilities
 
