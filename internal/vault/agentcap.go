@@ -437,6 +437,12 @@ func (s *Session) agentCapList(agentID string) ([]agentCapSnapshot, error) {
 		return strings.Compare(a.grantID, b.grantID)
 	})
 	if len(snaps) > maxAgentCapEntries {
+		// Nothing deletes a grant, so revoked and expired ones accumulate for
+		// the life of the agent. They carry no authority and must not crowd
+		// out the grants that do: only live grants count toward the ceiling.
+		snaps = slices.DeleteFunc(snaps, func(c agentCapSnapshot) bool { return c.status != GrantActive })
+	}
+	if len(snaps) > maxAgentCapEntries {
 		if err := s.finish(auditEvent{Action: actionCapList, Result: resultDenied, AgentID: agentID}, nil); err != nil {
 			return nil, err
 		}
