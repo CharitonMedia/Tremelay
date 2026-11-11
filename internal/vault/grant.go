@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"slices"
@@ -348,6 +349,22 @@ func (s *Session) CreateAgent(label string) (Agent, error) {
 	return out, nil
 }
 
+// tokenAgent returns the index of the agent that holds token, or -1. The
+// caller holds s.mu.
+func (s *Session) tokenAgent(token []byte) int {
+	sum := sha256.Sum256(token)
+	defer wipe(sum[:])
+	if len(token) != AgentTokenLen {
+		return -1
+	}
+	for i := range s.agents {
+		if len(s.agents[i].TokenHash) == sha256.Size && subtle.ConstantTimeCompare(s.agents[i].TokenHash, sum[:]) == 1 {
+			return i
+		}
+	}
+	return -1
+}
+
 // AuthenticateAgentToken resolves one active agent principal from a bearer
 // token and nothing else. The caller cannot name an agent, a human, the
 // session, the vault, or the clock. The vault holds only SHA-256(token) and
@@ -356,29 +373,23 @@ func (s *Session) CreateAgent(label string) (Agent, error) {
 // and no attribution at all for an unknown token. The token, its hash, and
 // its length are never audit fields, log text, or error text.
 //
+// Attempts are paced before they are audited (see pace.go): unknown tokens
+// share one slow budget, a held token is charged to its agent. ctx only ends
+// that wait early; the attempt is still decided and audited.
+//
 // ponytail: a linear constant-time scan over the agent list, and repeated
 // failures are ordinary expected denials rather than a detection class. The
 // endpoint already restricts callers to the vault owner's uid. Upgrade path:
 // a keyed index plus a daemon_auth failure class in the M5 lookback.
-func (s *Session) AuthenticateAgentToken(token []byte) (*AgentPrincipal, error) {
+func (s *Session) AuthenticateAgentToken(ctx context.Context, token []byte) (*AgentPrincipal, error) {
+	s.paceLogin(ctx, token)
 	if err := s.begin(); err != nil {
 		return nil, err
 	}
 	defer s.end()
-	sum := sha256.Sum256(token)
-	defer wipe(sum[:])
 	matched, active, gen := "", false, uint64(0)
-	if len(token) == AgentTokenLen {
-		for i := range s.agents {
-			if len(s.agents[i].TokenHash) != sha256.Size {
-				continue
-			}
-			if subtle.ConstantTimeCompare(s.agents[i].TokenHash, sum[:]) == 1 {
-				matched, active = s.agents[i].ID, s.agents[i].State == agentStateActive
-				gen = s.agents[i].tokenGen()
-				break
-			}
-		}
+	if i := s.tokenAgent(token); i >= 0 {
+		matched, active, gen = s.agents[i].ID, s.agents[i].State == agentStateActive, s.agents[i].tokenGen()
 	}
 	if matched == "" {
 		return nil, s.finish(auditEvent{Action: actionDaemonAuth, Result: resultDenied}, ErrUnauthenticated)

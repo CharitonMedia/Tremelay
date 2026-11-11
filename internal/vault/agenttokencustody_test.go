@@ -57,7 +57,7 @@ func TestAgentTokenCustody(t *testing.T) {
 	if bytes.Equal(first, second) {
 		t.Fatal("rotation minted the same token")
 	}
-	if _, err := session.AuthenticateAgentToken(first); !errors.Is(err, ErrUnauthenticated) {
+	if _, err := session.AuthenticateAgentToken(t.Context(), first); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("the rotated-away token still authenticated: %v", err)
 	}
 	assertAuthenticates(t, session, second, env.agent.ID, grant.ID)
@@ -68,7 +68,7 @@ func TestAgentTokenCustody(t *testing.T) {
 	if err := session.RevokeAgentToken(env.agent.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := session.AuthenticateAgentToken(second); !errors.Is(err, ErrUnauthenticated) {
+	if _, err := session.AuthenticateAgentToken(t.Context(), second); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("a revoked token still authenticated: %v", err)
 	}
 	if session.agents[0].TokenHash != nil {
@@ -92,7 +92,7 @@ func TestAgentTokenCustody(t *testing.T) {
 		t.Fatalf("reissued token is generation %d", gen)
 	}
 	for _, old := range [][]byte{first, second} {
-		if _, err := session.AuthenticateAgentToken(old); !errors.Is(err, ErrUnauthenticated) {
+		if _, err := session.AuthenticateAgentToken(t.Context(), old); !errors.Is(err, ErrUnauthenticated) {
 			t.Fatalf("a superseded token authenticated after reissue: %v", err)
 		}
 	}
@@ -133,7 +133,7 @@ func TestAgentTokenBindsTheConnection(t *testing.T) {
 			}
 			held := append([]byte(nil), minted.Token...)
 			Wipe(minted.Token)
-			principal, err := env.s.AuthenticateAgentToken(held)
+			principal, err := env.s.AuthenticateAgentToken(t.Context(), held)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -230,7 +230,7 @@ func TestAgentTokenBindsTheConnection(t *testing.T) {
 
 func assertAuthenticates(t *testing.T, s *Session, token []byte, agentID, grantID string) {
 	t.Helper()
-	principal, err := s.AuthenticateAgentToken(token)
+	principal, err := s.AuthenticateAgentToken(t.Context(), token)
 	if err != nil || principal == nil || principal.id != agentID {
 		t.Fatalf("token did not resolve its agent: %v", err)
 	}

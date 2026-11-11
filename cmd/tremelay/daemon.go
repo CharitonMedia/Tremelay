@@ -291,7 +291,7 @@ func (d *daemon) handle(conn net.Conn) {
 		d.requestLock()
 		return
 	}
-	principal, err := daemonAuthenticate(d.session, token)
+	principal, err := daemonAuthenticate(d.session, d.ctx, token)
 	vault.Wipe(token)
 	if err != nil {
 		// Accepted, wrong-token, and inactive-agent attempts are all audited

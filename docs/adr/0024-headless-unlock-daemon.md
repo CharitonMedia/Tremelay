@@ -360,7 +360,8 @@ make CI pass.
 - A resident unlocked daemon is a new persistent asset for the M5 detection
   work to reason about. Repeated `daemon_auth` denials are ordinary expected
   denials today, not a detection class; that is marked in the code as a
-  deliberate simplification with its upgrade path.
+  deliberate simplification with its upgrade path. Since the 2026-11-11
+  amendment they are paced.
 - Token files are a new on-disk secret class. They are 0600, their path is the
   thing that gets printed, and a file with wider permissions is refused on use.
 
@@ -628,3 +629,54 @@ Tests: `TestDaemonLocksOnPassphraseChange` (Linux, macOS and Windows CI: next
 call refused, refusal audited, daemon exits, new passphrase serves, `grant
 create` still reloads with no lock) and `TestSessionLocksOnPassphraseRotation`
 (key zeroised, planted handoff ignored, audit chain verifies).
+
+## Amendment 2026-11-11: attempts are paced before they are audited
+
+Every attempt is one audit row, and an audit row is a durable commit under the
+session lock and the SQLite write lock. Nothing bounded how fast a caller could
+spend that. A same-uid process with no token could present unknown tokens in a
+loop, and one agent could send blank lines down its MCP connection; either
+wrote rows as fast as the disk allowed and, against the login flood, every
+human command lost the commit race.
+
+Attempts are now delayed before they are audited. Nothing is dropped, so the
+"every attempt is audited" statement holds as written.
+
+- Unknown tokens share one budget for the whole daemon: 10 in any 10 seconds.
+- Each agent has its own budget, shared by all of its connections and charged
+  for each login with its token and each MCP frame read from it, valid or not:
+  40 in any 2 seconds. A flood of unknown tokens does not touch it.
+- An attempt past the budget waits for its window to end and then proceeds. No
+  wait outlasts one window, so a crowd of parallel connections loosens the
+  bound instead of being held open without limit.
+- A wait ends when the daemon shuts down, so `tremelay lock` and the idle
+  timeout are not delayed. A login cut short this way is still decided and
+  audited. A frame is paced before it is read, so none is consumed unaudited.
+
+The budget is a window and not an even rate on purpose. A flood gets its burst
+and then silence until the window ends. An even 20 commits a second was tried
+first and measured worse for the owner than no pacing: a commit landed inside
+every human command, and all five of five `credential list` runs lost the race
+recorded in the 2026-10-13 amendment. The silence is when the owner can revoke.
+
+Measured on tmpfs, daemon and CLI on one vault, five `credential list` runs
+during each flood:
+
+| | before | after |
+| --- | --- | --- |
+| unknown-token flood, 8 connections, 20 s | 78,945 rows, 0 of 5 commands succeed | 36 attempts, 5 of 5 |
+| blank-line flood, 4 connections of one agent, 15 s | 8,115 rows, 5 of 5 | 356 rows, 4 of 5 |
+
+Limits, recorded rather than hidden. The ceilings are constants, not settings.
+The race in the 2026-10-13 amendment is unchanged: a human command that
+overlaps a burst still fails as a stale session and must be re-run, and
+commits arriving at a steady 20 a second, which is what the first design
+produced, defeat it every time. The
+ssh-agent relay stream is not paced. The audit log still grows by one row per
+attempt, at the paced rate. On a disk where one commit takes hundreds of
+milliseconds a 40-commit burst is itself long.
+
+Tests: `TestFailedLoginsSpendTheSharedBudgetAndAreAudited`,
+`TestLoginPacingEndsWithContext`, `TestJunkFramesArePacedAndStillAudited`,
+`TestFramePacingEndsWithServe`, `TestPacerAllowsBurstThenWaitsOutTheWindow`
+and `TestPacerWaitEndsWithContext`.
