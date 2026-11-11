@@ -92,7 +92,9 @@ again.
 The daemon still locks and exits when it cannot verify the file — a tampered
 document, a broken audit chain, a rolled-back audit head, or a chain that no
 longer contains the audit event the daemon last served, which is what an
-older copy of the vault restored underneath it looks like.
+older copy of the vault restored underneath it looks like. That exit, and the
+one after an endpoint that stopped accepting connections, has status 1. An
+ordinary lock, the idle timeout and a signal exit with status 0.
 
 ## Passphrase from the environment
 
@@ -186,6 +188,13 @@ tremelay lock
 The daemon zeroises the session and exits, and the next client call fails
 closed with a generic error. The idle timeout and losing the process do the
 same thing. Nothing survives to be unlocked without your passphrase.
+
+An agent client connected at that moment sees its `tremelay mcp --daemon`
+process print that the daemon ended the session and exit with status 1. It
+does not wait for the client to close its side first.
+
+Ctrl-C at the daemon's passphrase prompt ends the command. Nothing typed
+afterwards is read.
 
 ## What gets audited
 

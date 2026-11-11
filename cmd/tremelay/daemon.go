@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
+	"golang.org/x/term"
 )
 
 const (
@@ -64,6 +65,7 @@ var (
 	errDaemonRefused          = errors.New("daemon refused the agent token")
 	errDaemonHandshakeTimeout = errors.New("daemon handshake timed out")
 	errDaemonHandshakeIO      = errors.New("daemon handshake failed")
+	errDaemonEnded            = errors.New("the daemon ended this session; it has locked or stopped")
 	errDaemonSession          = errors.New("daemon agent session failed; inspect the vault audit before retrying an operation")
 	errDaemonTerminal         = errors.New("daemon can no longer serve this vault and has locked; inspect the vault audit, then restart it")
 	errDaemonRekeyed          = errors.New("vault passphrase changed; daemon locked. Run tremelay daemon again and unlock with the new passphrase")
@@ -130,7 +132,7 @@ func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv fu
 		return fail(err.Error())
 	}
 	defer listener.Close()
-	pass, err := readPassphrase(getenv, stdin, stderr)
+	pass, err := daemonPassphrase(ctx, getenv, stdin, stderr)
 	if err != nil {
 		return fail(err.Error())
 	}
@@ -172,7 +174,26 @@ func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv fu
 	listener.Close()
 	d.conns.Wait()
 	session.Lock()
+	if d.fault.Load() {
+		return 1
+	}
 	return 0
+}
+
+// daemonPassphrase is readPassphrase with a prompt that a signal ends. The
+// daemon catches SIGINT and SIGTERM for an orderly lock, so the plain prompt
+// swallowed Ctrl-C and the next line typed still unlocked the vault.
+func daemonPassphrase(ctx context.Context, getenv func(string) string, stdin io.Reader, stderr io.Writer) ([]byte, error) {
+	if getenv != nil {
+		if v := getenv("TREMELAY_PASSPHRASE"); v != "" {
+			return []byte(v), nil
+		}
+	}
+	terminal := term.NewTerminal(struct {
+		io.Reader
+		io.Writer
+	}{stdin, io.Discard}, "")
+	return readChangePassphrase(ctx, stdin, stderr, terminal, "passphrase: ")
 }
 
 // daemon serves one unlocked Session to many agents. Every vault entry point
@@ -187,6 +208,10 @@ type daemon struct {
 	locked  chan struct{}
 	once    sync.Once
 	conns   sync.WaitGroup
+	// fault records a lock the daemon forced on itself: a dead endpoint, or a
+	// vault that failed verification. The process then exits non-zero, so a
+	// supervisor or script does not read it as an ordinary lock.
+	fault atomic.Bool
 
 	mu   sync.Mutex
 	live int
@@ -206,6 +231,7 @@ func (d *daemon) accept(listener net.Listener) {
 	})
 	if err != nil {
 		fmt.Fprintln(d.stderr, err.Error())
+		d.fault.Store(true)
 		d.requestLock()
 	}
 }
@@ -366,6 +392,7 @@ func (d *daemon) serveSSHAgent(conn net.Conn, principal *vault.AgentPrincipal) {
 func (d *daemon) checkTerminal(err error) {
 	if errors.Is(err, vault.ErrCorrupt) || errors.Is(err, vault.ErrAudit) {
 		fmt.Fprintln(d.stderr, errDaemonTerminal.Error())
+		d.fault.Store(true)
 		d.requestLock()
 	}
 }
@@ -474,10 +501,11 @@ func relayDaemonMCP(getenv func(string) string, tokenFile string, stdin io.Reade
 	}
 	// Protocol bytes only. Nothing here inspects, logs, or rewrites them.
 	done := make(chan struct{})
-	var ended atomic.Bool
+	var ended, clientDone atomic.Bool
 	go func() {
 		defer close(done)
-		_, _ = io.Copy(conn, stdin)
+		_, err := io.Copy(conn, stdin)
+		clientDone.Store(err == nil)
 		if half, ok := conn.(interface{ CloseWrite() error }); ok && half.CloseWrite() == nil {
 			return
 		}
@@ -488,6 +516,13 @@ func relayDaemonMCP(getenv func(string) string, tokenFile string, stdin io.Reade
 	}()
 	_, copyErr := io.Copy(stdout, conn)
 	conn.Close()
+	if !clientDone.Load() {
+		// The daemon closed the stream while the client still holds stdin
+		// open: a lock, the idle timeout, or a stop. Waiting for that stdin
+		// would hang until the client's next write and then report success.
+		fmt.Fprintln(stderr, errDaemonEnded.Error())
+		return 1
+	}
 	<-done
 	if copyErr != nil && !ended.Load() {
 		fmt.Fprintln(stderr, errDaemonReach.Error())
