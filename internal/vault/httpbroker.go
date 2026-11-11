@@ -1115,7 +1115,7 @@ func containsCredentialForm(buf []byte, forms [][]byte) bool {
 }
 
 // spells reads buf from its start as a spelling of form, taking each form
-// byte either as written or as a %XX escape of it. Percent-encoders disagree
+// byte either as written or as a %XX escape of it, and a space also as "+". Percent-encoders disagree
 // about which bytes to escape (Go, Python, Java and JavaScript each leave a
 // different set alone), so an echoed credential can mix both freely. A
 // whole-hex form also matches in either letter case.
@@ -1149,7 +1149,8 @@ func spells(buf, form []byte, hexFold bool) (n int, cut bool) {
 				cut = cut || tailCut || len(rest) == 3
 			}
 		}
-		if !sameFormByte(rest[0], c, hexFold) {
+		// Form encoding writes a space as "+".
+		if !sameFormByte(rest[0], c, hexFold) && !(c == ' ' && rest[0] == '+') {
 			return 0, cut
 		}
 		j++

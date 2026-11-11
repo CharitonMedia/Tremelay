@@ -62,6 +62,12 @@ func TestSpellsReadsEscapesAndCuts(t *testing.T) {
 		{"50%25", "50%25", 5, false},
 		{"50%2525", "50%25", 7, false},
 		{"%", "%", 1, false},
+		// A space, as form encoding and as each escape case writes it.
+		{"a+b%2fc", "a b/c", 7, false},
+		{"a%20b%2Fc", "a b/c", 9, false},
+		{"a b/c", "a b/c", 5, false},
+		{"a+b", "a+b", 3, false},
+		{"a b", "a+b", 0, false},
 		{"%25", "%", 3, false},
 		// buf ends partway through a spelling.
 		{"a%2B", "a+b", 0, true},
