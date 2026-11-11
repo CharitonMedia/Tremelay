@@ -1136,4 +1136,16 @@ func TestCLIReplaceHealthRefreshAndPolicy(t *testing.T) {
 	assertNoSecret(t, &stdout, next, pass)
 	assertNoSecret(t, &stderr, next, pass)
 	assertNoSecret(t, &stderr, secret, pass)
+	if strings.Contains(stderr.String(), "breach lookup") {
+		t.Fatalf("opting out printed the breach-lookup note: %s", stderr.String())
+	}
+	// Opting in is stored, and the CLI says plainly that nothing checks yet.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"credential", "policy", "--path", path, "--compromise-opt-in", "true"}, envGet(env), strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("policy %d %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "policy updated") || !strings.Contains(stderr.String(), "ships no breach lookup") {
+		t.Fatalf("stdout %q stderr %q", stdout.String(), stderr.String())
+	}
 }

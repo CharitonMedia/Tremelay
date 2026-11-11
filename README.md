@@ -149,8 +149,10 @@ Read this before you trust it with anything.
   macOS only and fails closed on Windows.
 - **The agent still reads broker responses.** An `http_broker` grant returns the
   status code, an allowlisted set of response headers, and up to 32 KiB of the
-  body with the credential redacted in its common encodings (raw, URL, base64,
-  hex, JSON-escaped). The agent never sees the credential, but it does see the
+  body with the credential redacted in its common encodings (raw, URL with any
+  mix of percent-escapes, base64, hex, JSON-escaped). A response that carries
+  the credential inside the base64 of something longer is withheld whole. The
+  agent never sees the credential, but it does see the
   data that credential unlocks — and anything in that body can be prompt
   injection (H1). A hostile upstream that deliberately re-encodes or splits the
   credential is not caught; grant only origins you trust with the credential.
@@ -161,6 +163,11 @@ Read this before you trust it with anything.
   as you can use your agents' granted capabilities. It still cannot read a
   credential, change a grant, or learn your passphrase, and everything it does is
   audited — but that is the boundary.
+- **No alerts, no automatic containment, no breach check.** Every attempt,
+  allowed or denied, is written to the audit log, and nothing tells you about
+  it: read it with `tremelay audit list`. No agent is suspended automatically.
+  `credential policy --compromise-opt-in` stores your choice, but this version
+  ships no breach lookup, so no password is ever checked against one.
 - **No OAuth refresh brokering, no database session brokering, no browser form
   fill, no TOTP, no provider-assisted rotation.** These are in
   [VISION.md](VISION.md) and on the roadmap, not in v1.

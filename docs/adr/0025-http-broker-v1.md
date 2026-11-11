@@ -398,3 +398,56 @@ Synthetic only. No live API is called by the test suite.
 - `TestMCPSyntheticCredentialFixture` and the named-client smoke script — a real
   stdio MCP client reads a brokered body from a TLS upstream that echoes the
   credential, and gets `[redacted]` in every field.
+
+## Amendment 2026-11-11: override names, mixed escapes, shifted base64, body reads
+
+A review of v1.0.3 found four gaps in sections 4 and 5. None let an agent read
+a credential it was not sent; each is closed here.
+
+**Method-override field names (section 4).** Only `_method` was refused as a
+query, form or JSON field. `_HttpMethod` (Salesforce) and the override header
+names used as field names (`X-HTTP-Method-Override`, `X-HTTP-Method`,
+`X-Method-Override`, which ASP.NET MVC reads from the form and query) reached
+the upstream on a POST-only grant. All five are now `denied_malformed` before
+DNS, compared the same case-insensitive, PHP-normalised way. Whether a given
+upstream honours them was not tested; the broker does not need to know.
+
+**Body charset (section 4).** A request body whose `Content-Type` names a
+charset other than UTF-8, US-ASCII or ISO-8859-1 is `denied_malformed`. Tomcat
+decodes form names with the declared charset, so a UTF-16 body spelled
+`_method` in bytes the scan did not read.
+
+**Mixed percent-escapes (section 5).** Redaction matched the credential raw
+and as `url.QueryEscape` writes it. Python, Java and JavaScript each escape a
+different set of bytes, so an upstream that rebuilt a URL (a `Link` header, a
+`next` field) echoed a query-injected credential in a spelling that matched
+neither. Every form is now matched escape-aware: each byte either as written
+or as its `%XX` escape, in any mix. One level of double-escaping is covered
+because the escaped form is matched the same way. The truncation trim reads
+the same spellings.
+
+**Base64 of something longer (section 5).** The credential inside the base64
+of a larger value, such as a whole echoed `Authorization` line, reads
+differently at each of three byte alignments, and none is the base64 of the
+credential alone. The run of characters that depends only on the credential is
+now detected in both alphabets at all three alignments. It is not rewritten:
+the characters at each end still mix in a few credential bits, so the whole
+response is withheld as `upstream_error`. Runs under 8 characters are ignored,
+so a credential shorter than 6 bytes has no such check. A body cut at the cap
+inside a run loses the partial run.
+
+**Body reads (section 6).** The upstream round trip already ran with the
+session mutex released; the body read that follows did not, so an upstream
+that sent headers and then trickled its body held the vault for up to the
+10-second broker timeout, stalling the owner's CLI and every other agent.
+Every read of upstream bytes now runs released, like the round trip. Nothing
+new is decided after it: the same re-checks that follow the round trip follow
+the read.
+
+Still not caught, as before: an upstream that deliberately re-encodes or
+splits the credential.
+
+Tests: `TestMethodOverrideFieldNamesAreRefused`,
+`TestRedactionReadsMixedPercentEncoding`, `TestSpellsReadsEscapesAndCuts`,
+`TestTruncationDropsPartialMixedSpelling`, `TestShiftedBase64EchoIsWithheld`,
+`TestOrdinaryBase64IsNotWithheld`, `TestSlowUpstreamBodyDoesNotHoldTheSession`.
