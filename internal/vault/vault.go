@@ -357,6 +357,10 @@ type Session struct {
 	rekeyed         chan struct{}
 	// pace spaces out audited attempts per source. It has its own lock.
 	pace pacer
+	// reloads counts adoptions of the file's newer state. Each one replaces
+	// creds and zeroes the superseded secrets, so a plan cloned before it
+	// shares zeroed buffers and must not be committed.
+	reloads uint64
 }
 
 // Create makes a new vault at path and returns it unlocked.
@@ -841,6 +845,7 @@ func (s *Session) reloadLocked() error {
 	// Zeroing the superseded secrets matches Lock, which an entrant holding
 	// this mutex can already call between a callback and its continuation.
 	wipeCredentials(s.creds)
+	s.reloads++
 	s.header = header
 	s.creds = doc.Credentials
 	s.agents = doc.Agents
