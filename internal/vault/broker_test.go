@@ -461,14 +461,14 @@ func TestBrokerHTTP(t *testing.T) {
 		}
 		return []net.IP{net.ParseIP("127.0.0.1")}, nil
 	}
-	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://rebind.nip.io/latest"}, principal, ErrDeniedSSRF)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: "https://rebind.nip.io/latest"}, principal, ErrDeniedDestination)
 	if lookups != 1 {
 		t.Fatalf("rebind lookups %d", lookups)
 	}
 	session.resolve = func(context.Context, string) ([]net.IP, error) {
 		return []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.1")}, nil
 	}
-	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: target}, principal, ErrDeniedSSRF)
+	expect(HTTPBrokerRequest{CredentialID: api.ID, Method: http.MethodGet, Target: target}, principal, ErrDeniedDestination)
 	for _, raw := range []string{"fec0::1", "64:ff9b::c000:201", "64:ff9b:1::1", "100::1", "2001:2::1", "3fff::1", "3fff:fff::1", "192.88.99.0", "192.88.99.1", "192.88.99.2", "192.88.99.255"} {
 		session.resolve = func(context.Context, string) ([]net.IP, error) {
 			return []net.IP{net.ParseIP(raw)}, nil
@@ -477,7 +477,7 @@ func TestBrokerHTTP(t *testing.T) {
 			t.Fatal("non-public address was dialed")
 			return nil, errors.New("network")
 		}
-		expect(good, principal, ErrDeniedSSRF)
+		expect(good, principal, ErrDeniedDestination)
 	}
 	for _, raw := range []string{"3ff1::1", "3fff:1000::1", "192.88.98.1", "192.88.100.1"} {
 		session.resolve = func(context.Context, string) ([]net.IP, error) {

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	daemonUsage = "usage: tremelay daemon --vault PATH [--idle-timeout 1h]"
+	daemonUsage = "usage: tremelay daemon --vault PATH [--idle-timeout 1h] [--alert-command /absolute/path]"
 	lockUsage   = "usage: tremelay lock"
 
 	// The handshake is one bounded line. Its only verbs are agent token
@@ -106,22 +106,29 @@ func cmdDaemon(args []string, getenv func(string) string, stdin io.Reader, stdou
 	fs.SetOutput(io.Discard) // Never reflect flag values into diagnostics.
 	path := fs.String("vault", "", "vault file")
 	idle := fs.Duration("idle-timeout", time.Hour, "lock and exit after this much idle time")
+	alert := fs.String("alert-command", "", "executable run with high-risk alerts on stdin")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *path == "" ||
 		*idle < minIdleTimeout || *idle > maxIdleTimeout {
 		fmt.Fprintln(stderr, daemonUsage)
 		return 2
 	}
+	if *alert != "" {
+		if err := checkAlertCommand(*alert); err != nil {
+			fmt.Fprintln(stderr, err.Error())
+			return 2
+		}
+	}
 	stopPipe := lifecyclePipeErrors()
 	defer stopPipe()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serveDaemon(ctx, *path, *idle, getenv, stdin, stdout, stderr)
+	return serveDaemon(ctx, *path, *idle, *alert, getenv, stdin, stdout, stderr)
 }
 
 // serveDaemon unlocks once from the human's terminal and then holds that
 // Session in memory only. Nothing writes the passphrase or the unlocked state
 // to disk, so losing the process (including a reboot) locks the vault.
-func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+func serveDaemon(ctx context.Context, path string, idle time.Duration, alertCommand string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fail := func(message string) int {
 		fmt.Fprintln(stderr, message)
 		return 1
@@ -143,6 +150,21 @@ func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv fu
 	if err != nil {
 		return fail("vault unlock failed")
 	}
+	// The owner's alert command, when one is named. Without it high-risk
+	// events are audited and nobody is told. The sink outlives the lock below
+	// so the events of the last moments still reach the command.
+	stopAlerts := func() {}
+	if alertCommand != "" {
+		sink := newAlertSink(alertCommand, stderr)
+		if session.SetNotifier(sink) != nil {
+			session.Lock()
+			return fail("vault unlock failed")
+		}
+		alertCtx, cancelAlerts := context.WithCancel(context.Background())
+		go sink.run(alertCtx)
+		stopAlerts = func() { cancelAlerts(); <-sink.done }
+	}
+	defer stopAlerts()
 	connCtx, cancelConns := context.WithCancel(ctx)
 	d := &daemon{
 		session: session,

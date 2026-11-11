@@ -82,7 +82,7 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay grant revoke --path PATH --id ID
   tremelay capability list --path PATH --agent ID
   tremelay capability authorize --path PATH --agent ID --credential ID --operation OP --resource SCOPE
-  tremelay daemon --vault PATH [--idle-timeout 1h]
+  tremelay daemon --vault PATH [--idle-timeout 1h] [--alert-command /absolute/path]
   tremelay mcp --daemon --token-file PATH
   tremelay ssh-agent --token-file PATH [--socket /absolute/path]
   tremelay lock

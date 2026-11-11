@@ -42,8 +42,11 @@ type HTTPBrokerResponse struct {
 
 var (
 	errRedirectRefused = errors.New("redirect refused")
-	errDestination     = errors.New("destination refused")
-	errBrokerTransport = errors.New("broker transport failed")
+	// errRedirectSameOrigin is deliberately not matched by the transport's
+	// error mapping, so it ends as errBrokerTransport and upstream_error.
+	errRedirectSameOrigin = errors.New("same-origin redirect not followed")
+	errDestination        = errors.New("destination refused")
+	errBrokerTransport    = errors.New("broker transport failed")
 )
 
 // brokerAttempt is one authorized broker call. prepare may set broker-owned
@@ -218,17 +221,21 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		partial.Result = resultDeniedDestination
 		return s.failExchange(partial, call.method, ErrDeniedDestination)
 	}
+	// A granted name that resolves somewhere the broker will not dial is the
+	// resolver's doing, not the agent's: the agent asked for exactly what its
+	// grant names. It is refused as an unusable destination, like a failed
+	// lookup. denied_ssrf is kept for a target the agent itself wrote.
 	if !publicIPs(ips) {
-		partial.Result = resultDeniedSSRF
-		return s.failExchange(partial, call.method, ErrDeniedSSRF)
+		partial.Result = resultDeniedDestination
+		return s.failExchange(partial, call.method, ErrDeniedDestination)
 	}
 	// ponytail: pin the first validated address. A mixed answer set was refused
 	// above. Upgrade path: dial any address in the already-validated set,
 	// still without a second lookup.
 	pin := normalizeIP(ips[0])
 	if !isPublicIP(pin) {
-		partial.Result = resultDeniedSSRF
-		return s.failExchange(partial, call.method, ErrDeniedSSRF)
+		partial.Result = resultDeniedDestination
+		return s.failExchange(partial, call.method, ErrDeniedDestination)
 	}
 	var send io.Reader
 	if len(call.body) > 0 {
@@ -310,8 +317,8 @@ func (s *Session) failTransport(partial auditEvent, method string, err error) (i
 		return s.failExchange(partial, method, ErrDeniedRedirect)
 	}
 	if errors.Is(err, errDestination) {
-		partial.Result = resultDeniedSSRF
-		return s.failExchange(partial, method, ErrDeniedSSRF)
+		partial.Result = resultDeniedDestination
+		return s.failExchange(partial, method, ErrDeniedDestination)
 	}
 	partial.Result = resultUpstreamError
 	return s.failExchange(partial, method, ErrBrokerUpstream)
@@ -345,6 +352,10 @@ func (s *Session) finishCaptured(partial auditEvent, upstream *http.Request, pin
 	code := 0
 	if resp != nil {
 		code = resp.StatusCode
+	}
+	if bareRedirect(resp) {
+		s.discard(resp)
+		return s.finishKind(partial, method, 0, brokerBodyBad)
 	}
 	if status, kind := responseClass(code, nil); kind != brokerBodyOK {
 		s.discard(resp)
@@ -537,7 +548,16 @@ func (s *Session) roundTripInner(req *http.Request, ip net.IP, port string) (*ht
 
 // refuseRedirect stops every redirect. A 3xx is not followed, including chains.
 // The next hop does not inherit the credential.
-func refuseRedirect(*http.Request, []*http.Request) error {
+//
+// A redirect that stays on the origin the request was sent to is still not
+// followed, but it is not an escape: GitHub answers a renamed repository with
+// a 301 to the same host. It ends as an ordinary upstream failure, so an alert
+// about a redirect means the upstream pointed the credential somewhere else.
+func refuseRedirect(next *http.Request, via []*http.Request) error {
+	if next != nil && next.URL != nil && len(via) > 0 && via[0].URL != nil &&
+		next.URL.Scheme == via[0].URL.Scheme && next.URL.Host == via[0].URL.Host {
+		return errRedirectSameOrigin
+	}
 	return errRedirectRefused
 }
 
@@ -625,7 +645,17 @@ func takeStatus(resp *http.Response) (int, int) {
 		wipe(buf)
 		readErr = err
 	}
+	if bareRedirect(resp) {
+		return 0, brokerBodyBad
+	}
 	return responseClass(resp.StatusCode, readErr)
+}
+
+// bareRedirect reports a 3xx that names no next hop: 304 Not Modified, or a
+// redirect status with no Location. It points the credential nowhere, so it is
+// an unusable response, not a redirect escape.
+func bareRedirect(resp *http.Response) bool {
+	return resp != nil && resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.Header.Get("Location") == ""
 }
 
 func responseClass(code int, readErr error) (int, int) {

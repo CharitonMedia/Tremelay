@@ -2,8 +2,10 @@ package vault
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -255,6 +257,73 @@ func TestSlowUpstreamBodyDoesNotHoldTheSession(t *testing.T) {
 			close(release)
 			if err := <-brokered; err != nil {
 				t.Errorf("broker: %v", err)
+			}
+		})
+	}
+}
+
+// An alert names an agent. It must not name one for what the upstream or the
+// resolver did: a redirect that stays on the granted origin (GitHub answers a
+// renamed repository that way), a 304, or a granted name the resolver points
+// at a private address. A redirect to another origin still alerts.
+func TestUpstreamAndResolverFaultsDoNotAlert(t *testing.T) {
+	for name, tc := range map[string]struct {
+		handler http.HandlerFunc
+		resolve []net.IP
+		want    string
+		err     error
+		alerts  int
+	}{
+		"same-origin redirect": {
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", brokerTestPrefix+"/moved")
+				w.WriteHeader(http.StatusMovedPermanently)
+			},
+			want: resultUpstreamError, err: ErrBrokerUpstream,
+		},
+		"not modified": {
+			handler: func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotModified) },
+			want:    resultUpstreamError, err: ErrBrokerUpstream,
+		},
+		"redirect to another origin": {
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", "https://attacker.example/collect")
+				w.WriteHeader(http.StatusFound)
+			},
+			want: resultDeniedRedirect, err: ErrDeniedRedirect, alerts: 1,
+		},
+		"resolver answers with a private address": {
+			resolve: []net.IP{net.ParseIP("10.0.0.7")},
+			want:    resultDeniedDestination, err: ErrDeniedDestination,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newHTTPBrokerEnv(t, InjectBearer, "")
+			note := &MemoryNotifier{}
+			if err := e.s.SetNotifier(note); err != nil {
+				t.Fatal(err)
+			}
+			// The strictest containment: nothing here may trip it.
+			if err := e.s.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.handler != nil {
+				e.handler = tc.handler
+			}
+			if tc.resolve != nil {
+				e.s.resolve = func(context.Context, string) ([]net.IP, error) { return tc.resolve, nil }
+			}
+			if _, err := e.principal.BrokerRequest(e.request(brokerTestPrefix)); !errors.Is(err, tc.err) {
+				t.Fatalf("err = %v, want %v", err, tc.err)
+			}
+			if got := e.lastResult(t); got != tc.want {
+				t.Fatalf("audit result %q, want %q", got, tc.want)
+			}
+			if got := len(note.Snapshot()); got != tc.alerts {
+				t.Fatalf("%d alerts, want %d: %+v", got, tc.alerts, note.Snapshot())
+			}
+			if active := e.s.agentActive(e.agentID); active != (tc.alerts == 0) {
+				t.Fatalf("agent active = %v", active)
 			}
 		})
 	}

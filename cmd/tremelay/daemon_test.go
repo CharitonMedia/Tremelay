@@ -60,6 +60,8 @@ type daemonFixture struct {
 	once           sync.Once
 	code           int
 	cancel         context.CancelFunc
+	// alertCommand is passed to the next launch as --alert-command.
+	alertCommand string
 }
 
 // wait joins the daemon once, so a test and the cleanup can both observe it.
@@ -156,7 +158,7 @@ func (f *daemonFixture) launch(t *testing.T, idle time.Duration) {
 	f.cancel = cancel
 	exit, stdout, stderr := f.exit, f.stdout, f.stderr
 	go func() {
-		exit <- serveDaemon(ctx, f.path, idle, envGet(f.env), strings.NewReader(""), stdout, stderr)
+		exit <- serveDaemon(ctx, f.path, idle, f.alertCommand, envGet(f.env), strings.NewReader(""), stdout, stderr)
 	}()
 	t.Cleanup(func() { cancel(); f.wait(t, 15*time.Second) })
 	deadline := time.Now().Add(20 * time.Second)
