@@ -20,7 +20,7 @@ apply_bootstrap_env() {
 	export GOEXPERIMENT=
 	export GOCACHEPROG=
 	export GOFIPS140=off
-	export GOTOOLCHAIN=go1.26.9
+	export GOTOOLCHAIN=go1.26.11
 	export GO111MODULE=on
 	export GOFLAGS=-mod=readonly
 	export GOCACHE=$cache
@@ -32,8 +32,8 @@ apply_bootstrap_env() {
 	export GOAMD64=v1 GO386=softfloat GOARM=5,softfloat GOARM64=v8.0
 	export GOMIPS=softfloat GOMIPS64=softfloat GOPPC64=power8 GORISCV64=rva20u64 GOWASM=
 	version=$(go env GOVERSION)
-	if [ "$version" != go1.26.9 ]; then
-		echo "candidate bootstrap: Go version $version, want go1.26.9" >&2
+	if [ "$version" != go1.26.11 ]; then
+		echo "candidate bootstrap: Go version $version, want go1.26.11" >&2
 		exit 1
 	fi
 	host_os=$(go env GOHOSTOS)

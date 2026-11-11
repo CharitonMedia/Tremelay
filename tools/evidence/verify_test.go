@@ -343,9 +343,9 @@ func buildSynth(t *testing.T) (string, *buildinfo.BuildInfo) {
 			t.Fatal(err)
 		}
 	}
-	write("go.mod", "module example.com/synth\n\ngo 1.26.9\n\nrequire example.com/dep v1.2.3\n\nreplace example.com/dep => ./dep\n")
+	write("go.mod", "module example.com/synth\n\ngo 1.26.11\n\nrequire example.com/dep v1.2.3\n\nreplace example.com/dep => ./dep\n")
 	write("main.go", "package main\n\nimport \"example.com/dep\"\n\nfunc main() { dep.F() }\n")
-	if err := os.WriteFile(filepath.Join(dep, "go.mod"), []byte("module example.com/dep\n\ngo 1.26.9\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dep, "go.mod"), []byte("module example.com/dep\n\ngo 1.26.11\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dep, "dep.go"), []byte("package dep\n\nfunc F() {}\n"), 0o644); err != nil {

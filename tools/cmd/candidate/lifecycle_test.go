@@ -56,7 +56,7 @@ func TestCompletedScansRetainedOnLaterFailures(t *testing.T) {
 	for _, failure := range []string{"module verification", "source drift", "write", "final verification", "publication"} {
 		t.Run(failure, func(t *testing.T) {
 			root := gitRepo(t)
-			writeRepoFile(t, root, "go.mod", "module example.com/fixture\n\ngo 1.26.9\n")
+			writeRepoFile(t, root, "go.mod", "module example.com/fixture\n\ngo 1.26.11\n")
 			gitCommit(t, root, "fixture")
 			commit, tree := fixtureIdentity(t, root)
 			out := filepath.Join(t.TempDir(), "m11a-candidate")

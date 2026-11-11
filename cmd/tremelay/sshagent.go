@@ -79,11 +79,7 @@ func serveSSHAgentSocket(ctx context.Context, getenv func(string) string, tokenF
 		return fail("ssh-agent endpoint could not be reported")
 	}
 	var conns sync.WaitGroup
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			break
-		}
+	err = acceptLoop(ctx, listener, acceptRetryLimit, func(conn net.Conn) {
 		conns.Add(1)
 		go func() {
 			defer conns.Done()
@@ -96,8 +92,13 @@ func serveSSHAgentSocket(ctx context.Context, getenv func(string) string, tokenF
 				fmt.Fprintln(stderr, err.Error())
 			}
 		}()
-	}
+	})
+	// New clients are refused from here on, not queued behind live ones.
+	listener.Close()
 	conns.Wait()
+	if err != nil {
+		return fail(err.Error())
+	}
 	return 0
 }
 

@@ -34,7 +34,7 @@ stage=$out/stage
 # ship an archive with no binary in it that still matches its checksum.
 unset ZIPOPT ZIP TAR_OPTIONS GZIP
 
-export GOTOOLCHAIN=go1.26.9
+export GOTOOLCHAIN=go1.26.11
 export CGO_ENABLED=0
 export GOFLAGS=-mod=readonly
 # Keep the per-architecture baselines at their defaults so two builders agree.

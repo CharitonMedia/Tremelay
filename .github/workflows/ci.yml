@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  GOTOOLCHAIN: go1.26.9
+  GOTOOLCHAIN: go1.26.11
 
 jobs:
   test:
@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.11'
       # internal/vault can take ~10m on windows-latest; the default is 10m.
       - run: go test -timeout 20m ./...
       - run: go vet ./...
@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.11'
       - run: go test -race ./...
 
   vuln:
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.11'
       - name: Install pinned govulncheck
         working-directory: tools
         run: go install -mod=readonly golang.org/x/vuln/cmd/govulncheck
@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.11'
           check-latest: false
       - name: Reproducible unsigned Linux CLI evidence
         run: make candidate

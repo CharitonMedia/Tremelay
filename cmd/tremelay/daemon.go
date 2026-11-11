@@ -41,7 +41,11 @@ const (
 	daemonHelloReadWait = 10 * time.Second
 
 	minIdleTimeout = time.Second
-	maxIdleTimeout = 24 * time.Hour
+	// A failed Accept is retried from floor to cap for at most limit.
+	acceptRetryFloor = 5 * time.Millisecond
+	acceptRetryCap   = time.Second
+	acceptRetryLimit = 30 * time.Second
+	maxIdleTimeout   = 24 * time.Hour
 )
 
 // Client wait for daemon OK after sending the hello. Must cover one
@@ -54,6 +58,7 @@ var daemonAuthenticate = (*vault.Session).AuthenticateAgentToken
 
 var (
 	errDaemonEndpoint         = errors.New("daemon endpoint must be a user-only directory and socket this user owns")
+	errAcceptDead             = errors.New("endpoint stopped accepting connections")
 	errDaemonRunning          = errors.New("a daemon is already serving this endpoint")
 	errDaemonReach            = errors.New("no unlocked daemon is reachable")
 	errDaemonRefused          = errors.New("daemon refused the agent token")
@@ -187,12 +192,10 @@ type daemon struct {
 	live int
 }
 
+// accept serves until shutdown. An endpoint that stays dead locks the daemon:
+// an unlocked vault nobody can reach could not be locked either.
 func (d *daemon) accept(listener net.Listener) {
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
+	err := acceptLoop(d.ctx, listener, acceptRetryLimit, func(conn net.Conn) {
 		d.enter()
 		d.conns.Add(1)
 		go func() {
@@ -200,6 +203,39 @@ func (d *daemon) accept(listener net.Listener) {
 			defer d.leave()
 			d.handle(conn)
 		}()
+	})
+	if err != nil {
+		fmt.Fprintln(d.stderr, err.Error())
+		d.requestLock()
+	}
+}
+
+// acceptLoop hands each connection to serve until the listener closes or ctx
+// ends. A failed Accept is retried with a doubling delay, because running out
+// of file descriptors passes. errAcceptDead reports an endpoint that kept
+// failing for limit, so the caller can fail closed.
+func acceptLoop(ctx context.Context, listener net.Listener, limit time.Duration, serve func(net.Conn)) error {
+	var delay, waited time.Duration
+	for {
+		conn, err := listener.Accept()
+		if err == nil {
+			delay, waited = 0, 0
+			serve(conn)
+			continue
+		}
+		if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+			return nil
+		}
+		if waited >= limit {
+			return errAcceptDead
+		}
+		delay = min(max(2*delay, acceptRetryFloor), acceptRetryCap)
+		waited += delay
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil
+		}
 	}
 }
 

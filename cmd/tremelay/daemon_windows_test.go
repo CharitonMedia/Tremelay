@@ -4,9 +4,12 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
@@ -104,6 +107,49 @@ func TestDaemonPipeNameIsClaimedExclusively(t *testing.T) {
 		t.Fatalf("released pipe name was not reusable: %v", err)
 	}
 	again.Close()
+}
+
+// TestDaemonPipeSurvivesClientThatLeftEarly opens the listening instance and
+// leaves before the daemon reaches its connect. However the kernel reports
+// that instance, the endpoint must keep serving the clients that follow.
+func TestDaemonPipeSurvivesClientThatLeftEarly(t *testing.T) {
+	getenv := envGet(daemonTestEnv(t))
+	listener, _, err := daemonListen(getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	early, err := daemonDial(getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	early.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go acceptLoop(ctx, listener, time.Minute, func(c net.Conn) {
+		_, _ = c.Write([]byte{'k'})
+		c.Close()
+	})
+	for i := range 3 {
+		conn, err := daemonDial(getenv)
+		if err != nil {
+			t.Fatalf("client %d after an early leaver could not connect: %v", i, err)
+		}
+		got := make(chan error, 1)
+		go func() {
+			_, err := conn.Read(make([]byte, 1))
+			got <- err
+		}()
+		select {
+		case err := <-got:
+			if err != nil {
+				t.Fatalf("client %d after an early leaver was not served: %v", i, err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatalf("client %d after an early leaver was never accepted", i)
+		}
+		conn.Close()
+	}
 }
 
 // TestDaemonPipeNameRejectsUnsafeInstance keeps the instance label from

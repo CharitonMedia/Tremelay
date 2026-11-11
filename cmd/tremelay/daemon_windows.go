@@ -152,8 +152,15 @@ func (l *pipeListener) Accept() (net.Conn, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	close(idle)
-	if err != nil || l.closed {
+	if l.closed {
 		return nil, net.ErrClosed // Close releases the handle.
+	}
+	if err != nil {
+		// A client that opened this instance and left before the connect
+		// leaves it unusable until it is disconnected. That is not shutdown:
+		// the caller retries, and this instance listens again.
+		_ = windows.DisconnectNamedPipe(handle)
+		return nil, errDaemonEndpoint
 	}
 	next, err := createPipeInstance(l.name, l.sd, false)
 	if err != nil {

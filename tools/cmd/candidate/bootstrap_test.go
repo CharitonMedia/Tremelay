@@ -33,7 +33,7 @@ func TestBootstrapExecution(t *testing.T) {
 		{"module integrity after build", "verify-after", "tools module cache changed before exec", true, false},
 		{"module inputs change during download", "module-before", "tools go.mod/go.sum changed", false, false},
 		{"module inputs change during build", "module-after", "tools go.mod/go.sum changed", true, false},
-		{"wrong toolchain", "wrong-version", "want go1.26.9", false, false},
+		{"wrong toolchain", "wrong-version", "want go1.26.11", false, false},
 		{"helper exit and cleanup", "helper-failure", "exit status 23", true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -44,7 +44,7 @@ func TestBootstrapExecution(t *testing.T) {
 				t.Fatal(err)
 			}
 			writeRepoFile(t, root, "tools/bootstrap-candidate.sh", string(script))
-			writeRepoFile(t, root, "tools/go.mod", "module example.com/bootstrap\n\ngo 1.26.9\n")
+			writeRepoFile(t, root, "tools/go.mod", "module example.com/bootstrap\n\ngo 1.26.11\n")
 			writeRepoFile(t, root, "tools/go.sum", "synthetic module integrity fixture\n")
 			writeRepoFile(t, root, "tools/cmd/candidate/main.go", "package main\n// old helper source\n")
 			gitCommit(t, root, "synthetic original source")
@@ -152,7 +152,7 @@ func mustGitTree(t *testing.T, root string) string {
 const bootstrapFakeGo = `#!/bin/sh
 set -eu
 fail() { echo "fake Go: $*" >&2; exit 91; }
-for pair in GOENV=off GOWORK=off GOEXPERIMENT= GOCACHEPROG= GOFIPS140=off GOTOOLCHAIN=go1.26.9 GO111MODULE=on GOFLAGS=-mod=readonly CGO_ENABLED=0 GO_EXTLINK_ENABLED=0 GOAMD64=v1 GO386=softfloat GOARM=5,softfloat GOARM64=v8.0 GOMIPS=softfloat GOMIPS64=softfloat GOPPC64=power8 GORISCV64=rva20u64 GOWASM= GOPRIVATE= GONOPROXY= GONOSUMDB= GOINSECURE=; do
+for pair in GOENV=off GOWORK=off GOEXPERIMENT= GOCACHEPROG= GOFIPS140=off GOTOOLCHAIN=go1.26.11 GO111MODULE=on GOFLAGS=-mod=readonly CGO_ENABLED=0 GO_EXTLINK_ENABLED=0 GOAMD64=v1 GO386=softfloat GOARM=5,softfloat GOARM64=v8.0 GOMIPS=softfloat GOMIPS64=softfloat GOPPC64=power8 GORISCV64=rva20u64 GOWASM= GOPRIVATE= GONOPROXY= GONOSUMDB= GOINSECURE=; do
     key=${pair%%=*}
     eval 'value=${'"$key"'-not-set}'
     [ "$key=$value" = "$pair" ] || fail "unexpected $key=$value"
@@ -166,7 +166,7 @@ if [ "$TEST_MODE" = alternate-host ]; then host_os=darwin; host_arch=arm64; fi
 printf '%s\n' "$*" >> "$TEST_PRIVATE/calls"
 case "$*" in
     "env GOVERSION")
-        if [ "$TEST_MODE" = wrong-version ]; then echo go1.26.8; else echo go1.26.9; fi
+        if [ "$TEST_MODE" = wrong-version ]; then echo go1.26.8; else echo go1.26.11; fi
         exit ;;
     "env GOHOSTOS"|"env GOHOSTARCH")
         [ -z "${GOOS-}" ] && [ -z "${GOARCH-}" ] || fail "host discovery inherited a target"
