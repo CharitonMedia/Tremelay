@@ -163,11 +163,14 @@ Read this before you trust it with anything.
   as you can use your agents' granted capabilities. It still cannot read a
   credential, change a grant, or learn your passphrase, and everything it does is
   audited — but that is the boundary.
-- **No alerts, no automatic containment, no breach check.** Every attempt,
-  allowed or denied, is written to the audit log, and nothing tells you about
-  it: read it with `tremelay audit list`. No agent is suspended automatically.
-  `credential policy --compromise-opt-in` stores your choice, but this version
-  ships no breach lookup, so no password is ever checked against one.
+- **Alerts only if you name a command; no automatic containment, no breach
+  check.** Every attempt, allowed or denied, is written to the audit log.
+  `tremelay daemon --alert-command /absolute/path` runs your command with the
+  high-risk ones (see [the daemon guide](docs/headless-daemon.md#alerts));
+  without it nothing tells you, and you read them with `tremelay audit list`.
+  No agent is suspended automatically. `credential policy --compromise-opt-in`
+  stores your choice, but this version ships no breach lookup, so no password
+  is ever checked against one.
 - **No OAuth refresh brokering, no database session brokering, no browser form
   fill, no TOTP, no provider-assisted rotation.** These are in
   [VISION.md](VISION.md) and on the roadmap, not in v1.

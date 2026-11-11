@@ -160,14 +160,16 @@ func TestBrokerDNSPinAndProxy(t *testing.T) {
 		return nil, nil
 	}
 	e.deny(t, good, ErrDeniedDestination)
+	// A granted name the resolver points at a non-public address is refused
+	// as an unusable destination: the agent asked for what its grant names.
 	e.session.resolve = func(context.Context, string) ([]net.IP, error) {
 		return []net.IP{net.ParseIP("1.1.1.1"), net.ParseIP("10.0.0.1")}, nil
 	}
-	e.deny(t, good, ErrDeniedSSRF)
+	e.deny(t, good, ErrDeniedDestination)
 	e.session.resolve = func(context.Context, string) ([]net.IP, error) {
 		return []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("192.88.99.2")}, nil
 	}
-	e.deny(t, good, ErrDeniedSSRF)
+	e.deny(t, good, ErrDeniedDestination)
 
 	var ip net.IP
 	lookups := 0
@@ -308,11 +310,22 @@ func TestBrokerRedirectsDoNotInherit(t *testing.T) {
 		t.Fatal(err)
 	}
 	via := []*http.Request{req, req, req}
-	if err := refuseRedirect(req, via); !errors.Is(err, errRedirectRefused) {
+	// A hop that stays on the origin is refused too, under its own error, so
+	// it ends as an upstream failure and not as a redirect escape.
+	if err := refuseRedirect(req, via); !errors.Is(err, errRedirectSameOrigin) {
 		t.Fatal(err)
 	}
-	if err := brokerClient(&http.Transport{Proxy: refuseProxy}).CheckRedirect(req, via); !errors.Is(err, errRedirectRefused) {
-		t.Fatal(err)
+	for _, elsewhere := range []string{"https://attacker.example/v1/ping", "http://svc.example/v1/ping", "https://svc.example:8443/v1/ping", "https://svc.example.attacker.example/"} {
+		next, err := http.NewRequest(http.MethodGet, elsewhere, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := refuseRedirect(next, via); !errors.Is(err, errRedirectRefused) {
+			t.Fatalf("%s: %v", elsewhere, err)
+		}
+		if err := brokerClient(&http.Transport{Proxy: refuseProxy}).CheckRedirect(next, via); !errors.Is(err, errRedirectRefused) {
+			t.Fatalf("%s: %v", elsewhere, err)
+		}
 	}
 	for _, ev := range e.session.audit {
 		fields := ev.Action + ev.Result + ev.Operation + ev.AgentID + ev.GrantID

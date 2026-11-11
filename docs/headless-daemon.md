@@ -196,6 +196,45 @@ does not wait for the client to close its side first.
 Ctrl-C at the daemon's passphrase prompt ends the command. Nothing typed
 afterwards is read.
 
+## Alerts
+
+```sh
+tremelay daemon --vault /absolute/vault.db --alert-command /absolute/path/to/alert
+```
+
+With `--alert-command` the daemon runs your command when an agent does
+something high-risk: probes for a secret, calls an origin or path its grant
+does not cover, writes a private address as its target, uses a revoked grant,
+keeps getting denied, or reaches an upstream that redirects the credential to
+another origin. Without the flag these are audited and nobody is told.
+
+The command is run directly, with no shell and no arguments, as you. It gets
+one JSON object per line on stdin:
+
+```json
+{"severity":"high","class":"replay","time":"2026-11-11T18:04:05Z","agent_id":"...","credential_id":"...","grant_id":"...","action":"local_attest","result":"denied_revoked","audit_seq":412,"audit_hash":"..."}
+```
+
+No line holds a secret, a token, a URL or a response body. `audit_seq` is the
+row to look up with `tremelay audit list`. A script that forwards the lines
+somewhere is enough:
+
+```sh
+#!/bin/sh
+# Append to a file, then post the batch wherever you read messages.
+tee -a "$HOME/tremelay-alerts.jsonl" | curl -fsS -X POST --data-binary @- https://example.invalid/your-hook
+```
+
+Alerts arrive in batches: the command runs at most once every 30 seconds with
+everything since its last run, up to 100 alerts. Beyond 100 the rest are
+recorded in the audit log as not delivered and the next batch ends with
+`{"dropped":N}`. A run that takes longer than 30 seconds is ended. If the
+command fails the daemon prints one line saying so; the alerts it was given
+are still in the audit log.
+
+Only what the daemon itself handles is alerted, which is everything agents do
+through it. Your own CLI commands are not.
+
 ## What gets audited
 
 Every authentication attempt lands in the audit chain as `daemon_auth`:

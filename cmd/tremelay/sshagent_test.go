@@ -133,7 +133,7 @@ func startSSHAgent(t *testing.T) *sshAgentFixture {
 	daemonCtx, cancelDaemon := context.WithCancel(context.Background())
 	f.cancel = cancelDaemon
 	go func() {
-		f.exit <- serveDaemon(daemonCtx, f.path, time.Hour, envGet(f.env), strings.NewReader(""), f.stdout, f.stderr)
+		f.exit <- serveDaemon(daemonCtx, f.path, time.Hour, "", envGet(f.env), strings.NewReader(""), f.stdout, f.stderr)
 	}()
 	t.Cleanup(func() { cancelDaemon(); f.wait(t, 15*time.Second) })
 	f.endpoint = awaitLine(t, f.stdout, f.stderr, "daemon endpoint")

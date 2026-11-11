@@ -694,6 +694,8 @@ func TestMCPNetworkBrokerDestinationDenials(t *testing.T) {
 				want, calls := resultDeniedSSRF, 0
 				switch mode {
 				case "private-dns", "mixed-dns":
+					// The resolver's answer, not the agent's request.
+					want = resultDeniedDestination
 					e.s.resolve = func(context.Context, string) ([]net.IP, error) {
 						ips := []net.IP{net.ParseIP("127.0.0.1")}
 						if mode == "mixed-dns" {
