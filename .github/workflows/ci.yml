@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  # A quiet branch stays green while new advisories land against its pinned
+  # toolchain and modules, so the default branch is re-checked every Monday.
+  schedule:
+    - cron: '17 9 * * 1'
 
 permissions:
   contents: read

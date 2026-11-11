@@ -680,3 +680,21 @@ Tests: `TestFailedLoginsSpendTheSharedBudgetAndAreAudited`,
 `TestLoginPacingEndsWithContext`, `TestJunkFramesArePacedAndStillAudited`,
 `TestFramePacingEndsWithServe`, `TestPacerAllowsBurstThenWaitsOutTheWindow`
 and `TestPacerWaitEndsWithContext`.
+
+## Amendment 2026-11-11 (second): three lifecycle corrections
+
+None changes a trust boundary; each makes the daemon say what happened.
+
+- **Exit status.** A lock the daemon forced on itself, because the vault failed
+  verification or the endpoint stopped accepting, exits 1. It exited 0, which
+  a supervisor or script read as an ordinary lock.
+- **Interrupted prompt.** The daemon catches SIGINT and SIGTERM for an orderly
+  lock, and the passphrase prompt did not watch for them: Ctrl-C was swallowed
+  and the next line typed still unlocked the vault. The prompt now ends with
+  the signal, using the reader `vault change-passphrase` already had.
+- **Relay after a lock.** `tremelay mcp --daemon` waited for its client's
+  stdin after the daemon had closed the stream, so it hung until the client's
+  next write and then exited 0. It now reports the ended session and exits 1.
+
+Tests: `TestDaemonPromptCancellation` (Linux, on a pty), the lock assertions in
+the daemon lifecycle test, and the exit status in the tamper cases.
