@@ -160,14 +160,25 @@ Read this before you trust it with anything.
   body (`multipart/form-data`, file uploads) is refused as `denied_malformed`.
   Send JSON or a urlencoded form instead.
 - **An unlocked daemon trusts your uid.** While it is unlocked, any code running
-  as you can use your agents' granted capabilities. It still cannot read a
-  credential, change a grant, or learn your passphrase, and everything it does is
-  audited — but that is the boundary.
-- **No alerts, no automatic containment, no breach check.** Every attempt,
-  allowed or denied, is written to the audit log, and nothing tells you about
-  it: read it with `tremelay audit list`. No agent is suspended automatically.
-  `credential policy --compromise-opt-in` stores your choice, but this version
-  ships no breach lookup, so no password is ever checked against one.
+  as you can use your agents' granted capabilities. Through Tremelay it still
+  cannot read a credential, change a grant, or learn your passphrase, and
+  everything it does is audited — but that is the boundary. On Linux the
+  process also refuses same-user debuggers and writes no core file. On macOS
+  and Windows it does not, so code running as you that attaches a debugger can
+  read its memory.
+- **Alerts only if you name a command; no automatic containment, no breach
+  check.** Every attempt, allowed or denied, is written to the audit log.
+  `tremelay daemon --alert-command /absolute/path` runs your command with the
+  high-risk ones (see [the daemon guide](docs/headless-daemon.md#alerts));
+  without it nothing tells you, and you read them with `tremelay audit list`.
+  No agent is suspended automatically. `credential policy --compromise-opt-in`
+  stores your choice, but this version ships no breach lookup, so no password
+  is ever checked against one.
+- **The audit log is never trimmed.** Every attempt adds at least one row, and
+  every unlock and every daemon reload reads and verifies all of them, so
+  commands slow down as the log grows and the daemon holds it all in memory.
+  Pacing caps how fast one agent can make attempts, at about 20 a second.
+  There is no command to archive or prune old rows yet.
 - **No OAuth refresh brokering, no database session brokering, no browser form
   fill, no TOTP, no provider-assisted rotation.** These are in
   [VISION.md](VISION.md) and on the roadmap, not in v1.

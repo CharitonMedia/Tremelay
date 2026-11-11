@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Amendment 2026-11-11: [ADR 0028](0028-owner-alerts.md) changes two results fixed here. A granted name that resolves to a non-public address is `denied_destination`, not `denied_ssrf`, and a redirect that stays on the origin is `upstream_error`, not `denied_redirect`. No redirect is followed in either version.
+
 ## Context
 
 M3 ([ADR 0005](0005-http-credential-broker.md)) lets an agent with an active `http_request` grant call one canonical HTTPS target. The broker inserts the credential. The agent receives a status code and not the secret, the header, or the upstream body. ADR 0005 refuses redirects, pins the first public address, and treats every destination failure as `denied_destination`. It leaves generalized host, method, path, and redirect policy to M4.

@@ -988,6 +988,17 @@ func projectResponse(inj grantInjection, secret []byte, upstream http.Header, bo
 			out.Body = out.Body[:len(out.Body)-n]
 		}
 	}
+	// The MCP result carries the body twice, the second time inside a JSON
+	// string, so markup- or quote-heavy text grows several times over and a
+	// 32 KiB body can outgrow the frame. The upstream call has already run:
+	// a truncated body the agent can read beats an "internal error" that
+	// leaves it unable to tell whether its POST happened.
+	for len(out.Body) > 0 && !brokerResultFits(out) {
+		keep := brokerReadableBody(out.Body[:len(out.Body)*3/4], true)
+		wipe(out.Body[len(keep):])
+		out.Body = keep
+		out.Truncated = true
+	}
 	if out.Truncated {
 		// The cap can cut a shifted run short of the length that withholds.
 		if n := partialTail(out.Body, shifted); n > 0 {

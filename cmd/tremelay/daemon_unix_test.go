@@ -53,7 +53,7 @@ func TestDaemonEndpointPermissions(t *testing.T) {
 		t.Fatalf("second daemon on a live endpoint: %v", err)
 	}
 	// Leave the socket file behind with nothing listening on it.
-	listener.(*net.UnixListener).SetUnlinkOnClose(false)
+	listener.(lockedListener).Listener.(*net.UnixListener).SetUnlinkOnClose(false)
 	listener.Close()
 	if _, err := os.Lstat(endpoint); err != nil {
 		t.Fatalf("stale endpoint fixture: %v", err)
@@ -288,5 +288,66 @@ func TestSSHAgentDefaultSocketFollowsOverride(t *testing.T) {
 	got := sshAgentDefaultSocket(func(k string) string { return env[k] })
 	if got != filepath.Join("/tmp/tm", sshAgentSocketName) {
 		t.Fatalf("default agent socket %q does not follow the override", got)
+	}
+}
+
+// Two daemons started together against one stale socket must not both come
+// up. The loser of that race used to sit unlocked behind a socket nobody
+// could reach, and to remove the winner's socket when it exited.
+func TestDaemonListenAdmitsOneOfManyRacers(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		getenv := envGet(map[string]string{"XDG_RUNTIME_DIR": socketDir(t)})
+		stale, endpoint, err := daemonListen(getenv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stale.(lockedListener).Listener.(*net.UnixListener).SetUnlinkOnClose(false)
+		stale.Close()
+		if _, err := os.Lstat(endpoint); err != nil {
+			t.Fatalf("no stale socket to race for: %v", err)
+		}
+		const racers = 8
+		type result struct {
+			listener net.Listener
+			err      error
+		}
+		results := make(chan result, racers)
+		start := make(chan struct{})
+		for i := 0; i < racers; i++ {
+			go func() {
+				<-start
+				l, _, err := daemonListen(getenv)
+				results <- result{l, err}
+			}()
+		}
+		close(start)
+		var winner net.Listener
+		for i := 0; i < racers; i++ {
+			r := <-results
+			switch {
+			case r.err == nil && winner == nil:
+				winner = r.listener
+			case r.err == nil:
+				t.Fatal("two daemons hold one endpoint")
+			case r.err != errDaemonRunning:
+				t.Fatalf("a racer failed with %v, want errDaemonRunning", r.err)
+			}
+		}
+		if winner == nil {
+			t.Fatal("no daemon came up")
+		}
+		// The winner's socket is the one at the path, and it answers.
+		conn, err := net.Dial("unix", endpoint)
+		if err != nil {
+			t.Fatalf("round %d: the winning daemon is unreachable: %v", round, err)
+		}
+		conn.Close()
+		winner.Close()
+		// Its lock went with it: the endpoint can be served again.
+		again, _, err := daemonListen(getenv)
+		if err != nil {
+			t.Fatalf("endpoint not reusable after a clean close: %v", err)
+		}
+		again.Close()
 	}
 }

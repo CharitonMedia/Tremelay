@@ -2,14 +2,20 @@ package vault
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
+
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 )
 
 // Percent-encoders disagree about which bytes to escape, so an upstream that
@@ -255,6 +261,123 @@ func TestSlowUpstreamBodyDoesNotHoldTheSession(t *testing.T) {
 			close(release)
 			if err := <-brokered; err != nil {
 				t.Errorf("broker: %v", err)
+			}
+		})
+	}
+}
+
+// An alert names an agent. It must not name one for what the upstream or the
+// resolver did: a redirect that stays on the granted origin (GitHub answers a
+// renamed repository that way), a 304, or a granted name the resolver points
+// at a private address. A redirect to another origin still alerts.
+func TestUpstreamAndResolverFaultsDoNotAlert(t *testing.T) {
+	for name, tc := range map[string]struct {
+		handler http.HandlerFunc
+		resolve []net.IP
+		want    string
+		err     error
+		alerts  int
+	}{
+		"same-origin redirect": {
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", brokerTestPrefix+"/moved")
+				w.WriteHeader(http.StatusMovedPermanently)
+			},
+			want: resultUpstreamError, err: ErrBrokerUpstream,
+		},
+		"not modified": {
+			handler: func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotModified) },
+			want:    resultUpstreamError, err: ErrBrokerUpstream,
+		},
+		"redirect to another origin": {
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", "https://attacker.example/collect")
+				w.WriteHeader(http.StatusFound)
+			},
+			want: resultDeniedRedirect, err: ErrDeniedRedirect, alerts: 1,
+		},
+		"resolver answers with a private address": {
+			resolve: []net.IP{net.ParseIP("10.0.0.7")},
+			want:    resultDeniedDestination, err: ErrDeniedDestination,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newHTTPBrokerEnv(t, InjectBearer, "")
+			note := &MemoryNotifier{}
+			if err := e.s.SetNotifier(note); err != nil {
+				t.Fatal(err)
+			}
+			// The strictest containment: nothing here may trip it.
+			if err := e.s.SetResponsePolicy(ResponsePolicy{High: ContainSuspendAgent}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.handler != nil {
+				e.handler = tc.handler
+			}
+			if tc.resolve != nil {
+				e.s.resolve = func(context.Context, string) ([]net.IP, error) { return tc.resolve, nil }
+			}
+			if _, err := e.principal.BrokerRequest(e.request(brokerTestPrefix)); !errors.Is(err, tc.err) {
+				t.Fatalf("err = %v, want %v", err, tc.err)
+			}
+			if got := e.lastResult(t); got != tc.want {
+				t.Fatalf("audit result %q, want %q", got, tc.want)
+			}
+			if got := len(note.Snapshot()); got != tc.alerts {
+				t.Fatalf("%d alerts, want %d: %+v", got, tc.alerts, note.Snapshot())
+			}
+			if active := e.s.agentActive(e.agentID); active != (tc.alerts == 0) {
+				t.Fatalf("agent active = %v", active)
+			}
+		})
+	}
+}
+
+// The MCP result carries a broker body twice, once inside a JSON string, so
+// markup and quotes grow it several times over. A body under the 32 KiB cap
+// that would outgrow the frame is cut and marked truncated. It used to become
+// "internal error" after the upstream call had already run.
+func TestBrokerBodyIsCutToFitTheMCPFrame(t *testing.T) {
+	secret := []byte("ghp_" + strings.Repeat("Z", 36))
+	inj := grantInjection{style: InjectBearer}
+	for name, body := range map[string][]byte{
+		"ascii":   bytes.Repeat([]byte("a"), maxAgentBody),
+		"quotes":  bytes.Repeat([]byte(`"`), maxAgentBody),
+		"markup":  bytes.Repeat([]byte("<"), maxAgentBody),
+		"html":    bytes.Repeat([]byte("<b>text</b>"), maxAgentBody/11),
+		"json":    bytes.Repeat([]byte(`{"k":"v"},`), maxAgentBody/10),
+		"control": bytes.Repeat([]byte("\x01"), maxAgentBody),
+		"rune":    bytes.Repeat([]byte(" "), maxAgentBody/3),
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := projectResponse(inj, secret, http.Header{"Content-Type": []string{"text/html"}}, body, false)
+			if err != nil {
+				t.Fatalf("withheld: %v", err)
+			}
+			res, err := toolValue(brokerBody(out))
+			if err != nil {
+				t.Fatalf("tool result refused: %v", err)
+			}
+			raw, err := json.Marshal(res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, _ := jsonrpc.MakeID(float64(7))
+			frame := frameFor(&jsonrpc.Response{ID: id, Result: raw})
+			if len(frame) > maxMCPFrame || bytes.Contains(frame, []byte(`"error"`)) {
+				t.Fatalf("frame of %d bytes: %.80s", len(frame), frame)
+			}
+			if !utf8.Valid(out.Body) || !bytes.HasPrefix(body, out.Body) {
+				t.Fatal("the cut body is not a clean prefix of the upstream body")
+			}
+			if cut := len(out.Body) < len(body); cut != out.Truncated {
+				t.Fatalf("kept %d of %d bytes, truncated=%v", len(out.Body), len(body), out.Truncated)
+			}
+			if name == "ascii" && out.Truncated {
+				t.Fatal("a plain 32 KiB body was cut")
+			}
+			if len(out.Body) < maxAgentBody/8 {
+				t.Fatalf("only %d bytes kept", len(out.Body))
 			}
 		})
 	}

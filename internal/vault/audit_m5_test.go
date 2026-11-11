@@ -254,7 +254,7 @@ func TestM5NotifyContainAndViews(t *testing.T) {
 	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: target}, ErrDeniedAbuse)
 	e.session.SetAbuseGuard(nil)
 	e.session.httpDo = func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusFound, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+		return &http.Response{StatusCode: http.StatusFound, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{"Location": []string{"https://attacker.example/"}}}, nil
 	}
 	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: target}, ErrDeniedRedirect)
 
