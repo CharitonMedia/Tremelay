@@ -444,10 +444,20 @@ Every read of upstream bytes now runs released, like the round trip. Nothing
 new is decided after it: the same re-checks that follow the round trip follow
 the read.
 
+**Frame fit (section 5).** The 32 KiB response cap was chosen to fit the MCP
+frame, and did not: the tool result carries the body twice, the second time
+inside a JSON string, so markup and quotes grow it up to twelvefold. A body of
+`<` characters under the cap became `internal error` after the upstream call
+had already run, which for a POST leaves the agent unable to tell whether it
+happened. The body is now cut until the encoded result fits one frame with
+room for its envelope, and `truncated` is set. Plain text still gets the full
+32 KiB.
+
 Still not caught, as before: an upstream that deliberately re-encodes or
 splits the credential.
 
 Tests: `TestMethodOverrideFieldNamesAreRefused`,
 `TestRedactionReadsMixedPercentEncoding`, `TestSpellsReadsEscapesAndCuts`,
 `TestTruncationDropsPartialMixedSpelling`, `TestShiftedBase64EchoIsWithheld`,
-`TestOrdinaryBase64IsNotWithheld`, `TestSlowUpstreamBodyDoesNotHoldTheSession`.
+`TestOrdinaryBase64IsNotWithheld`, `TestSlowUpstreamBodyDoesNotHoldTheSession`,
+`TestBrokerBodyIsCutToFitTheMCPFrame`.

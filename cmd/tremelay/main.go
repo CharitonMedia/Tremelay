@@ -17,6 +17,11 @@ import (
 )
 
 func main() {
+	if err := hardenProcess(); err != nil {
+		// Not fatal: a sandbox that forbids the call should not make the
+		// tool unusable. It is said once, in fixed words.
+		fmt.Fprintln(os.Stderr, "warning: could not make this process non-dumpable; same-user processes may be able to read its memory")
+	}
 	vault.ServerVersion, _, _ = versionFromBuildInfo()
 	os.Exit(run(os.Args[1:], os.Getenv, os.Stdin, os.Stdout, os.Stderr))
 }

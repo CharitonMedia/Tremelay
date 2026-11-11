@@ -604,6 +604,21 @@ func entryBody(e capEntry) mcpEntryBody {
 	}
 }
 
+// mcpEnvelopeRoom is what the JSON-RPC envelope around a tool result may
+// take: the fixed keys and the request id.
+const mcpEnvelopeRoom = 2 << 10
+
+// brokerResultFits reports whether the tool result for resp fits one frame
+// with room for its envelope. It encodes what toolValue returns.
+func brokerResultFits(resp HTTPResponse) bool {
+	res, err := toolValue(brokerBody(resp))
+	if err != nil {
+		return false
+	}
+	raw, err := json.Marshal(res)
+	return err == nil && len(raw)+mcpEnvelopeRoom <= maxMCPFrame
+}
+
 func toolValue(v any) (*mcp.CallToolResult, error) {
 	raw, err := json.Marshal(v)
 	if err != nil || len(raw) > maxMCPFrame {

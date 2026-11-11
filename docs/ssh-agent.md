@@ -18,8 +18,15 @@ that sends no binding is told about no key and gets no signature, because
 without it there is no proof of which destination the signature is for. The
 server can be anything, including GitHub and other hosted forges, which do not
 implement `publickey-hostbound-v00@openssh.com`
-([ADR 0013](adr/0013-ssh-userauth.md), amendment of 2026-10-14). Forwarded
-agent connections (`ssh -A` on a second hop) are still refused.
+([ADR 0013](adr/0013-ssh-userauth.md), amendment of 2026-10-14).
+
+**Do not forward this agent (`ssh -A`) from a client older than OpenSSH 8.9.**
+A forwarded connection is refused only when the client marks it as forwarded,
+which OpenSSH 8.9 and later do. Older OpenSSH (8.2 on Ubuntu 20.04 and RHEL 8,
+for example), Go's `ssh/agent` forwarding, paramiko and similar do not mark
+it. The far host's binding then looks like an ordinary first-hop one, and this
+agent cannot tell the difference: that host can obtain a signature that logs
+it in to the pinned host as you. The code has no way to detect this case.
 
 ## Create the key and the grant
 

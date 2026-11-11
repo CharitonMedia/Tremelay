@@ -273,7 +273,10 @@ type document struct {
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
 type Session struct {
-	path     string
+	path string
+	// file identifies the file opened at path, so a later replacement of
+	// that path can be told from a transient read failure.
+	file     os.FileInfo
 	id       string
 	dek      []byte
 	header   fileHeader
@@ -404,6 +407,7 @@ func Create(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	red.Add(passphrase)
 	s := &Session{
 		path: path,
+		file: fileIdentity(path),
 		id:   id,
 		dek:  dek,
 		header: fileHeader{
@@ -539,6 +543,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 	}
 	s := &Session{
 		path:            path,
+		file:            fileIdentity(path),
 		id:              header.ID,
 		dek:             dek,
 		header:          header,
@@ -763,8 +768,17 @@ func (s *Session) adoptLocked() error {
 	var seq, tip int64
 	var head string
 	if err := s.db.QueryRow(`SELECT audit_seq, audit_head, COALESCE((SELECT seq FROM audit ORDER BY seq DESC LIMIT 1), 0) FROM vault WHERE id=?`, s.id).Scan(&seq, &head, &tip); err != nil {
-		// A read that cannot happen is an IO failure, not a verdict about the
-		// chain, and it does not retire the session.
+		// The file under this session is no longer this vault: another
+		// vault's bytes were written in place, or the path now names a
+		// different file and SQLite refuses the one it still holds. That
+		// never heals, so the session is retired and a daemon locks and
+		// exits. Before this it answered every call with an IO error forever.
+		if errors.Is(err, sql.ErrNoRows) || s.fileReplaced() {
+			s.defunct = true
+			return ErrCorrupt
+		}
+		// Any other read that cannot happen is an IO failure, not a verdict
+		// about the chain, and it does not retire the session.
 		return ErrIO
 	}
 	if seq < 0 || tip < 0 {
@@ -779,6 +793,28 @@ func (s *Session) adoptLocked() error {
 		return ErrCorrupt
 	}
 	return s.reloadLocked()
+}
+
+func fileIdentity(path string) os.FileInfo {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	return info
+}
+
+// fileReplaced reports that path no longer names the file this session
+// opened: it was renamed over, or removed. A path that cannot be examined for
+// another reason is not a replacement.
+func (s *Session) fileReplaced() bool {
+	if s.file == nil {
+		return false
+	}
+	now, err := os.Stat(s.path)
+	if err != nil {
+		return errors.Is(err, os.ErrNotExist)
+	}
+	return !os.SameFile(s.file, now)
 }
 
 // reloadLocked replaces this session's cached authority with the durable state
@@ -1128,6 +1164,13 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 		}
 		if errors.Is(err, ErrIO) {
 			s.logf("vault_write result=error")
+			// SQLite refuses to write a file that is no longer at its path.
+			// Reads of the old file still succeed, so this is where a
+			// rename over the vault first shows.
+			if s.fileReplaced() {
+				s.defunct = true
+				return ErrCorrupt
+			}
 		}
 		return err
 	}
