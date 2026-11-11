@@ -9,6 +9,8 @@ import (
 	"sync"
 	"unicode"
 	"unicode/utf8"
+
+	"filippo.io/edwards25519"
 )
 
 const (
@@ -811,7 +813,29 @@ func sshGrantOK(ops []string, spec GrantSpec, credType string) error {
 	if !validSSHUsername(spec.SSHUsername) || !canonicalSSHEd25519Blob(spec.SSHHostKey) {
 		return ErrInvalid
 	}
+	if host, ok := parseEd25519Blob(spec.SSHHostKey); !ok || !strongEd25519Key(host) {
+		return ErrInvalid
+	}
 	return nil
+}
+
+// strongEd25519Key reports a public key that can stand for a host: a point on
+// the curve that is not of small order. crypto/ed25519.Verify accepts the
+// eight small-order points as keys, and under one of them a signature anyone
+// can write (R the identity, S zero) verifies over every message, or over one
+// message in a few. A host key like that pins nothing: any caller could forge
+// the session binding for any session. The check is the standard one, clearing
+// the cofactor and comparing with the identity.
+//
+// It guards issuance and each binding, not the stored grant's shape, so a
+// vault that already holds such a grant still opens; the grant just never
+// binds.
+func strongEd25519Key(key []byte) bool {
+	p, err := new(edwards25519.Point).SetBytes(key)
+	if err != nil {
+		return false
+	}
+	return new(edwards25519.Point).MultByCofactor(p).Equal(edwards25519.NewIdentityPoint()) != 1
 }
 
 func soleSSH(ops []string) bool {
@@ -919,7 +943,7 @@ func verifyHostBind(hostBlob, sessionID, sigBlob []byte) bool {
 		return false
 	}
 	pub, ok := parseEd25519Blob(hostBlob)
-	if !ok {
+	if !ok || !strongEd25519Key(pub) {
 		return false
 	}
 	raw, ok := parseEd25519Sig(sigBlob)

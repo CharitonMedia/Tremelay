@@ -94,29 +94,60 @@ func listenUserSocket(path string) (net.Listener, error) {
 	if err := ownedExclusively(dir, os.ModeDir); err != nil {
 		return nil, err
 	}
+	// Checking for a live socket, removing a stale one and binding are three
+	// steps. Two daemons started together against one stale socket could both
+	// pass them: one ended up unlocked behind an unlinked socket nobody could
+	// reach to lock it, and when it exited it removed the other's socket. An
+	// exclusive lock on a file beside the socket, held for the life of the
+	// listener, lets one in. The kernel drops it when the process dies.
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, errDaemonEndpoint
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, errDaemonRunning
+	}
 	if _, err := os.Lstat(path); err == nil {
 		if err := ownedExclusively(path, os.ModeSocket); err != nil {
+			lock.Close()
 			return nil, err
 		}
 		if conn, err := net.Dial("unix", path); err == nil {
 			conn.Close()
+			lock.Close()
 			return nil, errDaemonRunning
 		}
 		if err := os.Remove(path); err != nil {
+			lock.Close()
 			return nil, errDaemonEndpoint
 		}
 	}
 	listener, err := net.Listen("unix", path)
 	if err != nil {
+		lock.Close()
 		return nil, errDaemonEndpoint
 	}
 	// Bind inherits the process umask. The 0700 parent already excludes other
 	// users during that window; this makes the socket itself user-only too.
 	if err := os.Chmod(path, 0o600); err != nil {
 		listener.Close()
+		lock.Close()
 		return nil, errDaemonEndpoint
 	}
-	return listener, nil
+	return lockedListener{listener, lock}, nil
+}
+
+// lockedListener releases the endpoint's lock after its socket is closed.
+type lockedListener struct {
+	net.Listener
+	lock *os.File
+}
+
+func (l lockedListener) Close() error {
+	err := l.Listener.Close()
+	l.lock.Close()
+	return err
 }
 
 // daemonDial sends the agent token only to a daemon the kernel reports as

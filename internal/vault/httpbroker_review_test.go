@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -12,6 +13,9 @@ import (
 	"testing"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
+
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 )
 
 // Percent-encoders disagree about which bytes to escape, so an upstream that
@@ -324,6 +328,56 @@ func TestUpstreamAndResolverFaultsDoNotAlert(t *testing.T) {
 			}
 			if active := e.s.agentActive(e.agentID); active != (tc.alerts == 0) {
 				t.Fatalf("agent active = %v", active)
+			}
+		})
+	}
+}
+
+// The MCP result carries a broker body twice, once inside a JSON string, so
+// markup and quotes grow it several times over. A body under the 32 KiB cap
+// that would outgrow the frame is cut and marked truncated. It used to become
+// "internal error" after the upstream call had already run.
+func TestBrokerBodyIsCutToFitTheMCPFrame(t *testing.T) {
+	secret := []byte("ghp_" + strings.Repeat("Z", 36))
+	inj := grantInjection{style: InjectBearer}
+	for name, body := range map[string][]byte{
+		"ascii":   bytes.Repeat([]byte("a"), maxAgentBody),
+		"quotes":  bytes.Repeat([]byte(`"`), maxAgentBody),
+		"markup":  bytes.Repeat([]byte("<"), maxAgentBody),
+		"html":    bytes.Repeat([]byte("<b>text</b>"), maxAgentBody/11),
+		"json":    bytes.Repeat([]byte(`{"k":"v"},`), maxAgentBody/10),
+		"control": bytes.Repeat([]byte("\x01"), maxAgentBody),
+		"rune":    bytes.Repeat([]byte(" "), maxAgentBody/3),
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := projectResponse(inj, secret, http.Header{"Content-Type": []string{"text/html"}}, body, false)
+			if err != nil {
+				t.Fatalf("withheld: %v", err)
+			}
+			res, err := toolValue(brokerBody(out))
+			if err != nil {
+				t.Fatalf("tool result refused: %v", err)
+			}
+			raw, err := json.Marshal(res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, _ := jsonrpc.MakeID(float64(7))
+			frame := frameFor(&jsonrpc.Response{ID: id, Result: raw})
+			if len(frame) > maxMCPFrame || bytes.Contains(frame, []byte(`"error"`)) {
+				t.Fatalf("frame of %d bytes: %.80s", len(frame), frame)
+			}
+			if !utf8.Valid(out.Body) || !bytes.HasPrefix(body, out.Body) {
+				t.Fatal("the cut body is not a clean prefix of the upstream body")
+			}
+			if cut := len(out.Body) < len(body); cut != out.Truncated {
+				t.Fatalf("kept %d of %d bytes, truncated=%v", len(out.Body), len(body), out.Truncated)
+			}
+			if name == "ascii" && out.Truncated {
+				t.Fatal("a plain 32 KiB body was cut")
+			}
+			if len(out.Body) < maxAgentBody/8 {
+				t.Fatalf("only %d bytes kept", len(out.Body))
 			}
 		})
 	}

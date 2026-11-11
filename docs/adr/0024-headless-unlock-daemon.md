@@ -698,3 +698,35 @@ None changes a trust boundary; each makes the daemon say what happened.
 
 Tests: `TestDaemonPromptCancellation` (Linux, on a pty), the lock assertions in
 the daemon lifecycle test, and the exit status in the tamper cases.
+
+## Amendment 2026-11-11 (third): replaced file, racing starts, process memory
+
+- **A vault file replaced under the daemon.** A different file renamed over
+  the vault's path, another vault's bytes written in place, or the file's
+  removal left the session answering every call with an IO error, unlocked,
+  forever: SQLite refuses to write a file that moved, and the reload's
+  identity check was never reached. The session now records which file it
+  opened. When a read finds no row for its vault id, or a read or write fails
+  and the path no longer names that file, the session is retired with the
+  same error as a failed verification, and the daemon locks and exits 1.
+- **Two daemons started together.** Checking for a live socket, removing a
+  stale one and binding are three steps, and two processes could interleave
+  them. One then sat unlocked behind an unlinked socket that `tremelay lock`
+  could not reach, and removed the other's socket when it exited. The listener
+  now holds an exclusive `flock` on `<socket>.lock` for its whole life. The
+  second starter is told a daemon is already serving. The lock file stays
+  behind after exit and is harmless.
+- **Process memory (Linux).** Every command marks itself non-dumpable at
+  start. Another process of the same user can no longer read the vault key
+  through ptrace or `/proc/PID/mem` on hosts that allow same-user tracing, and
+  a crash writes no core file. This is Linux only, and root is not stopped.
+  macOS and Windows are unchanged: there, "an unlocked daemon trusts your uid"
+  includes a same-user debugger.
+
+Not changed, and not verified for lack of a host: on Windows, a client
+running elevated may be refused by a daemon that is not, because the daemon
+reads the client's process token to compare users. It fails closed.
+
+Tests: `TestReplacedVaultFileRetiresTheSession`,
+`TestDaemonListenAdmitsOneOfManyRacers`, `TestHardenProcessClearsDumpable`.
+

@@ -229,3 +229,37 @@ the same release and the cross-grant refusal through the official
 `ssh/agent` client. Key material, usernames, host keys, session identifiers,
 preimages and signatures are still scanned out of the wire, logs, vault file
 and audit rows.
+
+## Amendment 2026-11-11: small-order host keys, and what forwarding refusal covers
+
+**Small-order host keys.** A pinned host key was checked for length, algorithm
+and canonical framing, never for being a usable point. `crypto/ed25519.Verify`
+accepts the eight small-order points as public keys, and under the identity
+point the signature "R is the identity, S is zero" verifies over every
+message. A grant pinning such a key let any caller forge the session binding
+for any session, after which the plain `publickey` path signs a login good on
+any server that accepts the user key. It needed the owner to pin a bad value,
+such as a paste of zeros, and nothing at the boundary caught it.
+
+Issuance now refuses a host key that is off the curve or of small order, and
+a binding is never verified under one. The stored grant's shape check is
+unchanged, so a vault that already holds such a grant still opens; the grant
+never binds.
+
+This adds a dependency, `filippo.io/edwards25519` v1.2.0, for one operation:
+decode the point, clear the cofactor, compare with the identity. The standard
+library has the same code but does not export it, and writing the test by
+hand would be inventing cryptography. The module is the upstream of the
+standard library's implementation, by the same author, BSD-licensed, with no
+dependencies of its own.
+
+**Forwarding refusal.** The stream refuses a binding marked `is_forwarding`.
+Only OpenSSH 8.9 and later mark a forwarded agent channel. Older OpenSSH,
+Go's `ssh/agent` forwarding, paramiko and similar do not, and the far host's
+binding is then indistinguishable from a first-hop one. The earlier wording,
+"forwarded agent connections are refused", claimed more than the code can
+deliver. `docs/ssh-agent.md` and `THREAT_MODEL.md` now say so and tell users
+not to forward this agent from an older client. No code can close this.
+
+Test: `TestSSHHostKeyOfSmallOrderIsRefused`.
+
