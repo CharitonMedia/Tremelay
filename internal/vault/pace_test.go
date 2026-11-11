@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -112,7 +113,7 @@ func TestJunkFramesArePacedAndStillAudited(t *testing.T) {
 	ep := stdioEndpoint(t, bindCap(t, env.s, env.agent.ID))
 	cr, sw := io.Pipe()
 	sr, cw := io.Pipe()
-	go io.Copy(io.Discard, cr)
+	replies := bufio.NewReader(cr)
 	done := make(chan error, 1)
 	before := len(mcpAuditSnapshot(env.s))
 	start := time.Now()
@@ -120,6 +121,11 @@ func TestJunkFramesArePacedAndStillAudited(t *testing.T) {
 	const n = agentPaceBurst + 6
 	for range n {
 		if _, err := cw.Write([]byte("\n")); err != nil {
+			t.Fatal(err)
+		}
+		// Take each refusal before sending more: the endpoint hangs up on a
+		// peer that lets a third reply queue, and that is not under test here.
+		if _, err := replies.ReadString('\n'); err != nil {
 			t.Fatal(err)
 		}
 	}
