@@ -406,8 +406,18 @@ func TestDaemonUnlockedAgentCall(t *testing.T) {
 	if code := f.wait(t, 15*time.Second); code != 0 {
 		t.Fatalf("locked daemon exited %d: %q", code, f.stderr.String())
 	}
-	// The in-flight session ends without a response; the next call fails closed.
-	agent.finish(t)
+	// The in-flight session ends without a response. Its client still holds
+	// stdin open, and the relay must not wait for it: it reports the ended
+	// session and exits non-zero.
+	select {
+	case code := <-agent.exit:
+		if code != 1 || !strings.Contains(agent.stderr.String(), errDaemonEnded.Error()) {
+			t.Fatalf("relay of a locked daemon exited %d: %q", code, agent.stderr.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("relay kept waiting on its client's stdin after the daemon locked")
+	}
+	// The next call fails closed.
 	if conn, err := daemonDial(envGet(f.env)); err == nil {
 		conn.Close()
 		t.Fatal("locked daemon left its endpoint reachable")
@@ -770,7 +780,9 @@ func TestDaemonLocksOnUnverifiableVault(t *testing.T) {
 			if code := refused.finish(t); code != 1 {
 				t.Fatalf("call against an unverifiable vault exited %d: %q", code, refused.stderr.String())
 			}
-			if code := f.wait(t, 15*time.Second); code != 0 {
+			// A lock forced by a vault that failed verification is not an
+			// ordinary lock, and the exit code says so.
+			if code := f.wait(t, 15*time.Second); code != 1 {
 				t.Fatalf("daemon exited %d: %q", code, f.stderr.String())
 			}
 			if !strings.Contains(f.stderr.String(), errDaemonTerminal.Error()) {

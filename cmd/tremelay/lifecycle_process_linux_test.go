@@ -266,3 +266,43 @@ func TestLifecycleProcessBrokenStdout(t *testing.T) {
 		})
 	}
 }
+
+// The daemon catches SIGINT and SIGTERM for an orderly lock. At the passphrase
+// prompt that must end the command, not arm it: an interrupted prompt once kept
+// reading, and the next line typed unlocked the vault.
+func TestDaemonPromptCancellation(t *testing.T) {
+	for _, interruption := range []string{"ctrl-c", "SIGINT", "SIGTERM"} {
+		t.Run(interruption, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "vault.db")
+			pass := randHex(t, 24)
+			s, err := vault.Create(path, []byte(pass), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.Lock()
+			for name, value := range daemonTestEnv(t) {
+				t.Setenv(name, value)
+			}
+			p := startLifecycleProcess(t, []string{"daemon", "--vault", path}, false)
+			p.prompt(t, "passphrase: ")
+			switch interruption {
+			case "ctrl-c":
+				// The right passphrase, typed after the interrupt, unlocks
+				// nothing. One stream, so the order is the order typed.
+				p.input(t, append([]byte{3}, pass+"\n"...))
+			case "SIGINT":
+				err = p.cmd.Process.Signal(syscall.SIGINT)
+			case "SIGTERM":
+				err = p.cmd.Process.Signal(syscall.SIGTERM)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A signal ends the prompt with nothing more typed.
+			p.finish(t, 1, pass)
+			if out := p.stdout.String(); out != "" {
+				t.Fatalf("an interrupted daemon reported an endpoint: %q", out)
+			}
+		})
+	}
+}

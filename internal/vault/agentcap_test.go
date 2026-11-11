@@ -685,3 +685,27 @@ func assertNoCapLeak(t *testing.T, raw []byte, env *attestEnv, grant Grant, payl
 	}
 	assertNoSecrets(t, raw, [][]byte{payload, env.der, env.priv.Seed(), append([]byte(nil), env.priv...)})
 }
+
+// TestAgentCapCeilingCountsOnlyLiveGrants is the regression test for an agent
+// locked out of discovery for good once it had ever been issued more than 64
+// grants: nothing deletes a grant, and revoked ones still filled the catalog.
+func TestAgentCapCeilingCountsOnlyLiveGrants(t *testing.T) {
+	session, _, grant, _, _ := newSingleAttestCap(t)
+	for i := 0; i < maxAgentCapEntries; i++ {
+		dead, err := session.IssueGrant(GrantSpec{
+			AgentID: grant.AgentID, CredentialID: grant.CredentialID,
+			Operations: []string{OpLocalArtifactAttest}, Resource: "artifact-" + randHex(t, 6),
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := session.RevokeGrant(dead.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listed := capCall(t, bindCap(t, session, grant.AgentID), okBytes(t)(encodeCapList()))
+	if listed.method != capMethodList || len(listed.entries) != 1 || listed.entries[0].resource != grant.Resource || listed.entries[0].status != GrantActive {
+		t.Fatalf("1 live grant beside %d revoked ones: %+v", maxAgentCapEntries, listed)
+	}
+}

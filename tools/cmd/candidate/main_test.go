@@ -82,13 +82,13 @@ func TestGoEnvIgnoresPersistedConfig(t *testing.T) {
 
 func TestArchiveUsesCapturedCommit(t *testing.T) {
 	root := gitRepo(t)
-	writeRepoFile(t, root, "go.mod", "module example.com/old\n\ngo 1.26.9\n")
+	writeRepoFile(t, root, "go.mod", "module example.com/old\n\ngo 1.26.11\n")
 	gitCommit(t, root, "old")
 	commit, err := gitOut(root, "rev-parse", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeRepoFile(t, root, "go.mod", "module example.com/new\n\ngo 1.26.9\n")
+	writeRepoFile(t, root, "go.mod", "module example.com/new\n\ngo 1.26.11\n")
 	gitCommit(t, root, "new")
 	dest := t.TempDir()
 	if err := extractArchive(root, commit, dest); err != nil {
@@ -108,7 +108,7 @@ func TestArchiveUsesCapturedCommit(t *testing.T) {
 
 func TestStableSourceRejectsDrift(t *testing.T) {
 	root := gitRepo(t)
-	writeRepoFile(t, root, "go.mod", "module example.com/x\n\ngo 1.26.9\n")
+	writeRepoFile(t, root, "go.mod", "module example.com/x\n\ngo 1.26.11\n")
 	gitCommit(t, root, "one")
 	commit, err := gitOut(root, "rev-parse", "HEAD")
 	if err != nil {
@@ -121,7 +121,7 @@ func TestStableSourceRejectsDrift(t *testing.T) {
 	if err := assertStableSource(root, commit, tree); err != nil {
 		t.Fatal(err)
 	}
-	writeRepoFile(t, root, "go.mod", "module example.com/y\n\ngo 1.26.9\n")
+	writeRepoFile(t, root, "go.mod", "module example.com/y\n\ngo 1.26.11\n")
 	gitCommit(t, root, "two")
 	if err := assertStableSource(root, commit, tree); err == nil {
 		t.Fatal("expected commit drift")
@@ -264,7 +264,7 @@ func TestLaterScanKeepsEarlierReport(t *testing.T) {
 
 func TestPublishRechecksSource(t *testing.T) {
 	root := gitRepo(t)
-	writeRepoFile(t, root, "go.mod", "module example.com/x\n\ngo 1.26.9\n")
+	writeRepoFile(t, root, "go.mod", "module example.com/x\n\ngo 1.26.11\n")
 	gitCommit(t, root, "one")
 	commit, err := gitOut(root, "rev-parse", "HEAD")
 	if err != nil {
@@ -285,7 +285,7 @@ func TestPublishRechecksSource(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(staging, "tremelay"), []byte("new"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	writeRepoFile(t, root, "go.mod", "module example.com/y\n\ngo 1.26.9\n")
+	writeRepoFile(t, root, "go.mod", "module example.com/y\n\ngo 1.26.11\n")
 	gitCommit(t, root, "two")
 	if err := publishVerified(root, commit, tree, staging, out); err == nil {
 		t.Fatal("expected source drift to stop publication")
@@ -305,7 +305,7 @@ func TestModVerifyDetectsCacheModification(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/corrupt\n\ngo 1.26.9\n\nrequire github.com/google/uuid v1.6.0\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/corrupt\n\ngo 1.26.11\n\nrequire github.com/google/uuid v1.6.0\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package corrupt\n\nimport _ \"github.com/google/uuid\"\n"), 0o644); err != nil {

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -18,9 +19,9 @@ import (
 func TestDaemonHandshakeCompletesWhenAuthSlow(t *testing.T) {
 	const slow = 12 * time.Second
 	auth := daemonAuthenticate
-	daemonAuthenticate = func(s *vault.Session, token []byte) (*vault.AgentPrincipal, error) {
+	daemonAuthenticate = func(s *vault.Session, ctx context.Context, token []byte) (*vault.AgentPrincipal, error) {
 		time.Sleep(slow)
-		return auth(s, token)
+		return auth(s, ctx, token)
 	}
 	t.Cleanup(func() { daemonAuthenticate = auth })
 

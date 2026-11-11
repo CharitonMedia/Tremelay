@@ -606,6 +606,30 @@ func injectionCollides(headers map[string]string, query string, inj grantInjecti
 	return false
 }
 
+// methodOverrideParams are the query, form and JSON field names a framework
+// reads as the request's real method: Rails, Laravel, Symfony and Spring
+// (_method), Salesforce (_HttpMethod), and ASP.NET MVC, which takes the
+// override header's name as a field as well. The header spellings are in
+// refusedAgentHeaders.
+var methodOverrideParams = []string{
+	"_method", "_HttpMethod", "X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override",
+}
+
+// methodOverridden reports a request that asks the upstream to treat it as
+// another method than the one the grant was judged on, or whose body cannot
+// be read well enough to tell.
+func methodOverridden(query string, body []byte, contentType string) bool {
+	for _, name := range methodOverrideParams {
+		if queryParamNamed(query, name) {
+			return true
+		}
+		if found, malformed := bodyParamNamed(body, contentType, name); found || malformed {
+			return true
+		}
+	}
+	return false
+}
+
 // queryParamNamed reports a form-encoded parameter with this name in a query
 // string. The query has already been refused if it carries percent-encoding or
 // spaces, so names are compared literally aside from & and ; separators.
@@ -627,11 +651,16 @@ func queryParamNamed(query, want string) bool {
 // malformed. Servers disagree on how they read part names (RFC 2231, RFC 2047,
 // whitespace trimming, header-name spacing), and every rule we tried to match
 // them left another spelling open.
+//
+// A body in a charset that is not ASCII-compatible is malformed too: Tomcat
+// decodes form names with the Content-Type charset, so UTF-16 spells _method
+// in bytes this scan does not read.
 func bodyParamNamed(body []byte, contentType, want string) (found, malformed bool) {
 	var mediaType string
+	var params map[string]string
 	if contentType != "" {
 		var err error
-		if mediaType, _, err = mime.ParseMediaType(contentType); err != nil {
+		if mediaType, params, err = mime.ParseMediaType(contentType); err != nil {
 			return false, true
 		}
 	}
@@ -640,6 +669,11 @@ func bodyParamNamed(body []byte, contentType, want string) (found, malformed boo
 	}
 	if len(body) == 0 {
 		return false, false
+	}
+	switch strings.ToLower(params["charset"]) {
+	case "", "utf-8", "utf8", "us-ascii", "iso-8859-1":
+	default:
+		return false, true
 	}
 	lower := strings.ToLower(contentType)
 	isJSON := strings.Contains(lower, "/json") || strings.Contains(lower, "+json")
@@ -775,7 +809,10 @@ func clearCredential(r *http.Request, inj grantInjection) {
 // spellings. An upstream that echoes the credential usually echoes one of
 // these.
 //
-// ponytail: a closed list of literal spellings, not an encoding-aware scan.
+// Each form is matched percent-escape-aware (see spells), so an upstream that
+// escapes more or fewer bytes than url.QueryEscape does is still caught.
+//
+// ponytail: a closed list of spellings, not an encoding-aware scan.
 // Upgrade path: decode the body by Content-Type before matching, if a real
 // upstream is found that re-encodes credentials some other way.
 func credentialForms(inj grantInjection, secret []byte) [][]byte {
@@ -829,6 +866,38 @@ func credentialForms(inj grantInjection, secret []byte) [][]byte {
 		spellings(inj.name + ":" + string(secret))
 	}
 	sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
+	return forms
+}
+
+// minShiftedForm is the shortest base64 run treated as a credential inside a
+// larger blob. Shorter runs turn up in ordinary text.
+const minShiftedForm = 8
+
+// shiftedBase64 is how the credential reads inside the base64 of something
+// longer, such as a whole echoed "Authorization: Bearer ..." line. The three
+// possible byte alignments give three different texts, and the characters at
+// each end mix credential bits with the neighbours' bits, so only the run in
+// between is fixed. These runs are detected, never rewritten: the end
+// characters still carry a few credential bits, so a response holding one is
+// withheld whole. A credential under 6 bytes is too short to have a run.
+func shiftedBase64(secret []byte) [][]byte {
+	var forms [][]byte
+	for _, enc := range []*base64.Encoding{base64.RawStdEncoding, base64.RawURLEncoding} {
+		for lead := 0; lead < 3; lead++ {
+			padded := append(make([]byte, lead), secret...)
+			text := make([]byte, enc.EncodedLen(len(padded)))
+			enc.Encode(text, padded)
+			wipe(padded)
+			from, to := []int{0, 2, 3}[lead], len(text)
+			if len(padded)%3 != 0 {
+				to--
+			}
+			if to-from >= minShiftedForm {
+				forms = append(forms, append([]byte(nil), text[from:to]...))
+			}
+			wipe(text)
+		}
+	}
 	return forms
 }
 
@@ -900,6 +969,8 @@ func bodyNotText(body []byte) bool {
 func projectResponse(inj grantInjection, secret []byte, upstream http.Header, body []byte, truncated bool) (HTTPResponse, error) {
 	forms := credentialForms(inj, secret)
 	defer wipeForms(forms)
+	shifted := shiftedBase64(secret)
+	defer wipeForms(shifted)
 	out := HTTPResponse{
 		Headers:   projectHeaders(upstream, forms),
 		Body:      redactForms(append([]byte(nil), body...), forms, truncated),
@@ -917,6 +988,14 @@ func projectResponse(inj grantInjection, secret []byte, upstream http.Header, bo
 			out.Body = out.Body[:len(out.Body)-n]
 		}
 	}
+	if out.Truncated {
+		// The cap can cut a shifted run short of the length that withholds.
+		if n := partialTail(out.Body, shifted); n > 0 {
+			wipe(out.Body[len(out.Body)-n:])
+			out.Body = out.Body[:len(out.Body)-n]
+		}
+	}
+	forms = append(forms, shifted...)
 	if containsCredentialForm(out.Body, forms) {
 		wipe(out.Body)
 		return HTTPResponse{}, ErrBrokerUpstream
@@ -1012,11 +1091,15 @@ func redactForms(buf []byte, forms [][]byte, truncated bool) []byte {
 	return out
 }
 
-// matchFormAt returns the length of the longest form starting at i.
+// matchFormAt returns how many bytes at buf[i:] spell a form. Forms are
+// ordered longest first.
 func matchFormAt(buf []byte, i int, forms [][]byte) int {
 	for _, form := range forms {
-		if len(buf)-i >= len(form) && formPrefixEqual(buf[i:i+len(form)], form) {
-			return len(form)
+		if len(buf)-i < len(form) {
+			continue
+		}
+		if n, _ := spells(buf[i:], form, isHexSpelling(form)); n > 0 {
+			return n
 		}
 	}
 	return 0
@@ -1031,41 +1114,62 @@ func containsCredentialForm(buf []byte, forms [][]byte) bool {
 	return false
 }
 
-// formPrefixEqual compares percent-escape hex digits case-insensitively,
-// whole hex spellings case-insensitively on a-f/A-F, and every other byte
-// exactly.
-func formPrefixEqual(got, form []byte) bool {
-	if len(got) > len(form) {
-		return false
-	}
-	if isHexSpelling(form) {
-		for i := range got {
-			if foldHex(got[i]) != foldHex(form[i]) {
-				return false
+// spells reads buf from its start as a spelling of form, taking each form
+// byte either as written or as a %XX escape of it, and a space also as "+". Percent-encoders disagree
+// about which bytes to escape (Go, Python, Java and JavaScript each leave a
+// different set alone), so an echoed credential can mix both freely. A
+// whole-hex form also matches in either letter case.
+//
+// n is the length of a whole spelling, or 0. cut reports that buf ended
+// partway through one, which is what a body truncated at the cap looks like.
+func spells(buf, form []byte, hexFold bool) (n int, cut bool) {
+	j := 0
+	for k, c := range form {
+		rest := buf[j:]
+		if len(rest) == 0 {
+			return 0, k > 0
+		}
+		if rest[0] == '%' {
+			switch {
+			case len(rest) == 1:
+				cut = true
+			case len(rest) == 2:
+				cut = cut || isHex(rest[1]) && unhex(rest[1]) == c>>4
+			case isHex(rest[1]) && isHex(rest[2]) && sameFormByte(unhex(rest[1])<<4|unhex(rest[2]), c, hexFold):
+				if c != '%' {
+					j += 3
+					continue
+				}
+				// "%25" is an escaped percent sign or a literal one followed
+				// by "25". Try the escape, then fall through to the literal.
+				m, tailCut := spells(rest[3:], form[k+1:], hexFold)
+				if m > 0 || k+1 == len(form) {
+					return j + 3 + m, false
+				}
+				cut = cut || tailCut || len(rest) == 3
 			}
 		}
-		return true
-	}
-	for i := range got {
-		if got[i] == form[i] {
-			continue
+		// Form encoding writes a space as "+".
+		if !sameFormByte(rest[0], c, hexFold) && !(c == ' ' && rest[0] == '+') {
+			return 0, cut
 		}
-		if !percentHexDigit(form, i) || foldHex(got[i]) != foldHex(form[i]) {
-			return false
-		}
+		j++
 	}
-	return true
+	return j, false
 }
 
-func percentHexDigit(form []byte, i int) bool {
+func sameFormByte(got, want byte, hexFold bool) bool {
+	return got == want || hexFold && foldHex(got) == foldHex(want)
+}
+
+func unhex(c byte) byte {
 	switch {
-	case i > 0 && form[i-1] == '%' && i+1 < len(form):
-		return isHex(form[i]) && isHex(form[i+1])
-	case i > 1 && form[i-2] == '%':
-		return isHex(form[i-1]) && isHex(form[i])
-	default:
-		return false
+	case c >= 'a':
+		return c - 'a' + 10
+	case c >= 'A':
+		return c - 'A' + 10
 	}
+	return c - '0'
 }
 
 func isHex(c byte) bool {
@@ -1091,18 +1195,24 @@ func foldHex(c byte) byte {
 	return c
 }
 
-// partialTail is the longest proper prefix of any form that ends buf.
+// partialTail is the longest run ending buf that starts spelling a form
+// without finishing it.
 func partialTail(buf []byte, forms [][]byte) int {
-	best := 0
-	for _, form := range forms {
-		for k := len(form) - 1; k > best; k-- {
-			if k <= len(buf) && formPrefixEqual(buf[len(buf)-k:], form) {
-				best = k
-				break
+	longest := 0
+	fold := make([]bool, len(forms))
+	for i, form := range forms {
+		fold[i] = isHexSpelling(form)
+		longest = max(longest, len(form))
+	}
+	// Every form byte takes at most three buf bytes.
+	for start := max(0, len(buf)-3*longest); start < len(buf); start++ {
+		for i, form := range forms {
+			if _, cut := spells(buf[start:], form, fold[i]); cut {
+				return len(buf) - start
 			}
 		}
 	}
-	return best
+	return 0
 }
 
 // readTruncating reads at most n bytes and reports whether more remained.

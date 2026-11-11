@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/CharitonMedia/Tremelay/internal/vault"
+	"golang.org/x/term"
 )
 
 const (
@@ -41,7 +42,11 @@ const (
 	daemonHelloReadWait = 10 * time.Second
 
 	minIdleTimeout = time.Second
-	maxIdleTimeout = 24 * time.Hour
+	// A failed Accept is retried from floor to cap for at most limit.
+	acceptRetryFloor = 5 * time.Millisecond
+	acceptRetryCap   = time.Second
+	acceptRetryLimit = 30 * time.Second
+	maxIdleTimeout   = 24 * time.Hour
 )
 
 // Client wait for daemon OK after sending the hello. Must cover one
@@ -54,11 +59,13 @@ var daemonAuthenticate = (*vault.Session).AuthenticateAgentToken
 
 var (
 	errDaemonEndpoint         = errors.New("daemon endpoint must be a user-only directory and socket this user owns")
+	errAcceptDead             = errors.New("endpoint stopped accepting connections")
 	errDaemonRunning          = errors.New("a daemon is already serving this endpoint")
 	errDaemonReach            = errors.New("no unlocked daemon is reachable")
 	errDaemonRefused          = errors.New("daemon refused the agent token")
 	errDaemonHandshakeTimeout = errors.New("daemon handshake timed out")
 	errDaemonHandshakeIO      = errors.New("daemon handshake failed")
+	errDaemonEnded            = errors.New("the daemon ended this session; it has locked or stopped")
 	errDaemonSession          = errors.New("daemon agent session failed; inspect the vault audit before retrying an operation")
 	errDaemonTerminal         = errors.New("daemon can no longer serve this vault and has locked; inspect the vault audit, then restart it")
 	errDaemonRekeyed          = errors.New("vault passphrase changed; daemon locked. Run tremelay daemon again and unlock with the new passphrase")
@@ -125,7 +132,7 @@ func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv fu
 		return fail(err.Error())
 	}
 	defer listener.Close()
-	pass, err := readPassphrase(getenv, stdin, stderr)
+	pass, err := daemonPassphrase(ctx, getenv, stdin, stderr)
 	if err != nil {
 		return fail(err.Error())
 	}
@@ -167,7 +174,26 @@ func serveDaemon(ctx context.Context, path string, idle time.Duration, getenv fu
 	listener.Close()
 	d.conns.Wait()
 	session.Lock()
+	if d.fault.Load() {
+		return 1
+	}
 	return 0
+}
+
+// daemonPassphrase is readPassphrase with a prompt that a signal ends. The
+// daemon catches SIGINT and SIGTERM for an orderly lock, so the plain prompt
+// swallowed Ctrl-C and the next line typed still unlocked the vault.
+func daemonPassphrase(ctx context.Context, getenv func(string) string, stdin io.Reader, stderr io.Writer) ([]byte, error) {
+	if getenv != nil {
+		if v := getenv("TREMELAY_PASSPHRASE"); v != "" {
+			return []byte(v), nil
+		}
+	}
+	terminal := term.NewTerminal(struct {
+		io.Reader
+		io.Writer
+	}{stdin, io.Discard}, "")
+	return readChangePassphrase(ctx, stdin, stderr, terminal, "passphrase: ")
 }
 
 // daemon serves one unlocked Session to many agents. Every vault entry point
@@ -182,17 +208,19 @@ type daemon struct {
 	locked  chan struct{}
 	once    sync.Once
 	conns   sync.WaitGroup
+	// fault records a lock the daemon forced on itself: a dead endpoint, or a
+	// vault that failed verification. The process then exits non-zero, so a
+	// supervisor or script does not read it as an ordinary lock.
+	fault atomic.Bool
 
 	mu   sync.Mutex
 	live int
 }
 
+// accept serves until shutdown. An endpoint that stays dead locks the daemon:
+// an unlocked vault nobody can reach could not be locked either.
 func (d *daemon) accept(listener net.Listener) {
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
+	err := acceptLoop(d.ctx, listener, acceptRetryLimit, func(conn net.Conn) {
 		d.enter()
 		d.conns.Add(1)
 		go func() {
@@ -200,6 +228,40 @@ func (d *daemon) accept(listener net.Listener) {
 			defer d.leave()
 			d.handle(conn)
 		}()
+	})
+	if err != nil {
+		fmt.Fprintln(d.stderr, err.Error())
+		d.fault.Store(true)
+		d.requestLock()
+	}
+}
+
+// acceptLoop hands each connection to serve until the listener closes or ctx
+// ends. A failed Accept is retried with a doubling delay, because running out
+// of file descriptors passes. errAcceptDead reports an endpoint that kept
+// failing for limit, so the caller can fail closed.
+func acceptLoop(ctx context.Context, listener net.Listener, limit time.Duration, serve func(net.Conn)) error {
+	var delay, waited time.Duration
+	for {
+		conn, err := listener.Accept()
+		if err == nil {
+			delay, waited = 0, 0
+			serve(conn)
+			continue
+		}
+		if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+			return nil
+		}
+		if waited >= limit {
+			return errAcceptDead
+		}
+		delay = min(max(2*delay, acceptRetryFloor), acceptRetryCap)
+		waited += delay
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil
+		}
 	}
 }
 
@@ -255,7 +317,7 @@ func (d *daemon) handle(conn net.Conn) {
 		d.requestLock()
 		return
 	}
-	principal, err := daemonAuthenticate(d.session, token)
+	principal, err := daemonAuthenticate(d.session, d.ctx, token)
 	vault.Wipe(token)
 	if err != nil {
 		// Accepted, wrong-token, and inactive-agent attempts are all audited
@@ -330,6 +392,7 @@ func (d *daemon) serveSSHAgent(conn net.Conn, principal *vault.AgentPrincipal) {
 func (d *daemon) checkTerminal(err error) {
 	if errors.Is(err, vault.ErrCorrupt) || errors.Is(err, vault.ErrAudit) {
 		fmt.Fprintln(d.stderr, errDaemonTerminal.Error())
+		d.fault.Store(true)
 		d.requestLock()
 	}
 }
@@ -438,10 +501,11 @@ func relayDaemonMCP(getenv func(string) string, tokenFile string, stdin io.Reade
 	}
 	// Protocol bytes only. Nothing here inspects, logs, or rewrites them.
 	done := make(chan struct{})
-	var ended atomic.Bool
+	var ended, clientDone atomic.Bool
 	go func() {
 		defer close(done)
-		_, _ = io.Copy(conn, stdin)
+		_, err := io.Copy(conn, stdin)
+		clientDone.Store(err == nil)
 		if half, ok := conn.(interface{ CloseWrite() error }); ok && half.CloseWrite() == nil {
 			return
 		}
@@ -452,6 +516,13 @@ func relayDaemonMCP(getenv func(string) string, tokenFile string, stdin io.Reade
 	}()
 	_, copyErr := io.Copy(stdout, conn)
 	conn.Close()
+	if !clientDone.Load() {
+		// The daemon closed the stream while the client still holds stdin
+		// open: a lock, the idle timeout, or a stop. Waiting for that stdin
+		// would hang until the client's next write and then report success.
+		fmt.Fprintln(stderr, errDaemonEnded.Error())
+		return 1
+	}
 	<-done
 	if copyErr != nil && !ended.Load() {
 		fmt.Fprintln(stderr, errDaemonReach.Error())

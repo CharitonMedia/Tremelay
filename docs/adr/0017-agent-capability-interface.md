@@ -59,7 +59,7 @@ Any other method id is an unknown method. `request_capability` is recognized and
 
 Success responses use the same envelope and the request's method id. The field set is exact.
 
-`list_capabilities` returns one field, id 8, type bytes. Its value is `u16be entry_count` (0 through 64) and then that many entries. An entry is not a length-prefixed blob. It is `u16be field_count`, which is 6, and then these fields in the same TLV: 1 `handle`, 3 `operation`, 4 `resource`, 5 `key_id`, 6 `status`, 7 `expiry`. Bytes after the last entry are rejected. A catalog of more than 64 grants is denied in full and is not truncated into this framing.
+`list_capabilities` returns one field, id 8, type bytes. Its value is `u16be entry_count` (0 through 64) and then that many entries. An entry is not a length-prefixed blob. It is `u16be field_count`, which is 6, and then these fields in the same TLV: 1 `handle`, 3 `operation`, 4 `resource`, 5 `key_id`, 6 `status`, 7 `expiry`. Bytes after the last entry are rejected. A catalog of more than 64 live grants is denied in full and is not truncated into this framing (see the 2026-11-11 amendment below for revoked and expired grants).
 
 `describe_capability` returns exactly fields 1, 3, 4, 5, 6, and 7, with the same types and values as one catalog entry.
 
@@ -85,7 +85,7 @@ Caller bytes are not copied into those strings. A locked session, a stale sessio
 
 ### Catalog and handles
 
-`list_capabilities` returns only this principal's `local_artifact_attest` grants, at most 64. A larger catalog is denied in full. Each entry has a handle, the operation, the exact resource, the public key id, a lifecycle status (`active`, `revoked`, or `expired`), and the expiry. Credential ids, labels, other principals' grants, human requester and approver ids, and HTTP or SSH metadata are not fields. A shared grant whose membership generation is no longer live is shown as `revoked`. That status is advisory. Invocation checks authority again.
+`list_capabilities` returns only this principal's `local_artifact_attest` grants, at most 64. A larger catalog is denied in full. Since the 2026-11-11 amendment only live grants count toward that ceiling: when the full catalog would exceed 64, revoked and expired grants are left out of it, because nothing deletes a grant and an agent that had ever been issued more than 64 could otherwise never list again. More than 64 live grants is still denied in full. Each entry has a handle, the operation, the exact resource, the public key id, a lifecycle status (`active`, `revoked`, or `expired`), and the expiry. Credential ids, labels, other principals' grants, human requester and approver ids, and HTTP or SSH metadata are not fields. A shared grant whose membership generation is no longer live is shown as `revoked`. That status is advisory. Invocation checks authority again.
 
 A handle is 32 random bytes stored in the adapter. It locates one grant, credential, key id, and resource for this adapter and this principal. It is not an authentication credential. Listing again does not point an existing handle at a different grant or key. A handle from another adapter, a handle that was never issued, and a handle whose stored binding no longer matches that grant are the same client result, `unknown_handle`. The denial does not copy the handle or another agent's grant.
 

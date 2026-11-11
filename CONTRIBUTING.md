@@ -5,7 +5,7 @@ boundary matters more than a fast merge.
 
 ## Build and test
 
-Use the pinned toolchain, Go 1.26.9 (see [go.mod](go.mod)). Everything CI runs is
+Use the pinned toolchain, Go 1.26.11 (see [go.mod](go.mod)). Everything CI runs is
 in the [Makefile](Makefile):
 
 ```sh

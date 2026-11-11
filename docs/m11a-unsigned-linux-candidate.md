@@ -2,13 +2,13 @@
 
 M11a builds one unsigned linux/amd64 `tremelay` human CLI and a local evidence directory. It does not publish a release, sign a binary, or complete M9, M10, or M11.
 
-The profile is Go 1.26.9, `GOOS=linux`, `GOARCH=amd64`, `GOAMD64=v1`, `CGO_ENABLED=0`, and:
+The profile is Go 1.26.11, `GOOS=linux`, `GOARCH=amd64`, `GOAMD64=v1`, `CGO_ENABLED=0`, and:
 
 ```text
 go build -trimpath -buildvcs=false -mod=readonly -pgo=off -o OUTPUT ./cmd/tremelay
 ```
 
-`GOTOOLCHAIN=go1.26.9` selects that toolchain and refuses a newer one. The application `go` line is already `1.26.9`. A `toolchain` directive is not added: current `go mod tidy` removes it, and `-mod=readonly` then refuses the module. The candidate checks `go version` before it builds. `-buildvcs=false` omits VCS metadata from the executable; the evidence manifest records the git commit and tree. Two matching builds are the reproducibility check. The flag list is not that check.
+`GOTOOLCHAIN=go1.26.11` selects that toolchain and refuses a newer one. The application `go` line is already `1.26.11`. A `toolchain` directive is not added: current `go mod tidy` removes it, and `-mod=readonly` then refuses the module. The candidate checks `go version` before it builds. `-buildvcs=false` omits VCS metadata from the executable; the evidence manifest records the git commit and tree. Two matching builds are the reproducibility check. The flag list is not that check.
 
 ## Rerun
 

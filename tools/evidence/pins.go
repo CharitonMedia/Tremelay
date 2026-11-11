@@ -1,12 +1,12 @@
 package evidence
 
 // Pinned build/evidence inputs. These are not application dependencies.
-// The application module already declares go 1.26.9. GOTOOLCHAIN=go1.26.9
+// The application module already declares go 1.26.11. GOTOOLCHAIN=go1.26.11
 // selects that toolchain and refuses a newer one. A toolchain line in go.mod
 // is not used: go 1.26 go mod tidy deletes it, and -mod=readonly then fails.
 const (
-	GoVersion           = "go1.26.9"
-	GoToolchain         = "go1.26.9"
+	GoVersion           = "go1.26.11"
+	GoToolchain         = "go1.26.11"
 	TargetGOOS          = "linux"
 	TargetGOARCH        = "amd64"
 	TargetGOAMD64       = "v1"

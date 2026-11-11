@@ -217,6 +217,22 @@ func openSQLite(path string, readonly bool) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Another process holding the file's lock (a daemon committing audit
+	// rows) is contention, not damage. It is retried like a write and ends as
+	// an IO failure, never as a verdict that the vault was tampered with.
+	for attempt := 0; ; attempt++ {
+		db, err := openSQLiteOnce(dsn)
+		if !errors.Is(err, errSQLiteBusy) {
+			return db, err
+		}
+		if attempt+1 == sqliteWriteMaxAttempts {
+			return nil, ErrIO
+		}
+		time.Sleep(sqliteWriteBackoff(attempt))
+	}
+}
+
+func openSQLiteOnce(dsn string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, ErrIO
@@ -225,13 +241,22 @@ func openSQLite(path string, readonly bool) (*sql.DB, error) {
 	db.SetMaxIdleConns(1)
 	if err := db.Ping(); err != nil {
 		db.Close()
-		return nil, ErrCorrupt
+		return nil, openFailure(err)
 	}
 	if err := assertDurable(db); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+// openFailure separates a file SQLite could not lock from one it could not
+// read as a vault.
+func openFailure(err error) error {
+	if sqliteBusy(err) {
+		return errSQLiteBusy
+	}
+	return ErrCorrupt
 }
 
 func sqliteReadDSN(path string) (string, error) {
@@ -261,34 +286,37 @@ func sqliteReadDSN(path string) (string, error) {
 func assertDurable(db *sql.DB) error {
 	var mode string
 	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
-		return ErrCorrupt
+		return openFailure(err)
 	}
 	if !strings.EqualFold(mode, "delete") {
 		return ErrIO
 	}
 	var syncMode int
 	if err := db.QueryRow(`PRAGMA synchronous`).Scan(&syncMode); err != nil {
-		return ErrCorrupt
+		return openFailure(err)
 	}
 	if syncMode != 2 {
 		return ErrIO
 	}
 	var fk int
 	if err := db.QueryRow(`PRAGMA foreign_keys`).Scan(&fk); err != nil {
-		return ErrCorrupt
+		return openFailure(err)
 	}
 	if fk != 1 {
 		return ErrIO
 	}
 	var busy int
 	if err := db.QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil {
-		return ErrCorrupt
+		return openFailure(err)
 	}
 	if busy != 5000 {
 		return ErrIO
 	}
 	var check string
-	if err := db.QueryRow(`PRAGMA quick_check`).Scan(&check); err != nil || check != "ok" {
+	if err := db.QueryRow(`PRAGMA quick_check`).Scan(&check); err != nil {
+		return openFailure(err)
+	}
+	if check != "ok" {
 		return ErrCorrupt
 	}
 	return nil

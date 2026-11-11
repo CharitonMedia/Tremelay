@@ -163,12 +163,7 @@ func (s *Session) brokerExchange(agentID string, call brokerAttempt) (int, error
 		}
 		call.injection = grantInjectionOf(g)
 		if injectionCollides(call.headers, call.query, call.injection) ||
-			queryParamNamed(call.query, "_method") {
-			partial.Result = resultDeniedMalformed
-			return s.failExchange(partial, call.method, ErrDeniedMalformed)
-		}
-		found, malformed := bodyParamNamed(call.body, call.headers["Content-Type"], "_method")
-		if found || malformed {
+			methodOverridden(call.query, call.body, call.headers["Content-Type"]) {
 			partial.Result = resultDeniedMalformed
 			return s.failExchange(partial, call.method, ErrDeniedMalformed)
 		}
@@ -326,12 +321,11 @@ func (s *Session) finishStatus(partial auditEvent, upstream *http.Request, pin n
 	method := call.method
 	resp, err := s.doBroker(upstream, pin, port)
 	if err != nil {
-		if resp != nil && resp.Body != nil {
-			discardBody(resp.Body)
-		}
+		s.discard(resp)
 		return s.failTransport(partial, method, err)
 	}
-	status, kind := takeStatus(resp)
+	var status, kind int
+	s.duringCallback(func() { status, kind = takeStatus(resp) })
 	if err := s.checkExactNetwork(partial.AgentID, call, true); err != nil {
 		return 0, err
 	}
@@ -345,9 +339,7 @@ func (s *Session) finishCaptured(partial auditEvent, upstream *http.Request, pin
 	method := call.method
 	resp, err := s.roundTrip(upstream, pin, port)
 	if err != nil {
-		if resp != nil && resp.Body != nil {
-			discardBody(resp.Body)
-		}
+		s.discard(resp)
 		return s.failTransport(partial, method, err)
 	}
 	code := 0
@@ -355,20 +347,19 @@ func (s *Session) finishCaptured(partial auditEvent, upstream *http.Request, pin
 		code = resp.StatusCode
 	}
 	if status, kind := responseClass(code, nil); kind != brokerBodyOK {
-		if resp != nil && resp.Body != nil {
-			discardBody(resp.Body)
-		}
+		s.discard(resp)
 		return s.finishKind(partial, method, status, kind)
 	}
 	// An undecoded coding or a byte-range fragment hides a credential from
 	// the literal scan, so it is withheld whole, like a surviving form.
 	if bodyNotRedactable(code, resp.Header) {
-		if resp.Body != nil {
-			discardBody(resp.Body)
-		}
+		s.discard(resp)
 		return s.finishKind(partial, method, 0, brokerBodyBad)
 	}
-	body, truncated, readErr := readTruncating(resp.Body, maxAgentBody)
+	var body []byte
+	var truncated bool
+	var readErr error
+	s.duringCallback(func() { body, truncated, readErr = readTruncating(resp.Body, maxAgentBody) })
 	defer wipe(body)
 	readable := brokerReadableBody(body, truncated)
 	if len(readable) < len(body) {
@@ -484,14 +475,28 @@ func (s *Session) doBroker(req *http.Request, ip net.IP, port string) (*http.Res
 	if resp == nil || resp.Body == nil {
 		return resp, nil
 	}
-	buf, readErr := readLimited(resp.Body)
-	_ = resp.Body.Close()
-	wipe(buf)
+	var readErr error
+	s.duringCallback(func() {
+		var buf []byte
+		buf, readErr = readLimited(resp.Body)
+		_ = resp.Body.Close()
+		wipe(buf)
+	})
 	if readErr != nil {
 		return nil, errBrokerTransport
 	}
 	resp.Body = http.NoBody
 	return resp, nil
+}
+
+// discard drains a response nobody will read. Like every read of upstream
+// bytes it runs with the mutex released, as the round trip does: an upstream
+// that trickles its body stalls its own caller for up to brokerTimeout, not
+// every other user of the vault.
+func (s *Session) discard(resp *http.Response) {
+	if resp != nil && resp.Body != nil {
+		s.duringCallback(func() { discardBody(resp.Body) })
+	}
 }
 
 func (s *Session) roundTrip(req *http.Request, ip net.IP, port string) (*http.Response, error) {

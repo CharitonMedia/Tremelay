@@ -499,6 +499,11 @@ func cmdPolicy(args []string, getenv func(string) string, stdin io.Reader, stdou
 		if err := session.SetHealthPolicy(current); err != nil {
 			return err
 		}
+		if *optIn == "true" {
+			// Nothing in cmd/ installs a CompromiseChecker, so say so rather
+			// than let "policy updated" read as "breach checks are on".
+			fmt.Fprintln(stderr, "note: this version ships no breach lookup; the opt-in is stored and nothing is checked")
+		}
 		_, err = fmt.Fprintln(stdout, "policy updated")
 		return err
 	})

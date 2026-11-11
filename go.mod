@@ -1,6 +1,6 @@
 module github.com/CharitonMedia/Tremelay
 
-go 1.26.9
+go 1.26.11
 
 require (
 	github.com/modelcontextprotocol/go-sdk v1.8.0
