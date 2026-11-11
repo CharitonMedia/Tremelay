@@ -690,13 +690,17 @@ func (s *Session) checkCompromise(c credential, prev *storedHealth, pol resolved
 		return CompromiseNotChecked, nil
 	}
 	prefix, suffix := splitHash(c.Secret)
-	seq := s.header.AuditSeq
+	seq, reloads := s.header.AuditSeq, s.reloads
 	var suffixes []string
 	var err error
 	s.duringCallback(func() {
 		suffixes, err = checker.Lookup(CompromiseQuery{Algorithm: "sha256", Prefix: prefix})
 	})
-	if s.header.AuditSeq != seq {
+	// A reload does not always move the audit sequence: another process's
+	// locked-out unlock attempt appends a denial behind the head. It still
+	// zeroes the secrets the caller's plan shares, and committing that plan
+	// would store those zeroes.
+	if s.header.AuditSeq != seq || s.reloads != reloads {
 		return "", ErrConflict
 	}
 	if err != nil || !validSuffixes(suffixes) {
