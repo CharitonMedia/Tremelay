@@ -86,7 +86,7 @@ from `TREMELAY_PASSPHRASE`; interactively you get a no-echo prompt instead.
 
 ## Install
 
-Tremelay needs the pinned Go toolchain (1.26.9, see [go.mod](go.mod)); `go install`
+Tremelay needs the pinned Go toolchain (1.26.11, see [go.mod](go.mod)); `go install`
 switches to it for you.
 
 ```

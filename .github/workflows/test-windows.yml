@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  GOTOOLCHAIN: go1.26.9
+  GOTOOLCHAIN: go1.26.11
 
 jobs:
   test:
@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.11'
       - name: Verify required Cursor rule
         run: python scripts/verify_ponytail.py
       - name: Prepare official Windows GUI helper

@@ -54,7 +54,7 @@ the publish step that would follow it.
 ## Build profile
 
 ```text
-GOTOOLCHAIN=go1.26.9 CGO_ENABLED=0 GOFLAGS=-mod=readonly GOAMD64=v1 GOARM64=v8.0
+GOTOOLCHAIN=go1.26.11 CGO_ENABLED=0 GOFLAGS=-mod=readonly GOAMD64=v1 GOARM64=v8.0
 go build -trimpath -buildvcs=false -pgo=off \
   -ldflags "-X main.versionOverride=VERSION -X main.vcsRevisionOverride=COMMIT_OR_EMPTY" \
   -o OUTPUT ./cmd/tremelay
