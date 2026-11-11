@@ -37,7 +37,7 @@ func TestAgentTokenAuthentication(t *testing.T) {
 		t.Fatal("agent record does not bind this token digest")
 	}
 
-	principal, err := session.AuthenticateAgentToken(token)
+	principal, err := session.AuthenticateAgentToken(t.Context(), token)
 	if err != nil || principal == nil {
 		t.Fatalf("accepted token did not authenticate: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestAgentTokenAuthentication(t *testing.T) {
 		"long token":    append(append([]byte(nil), token...), 0),
 		"digest replay": sum[:],
 	} {
-		if _, err := session.AuthenticateAgentToken(wrong); !errors.Is(err, ErrUnauthenticated) {
+		if _, err := session.AuthenticateAgentToken(t.Context(), wrong); !errors.Is(err, ErrUnauthenticated) {
 			t.Fatalf("%s authenticated: %v", name, err)
 		}
 	}
@@ -68,7 +68,7 @@ func TestAgentTokenAuthentication(t *testing.T) {
 			session.agents[i].State = agentStateSuspended
 		}
 	}
-	if _, err := session.AuthenticateAgentToken(token); !errors.Is(err, ErrDeniedAgent) {
+	if _, err := session.AuthenticateAgentToken(t.Context(), token); !errors.Is(err, ErrDeniedAgent) {
 		t.Fatalf("suspended agent authenticated: %v", err)
 	}
 
@@ -101,7 +101,7 @@ func TestAgentTokenAuthentication(t *testing.T) {
 
 	// A locked session cannot authenticate at all, and cannot audit either.
 	session.Lock()
-	if _, err := session.AuthenticateAgentToken(token); !errors.Is(err, ErrUnauthenticated) {
+	if _, err := session.AuthenticateAgentToken(t.Context(), token); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("locked session authenticated a token: %v", err)
 	}
 
@@ -134,14 +134,14 @@ func TestAgentTokenRequiresMintedAgent(t *testing.T) {
 	for i := range session.agents {
 		session.agents[i].TokenHash = nil
 	}
-	if _, err := session.AuthenticateAgentToken(token); !errors.Is(err, ErrUnauthenticated) {
+	if _, err := session.AuthenticateAgentToken(t.Context(), token); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("agent without a token digest authenticated: %v", err)
 	}
 	sum := sha256.Sum256(token)
 	for i := range session.agents {
 		session.agents[i].TokenHash = sum[:sha256.Size-1]
 	}
-	if _, err := session.AuthenticateAgentToken(token); !errors.Is(err, ErrUnauthenticated) {
+	if _, err := session.AuthenticateAgentToken(t.Context(), token); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("short token digest authenticated: %v", err)
 	}
 	doc := document{Agents: []agentRecord{{

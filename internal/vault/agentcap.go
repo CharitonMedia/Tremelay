@@ -118,6 +118,7 @@ type agentCapBroker interface {
 	agentCapInvoke(agentID, grantID string, payload []byte) (LocalAttestation, error)
 	agentCapNetwork(context.Context, string, agentCapGrant, HTTPRequest) (capNetworkResult, error)
 	agentCapDeny(agentID string, invoke bool) error
+	paceAgent(ctx context.Context, agentID string)
 }
 
 // AgentCapability is one in-process caller boundary for an already-bound agent.
@@ -208,6 +209,13 @@ func (a *AgentCapability) denyBound(invoke bool) error {
 		return ErrUnauthenticated
 	}
 	return a.broker.agentCapDeny(a.agentID, invoke)
+}
+
+// pace spaces out this agent's attempts across all its connections.
+func (a *AgentCapability) pace(ctx context.Context) {
+	if a != nil && a.broker != nil {
+		a.broker.paceAgent(ctx, a.agentID)
+	}
 }
 
 func (a *AgentCapability) list() ([]byte, error) {
@@ -392,6 +400,8 @@ func (b agentBinder) agentCapInvoke(agentID, grantID string, payload []byte) (Lo
 	}
 	return b.s.localAttestExact(agentID, grantID, payload)
 }
+
+func (b agentBinder) paceAgent(ctx context.Context, agentID string) { b.s.paceAgent(ctx, agentID) }
 
 func (b agentBinder) agentCapDeny(agentID string, invoke bool) error {
 	if err := b.bound(agentID); err != nil {

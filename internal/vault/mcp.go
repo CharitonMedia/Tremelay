@@ -207,11 +207,15 @@ func (e *MCPEndpoint) Serve(ctx context.Context, r io.ReadCloser, w io.WriteClos
 		e.mu.Unlock()
 	}()
 
+	paceCtx, stopPace := context.WithCancel(ctx)
+	defer stopPace()
 	conn := &admitConn{
-		ep:   e,
-		in:   bufio.NewReaderSize(r, 4096),
-		raw:  r,
-		rawW: w,
+		ep:       e,
+		in:       bufio.NewReaderSize(r, 4096),
+		raw:      r,
+		rawW:     w,
+		paceCtx:  paceCtx,
+		stopPace: stopPace,
 	}
 	conn.startWriter()
 	defer func() {
@@ -734,6 +738,10 @@ type admitConn struct {
 	legacyPhase      int
 	initializeID     callKey
 	initializeNotice bool
+	// paceCtx ends a pacing wait when Serve is cancelled or this connection
+	// closes. Both are nil on a connection Serve did not build.
+	paceCtx  context.Context
+	stopPace context.CancelFunc
 }
 
 type mcpOutput struct {
@@ -757,6 +765,9 @@ func (c *admitConn) startWriter() {
 func (c *admitConn) Close() error {
 	var err error
 	c.once.Do(func() {
+		if c.stopPace != nil {
+			c.stopPace()
+		}
 		c.ep.mu.Lock()
 		c.closed = true
 		idle := c.ep.sshEpoch.stop()
@@ -889,6 +900,9 @@ func (c *admitConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 		if ctx != nil && ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		// Each frame is at least one audit commit, a blank line included.
+		// Paced before it is read, so nothing consumed goes unaudited.
+		c.ep.cap.pace(c.paceCtx)
 		frame, err := c.nextFrame()
 		if err != nil {
 			// Terminal input loss must interrupt output independently of SDK

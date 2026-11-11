@@ -355,6 +355,8 @@ type Session struct {
 	dekReloadPubKey []byte
 	rekeyOnce       sync.Once
 	rekeyed         chan struct{}
+	// pace spaces out audited attempts per source. It has its own lock.
+	pace pacer
 }
 
 // Create makes a new vault at path and returns it unlocked.
