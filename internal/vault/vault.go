@@ -1093,7 +1093,7 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 // withResp lets one ordinary security event pick up its M5 response.
 // policy, when non-nil, becomes the durable health policy only after commit.
 func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy) error {
-	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil, nil, nil)
+	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil, nil, nil, nil)
 }
 
 type dekRotation struct {
@@ -1106,8 +1106,9 @@ type dekRotation struct {
 //
 // cut, when set, is an archive: the rows through it leave the audit table in
 // this same transaction, and the document sealed here names it as the row the
-// chain now follows. The caller has those rows on file already.
-func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap, rot *dekRotation, cut *auditBase) error {
+// chain now follows. The caller has those rows on file, and onFile is asked
+// inside the transaction whether it still does.
+func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap, rot *dekRotation, cut *auditBase, onFile func() bool) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
@@ -1190,7 +1191,7 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	h.Data = ct
 	h.AuditHead = tip.Hash
 	h.AuditSeq = tip.Seq
-	if err := writeTx(s.db, h, s.header.AuditSeq, events, len(s.audit) == 0, trim, s.commitFault); err != nil {
+	if err := writeTx(s.db, h, s.header.AuditSeq, events, len(s.audit) == 0, trim, onFile, s.commitFault); err != nil {
 		if errors.Is(err, ErrCorrupt) {
 			// The vault row no longer matches what this session can account
 			// for. The cache must not approve, restore, or sign from its old

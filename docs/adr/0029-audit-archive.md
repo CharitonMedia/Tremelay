@@ -69,11 +69,30 @@ accidents. It was not built.
 
 The archive is one JSON object per line, each row exactly as stored. The
 command creates the file new and owner-only, refuses an existing name and any
-symlink in the path, flushes it, and reads it back and compares it with the
-rows in memory before the transaction that deletes them begins. It also
-refuses the names SQLite keeps beside the vault (`-journal`, `-wal`, `-shm`):
-SQLite deletes those when it likes, and an archive under one of them would
-vanish after its rows had left the vault.
+symlink in the path, and flushes it.
+
+The file is read back inside the transaction that deletes the rows, after the
+delete statement and before the commit. The rows leave only if the file is
+exactly those rows at that moment. The place matters. SQLite keeps files of
+its own beside a database (`-journal`, `-wal`, `-shm`) and names them after
+the file the database path resolves to, which is not always the path a
+session opened. It deletes a journal it finds and writes its own; it writes
+over a WAL. An archive that ended up under one of those names, by a link or
+any other alias, would vanish after its rows had left the vault. Inside the
+transaction SQLite has already done that: the stale journal is gone and its
+own is in place, to be deleted at commit. A file that still reads back as
+the rows is not that journal. The same transaction checks that SQLite is
+using the rollback journal at all, because it switches to a WAL when it
+finds one beside the vault and writes that at commit, after the read. If
+either check fails, nothing is deleted.
+
+In front of that stands a plain rule on the name: the command refuses a file
+name that contains `-journal`, `-wal` or `-shm`, in any directory and any
+letter case. That also keeps the file from being taken for the sidecar of
+some other database later. An earlier version compared the output path with
+the vault's own sidecar paths. A vault opened through a symlink got past it,
+which is why the check on the vault's side is now made by asking SQLite's
+transaction, not by predicting names.
 
 A line is accepted only if it is byte for byte what the command writes for
 that row. Go's JSON decoder matches member names without regard to case and
@@ -81,17 +100,21 @@ lets a repeated name win, so a looser reader would let one line carry the
 hashed value for the check and show a different one to a person reading the
 file.
 
-- A refusal (nothing to archive, a bad path, an existing file) writes an
-  `audit_archive`/`denied` row and no file.
+- A refusal (nothing to archive, a bad path, a refused name, an existing
+  file) writes an `audit_archive`/`denied` row and no file.
 - A commit that fails does not decide the file's fate by its error. The
   command brings its session up to what is stored and accounts for every
   row on file.
-  - This command's `audit_archive` row is in the chain: the transaction was
-    durable and a later step failed. The file is the archive of its rows,
-    and the command reports success, whether or not another archive has cut
-    further since. The session adopts a chain only if it still holds the row
-    the session last verified, and this command's row would come after that
-    one, so it cannot have been archived in between.
+  - This command's `audit_archive` row is in the chain and the vault's
+    sealed base is at or past this cut: the transaction was durable and a
+    later step failed. The file is the archive of its rows, and the command
+    reports success, whether or not another archive has cut further since.
+    The session adopts a chain only if it still holds the row the session
+    last verified, and this command's row would come after that one, so it
+    cannot have been archived in between. The base is asked as well as the
+    row because two processes on a coarse clock can write the same archive
+    row byte for byte. With the base at or past this cut, every row on file
+    has left the vault and the file holds it, whichever process cut.
   - Otherwise each row on file must be in one of two places. Rows at or
     before the vault's sealed base left in a cut made with the DEK, so
     another archive's file has them. Every later row must be in the audit

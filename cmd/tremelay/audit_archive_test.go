@@ -56,6 +56,22 @@ func TestCLIAuditArchive(t *testing.T) {
 	if _, err := os.Stat(out); err == nil {
 		t.Fatal("a refused archive left a file")
 	}
+	// SQLite names its journal after the file the vault path resolves to. An
+	// archive under that name would be deleted after its rows had gone, so
+	// the name is refused whichever way the vault was reached.
+	alias := filepath.Join(dir, "my-vault.db")
+	if err := os.Symlink(path, alias); err == nil {
+		journal := path + "-journal"
+		// Where a vault opens through a link at all.
+		if code, _, _ := cli("audit", "verify", "--path", alias); code == 0 {
+			if code, stdout, stderr := cli("audit", "archive", "--path", alias, "--out", journal, "--keep", "3"); code != 1 || stdout != "" || !strings.Contains(stderr, vault.ErrArchiveName.Error()) {
+				t.Fatalf("archive onto the journal of a vault opened through a link: exit %d %q %q", code, stdout, stderr)
+			}
+			if _, err := os.Lstat(journal); err == nil {
+				t.Fatal("the refused archive created the journal file")
+			}
+		}
+	}
 
 	code, stdout, stderr := cli("audit", "archive", "--path", path, "--out", out, "--keep", "3")
 	if code != 0 {

@@ -43,13 +43,14 @@ umask 077
 tremelay audit archive --path /canonical/vault.db --out /canonical/archives/audit-001.jsonl
 ```
 
-The command writes the oldest rows to the new file, reads the file back to
-check it, and only then removes those rows from the vault. It keeps the newest
-1000 rows; `--keep N` changes that. It prints one JSON line: the first and
-last sequence archived, the last row's hash, how many rows went, and how many
-the vault holds now. The output file must not exist, and its path must contain
-no symlink. It cannot be one of the names SQLite keeps beside the vault
-(`vault.db-journal`, `vault.db-wal`, `vault.db-shm`).
+The command writes the oldest rows to the new file. It removes them from the
+vault only if the file reads back as exactly those rows at the moment they are
+deleted. It keeps the newest 1000 rows; `--keep N` changes that. It prints one
+JSON line: the first and last sequence archived, the last row's hash, how many
+rows went, and how many the vault holds now. The output file must not exist,
+and its path must contain no symlink. Its name cannot contain `-journal`,
+`-wal` or `-shm`: SQLite keeps files with those endings beside a database and
+deletes them when it likes.
 
 The log is still one chain. The rows that stay keep their numbers, and the
 vault records, inside its encrypted part, which row its log now follows.

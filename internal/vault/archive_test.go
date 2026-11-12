@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // archiveEnv is a broker vault with a weak password stored early, so its
@@ -327,16 +328,54 @@ func TestArchiveRefusals(t *testing.T) {
 			t.Fatalf("symlink target: %v", err)
 		}
 	}
-	// SQLite deletes its journal and WAL when it likes. An archive under one
-	// of those names would vanish after its rows had left the vault.
-	for _, side := range []string{"-journal", "-wal", "-shm", "-JOURNAL"} {
-		name := canonicalExisting(t, e.path) + side
-		if _, err := e.session.ArchiveAudit(name, 2); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("archive onto the vault's own %s file: %v", side, err)
+	// A symlinked directory on the way to the file is refused like a symlink
+	// at the end of it.
+	real := e.out("real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, e.out("alias")); err == nil {
+		if _, err := e.session.ArchiveAudit(filepath.Join(e.out("alias"), "a.jsonl"), 2); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("symlinked directory in the path: %v", err)
 		}
-		if _, err := os.Lstat(name); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("the refused archive created %s", name)
+		if _, err := os.Lstat(filepath.Join(real, "a.jsonl")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("the refused archive was written through the link")
 		}
+	}
+	// SQLite deletes a journal and overwrites a WAL when it likes, and names
+	// them after whatever file a database path resolves to. An archive under
+	// such a name could vanish after its rows had left the vault, so the name
+	// is refused wherever it is and however it is spelled.
+	vaultFile := canonicalExisting(t, e.path)
+	names := []string{
+		vaultFile + "-journal", vaultFile + "-wal", vaultFile + "-shm", vaultFile + "-JOURNAL",
+		e.out(filepath.Base(e.path) + "-journal"), // another directory
+		e.out("other.db-Wal"),                     // another database's
+		e.out("a.db-ſhm"),                         // a long s, which some file systems fold to s
+		e.out("a.db-journal."),                    // Windows drops the dot
+		e.out("a.db-wal::$DATA"),                  // and reads this as the file's own data
+	}
+	listing := func() string {
+		var all []string
+		for _, dir := range []string{e.dir, filepath.Dir(vaultFile)} {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				all = append(all, filepath.Join(dir, entry.Name()))
+			}
+		}
+		return strings.Join(all, "\n")
+	}
+	before := listing()
+	for _, name := range names {
+		if _, err := e.session.ArchiveAudit(name, 2); !errors.Is(err, ErrArchiveName) || !errors.Is(err, ErrInvalid) {
+			t.Fatalf("archive to %s: %v", name, err)
+		}
+	}
+	if after := listing(); after != before {
+		t.Fatalf("a refused name left a file:\n%s\nbefore:\n%s", after, before)
 	}
 	if _, err := os.Stat(e.out("a.jsonl")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("a refused archive left a file")
@@ -344,11 +383,11 @@ func TestArchiveRefusals(t *testing.T) {
 	if e.session.base != nil || e.session.audit[0].Seq != 1 || len(e.session.audit) < rows {
 		t.Fatal("a refused archive cut the chain")
 	}
-	if got := archiveActions(e.session.audit, actionArchive, resultDenied); got < 7 {
-		t.Fatalf("%d refusals audited, want at least 7", got)
+	if got := archiveActions(e.session.audit, actionArchive, resultDenied); got < 3+len(names) {
+		t.Fatalf("%d refusals audited, want at least %d", got, 3+len(names))
 	}
-	// The same file name in another directory is an ordinary file.
-	mustArchive(t, e.session, e.out(filepath.Base(e.path)+"-journal"), 2)
+	// A name that only resembles one is an ordinary file.
+	mustArchive(t, e.session, e.out("journal.wal.shm.jsonl"), 2)
 	e.session.Lock()
 	if _, err := VerifyAudit(e.path, e.pass); err != nil {
 		t.Fatal(err)
@@ -1072,21 +1111,190 @@ func TestArchiveGivesUpUnderConstantUnlockDenials(t *testing.T) {
 	mustArchive(t, e.session, out, 6)
 }
 
-// The file must hold the rows that are about to be deleted, not merely rows
-// that read back as valid lines. A value that does not survive encoding comes
-// back changed, and the vault's copy must not be deleted on that file.
-func TestWriteArchiveComparesWhatItReadsBack(t *testing.T) {
-	e := newArchiveEnv(t, 3)
-	rows := append([]auditEvent{}, e.session.audit...)
-	rows[1].Reasons = "\xff"
+// The rows leave only if the file is exactly those rows at the moment they
+// are deleted. Whatever happened to it between the write and the commit, the
+// transaction is rolled back and the vault keeps every row.
+func TestArchiveReadsItsFileBackInsideTheTransaction(t *testing.T) {
+	reorder := func(change func(rows []auditEvent) []auditEvent) func(*testing.T, string) {
+		return func(t *testing.T, out string) {
+			rows, err := readArchive(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeLines(t, out, change(rows))
+		}
+	}
+	for name, spoil := range map[string]func(t *testing.T, out string){
+		"removed": func(t *testing.T, out string) {
+			if err := os.Remove(out); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"emptied": func(t *testing.T, out string) {
+			if err := os.Truncate(out, 0); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"one byte changed": func(t *testing.T, out string) {
+			raw := readAll(t, out)
+			raw[len(raw)/2] ^= 1
+			if err := os.WriteFile(out, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		// These three still read as well-formed rows.
+		"last row gone":    reorder(func(rows []auditEvent) []auditEvent { return rows[:len(rows)-1] }),
+		"a row added":      reorder(func(rows []auditEvent) []auditEvent { return append(rows, rows[0]) }),
+		"two rows swapped": reorder(func(rows []auditEvent) []auditEvent { rows[0], rows[1] = rows[1], rows[0]; return rows }),
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newArchiveEnv(t, 20)
+			rows := len(e.session.audit)
+			out := e.out("a.jsonl")
+			e.session.archiveAttempt = func() {
+				e.session.archiveAttempt = nil
+				spoil(t, out)
+			}
+			if _, err := e.session.ArchiveAudit(out, 4); !errors.Is(err, ErrIO) || errors.Is(err, ErrArchiveKept) {
+				t.Fatalf("archive whose file changed before the commit: %v", err)
+			}
+			if got := mustAudit(t, e.path); len(got) != rows || got[0].Seq != 1 {
+				t.Fatalf("vault holds %d rows from %d, want %d from 1", len(got), got[0].Seq, rows)
+			}
+			if e.session.base != nil || len(e.session.audit) != rows {
+				t.Fatal("the session adopted a cut that was not committed")
+			}
+			if _, err := os.Lstat(out); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("the spoiled file was left looking like an archive")
+			}
+			mustArchive(t, e.session, out, 4)
+			e.session.Lock()
+			if _, _, err := VerifyAuditArchive(e.path, e.pass, out); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// SQLite deletes a rollback journal it finds beside the vault and writes over
+// a WAL. The name check keeps an archive off those names. This is what stands
+// behind the name check: the file reaches such a name after it was written,
+// and the rows stay in the vault.
+func TestArchiveFileThatSQLiteTakesLosesNoRows(t *testing.T) {
+	for _, side := range []string{"-journal", "-wal"} {
+		t.Run(side, func(t *testing.T) {
+			e := newArchiveEnv(t, 20)
+			if err := os.Symlink(e.out("nothing"), e.out("probe")); err != nil {
+				t.Skip("no symlinks here")
+			}
+			rows := len(e.session.audit)
+			out := e.out("a.jsonl")
+			taken := canonicalExisting(t, e.path) + side
+			e.session.archiveAttempt = func() {
+				e.session.archiveAttempt = nil
+				// The archive is now the file SQLite will take, and out
+				// still leads to it.
+				if err := os.Rename(out, taken); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(taken, out); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if info, err := e.session.ArchiveAudit(out, 4); err == nil {
+				t.Fatalf("archive reported %+v with its file in SQLite's hands", info)
+			}
+			if e.session.base != nil || len(e.session.audit) != rows {
+				t.Fatal("the session adopted a cut")
+			}
+			e.session.Lock()
+			if got := mustAudit(t, e.path); len(got) != rows || got[0].Seq != 1 {
+				t.Fatalf("vault holds %d rows from %d, want %d from 1", len(got), got[0].Seq, rows)
+			}
+			if _, err := VerifyAudit(e.path, e.pass); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// With the clock held still, another process's archive rows are this call's
+// rows byte for byte. Finding its own row in the chain is then no proof that
+// this call's transaction committed, so the base decides.
+func TestArchiveDoesNotTakeAnIdenticalRowForItsOwn(t *testing.T) {
+	for name, theirKeep := range map[string]int{"a smaller cut": 25, "the same cut": 6} {
+		t.Run(name, func(t *testing.T) {
+			e := newArchiveEnv(t, 30)
+			control := mustUnlock(t, e.path, e.pass)
+			if _, err := e.session.List(); err != nil { // adopt the unlock row, so both build on the same tip
+				t.Fatal(err)
+			}
+			now := time.Now()
+			auditNow = func() time.Time { return now }
+			t.Cleanup(func() { auditNow = time.Now })
+			theirs, mine := e.out("theirs.jsonl"), e.out("mine.jsonl")
+			var won AuditArchive
+			e.session.archiveAttempt = func() {
+				if won.Rows == 0 {
+					won = mustArchive(t, control, theirs, theirKeep)
+				}
+			}
+			info, err := e.session.ArchiveAudit(mine, 6)
+			if tip := e.session.audit[len(e.session.audit)-1]; tip.Action != actionArchive || tip.Seq != won.LastSeq+uint64(won.Kept) {
+				t.Fatalf("the vault's tip %+v is not the winner's archive row", tip)
+			}
+			files := []string{theirs}
+			if theirKeep == 6 {
+				// Both files hold the rows that left. Either is their archive.
+				if err != nil || info.LastSeq != won.LastSeq || info.Rows != won.Rows {
+					t.Fatalf("an archive of the same rows: %+v %v, winner %+v", info, err, won)
+				}
+				files = []string{mine}
+			} else {
+				if !errors.Is(err, ErrStale) {
+					t.Fatalf("the archive that lost to a smaller cut: %+v %v", info, err)
+				}
+				if _, err := os.Stat(mine); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("the losing archive left a file that overlaps the winner's")
+				}
+			}
+			e.session.Lock()
+			control.Lock()
+			if _, _, err := VerifyAuditArchive(e.path, e.pass, files...); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// The vault file is swapped out while the archive is being made. The commit
+// retires the session, and the call reports that rather than the refusal to
+// adopt that follows from it. Nothing was cut from the file it opened or from
+// the one now at the path, so the archive file goes.
+func TestArchiveReportsAVaultReplacedUnderIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("an open file cannot be renamed over on Windows")
+	}
+	e := newArchiveEnv(t, 20)
 	out := e.out("a.jsonl")
-	if err := writeArchive(out, rows); !errors.Is(err, ErrIO) {
-		t.Fatalf("a file that reads back as different rows: %v", err)
+	e.session.archiveAttempt = func() {
+		copyFile(t, e.path, e.path+".copy")
+		if err := os.Rename(e.path+".copy", e.path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := len(e.session.audit)
+	if _, err := e.session.ArchiveAudit(out, 4); !errors.Is(err, ErrCorrupt) || errors.Is(err, ErrArchiveKept) {
+		t.Fatalf("archive of a vault replaced under it: %v", err)
 	}
 	if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("the rejected file was left in place")
+		t.Fatal("the failed archive left a file for rows the vault still holds")
 	}
-	if err := writeArchive(out, e.session.audit); err != nil {
+	e.session.Lock()
+	if got := mustAudit(t, e.path); len(got) != rows || got[0].Seq != 1 {
+		t.Fatalf("vault holds %d rows from %d, want %d from 1", len(got), got[0].Seq, rows)
+	}
+	if _, err := VerifyAudit(e.path, e.pass); err != nil {
 		t.Fatal(err)
 	}
 }
