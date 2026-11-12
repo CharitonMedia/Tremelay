@@ -172,13 +172,13 @@ func (idx *suspensionIndex) apply(events []auditEvent, ev auditEvent) {
 		idx.modern[ev.AgentID] = true
 		return
 	}
-	if ev.Result != resultSuspended || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq || ev.RefSeq > uint64(len(events)) {
+	if ev.Result != resultSuspended || ev.RefSeq == 0 || ev.RefSeq >= ev.Seq {
 		return
 	}
 	// Authenticated chain sequences are contiguous. Resolve the legacy source
 	// directly instead of scanning the prefix for every containment row.
-	src := events[ev.RefSeq-1]
-	if src.Seq != ev.RefSeq || src.AgentID != ev.AgentID {
+	src, ok := rowAt(events, ev.RefSeq)
+	if !ok || src.AgentID != ev.AgentID {
 		return
 	}
 	grantID := ev.GrantID
@@ -267,6 +267,19 @@ func legacyAgentSuspension(events []auditEvent, row auditEvent, agents []agentRe
 		return false
 	}
 	return true
+}
+
+// rowAt returns the row with sequence seq from a contiguous chain. The chain
+// starts at row 1, or after the last archived row.
+func rowAt(events []auditEvent, seq uint64) (auditEvent, bool) {
+	if len(events) == 0 || seq < events[0].Seq {
+		return auditEvent{}, false
+	}
+	i := seq - events[0].Seq
+	if i >= uint64(len(events)) || events[i].Seq != seq {
+		return auditEvent{}, false
+	}
+	return events[i], true
 }
 
 func eventBySeq(events []auditEvent, seq uint64) (auditEvent, bool) {
@@ -741,11 +754,12 @@ func (s *Session) AuditBySeq(seq uint64, hash string) (AuditRecord, error) {
 	if err := s.verified(); err != nil {
 		return AuditRecord{}, err
 	}
-	if seq == 0 || seq > uint64(len(s.audit)) {
+	// An archived row is not in the vault any more; it is in the archive.
+	if seq == 0 || len(s.audit) == 0 || seq < s.audit[0].Seq || seq > s.audit[len(s.audit)-1].Seq {
 		return AuditRecord{}, ErrAuditNotFound
 	}
-	ev := s.audit[seq-1]
-	if ev.Seq != seq {
+	ev, ok := rowAt(s.audit, seq)
+	if !ok {
 		return AuditRecord{}, ErrAudit
 	}
 	if hash != "" && hash != ev.Hash {
@@ -755,7 +769,7 @@ func (s *Session) AuditBySeq(seq uint64, hash string) (AuditRecord, error) {
 }
 
 func (s *Session) verified() error {
-	if err := verifyChain(s.audit); err != nil {
+	if verifyChain(s.audit) != nil || checkBase(s.base, s.audit) != nil {
 		return ErrAudit
 	}
 	if s.denials == nil {
