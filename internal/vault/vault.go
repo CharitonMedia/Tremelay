@@ -1148,6 +1148,12 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	}
 	nextDenials := base.clone()
 	for _, ev := range events {
+		// Every unlock checks a notice row against its source row. A notice
+		// about a row that has left the vault, written by a caller that chose
+		// its source before an archive, would leave a chain no unlock accepts.
+		if noticeAction(ev.Action) && len(kept) > 0 && ev.RefSeq < kept[0].Seq {
+			return ErrStale
+		}
 		nextDenials.apply(ev)
 	}
 	det := nextDenials.state()

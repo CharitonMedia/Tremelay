@@ -97,6 +97,7 @@ func (s *Session) ArchiveAudit(outPath string, keep int) (AuditArchive, error) {
 			return AuditArchive{}, err
 		}
 		tip := s.audit[len(s.audit)-1].Seq
+		mine := events[len(events)-1]
 		err = s.commitBatchWrap(events, s.creds, s.agents, s.grants, false, nil, nil, nil, cut)
 		if err == nil {
 			break
@@ -110,26 +111,42 @@ func (s *Session) ArchiveAudit(outPath string, keep int) (AuditArchive, error) {
 		}
 		if gone {
 			// The rows left the vault. Bring this session up to what is
-			// stored and see whose cut it was.
+			// stored and see whose transaction took them: this one's archive
+			// row is in the chain exactly when this one committed.
 			if aerr := s.adoptLocked(); aerr != nil {
 				return AuditArchive{}, aerr
 			}
-			if s.base != nil && *s.base == *cut {
+			if s.base == nil {
+				return AuditArchive{}, err
+			}
+			got, ok := rowAt(s.audit, mine.Seq)
+			landed := ok && got.Hash == mine.Hash
+			if landed && *s.base == *cut {
 				// This transaction is durable and only a step after it
 				// failed. The file is the vault's archive.
 				break
 			}
-			// Another archive took these rows and more, and has them on its
-			// own file. This one is a duplicate of part of that.
-			_ = os.Remove(out)
-			return AuditArchive{}, ErrStale
+			if !landed && s.base.Seq < mine.Seq {
+				// The place this transaction's row would hold is empty or
+				// holds another row, so it never committed. Another archive
+				// took these rows into its own file, and this one duplicates
+				// part of that.
+				_ = os.Remove(out)
+				return AuditArchive{}, ErrStale
+			}
+			// This transaction may have committed before a later archive cut
+			// further. The file may be the only copy of its rows; it stays.
+			return AuditArchive{}, err
 		}
-		// Every row is still in the vault, so the file can go whatever
+		// Every row on file is still in the vault, so the file can go whatever
 		// happens next. If another writer got in first, a commit or an unlock
 		// denial behind the head, adopt its rows and cut at the same row: the
-		// rows on file are history it could not change.
+		// rows on file are history it could not change. That holds only while
+		// the chain still starts where the file does. After a smaller archive
+		// by someone else, cutting here would leave a file that overlaps
+		// theirs and reports rows this call did not remove.
 		if try < archiveRetries {
-			if aerr := s.adoptLocked(); aerr == nil && s.audit[len(s.audit)-1].Seq != tip && cutHolds(s.audit, *cut) {
+			if aerr := s.adoptLocked(); aerr == nil && s.audit[len(s.audit)-1].Seq != tip && s.audit[0].Seq == info.FirstSeq && cutHolds(s.audit, *cut) {
 				continue
 			}
 		}

@@ -84,16 +84,25 @@ file.
   command asks the audit table whether the rows are still there.
   - Still there, and another writer got in first (a commit, or an unlock
     denial appended behind the head): the command adopts that writer's rows
-    and cuts at the same row, up to four more times.
-  - Still there otherwise: it removes its file and reports the error. Nothing
-    is left that looks like an archive and is not one.
-  - Gone, and the vault's base is this cut: the transaction was durable and a
-    later step failed. The file is the archive, and the command reports
-    success.
-  - Gone to a different cut: another archive took those rows into its own
-    file. This file duplicates part of it and is removed.
-  - The table cannot be read: the file stays, because it may be the only
-    copy, and the command says so.
+    and cuts at the same row, up to four more times. It does so only while
+    the chain still starts at the file's first row and no new notice row
+    names a row the cut would take.
+  - Still there otherwise: it removes its file and reports the error. That
+    includes a smaller archive by another process, which leaves the vault
+    holding only the later part of the file; cutting there would leave two
+    files that overlap. Nothing is left that looks like an archive and is
+    not one.
+  - Gone, the vault's base is this cut, and this command's `audit_archive`
+    row is in the chain: the transaction was durable and a later step
+    failed. The file is the archive, and the command reports success.
+  - Gone, and the place this command's `audit_archive` row would hold is
+    empty or holds another row: this transaction never committed, so another
+    archive took those rows into its own file. This file duplicates part of
+    it and is removed.
+  - Gone, and neither can be shown (this command's row is in the chain under
+    a later cut, or was itself archived since): the file stays, because it
+    may be the only copy, and the command says so.
+  - The table cannot be read: the file stays for the same reason.
 
 `audit verify --path VAULT --archive FILE ...` verifies the vault, verifies
 the files as linked runs in the order given, and requires them to be this
@@ -128,7 +137,10 @@ cut out of band.
 - **Notices.** A notice row is verified against its source row, so the cut is
   moved back until no kept notice names an archived source. An alert that was
   decided but not yet delivered, and whose rows are archived, is not retried.
-  No shipped build retries one (ADR 0028 delivers at commit).
+  No shipped build retries one (ADR 0028 delivers at commit). The commit
+  path refuses any notice row about a row the vault no longer holds, so an
+  alert whose delivery was in flight when its source was archived gets no
+  outcome row. Written, that row would leave a chain no unlock accepts.
 - **Suspension.** An agent suspended by a containment row that is archived is
   no longer recognised as suspended when its denials are classified. Its
   denials count toward repeated denial again. That raises alerts and hides

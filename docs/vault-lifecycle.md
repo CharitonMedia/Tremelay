@@ -93,8 +93,9 @@ What to know before you run it:
   the first `seq` is 1, or no higher than the first row in the file, the
   vault still holds those rows and the file is a spare. If it is higher, the
   file is the only copy: keep it, and check it with `audit verify --archive`.
-- **Under a busy daemon the command can report a stale session.** It tried
-  five times and cut nothing. Run it again.
+- **The command can report a stale session.** Other writers got in first
+  five times running, or another archive ran at the same moment. It cut
+  nothing and left no file. Run it again.
 - **Older builds refuse a vault once this command has run on it,** even if
   it refused. Upgrade only.
 - **The vault file does not get smaller.** The freed space is reused by new

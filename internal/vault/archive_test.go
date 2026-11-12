@@ -777,3 +777,168 @@ func TestDetectionMirrorFollowsTheKeptRows(t *testing.T) {
 		t.Fatalf("sealed mirror %+v", opened.detection)
 	}
 }
+
+// Another archive lands first and cuts less. The chain no longer starts where
+// this call's file does, so cutting at the same row would leave two files that
+// overlap and a report of rows this call did not remove. It gives way instead.
+func TestArchiveLosesToASmallerArchive(t *testing.T) {
+	e := newArchiveEnv(t, 30)
+	control := mustUnlock(t, e.path, e.pass)
+	theirs := e.out("theirs.jsonl")
+	var won AuditArchive
+	e.session.archiveAttempt = func() {
+		if won.Rows == 0 {
+			won = mustArchive(t, control, theirs, 25)
+		}
+	}
+	mine := e.out("mine.jsonl")
+	if _, err := e.session.ArchiveAudit(mine, 6); !errors.Is(err, ErrStale) {
+		t.Fatalf("the losing archive: %v", err)
+	}
+	if _, err := os.Stat(mine); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the losing archive left a file that overlaps the winner's")
+	}
+	if e.session.base == nil || e.session.base.Seq != won.LastSeq {
+		t.Fatalf("the loser did not adopt the winner's cut: %+v", e.session.base)
+	}
+	// Run again, it continues from the winner's file.
+	next := mustArchive(t, e.session, mine, 6)
+	if next.FirstSeq != won.LastSeq+1 {
+		t.Fatalf("the second try starts at %d, want %d", next.FirstSeq, won.LastSeq+1)
+	}
+	e.session.Lock()
+	control.Lock()
+	if _, _, err := VerifyAuditArchive(e.path, e.pass, theirs, mine); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A competing commit writes notice rows about a source this cut would
+// archive. The retry must not cut there: the notice would lose its source and
+// no unlock would accept the chain.
+func TestArchiveRetryRefusesACutUnderANewNotice(t *testing.T) {
+	e := archiveEnv{brokerEnv: newBrokerEnv(t)}
+	e.dir = canonicalExisting(t, t.TempDir())
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://other.example/v1/ping"}, ErrDeniedOrigin)
+	for range 20 {
+		if _, err := e.session.List(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	control := mustUnlock(t, e.path, e.pass)
+	fired := false
+	e.session.archiveAttempt = func() {
+		if fired {
+			return
+		}
+		fired = true
+		if err := control.SetNotifier(&MemoryNotifier{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := control.DeliverPending(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := e.out("a.jsonl")
+	if _, err := e.session.ArchiveAudit(out, 6); !errors.Is(err, ErrStale) {
+		t.Fatalf("archive over a new notice's source: %v", err)
+	}
+	if !fired || archiveActions(e.session.audit, actionNotify, resultDelivered) == 0 {
+		t.Fatal("the competing delivery did not happen; the test proves nothing")
+	}
+	if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the refused archive left its file")
+	}
+	e.session.Lock()
+	control.Lock()
+	if _, err := VerifyAudit(e.path, e.pass); err != nil {
+		t.Fatalf("vault after the refused archive: %v", err)
+	}
+}
+
+type hookNotifier struct{ hook func() }
+
+func (h *hookNotifier) Notify(Notification) error {
+	if f := h.hook; f != nil {
+		h.hook = nil
+		f()
+	}
+	return nil
+}
+
+// While an alert's callback runs, the session lock is released. Other calls
+// go on, another process archives the alert's source, and this session adopts
+// the cut. The outcome row for that alert must not be written: it would name a
+// row the vault no longer holds, and no unlock would accept the chain.
+func TestNoticeAboutAnArchivedRowIsNotWritten(t *testing.T) {
+	e := archiveEnv{brokerEnv: newBrokerEnv(t)}
+	e.dir = canonicalExisting(t, t.TempDir())
+	control := mustUnlock(t, e.path, e.pass)
+	cutDone := false
+	n := &hookNotifier{}
+	n.hook = func() {
+		for range 10 {
+			if _, err := e.session.List(); err != nil {
+				t.Error(err)
+			}
+		}
+		mustArchive(t, control, e.out("a.jsonl"), 3)
+		if _, err := e.session.List(); err != nil { // adopts the cut
+			t.Error(err)
+		}
+		cutDone = true
+	}
+	if err := e.session.SetNotifier(n); err != nil {
+		t.Fatal(err)
+	}
+	e.deny(t, HTTPBrokerRequest{CredentialID: e.apiID, Method: http.MethodGet, Target: "https://other.example/v1/ping"}, ErrDeniedOrigin)
+	if !cutDone || e.session.base == nil {
+		t.Fatal("the archive did not happen inside the callback; the test proves nothing")
+	}
+	first := e.session.audit[0].Seq
+	for _, ev := range e.session.audit {
+		if noticeAction(ev.Action) && ev.RefSeq < first {
+			t.Fatalf("row %d is a notice about archived row %d", ev.Seq, ev.RefSeq)
+		}
+	}
+	if _, err := e.session.List(); err != nil {
+		t.Fatalf("the session after the skipped notice: %v", err)
+	}
+	e.session.Lock()
+	control.Lock()
+	if _, _, err := VerifyAuditArchive(e.path, e.pass, e.out("a.jsonl")); err != nil {
+		t.Fatalf("vault after the skipped notice: %v", err)
+	}
+	mustUnlock(t, e.path, e.pass).Lock()
+}
+
+// This archive's transaction lands, the step after it fails, and before the
+// call can look, another archive cuts further. The vault's base is no longer
+// this cut, but the file is still the only copy of its rows. It stays.
+func TestArchiveThatLandedKeepsItsFileUnderALaterCut(t *testing.T) {
+	e := newArchiveEnv(t, 30)
+	control := mustUnlock(t, e.path, e.pass)
+	theirs := e.out("theirs.jsonl")
+	var later AuditArchive
+	e.session.postCommitFault = func() error {
+		if later.Rows == 0 {
+			later = mustArchive(t, control, theirs, 4)
+		}
+		return errors.New("after commit")
+	}
+	mine := e.out("mine.jsonl")
+	_, err := e.session.ArchiveAudit(mine, 12)
+	e.session.postCommitFault = nil
+	if err == nil {
+		t.Fatal("an archive whose outcome could not be established reported success")
+	}
+	got, verr := VerifyArchive(mine)
+	if verr != nil || got.FirstSeq != 1 || got.LastSeq+1 != later.FirstSeq {
+		t.Fatalf("the only copy of rows 1 to %d: %+v %v", later.FirstSeq-1, got, verr)
+	}
+	e.session.Lock()
+	control.Lock()
+	if _, _, err := VerifyAuditArchive(e.path, e.pass, mine, theirs); err != nil {
+		t.Fatal(err)
+	}
+}

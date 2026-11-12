@@ -640,21 +640,23 @@ func cmdAuditArchive(args []string, getenv func(string) string, stdin io.Reader,
 		usage(stderr)
 		return 2
 	}
+	// A name already taken is refused, and that file is not this command's.
+	_, taken := os.Lstat(*out)
 	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
 		info, err := session.ArchiveAudit(*out, *keep)
-		if err != nil {
-			// A refusal wrote no file, and a failed commit that left the rows
-			// in the vault removed its own. A file still here is one the
-			// engine could not account for. ErrInvalid is the refusal of a
-			// name that was already taken, by a file that is not ours.
-			if !errors.Is(err, vault.ErrInvalid) {
-				if _, serr := os.Stat(*out); serr == nil {
-					fmt.Fprintln(stderr, errArchiveLeft)
-				}
-			}
-			return err
+		if err == nil {
+			// The rows are archived whether or not the report can be printed.
+			err = json.NewEncoder(stdout).Encode(info)
 		}
-		return json.NewEncoder(stdout).Encode(info)
+		if err != nil && taken != nil {
+			// A refusal wrote no file, and a failed commit that left the rows
+			// in the vault removed its own. A file here now is one the engine
+			// could not account for, or the archive itself.
+			if _, serr := os.Stat(*out); serr == nil {
+				fmt.Fprintln(stderr, errArchiveLeft)
+			}
+		}
+		return err
 	})
 }
 
