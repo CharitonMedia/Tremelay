@@ -269,6 +269,9 @@ type document struct {
 	// HealthPolicy is absent on vaults sealed before M6. Absence means the
 	// documented defaults, not a fabricated healthy assessment.
 	HealthPolicy healthPolicy `json:"health_policy,omitempty"`
+	// AuditBase is absent until the owner archives audit rows. It names the
+	// last archived row, which the first row still in the vault must follow.
+	AuditBase *auditBase `json:"audit_base,omitempty"`
 }
 
 // Session is an unlocked vault. Lock zeroes the master key and cached secrets.
@@ -276,14 +279,17 @@ type Session struct {
 	path string
 	// file identifies the file opened at path, so a later replacement of
 	// that path can be told from a transient read failure.
-	file     os.FileInfo
-	id       string
-	dek      []byte
-	header   fileHeader
-	creds    []credential
-	agents   []agentRecord
-	grants   []grantRecord
-	audit    []auditEvent
+	file   os.FileInfo
+	id     string
+	dek    []byte
+	header fileHeader
+	creds  []credential
+	agents []agentRecord
+	grants []grantRecord
+	audit  []auditEvent
+	// base is the last archived audit row, nil until an archive. audit[0]
+	// follows it.
+	base     *auditBase
 	redactor *Redactor
 	logger   *log.Logger
 	db       *sql.DB
@@ -295,6 +301,9 @@ type Session struct {
 	// postCommitFault, when set, fails after a successful durable commit before
 	// the session cache is updated. Tests only.
 	postCommitFault func() error
+	// archiveAttempt, when set, runs once ArchiveAudit has its file on disk,
+	// before each attempt at the commit that deletes those rows. Tests only.
+	archiveAttempt func()
 	// attestFault, when set, runs after the local-attestation allowed row
 	// commits and before Ed25519 signing. A non-nil error withholds the
 	// signature. Tests use it. Production leaves it nil.
@@ -478,6 +487,11 @@ func openDocument(dek []byte, header fileHeader, events []auditEvent) (document,
 	if err := validateDocument(doc); err != nil {
 		return document{}, nil, err
 	}
+	// Before the mirror and health checks, which read the same rows: a chain
+	// cut at the front is an audit failure, whatever else it also breaks.
+	if err := checkBase(doc.AuditBase, events); err != nil {
+		return document{}, nil, err
+	}
 	idx := indexFromAudit(events)
 	if err := matchDetection(idx.state(), doc.Detection); err != nil {
 		return document{}, nil, ErrCorrupt
@@ -551,6 +565,7 @@ func Unlock(path string, passphrase []byte, logger *log.Logger) (*Session, error
 		agents:          doc.Agents,
 		grants:          doc.Grants,
 		audit:           events,
+		base:            doc.AuditBase,
 		detection:       doc.Detection,
 		denials:         idx,
 		notices:         noticeIndex(events),
@@ -887,6 +902,7 @@ func (s *Session) reloadLocked() error {
 	s.agents = doc.Agents
 	s.grants = doc.Grants
 	s.audit = events
+	s.base = doc.AuditBase
 	s.detection = doc.Detection
 	s.denials = idx
 	s.notices = noticeIndex(events)
@@ -1077,7 +1093,7 @@ func (s *Session) commitState(ev auditEvent, creds []credential, agents []agentR
 // withResp lets one ordinary security event pick up its M5 response.
 // policy, when non-nil, becomes the durable health policy only after commit.
 func (s *Session) commitBatch(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy) error {
-	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil, nil)
+	return s.commitBatchWrap(events, creds, agents, grants, withResp, policy, nil, nil, nil)
 }
 
 type dekRotation struct {
@@ -1087,7 +1103,11 @@ type dekRotation struct {
 // commitBatchWrap optionally replaces the passphrase wrap and/or rotates the DEK
 // in the same transaction. Neither the session header nor its audit cache
 // changes before commit succeeds.
-func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap, rot *dekRotation) error {
+//
+// cut, when set, is an archive: the rows through it leave the audit table in
+// this same transaction, and the document sealed here names it as the row the
+// chain now follows. The caller has those rows on file already.
+func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agents []agentRecord, grants []grantRecord, withResp bool, policy *healthPolicy, wrap *passphraseWrap, rot *dekRotation, cut *auditBase) error {
 	if s == nil || s.db == nil || len(s.dek) != keyLen {
 		return ErrUnauthenticated
 	}
@@ -1115,6 +1135,17 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	if base == nil {
 		base = indexFromAudit(s.audit)
 	}
+	kept, docBase, trim := s.audit, s.base, uint64(0)
+	if cut != nil {
+		last, ok := rowAt(s.audit, cut.Seq)
+		if !ok || last.Hash != cut.Hash || cut.Seq == s.audit[len(s.audit)-1].Seq {
+			return ErrAudit
+		}
+		// The mirror is checked against the rows the vault holds, so it is
+		// sealed from the rows that stay.
+		kept, docBase, trim = s.audit[cut.Seq-s.audit[0].Seq+1:], cut, cut.Seq
+		base = indexFromAudit(kept)
+	}
 	nextDenials := base.clone()
 	for _, ev := range events {
 		nextDenials.apply(ev)
@@ -1126,7 +1157,7 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	tip := events[len(events)-1]
 	plain, err := json.Marshal(document{
 		Credentials: creds, Agents: agents, Grants: grants, Detection: det, HealthPolicy: pol,
-		DEKReloadPubKey: s.dekReloadPubKey,
+		DEKReloadPubKey: s.dekReloadPubKey, AuditBase: docBase,
 	})
 	if err != nil {
 		return ErrIO
@@ -1153,7 +1184,7 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	h.Data = ct
 	h.AuditHead = tip.Hash
 	h.AuditSeq = tip.Seq
-	if err := writeTx(s.db, h, s.header.AuditSeq, events, len(s.audit) == 0, s.commitFault); err != nil {
+	if err := writeTx(s.db, h, s.header.AuditSeq, events, len(s.audit) == 0, trim, s.commitFault); err != nil {
 		if errors.Is(err, ErrCorrupt) {
 			// The vault row no longer matches what this session can account
 			// for. The cache must not approve, restore, or sign from its old
@@ -1188,6 +1219,13 @@ func (s *Session) commitBatchWrap(events []auditEvent, creds []credential, agent
 	// prefix in place, and append grows the backing array instead of copying
 	// it on every row. The notice index follows the same commit: a failed
 	// write does not publish the rows that were not stored.
+	if cut != nil {
+		// A copy, not a re-slice, so the archived rows are released. Both
+		// indexes are keyed to rows that are gone; rebuild them just below.
+		s.base = docBase
+		s.audit = append(make([]auditEvent, 0, len(kept)+len(events)), kept...)
+		s.notices, s.suspensions = nil, nil
+	}
 	if s.notices == nil {
 		s.notices = noticeIndex(s.audit)
 	}

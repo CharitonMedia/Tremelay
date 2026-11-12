@@ -136,6 +136,10 @@ The host is trusted to supply the current checkpoint, quiesce the source, and ru
 
 The human host can generate a fresh DEK, re-encrypt every stored credential under it, and rewrap under the new passphrase after reauthenticating the old one ([ADR 0019](docs/adr/0019-human-vault-lifecycle.md)). The new wrap and audit event commit together. Cached sessions cannot overwrite a newer wrap, but a process already holding the DEK still knows it. This is not key revocation against a compromised host. Existing snapshots and copies retain their original passphrase. Agents do not receive this operation.
 
+## Audit archive limits
+
+The human host can move the oldest audit rows to a file and leave the rest in the vault ([ADR 0029](docs/adr/0029-audit-archive.md)). The chain is not restarted: the rows that stay keep their sequence numbers, and the sequence and hash of the last archived row are sealed in the encrypted document in the transaction that deletes those rows. Without the DEK the front of the chain cannot be moved in either direction. The archive file is outside the vault: a changed or shortened file fails verification against the vault, and a lost file is not recoverable, so the host keeps it as it keeps a backup. Detection counts and pending notices are derived from the rows the vault still holds. A resident session whose last verified row was archived retires itself. Agents do not receive this operation.
+
 ## Agent capability interface limits
 
 M10a is one in-process message boundary for `local_artifact_attest`. The trusted host constructs it from an already-bound agent principal. Messages cannot choose or replace that principal, a human identity, the session, the vault path, unlock material, the clock, or a host callback. A handle locates one exact grant inside that adapter. It is not a new authentication credential and it is not accepted by a different adapter. Discovery metadata is advisory. Invocation rechecks the selected grant and does not move the handle onto another grant or key.

@@ -49,6 +49,10 @@ const (
 	actionHealthPolicy       = "health_policy"
 	actionHealthGet          = "health_get"
 	actionHealthList         = "health_list"
+	// actionArchive records the owner moving the oldest rows to a file. It is
+	// a version-1 row: no field of it names what was archived. The cut is in
+	// the sealed document. See ADR 0029.
+	actionArchive = "audit_archive"
 
 	resultAllowed           = "allowed"
 	resultDenied            = "denied"
@@ -122,20 +126,52 @@ type auditEvent struct {
 // locked-state unlock denials with a chronological timestamp. The returned
 // hash is the chain tip, for a later external checkpoint. This read does not
 // append an audit event or migrate the file, including before authentication.
+//
+// After an archive the vault holds only the rows that were kept. The check
+// then covers those rows and that the first of them follows the archived row
+// sealed in the document. VerifyAuditArchive also checks the archive files.
 func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
+	tip, _, _, err := verifyAudit(vaultPath, passphrase)
+	return tip, err
+}
+
+// VerifyAuditArchive verifies the vault as VerifyAudit does and the archive
+// files as VerifyArchive does, then requires the files to be this vault's
+// rows, to start at row 1 and to end at the row its chain follows. Passing
+// means the files and the vault together are the whole history. Files that
+// are this vault's but start later are ErrArchiveIncomplete.
+func VerifyAuditArchive(vaultPath string, passphrase []byte, archives ...string) (string, AuditArchive, error) {
+	tip, base, id, err := verifyAudit(vaultPath, passphrase)
+	if err != nil {
+		return "", AuditArchive{}, err
+	}
+	info, vaultID, err := verifyArchive(archives)
+	if err != nil {
+		return "", AuditArchive{}, err
+	}
+	if base == nil || vaultID != id || info.LastSeq != base.Seq || info.LastHash != base.Hash {
+		return "", AuditArchive{}, ErrAudit
+	}
+	if info.FirstSeq != 1 {
+		return "", AuditArchive{}, ErrArchiveIncomplete
+	}
+	return tip, info, nil
+}
+
+func verifyAudit(vaultPath string, passphrase []byte) (string, *auditBase, string, error) {
 	db, header, events, err := loadVaultForVerify(vaultPath)
 	if err != nil {
-		return "", err
+		return "", nil, "", err
 	}
 	defer db.Close()
 	if err := validatePassphrase(passphrase); err != nil {
-		return "", err
+		return "", nil, "", err
 	}
 	kek := deriveKEK(passphrase, header.KDF)
 	defer wipe(kek)
 	dek, err := openAEAD(kek, header.WrapNonce, header.WrappedDEK, dekAAD(header.ID))
 	if err != nil {
-		return "", ErrUnauthenticated
+		return "", nil, "", ErrUnauthenticated
 	}
 	defer wipe(dek)
 	// openDocument authenticates the sealed document under the plaintext audit
@@ -144,10 +180,10 @@ func VerifyAudit(vaultPath string, passphrase []byte) (string, error) {
 	// verification here, not a clean tip.
 	doc, _, err := openDocument(dek, header, events)
 	if err != nil {
-		return "", ErrAudit
+		return "", nil, "", ErrAudit
 	}
 	defer wipeCredentials(doc.Credentials)
-	return events[len(events)-1].Hash, nil
+	return events[len(events)-1].Hash, doc.AuditBase, header.ID, nil
 }
 
 func eventHash(prev []byte, seq uint64, timeStr, action, vaultID, credID, credType, result string) []byte {
@@ -314,17 +350,48 @@ func hashEvent(prev []byte, ev auditEvent) []byte {
 	}
 }
 
+// verifyChain checks the rows a vault holds. A chain that starts at row 1
+// starts with the vault's creation. One that starts later is what an archive
+// left behind: its rows must link to each other here, and checkBase holds the
+// first of them to the row the sealed document says it follows. No caller
+// trusts a chain on this check alone.
 func verifyChain(events []auditEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
-	if events[0].Seq != 1 {
-		return ErrAudit
-	}
 	if err := verifyLinked(events); err != nil {
 		return err
 	}
-	if events[0].Action != actionCreate || events[0].Result != resultAllowed {
+	if events[0].Seq == 1 && (events[0].Action != actionCreate || events[0].Result != resultAllowed) {
+		return ErrAudit
+	}
+	return nil
+}
+
+// auditBase is the last archived row: its sequence and its hash. It lives in
+// the encrypted document, so only someone holding the DEK can move it.
+type auditBase struct {
+	Seq  uint64 `json:"seq"`
+	Hash string `json:"hash"`
+}
+
+// checkBase holds the front of the chain to the authenticated document, the
+// way the audit head holds its end. With no base the chain must start at row
+// 1, so rows deleted from the front of a vault that was never archived fail
+// here. With a base the first row must be the one after it and must name its
+// hash, so neither more rows removed nor archived rows put back verify.
+func checkBase(base *auditBase, events []auditEvent) error {
+	if len(events) == 0 {
+		return ErrAudit
+	}
+	first := events[0]
+	if base == nil {
+		if first.Seq != 1 {
+			return ErrAudit
+		}
+		return nil
+	}
+	if base.Seq == 0 || !canonicalHexN(base.Hash, 64) || first.Seq != base.Seq+1 || first.Prev != base.Hash {
 		return ErrAudit
 	}
 	return nil
@@ -380,7 +447,7 @@ func knownAction(action string) bool {
 		actionDaemonAuth, actionDaemonReloadPubkey, actionGrantCreate, actionGrantRevoke, actionAuthorize, actionCapList,
 		actionBroker, actionLocalAttest, actionSSHUserAuth, actionAgentCap, actionNotify, actionContain, actionRespond,
 		actionReplace, actionLifecycle, actionHealth, actionRefresh, actionHealthPolicy,
-		actionHealthGet, actionHealthList:
+		actionHealthGet, actionHealthList, actionArchive:
 		return true
 	default:
 		return false

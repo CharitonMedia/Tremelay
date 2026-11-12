@@ -33,6 +33,73 @@ After success, `audit verify` can authenticate the current vault with the new
 passphrase without writing it. Older binaries lacking the new audit action fail
 closed after a change; use the current build for changed vaults.
 
+## Archive old audit rows
+
+The audit log grows with every attempt, and every unlock reads and checks all
+of it. When unlocking gets slow, move the old rows to a file:
+
+```sh
+umask 077
+tremelay audit archive --path /canonical/vault.db --out /canonical/archives/audit-001.jsonl
+```
+
+The command writes the oldest rows to the new file, reads the file back to
+check it, and only then removes those rows from the vault. It keeps the newest
+1000 rows; `--keep N` changes that. It prints one JSON line: the first and
+last sequence archived, the last row's hash, how many rows went, and how many
+the vault holds now. The output file must not exist, and its path must contain
+no symlink.
+
+The log is still one chain. The rows that stay keep their numbers, and the
+vault records, inside its encrypted part, which row its log now follows.
+Nobody without the passphrase can move that point: removing more rows, or
+putting old ones back, fails verification. See
+[ADR 0029](adr/0029-audit-archive.md).
+
+Check a vault against all of its archive files, oldest first:
+
+```sh
+tremelay audit verify --path /canonical/vault.db --archive /canonical/archives/audit-001.jsonl --archive /canonical/archives/audit-002.jsonl
+```
+
+The first line is the chain tip, as before. The second says which rows the
+files hold. Passing means the files and the vault together are the whole
+history, from row 1. A changed line, files out of order, another vault's file,
+or a file that does not end where this vault's log begins all fail as an audit
+failure. Files that are right but do not reach back to row 1 fail with
+"archive files do not reach back to row 1": an older file is missing from the
+command, or the front of one was removed.
+
+What to know before you run it:
+
+- **The file is the only copy of those rows.** It holds no secret, but it
+  names your agents, credentials and grants and everything they did. Keep it
+  the way you keep a backup. A changed or shortened file is caught when you
+  verify it against the vault. A lost one is gone.
+- **Read the file only after it verifies.** It is one JSON object per line.
+- **`audit list` and `audit get` cover the rows in the vault.** An archived
+  row is in its file.
+- **A running daemon may lock.** A daemon accepts another process's changes
+  only while the last row it checked is still in the vault. That row is
+  among the newest, so the default of 1000 kept rows leaves it there. With a
+  small `--keep` the daemon locks and exits 1 on its next call; start it
+  again.
+- **Repeated-denial counting starts from the kept rows.** An alert that was
+  decided but never delivered, and whose rows were archived, is not retried.
+- **A failed archive cleans up after itself.** If the rows are still in the
+  vault it removes its file, and you can run it again under the same name.
+  Only when it cannot tell does it leave the file and say so. Do not delete
+  that file on a guess. Run `tremelay audit list --path VAULT --limit 1`: if
+  the first `seq` is 1, or no higher than the first row in the file, the
+  vault still holds those rows and the file is a spare. If it is higher, the
+  file is the only copy: keep it, and check it with `audit verify --archive`.
+- **Under a busy daemon the command can report a stale session.** It tried
+  five times and cut nothing. Run it again.
+- **Older builds refuse a vault once this command has run on it,** even if
+  it refused. Upgrade only.
+- **The vault file does not get smaller.** The freed space is reused by new
+  rows.
+
 ## Back up and keep the checkpoint independently
 
 Quiesce writers first if the snapshot must represent the newest source state.

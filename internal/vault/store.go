@@ -778,7 +778,9 @@ func readAuditRowsMode(db queryer, legacy bool) ([]auditEvent, error) {
 // the transaction after the statements so tests can observe rollback.
 // A failure rolls every event in the call back; callers put a security
 // event, its response decision, and its containment row in one call.
-func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fresh bool, fault func() error) error {
+// trim, when non-zero, deletes the audit rows through that sequence in the
+// same transaction: an archive, whose rows the caller already has on file.
+func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fresh bool, trim uint64, fault func() error) error {
 	if len(events) == 0 {
 		return ErrAudit
 	}
@@ -803,6 +805,13 @@ func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fres
 		for _, ev := range events {
 			if err := insertAudit(tx, ev); err != nil {
 				return err
+			}
+		}
+		if trim != 0 {
+			// ponytail: the pages are freed for reuse and the file does not
+			// shrink. VACUUM if the size on disk ever matters.
+			if _, err := tx.Exec(`DELETE FROM audit WHERE seq <= ?`, int64(trim)); err != nil {
+				return ErrIO
 			}
 		}
 		if fault != nil {

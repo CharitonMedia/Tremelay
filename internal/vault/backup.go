@@ -359,6 +359,9 @@ func readSnapshot(path string, passphrase []byte) (snapshotView, error) {
 	if err := unmarshalStrict(plain, &doc); err != nil {
 		return snapshotView{}, ErrCorrupt
 	}
+	if err := checkBase(doc.AuditBase, events); err != nil {
+		return snapshotView{}, err
+	}
 	doc.Detection, err = sealedDetection(plain, events, doc.Detection)
 	if err != nil {
 		return snapshotView{}, err
