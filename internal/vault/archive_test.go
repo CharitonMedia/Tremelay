@@ -740,7 +740,7 @@ func TestBackupAndRestoreAfterArchive(t *testing.T) {
 	// further, without the DEK, yields no artifact and no checkpoint.
 	execArchiveSQL(t, e.path, `DELETE FROM audit WHERE seq=?`, int64(info.LastSeq+1))
 	bad := filepath.Join(e.dir, "bad-art.db")
-	if _, err := Backup(e.path, bad, e.pass, nil); !errors.Is(err, ErrAudit) {
+	if _, err := Backup(canonicalExisting(t, e.path), bad, e.pass, nil); !errors.Is(err, ErrAudit) {
 		t.Fatalf("backup of a vault with its front cut further: %v", err)
 	}
 	if _, err := os.Stat(bad); !errors.Is(err, os.ErrNotExist) {
