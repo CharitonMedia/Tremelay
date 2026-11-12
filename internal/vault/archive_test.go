@@ -992,36 +992,124 @@ func TestArchiveLosesToAnArchiveOfTheSameRows(t *testing.T) {
 	}
 }
 
-// Someone without the passphrase deletes the rows this archive is about to
-// cut, and the commit fails. The table says the rows are gone, but no archive
-// took them: the vault's head never moved. The file is the only copy left, so
-// it stays, and the error says so.
-func TestArchiveKeepsItsFileWhenTheRowsWereDeletedUnderIt(t *testing.T) {
+// Someone without the passphrase removes or changes rows this archive has on
+// file, and the commit fails. No archive took those rows: the file is the only
+// true copy left. It stays, whatever else the tampering did to the vault, and
+// the error says so.
+func TestArchiveKeepsItsFileWhenItsRowsLeftTheTableByHand(t *testing.T) {
+	for name, tamper := range map[string]func(t *testing.T, e archiveEnv, first, cut uint64){
+		"every row through the cut deleted": func(t *testing.T, e archiveEnv, _, cut uint64) {
+			execArchiveSQL(t, e.path, `DELETE FROM audit WHERE seq<=?`, int64(cut))
+		},
+		"all but the first deleted": func(t *testing.T, e archiveEnv, first, cut uint64) {
+			execArchiveSQL(t, e.path, `DELETE FROM audit WHERE seq>? AND seq<=?`, int64(first), int64(cut))
+		},
+		"deleted, and the head moved so the session cannot adopt": func(t *testing.T, e archiveEnv, first, cut uint64) {
+			execArchiveSQL(t, e.path, `DELETE FROM audit WHERE seq>? AND seq<=?`, int64(first), int64(cut))
+			execArchiveSQL(t, e.path, `UPDATE vault SET audit_seq=audit_seq+1`)
+		},
+		"the whole table emptied": func(t *testing.T, e archiveEnv, _, _ uint64) {
+			execArchiveSQL(t, e.path, `DELETE FROM audit`)
+		},
+		"one row changed in place": func(t *testing.T, e archiveEnv, first, _ uint64) {
+			execArchiveSQL(t, e.path, `UPDATE audit SET result='denied' WHERE seq=?`, int64(first+1))
+		},
+		"the table cannot be read": func(t *testing.T, e archiveEnv, _, _ uint64) {
+			execArchiveSQL(t, e.path, `ALTER TABLE audit RENAME TO elsewhere`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newArchiveEnv(t, 20)
+			before := mustArchive(t, e.session, e.out("first.jsonl"), 20)
+			for range 15 {
+				if _, err := e.session.List(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cut := e.session.audit[len(e.session.audit)-6].Seq
+			e.session.archiveAttempt = func() { tamper(t, e, before.LastSeq+1, cut) }
+			e.session.commitFault = func() error { return errors.New("disk") }
+			out := e.out("second.jsonl")
+			_, err := e.session.ArchiveAudit(out, 5)
+			e.session.commitFault = nil
+			if !errors.Is(err, ErrArchiveKept) {
+				t.Fatalf("archive over rows tampered with under it: %v", err)
+			}
+			if got, verr := VerifyArchive(e.out("first.jsonl"), out); verr != nil || got.LastSeq != cut {
+				t.Fatalf("the only copy of rows through %d: %+v %v", cut, got, verr)
+			}
+			e.session.Lock()
+			if _, err := VerifyAudit(e.path, e.pass); err == nil {
+				t.Fatal("the tampered vault verified")
+			}
+		})
+	}
+}
+
+// Failed unlocks by someone else keep landing denial rows behind the head.
+// Each is a lost race, and the archive says so when it gives up: the write
+// that failed calls it an audit failure, which would read like tampering.
+func TestArchiveGivesUpUnderConstantUnlockDenials(t *testing.T) {
 	e := newArchiveEnv(t, 20)
-	mustArchive(t, e.session, e.out("first.jsonl"), 20)
-	for range 15 {
-		if _, err := e.session.List(); err != nil {
-			t.Fatal(err)
+	rounds := 0
+	e.session.archiveAttempt = func() {
+		rounds++
+		if _, err := Unlock(e.path, []byte("not the passphrase"), nil); !errors.Is(err, ErrUnauthenticated) {
+			t.Errorf("wrong passphrase: %v", err)
 		}
 	}
-	var cutAt uint64
-	e.session.archiveAttempt = func() {
-		cutAt = e.session.audit[len(e.session.audit)-6].Seq
-		execArchiveSQL(t, e.path, `DELETE FROM audit WHERE seq<=?`, int64(cutAt))
+	out := e.out("a.jsonl")
+	if _, err := e.session.ArchiveAudit(out, 6); !errors.Is(err, ErrStale) || errors.Is(err, ErrArchiveKept) {
+		t.Fatalf("archive under constant unlock denials: %v", err)
 	}
-	e.session.commitFault = func() error { return errors.New("disk") }
-	out := e.out("second.jsonl")
-	_, err := e.session.ArchiveAudit(out, 5)
-	e.session.commitFault = nil
-	if !errors.Is(err, ErrArchiveKept) {
-		t.Fatalf("archive over rows deleted under it: %v", err)
+	if rounds != archiveRetries+1 {
+		t.Fatalf("%d attempts, want %d", rounds, archiveRetries+1)
 	}
-	if got, verr := VerifyArchive(e.out("first.jsonl"), out); verr != nil || got.LastSeq != cutAt {
-		t.Fatalf("the only copy of the deleted rows: %+v %v, want through %d", got, verr, cutAt)
+	if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the archive that gave up left its file")
 	}
+	e.session.archiveAttempt = nil
+	mustArchive(t, e.session, out, 6)
+}
+
+// The file must hold the rows that are about to be deleted, not merely rows
+// that read back as valid lines. A value that does not survive encoding comes
+// back changed, and the vault's copy must not be deleted on that file.
+func TestWriteArchiveComparesWhatItReadsBack(t *testing.T) {
+	e := newArchiveEnv(t, 3)
+	rows := append([]auditEvent{}, e.session.audit...)
+	rows[1].Reasons = "\xff"
+	out := e.out("a.jsonl")
+	if err := writeArchive(out, rows); !errors.Is(err, ErrIO) {
+		t.Fatalf("a file that reads back as different rows: %v", err)
+	}
+	if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the rejected file was left in place")
+	}
+	if err := writeArchive(out, e.session.audit); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A copy of the vault from before its first archive has no base. Checking it
+// against the archive file made later is a failed verification, not a crash.
+func TestVerifyAuditArchiveAgainstACopyFromBeforeTheCut(t *testing.T) {
+	e := newArchiveEnv(t, 20)
 	e.session.Lock()
-	if _, err := VerifyAudit(e.path, e.pass); !errors.Is(err, ErrAudit) {
-		t.Fatalf("the vault with rows deleted by hand: %v", err)
+	raw, err := os.ReadFile(e.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := e.out("old-vault.db")
+	if err := os.WriteFile(old, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := mustUnlock(t, e.path, e.pass)
+	out := e.out("a.jsonl")
+	mustArchive(t, s, out, 4)
+	s.Lock()
+	if _, _, err := VerifyAuditArchive(old, e.pass, out); !errors.Is(err, ErrAudit) {
+		t.Fatalf("an archive checked against a copy that was never cut: %v", err)
 	}
 }
 

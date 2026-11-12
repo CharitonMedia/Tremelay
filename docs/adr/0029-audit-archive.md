@@ -84,35 +84,31 @@ file.
 - A refusal (nothing to archive, a bad path, an existing file) writes an
   `audit_archive`/`denied` row and no file.
 - A commit that fails does not decide the file's fate by its error. The
-  command asks the audit table whether the rows are still there.
-  - Still there, and another writer got in first (a commit, or an unlock
-    denial appended behind the head): the command adopts that writer's rows
-    and cuts at the same row, up to four more times. It does so only while
-    the chain still starts at the file's first row and no new notice row
-    names a row the cut would take.
-  - Still there otherwise: it removes its file and reports the error. That
-    includes a smaller archive by another process, which leaves the vault
-    holding only the later part of the file; cutting there would leave two
-    files that overlap. Nothing is left that looks like an archive and is
-    not one.
-  - Gone, and this command's `audit_archive` row is in the chain: the
-    transaction was durable and a later step failed. The file is the archive
-    of its rows, and the command reports success, whether or not another
-    archive has cut further since.
-  - Gone, and that row is not in the chain: this transaction never
-    committed, so another archive took those rows into its own file. This
-    file duplicates all or part of it and is removed. The session adopts a
-    chain only if it still holds the row the session last verified, and this
-    command's row would come after that one, so it cannot have been archived
-    in between.
-  - Gone from the table, but the vault's head has not moved and the chain
-    this session verified still holds them: no archive took those rows. They
-    were deleted by hand. The file stays, because it may be the only copy,
-    and the next unlock reports the tampering.
-  - The table cannot be read, or the session cannot adopt what is stored: the
-    file stays for the same reason.
+  command brings its session up to what is stored and accounts for every
+  row on file.
+  - This command's `audit_archive` row is in the chain: the transaction was
+    durable and a later step failed. The file is the archive of its rows,
+    and the command reports success, whether or not another archive has cut
+    further since. The session adopts a chain only if it still holds the row
+    the session last verified, and this command's row would come after that
+    one, so it cannot have been archived in between.
+  - Otherwise each row on file must be in one of two places. Rows at or
+    before the vault's sealed base left in a cut made with the DEK, so
+    another archive's file has them. Every later row must be in the audit
+    table, read from the table itself and compared field for field.
+  - Every row is accounted for: the file is a spare and is removed. If
+    another writer got in first (a commit, or an unlock denial appended
+    behind the head), the command cuts at the same row again, up to four
+    more times, but only while the chain still starts at the file's first
+    row and no new notice row names a row the cut would take. A smaller
+    archive by another process moves that start; cutting there would leave
+    two files that overlap. A lost race is reported as a stale session.
+  - Any row is not accounted for: it was deleted or changed by hand, the
+    table cannot be read, or the session could not adopt what is stored. The
+    file may be the only true copy. It stays, and the error says so.
 
-When the file stays after a failure, the error says so.
+A crash or an interrupt between writing the file and the commit leaves the
+file with nothing said. The vault still holds every row in it.
 
 `audit verify --path VAULT --archive FILE ...` verifies the vault, verifies
 the files as linked runs in the order given, and requires them to be this

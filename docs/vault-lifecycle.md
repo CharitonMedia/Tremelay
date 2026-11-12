@@ -94,7 +94,9 @@ What to know before you run it:
   the first `seq` is 1, or no higher than the first row in the file, the
   vault still holds those rows and the file is a spare. If it is higher, the
   file is the only copy: keep it, and check it with `audit verify --archive`.
-  If the vault no longer opens at all, keep the file.
+  If the vault no longer opens at all, keep the file. The same check sorts
+  out a file left behind by a crash or an interrupted run, which leaves it
+  without saying anything.
 - **The command can report a stale session.** Other writers got in first
   five times running, or another archive ran at the same moment. It cut
   nothing and left no file. Run it again.

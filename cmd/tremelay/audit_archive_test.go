@@ -41,6 +41,11 @@ func TestCLIAuditArchive(t *testing.T) {
 		return code, stdout.String(), stderr.String()
 	}
 
+	// The docs promise this default: it is what keeps a running daemon's
+	// last verified row in the vault.
+	if auditArchiveKeep != 1000 {
+		t.Fatalf("default --keep is %d; docs/vault-lifecycle.md and ADR 0029 say 1000", auditArchiveKeep)
+	}
 	out := filepath.Join(dir, "audit-1.jsonl")
 	if code, _, _ := cli("audit", "archive", "--path", path); code != 2 {
 		t.Fatalf("archive without --out: exit %d", code)

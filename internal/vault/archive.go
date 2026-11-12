@@ -94,6 +94,10 @@ func (s *Session) ArchiveAudit(outPath string, keep int) (AuditArchive, error) {
 	rows := s.audit[:n]
 	info := AuditArchive{FirstSeq: rows[0].Seq, LastSeq: rows[n-1].Seq, LastHash: rows[n-1].Hash, Rows: n}
 	cut := &auditBase{Seq: info.LastSeq, Hash: info.LastHash}
+	events, err := s.archiveRows(*cut)
+	if err != nil {
+		return AuditArchive{}, err
+	}
 	if err := writeArchive(out, rows); err != nil {
 		return refuse(err)
 	}
@@ -104,63 +108,69 @@ func (s *Session) ArchiveAudit(outPath string, keep int) (AuditArchive, error) {
 		if s.archiveAttempt != nil {
 			s.archiveAttempt()
 		}
-		events, err := s.archiveRows(*cut)
-		if err != nil {
-			_ = os.Remove(out)
-			return AuditArchive{}, err
-		}
 		tip := s.audit[len(s.audit)-1].Seq
 		mine := events[len(events)-1]
 		err = s.commitBatchWrap(events, s.creds, s.agents, s.grants, false, nil, nil, nil, cut)
 		if err == nil {
 			break
 		}
-		// The error alone does not say which side of the commit the vault is
-		// on, and the file's fate depends on exactly that. Ask the table.
-		gone, qerr := s.archivedRowsGone(*cut)
-		if qerr != nil {
-			// Unknown. The file may be the only copy of those rows; it stays.
-			return kept(err)
-		}
-		if gone {
-			// The rows left the vault. Bring this session up to what is
-			// stored and see whose transaction took them.
-			if aerr := s.adoptLocked(); aerr != nil {
-				return kept(aerr)
-			}
-			if s.audit[0].Seq <= cut.Seq {
-				// The table has lost rows that the chain this session
-				// verified still holds: no archive took them. The file may
-				// be the only copy; it stays.
-				return kept(err)
-			}
-			// The adopted chain starts after the cut and still holds the row
-			// this session last verified, so nothing newer than that row has
-			// been archived since. This call's archive row is in the chain
-			// exactly when its transaction committed.
+		// The error does not say which side of the commit the vault is on,
+		// and the file's fate depends on exactly that. Bring the session up
+		// to what is stored, then account for every row on file.
+		aerr := s.adoptLocked()
+		if aerr == nil {
+			// The adopted chain still holds the row this session last
+			// verified, and this call's archive row would come after that
+			// one. It is in the chain exactly when this transaction
+			// committed.
 			if got, ok := rowAt(s.audit, mine.Seq); ok && got.Hash == mine.Hash {
 				// Durable; only a step after the commit failed. The file is
 				// the archive of its rows, whatever was cut after it.
 				break
 			}
-			// Another archive took these rows into its own file, and this
-			// one duplicates all or part of that.
-			_ = os.Remove(out)
-			return AuditArchive{}, ErrStale
 		}
-		// Every row on file is still in the vault, so the file can go whatever
-		// happens next. If another writer got in first, a commit or an unlock
-		// denial behind the head, adopt its rows and cut at the same row: the
-		// rows on file are history it could not change. That holds only while
-		// the chain still starts where the file does. After a smaller archive
-		// by someone else, cutting here would leave a file that overlaps
-		// theirs and reports rows this call did not remove.
-		if try < archiveRetries {
-			if aerr := s.adoptLocked(); aerr == nil && s.audit[len(s.audit)-1].Seq != tip && s.audit[0].Seq == info.FirstSeq && cutHolds(s.audit, *cut) {
-				continue
+		cause := aerr
+		if cause == nil {
+			cause = err
+		}
+		// Rows at or before the base this session holds left in a cut made
+		// with the DEK, so an archive file has them. They are the rows on
+		// file: a base that moved was adopted with a chain that still holds
+		// the row this session last verified, and that row's hash covers
+		// every row before it. Every later row must still be in the audit
+		// table, exactly as it is on file. Otherwise this file may be the
+		// only copy of a row, and it stays.
+		live := rows
+		if s.base != nil && s.base.Seq >= info.FirstSeq {
+			live = rows[min(int(s.base.Seq-info.FirstSeq)+1, len(rows)):]
+		}
+		if !s.tableHolds(live) {
+			return kept(cause)
+		}
+		// The file is a spare. If another writer got in first, a commit or an
+		// unlock denial behind the head, cut at the same row again: the rows
+		// on file are history it could not change. That holds only while the
+		// chain still starts where the file does. After a smaller archive by
+		// someone else, cutting here would leave a file that overlaps theirs
+		// and reports rows this call did not remove.
+		moved := aerr == nil && s.audit[len(s.audit)-1].Seq != tip
+		if moved && try < archiveRetries && len(live) == len(rows) && cutHolds(s.audit, *cut) {
+			next, rerr := s.archiveRows(*cut)
+			if rerr != nil {
+				_ = os.Remove(out)
+				return AuditArchive{}, rerr
 			}
+			events = next
+			continue
 		}
 		_ = os.Remove(out)
+		switch {
+		case aerr != nil:
+			return AuditArchive{}, aerr
+		case moved:
+			// A lost race, whatever the failed write called it.
+			return AuditArchive{}, ErrStale
+		}
 		return AuditArchive{}, err
 	}
 	info.Kept = len(s.audit)
@@ -195,14 +205,28 @@ func (s *Session) besideVault(path string) bool {
 	return false
 }
 
-// archivedRowsGone reports whether the rows through cut have left the audit
-// table, whoever removed them.
-func (s *Session) archivedRowsGone(cut auditBase) (bool, error) {
-	var first int64
-	if err := s.db.QueryRow(`SELECT COALESCE(MIN(seq), 0) FROM audit`).Scan(&first); err != nil || first < 0 {
-		return false, ErrIO
+// tableHolds reports whether every one of rows is in the audit table exactly
+// as given. It reads the table, not the session's copy of it: rows deleted or
+// changed by hand do not move the vault's head, and the copy would not show
+// them.
+//
+// ponytail: reads the whole table once per failed attempt. A range query if
+// failures on a very large vault get slow.
+func (s *Session) tableHolds(rows []auditEvent) bool {
+	if len(rows) == 0 {
+		return true
 	}
-	return uint64(first) > cut.Seq, nil
+	stored, err := readAuditRows(s.db)
+	if err != nil {
+		return false
+	}
+	i := 0
+	for _, ev := range stored {
+		if i < len(rows) && ev == rows[i] {
+			i++
+		}
+	}
+	return i == len(rows)
 }
 
 // archiveCut returns how many rows from the front may leave: all but the
