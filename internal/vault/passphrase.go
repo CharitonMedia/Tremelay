@@ -73,7 +73,7 @@ func (s *Session) ChangePassphrase(oldPassphrase, newPassphrase []byte) error {
 	// newDEK is adopted by commitBatchWrap on success; do not wipe it here.
 	newDEK = nil
 	if err := s.commitBatchWrap([]auditEvent{ev}, s.creds, s.agents, s.grants, true, nil,
-		&passphraseWrap{kdf: kdf, nonce: wrapNonce, ciphertext: wrapped}, rot); err != nil {
+		&passphraseWrap{kdf: kdf, nonce: wrapNonce, ciphertext: wrapped}, rot, nil, nil); err != nil {
 		return err
 	}
 	s.logf("vault_passphrase_change result=allowed")

@@ -92,7 +92,8 @@ Agent and grant commands manage capability authority. They do not retrieve raw s
   tremelay ssh-agent --token-file PATH [--socket /absolute/path]
   tremelay lock
   tremelay mcp serve --path PATH --agent ID --pinentry /absolute/helper [--pinentry-tty /absolute/tty] [--unlock-timeout 2m]
-  tremelay audit verify --path PATH
+  tremelay audit verify --path PATH [--archive FILE ...]
+  tremelay audit archive --path PATH --out NEW_FILE [--keep N]
   tremelay audit list --path PATH [--credential ID] [--agent ID] [--action ACTION] [--class CLASS] [--since RFC3339] [--until RFC3339] [--after SEQ] [--limit N]
   tremelay audit get --path PATH --seq SEQ
   tremelay version
@@ -612,15 +613,49 @@ func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout
 		return cmdAuditList(args[1:], getenv, stdin, stdout, stderr)
 	case "get":
 		return cmdAuditGet(args[1:], getenv, stdin, stdout, stderr)
+	case "archive":
+		return cmdAuditArchive(args[1:], getenv, stdin, stdout, stderr)
 	default:
 		usage(stderr)
 		return 2
 	}
 }
 
+// auditArchiveKeep is how many of the newest rows stay in the vault when
+// --keep is not given. A running daemon locks if the row it last verified is
+// archived, and that row is among the newest; see docs/vault-lifecycle.md.
+const auditArchiveKeep = 1000
+
+func cmdAuditArchive(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := newHumanFlagSet("audit archive")
+	path := fs.String("path", "", "vault file")
+	out := fs.String("out", "", "new file for the archived rows")
+	keep := fs.Int("keep", auditArchiveKeep, "newest rows to leave in the vault")
+	if err := parseHumanFlags(fs, auditArchiveUsage, stderr, args); err != nil {
+		return 2
+	}
+	if *path == "" || *out == "" || fs.NArg() != 0 {
+		usage(stderr)
+		return 2
+	}
+	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
+		info, err := session.ArchiveAudit(*out, *keep)
+		if err != nil {
+			return err
+		}
+		if err := json.NewEncoder(stdout).Encode(info); err != nil {
+			// The rows are archived whether or not the report can be printed.
+			return fmt.Errorf("%w; %w", err, vault.ErrArchiveKept)
+		}
+		return nil
+	})
+}
+
 func cmdAuditVerify(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := newHumanFlagSet("audit verify")
 	path := fs.String("path", "", "vault file")
+	var archives opsFlag
+	fs.Var(&archives, "archive", "archive file, oldest first (repeatable)")
 	if err := parseHumanFlags(fs, auditVerifyUsage, stderr, args); err != nil {
 		return 2
 	}
@@ -636,7 +671,13 @@ func cmdAuditVerify(args []string, getenv func(string) string, stdin io.Reader, 
 	}
 	defer vault.Wipe(pass)
 	red.Add(pass)
-	head, err := vault.VerifyAudit(*path, pass)
+	var head string
+	var covered vault.AuditArchive
+	if len(archives) == 0 {
+		head, err = vault.VerifyAudit(*path, pass)
+	} else {
+		head, covered, err = vault.VerifyAuditArchive(*path, pass, archives...)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, red.Redact(err.Error()))
 		return 1
@@ -644,6 +685,14 @@ func cmdAuditVerify(args []string, getenv func(string) string, stdin io.Reader, 
 	if _, err := fmt.Fprintln(stdout, head); err != nil {
 		fmt.Fprintln(stderr, red.Redact(err.Error()))
 		return 1
+	}
+	if len(archives) != 0 {
+		// The second line says which rows the files hold. They start at row
+		// 1 or the check failed: files and vault together are the history.
+		if err := json.NewEncoder(stdout).Encode(covered); err != nil {
+			fmt.Fprintln(stderr, red.Redact(err.Error()))
+			return 1
+		}
 	}
 	return 0
 }

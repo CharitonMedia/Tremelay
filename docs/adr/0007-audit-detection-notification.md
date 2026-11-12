@@ -4,6 +4,8 @@ Status: Accepted
 
 Amendment 2026-11-11: [ADR 0028](0028-owner-alerts.md) installs the notifier in the daemon (`--alert-command`) and narrows which refusals reach the `ssrf` and `redirect_escape` classes. Containment stays unreachable from any command.
 
+Amendment 2026-11-11: [ADR 0029](0029-audit-archive.md) lets the owner archive the oldest audit rows. The detection lookback, the notice index and the suspension index are then derived from the rows the vault still holds.
+
 ## Context
 
 M1–M4 already append a secret-free hash-chained row for every credential, grant, and broker attempt ([ADR 0003](0003-custody-audit-hash-chain.md), [ADR 0004](0004-agent-capability-grants.md), [ADR 0006](0006-http-request-policy.md)). M5 has to make that history reviewable, distinguish suspicious results from ordinary denials, and notify the vault owner without a new secret path. It does not add credential-health checks, rotation, or an external chat/email service.

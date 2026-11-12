@@ -174,11 +174,13 @@ Read this before you trust it with anything.
   No agent is suspended automatically. `credential policy --compromise-opt-in`
   stores your choice, but this version ships no breach lookup, so no password
   is ever checked against one.
-- **The audit log is never trimmed.** Every attempt adds at least one row, and
-  every unlock and every daemon reload reads and verifies all of them, so
-  commands slow down as the log grows and the daemon holds it all in memory.
-  Pacing caps how fast one agent can make attempts, at about 20 a second.
-  There is no command to archive or prune old rows yet.
+- **The audit log grows until you archive it.** Every attempt adds at least
+  one row, and every unlock and every daemon reload reads and verifies all of
+  them, so commands slow down as the log grows and the daemon holds it all in
+  memory. Pacing caps how fast one agent can make attempts, at about 20 a
+  second. `tremelay audit archive` moves the old rows to a file you keep; it
+  never runs by itself. See
+  [docs/vault-lifecycle.md](docs/vault-lifecycle.md#archive-old-audit-rows).
 - **No OAuth refresh brokering, no database session brokering, no browser form
   fill, no TOTP, no provider-assisted rotation.** These are in
   [VISION.md](VISION.md) and on the roadmap, not in v1.
