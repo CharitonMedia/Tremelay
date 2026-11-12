@@ -626,8 +626,6 @@ func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout
 // archived, and that row is among the newest; see docs/vault-lifecycle.md.
 const auditArchiveKeep = 1000
 
-const errArchiveLeft = "the archive file was written and left in place: it may be the only copy of those rows; see docs/vault-lifecycle.md before deleting it"
-
 func cmdAuditArchive(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := newHumanFlagSet("audit archive")
 	path := fs.String("path", "", "vault file")
@@ -640,23 +638,16 @@ func cmdAuditArchive(args []string, getenv func(string) string, stdin io.Reader,
 		usage(stderr)
 		return 2
 	}
-	// A name already taken is refused, and that file is not this command's.
-	_, taken := os.Lstat(*out)
 	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
 		info, err := session.ArchiveAudit(*out, *keep)
-		if err == nil {
+		if err != nil {
+			return err
+		}
+		if err := json.NewEncoder(stdout).Encode(info); err != nil {
 			// The rows are archived whether or not the report can be printed.
-			err = json.NewEncoder(stdout).Encode(info)
+			return fmt.Errorf("%w; %w", err, vault.ErrArchiveKept)
 		}
-		if err != nil && taken != nil {
-			// A refusal wrote no file, and a failed commit that left the rows
-			// in the vault removed its own. A file here now is one the engine
-			// could not account for, or the archive itself.
-			if _, serr := os.Stat(*out); serr == nil {
-				fmt.Fprintln(stderr, errArchiveLeft)
-			}
-		}
-		return err
+		return nil
 	})
 }
 

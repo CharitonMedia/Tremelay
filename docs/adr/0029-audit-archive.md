@@ -70,7 +70,10 @@ accidents. It was not built.
 The archive is one JSON object per line, each row exactly as stored. The
 command creates the file new and owner-only, refuses an existing name and any
 symlink in the path, flushes it, and reads it back and compares it with the
-rows in memory before the transaction that deletes them begins.
+rows in memory before the transaction that deletes them begins. It also
+refuses the names SQLite keeps beside the vault (`-journal`, `-wal`, `-shm`):
+SQLite deletes those when it likes, and an archive under one of them would
+vanish after its rows had left the vault.
 
 A line is accepted only if it is byte for byte what the command writes for
 that row. Go's JSON decoder matches member names without regard to case and
@@ -92,17 +95,24 @@ file.
     holding only the later part of the file; cutting there would leave two
     files that overlap. Nothing is left that looks like an archive and is
     not one.
-  - Gone, the vault's base is this cut, and this command's `audit_archive`
-    row is in the chain: the transaction was durable and a later step
-    failed. The file is the archive, and the command reports success.
-  - Gone, and the place this command's `audit_archive` row would hold is
-    empty or holds another row: this transaction never committed, so another
-    archive took those rows into its own file. This file duplicates part of
-    it and is removed.
-  - Gone, and neither can be shown (this command's row is in the chain under
-    a later cut, or was itself archived since): the file stays, because it
-    may be the only copy, and the command says so.
-  - The table cannot be read: the file stays for the same reason.
+  - Gone, and this command's `audit_archive` row is in the chain: the
+    transaction was durable and a later step failed. The file is the archive
+    of its rows, and the command reports success, whether or not another
+    archive has cut further since.
+  - Gone, and that row is not in the chain: this transaction never
+    committed, so another archive took those rows into its own file. This
+    file duplicates all or part of it and is removed. The session adopts a
+    chain only if it still holds the row the session last verified, and this
+    command's row would come after that one, so it cannot have been archived
+    in between.
+  - Gone from the table, but the vault's head has not moved and the chain
+    this session verified still holds them: no archive took those rows. They
+    were deleted by hand. The file stays, because it may be the only copy,
+    and the next unlock reports the tampering.
+  - The table cannot be read, or the session cannot adopt what is stored: the
+    file stays for the same reason.
+
+When the file stays after a failure, the error says so.
 
 `audit verify --path VAULT --archive FILE ...` verifies the vault, verifies
 the files as linked runs in the order given, and requires them to be this

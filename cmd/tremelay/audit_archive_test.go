@@ -60,7 +60,7 @@ func TestCLIAuditArchive(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &info); err != nil || info.FirstSeq != 1 || info.Rows == 0 || info.LastSeq != uint64(info.Rows) {
 		t.Fatalf("archive output %q: %v", stdout, err)
 	}
-	if code, _, stderr := cli("audit", "archive", "--path", path, "--out", out, "--keep", "1"); code != 1 || !strings.Contains(stderr, vault.ErrInvalid.Error()) || strings.Contains(stderr, errArchiveLeft) {
+	if code, _, stderr := cli("audit", "archive", "--path", path, "--out", out, "--keep", "1"); code != 1 || !strings.Contains(stderr, vault.ErrInvalid.Error()) || strings.Contains(stderr, vault.ErrArchiveKept.Error()) {
 		t.Fatalf("archive onto an existing file: exit %d %q", code, stderr)
 	}
 
@@ -113,7 +113,7 @@ func TestCLIAuditArchive(t *testing.T) {
 	// only copy of its rows, and the command says so.
 	var stderrBuf bytes.Buffer
 	unprinted := filepath.Join(dir, "audit-unprinted.jsonl")
-	if code := run([]string{"audit", "archive", "--path", path, "--out", unprinted, "--keep", "2"}, env, strings.NewReader(""), failWriter{}, &stderrBuf); code != 1 || !strings.Contains(stderrBuf.String(), errArchiveLeft) {
+	if code := run([]string{"audit", "archive", "--path", path, "--out", unprinted, "--keep", "2"}, env, strings.NewReader(""), failWriter{}, &stderrBuf); code != 1 || !strings.Contains(stderrBuf.String(), vault.ErrArchiveKept.Error()) {
 		t.Fatalf("archive with a closed stdout: exit %d %q", code, stderrBuf.String())
 	}
 	if code, _, stderr := cli("audit", "verify", "--path", path, "--archive", out, "--archive", unprinted); code != 0 {

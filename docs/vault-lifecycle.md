@@ -48,7 +48,8 @@ check it, and only then removes those rows from the vault. It keeps the newest
 1000 rows; `--keep N` changes that. It prints one JSON line: the first and
 last sequence archived, the last row's hash, how many rows went, and how many
 the vault holds now. The output file must not exist, and its path must contain
-no symlink.
+no symlink. It cannot be one of the names SQLite keeps beside the vault
+(`vault.db-journal`, `vault.db-wal`, `vault.db-shm`).
 
 The log is still one chain. The rows that stay keep their numbers, and the
 vault records, inside its encrypted part, which row its log now follows.
@@ -93,6 +94,7 @@ What to know before you run it:
   the first `seq` is 1, or no higher than the first row in the file, the
   vault still holds those rows and the file is a spare. If it is higher, the
   file is the only copy: keep it, and check it with `audit verify --archive`.
+  If the vault no longer opens at all, keep the file.
 - **The command can report a stale session.** Other writers got in first
   five times running, or another archive ran at the same moment. It cut
   nothing and left no file. Run it again.

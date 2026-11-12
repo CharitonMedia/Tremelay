@@ -1,6 +1,9 @@
 package vault
 
 import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -324,15 +327,28 @@ func TestArchiveRefusals(t *testing.T) {
 			t.Fatalf("symlink target: %v", err)
 		}
 	}
+	// SQLite deletes its journal and WAL when it likes. An archive under one
+	// of those names would vanish after its rows had left the vault.
+	for _, side := range []string{"-journal", "-wal", "-shm", "-JOURNAL"} {
+		name := canonicalExisting(t, e.path) + side
+		if _, err := e.session.ArchiveAudit(name, 2); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("archive onto the vault's own %s file: %v", side, err)
+		}
+		if _, err := os.Lstat(name); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the refused archive created %s", name)
+		}
+	}
 	if _, err := os.Stat(e.out("a.jsonl")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("a refused archive left a file")
 	}
-	if e.session.base != nil || e.session.audit[0].Seq != 1 {
+	if e.session.base != nil || e.session.audit[0].Seq != 1 || len(e.session.audit) < rows {
 		t.Fatal("a refused archive cut the chain")
 	}
-	if got := archiveActions(e.session.audit, actionArchive, resultDenied); got < 3 {
-		t.Fatalf("%d refusals audited, want at least 3", got)
+	if got := archiveActions(e.session.audit, actionArchive, resultDenied); got < 7 {
+		t.Fatalf("%d refusals audited, want at least 7", got)
 	}
+	// The same file name in another directory is an ordinary file.
+	mustArchive(t, e.session, e.out(filepath.Base(e.path)+"-journal"), 2)
 	e.session.Lock()
 	if _, err := VerifyAudit(e.path, e.pass); err != nil {
 		t.Fatal(err)
@@ -914,8 +930,9 @@ func TestNoticeAboutAnArchivedRowIsNotWritten(t *testing.T) {
 
 // This archive's transaction lands, the step after it fails, and before the
 // call can look, another archive cuts further. The vault's base is no longer
-// this cut, but the file is still the only copy of its rows. It stays.
-func TestArchiveThatLandedKeepsItsFileUnderALaterCut(t *testing.T) {
+// this cut, but this call's archive row is in the chain: it committed, and
+// its file is the only copy of its rows. It stays, and the call says done.
+func TestArchiveThatLandedIsDoneUnderALaterCut(t *testing.T) {
 	e := newArchiveEnv(t, 30)
 	control := mustUnlock(t, e.path, e.pass)
 	theirs := e.out("theirs.jsonl")
@@ -927,18 +944,144 @@ func TestArchiveThatLandedKeepsItsFileUnderALaterCut(t *testing.T) {
 		return errors.New("after commit")
 	}
 	mine := e.out("mine.jsonl")
-	_, err := e.session.ArchiveAudit(mine, 12)
+	info, err := e.session.ArchiveAudit(mine, 12)
 	e.session.postCommitFault = nil
-	if err == nil {
-		t.Fatal("an archive whose outcome could not be established reported success")
+	if err != nil {
+		t.Fatalf("an archive that committed was reported as failed: %v", err)
 	}
-	got, verr := VerifyArchive(mine)
-	if verr != nil || got.FirstSeq != 1 || got.LastSeq+1 != later.FirstSeq {
-		t.Fatalf("the only copy of rows 1 to %d: %+v %v", later.FirstSeq-1, got, verr)
+	if info.FirstSeq != 1 || info.LastSeq+1 != later.FirstSeq || e.session.base == nil || e.session.base.Seq != later.LastSeq {
+		t.Fatalf("mine %+v, theirs %+v, base %+v", info, later, e.session.base)
 	}
 	e.session.Lock()
 	control.Lock()
 	if _, _, err := VerifyAuditArchive(e.path, e.pass, mine, theirs); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Another archive lands first and cuts at the very same row. The vault's base
+// is this call's cut, but the transaction that put it there was not this
+// one: the row in the chain is theirs. This file is a duplicate and goes.
+func TestArchiveLosesToAnArchiveOfTheSameRows(t *testing.T) {
+	e := newArchiveEnv(t, 30)
+	control := mustUnlock(t, e.path, e.pass)
+	if _, err := e.session.List(); err != nil { // adopt the unlock row, so both cut the same chain
+		t.Fatal(err)
+	}
+	theirs := e.out("theirs.jsonl")
+	var won AuditArchive
+	e.session.archiveAttempt = func() {
+		if won.Rows == 0 {
+			won = mustArchive(t, control, theirs, 6)
+		}
+	}
+	mine := e.out("mine.jsonl")
+	if _, err := e.session.ArchiveAudit(mine, 6); !errors.Is(err, ErrStale) {
+		t.Fatalf("the losing archive: %v", err)
+	}
+	if e.session.base == nil || e.session.base.Seq != won.LastSeq {
+		t.Fatalf("base %+v, winner %+v", e.session.base, won)
+	}
+	if _, err := os.Stat(mine); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the losing archive left its duplicate file")
+	}
+	e.session.Lock()
+	control.Lock()
+	if _, _, err := VerifyAuditArchive(e.path, e.pass, theirs); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Someone without the passphrase deletes the rows this archive is about to
+// cut, and the commit fails. The table says the rows are gone, but no archive
+// took them: the vault's head never moved. The file is the only copy left, so
+// it stays, and the error says so.
+func TestArchiveKeepsItsFileWhenTheRowsWereDeletedUnderIt(t *testing.T) {
+	e := newArchiveEnv(t, 20)
+	mustArchive(t, e.session, e.out("first.jsonl"), 20)
+	for range 15 {
+		if _, err := e.session.List(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var cutAt uint64
+	e.session.archiveAttempt = func() {
+		cutAt = e.session.audit[len(e.session.audit)-6].Seq
+		execArchiveSQL(t, e.path, `DELETE FROM audit WHERE seq<=?`, int64(cutAt))
+	}
+	e.session.commitFault = func() error { return errors.New("disk") }
+	out := e.out("second.jsonl")
+	_, err := e.session.ArchiveAudit(out, 5)
+	e.session.commitFault = nil
+	if !errors.Is(err, ErrArchiveKept) {
+		t.Fatalf("archive over rows deleted under it: %v", err)
+	}
+	if got, verr := VerifyArchive(e.out("first.jsonl"), out); verr != nil || got.LastSeq != cutAt {
+		t.Fatalf("the only copy of the deleted rows: %+v %v, want through %d", got, verr, cutAt)
+	}
+	e.session.Lock()
+	if _, err := VerifyAudit(e.path, e.pass); !errors.Is(err, ErrAudit) {
+		t.Fatalf("the vault with rows deleted by hand: %v", err)
+	}
+}
+
+// The chain's hashes are not keyed, so anyone can alter a row in an archive
+// file and recompute every hash after it. The result is a valid run on its
+// own. It is not this vault's history: the vault names the hash it follows.
+func TestVerifyAuditArchiveRejectsARecomputedFile(t *testing.T) {
+	e := newArchiveEnv(t, 20)
+	out := e.out("a.jsonl")
+	mustArchive(t, e.session, out, 4)
+	e.session.Lock()
+	rows, err := readArchive(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := len(rows) / 2
+	rows[i].Time = rows[i-1].Time
+	for ; i < len(rows); i++ {
+		prev, err := hex.DecodeString(rows[i-1].Hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows[i].Prev = rows[i-1].Hash
+		rows[i].Hash = hex.EncodeToString(hashEvent(prev, rows[i]))
+	}
+	forged := e.out("forged.jsonl")
+	writeLines(t, forged, rows)
+	if _, err := VerifyArchive(forged); err != nil {
+		t.Fatalf("the forged file should be a valid run on its own, or the test proves nothing: %v", err)
+	}
+	if _, _, err := VerifyAuditArchive(e.path, e.pass, forged); !errors.Is(err, ErrAudit) {
+		t.Fatalf("a recomputed archive verified against the vault: %v", err)
+	}
+	if _, _, err := VerifyAuditArchive(e.path, e.pass, out); err != nil {
+		t.Fatal(err)
+	}
+
+	// A run that starts at row 1 with anything but the vault's creation is
+	// not the start of a vault's history.
+	first, err := nextAudit(nil, rows[0].VaultID, auditEvent{Action: actionList, Result: resultAllowed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	headless := e.out("headless.jsonl")
+	writeLines(t, headless, []auditEvent{first})
+	if _, err := VerifyArchive(headless); !errors.Is(err, ErrAudit) {
+		t.Fatalf("a run whose row 1 is not vault_create verified: %v", err)
+	}
+}
+
+func writeLines(t *testing.T, path string, rows []auditEvent) {
+	t.Helper()
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, ev := range rows {
+		if err := enc.Encode(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
