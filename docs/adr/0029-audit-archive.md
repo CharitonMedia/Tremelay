@@ -114,7 +114,13 @@ file.
     cannot have been archived in between. The base is asked as well as the
     row because two processes on a coarse clock can write the same archive
     row byte for byte. With the base at or past this cut, every row on file
-    has left the vault and the file holds it, whichever process cut.
+    has left the vault and an archive file holds it. One case is reported
+    wrongly: two archives of the same vault started in the same clock tick,
+    and the other cut further. The loser reports success for rows the
+    winner's file also holds, and its own file ends before the vault's base,
+    so it does not verify against the vault; the winner's does. No row is
+    lost. Telling the two apart needs a row only one call could have
+    written, which is a change to the row format and was not made.
   - Otherwise each row on file must be in one of two places. Rows at or
     before the vault's sealed base left in a cut made with the DEK, so
     another archive's file has them. Every later row must be in the audit
