@@ -779,8 +779,9 @@ func readAuditRowsMode(db queryer, legacy bool) ([]auditEvent, error) {
 // A failure rolls every event in the call back; callers put a security
 // event, its response decision, and its containment row in one call.
 // trim, when non-zero, deletes the audit rows through that sequence in the
-// same transaction: an archive, whose rows the caller already has on file.
-func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fresh bool, trim uint64, fault func() error) error {
+// same transaction: an archive. The rows go only if onFile then says the
+// caller's file holds them.
+func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fresh bool, trim uint64, onFile func() bool, fault func() error) error {
 	if len(events) == 0 {
 		return ErrAudit
 	}
@@ -811,6 +812,22 @@ func writeTx(db *sql.DB, h fileHeader, prevSeq uint64, events []auditEvent, fres
 			// ponytail: the pages are freed for reuse and the file does not
 			// shrink. VACUUM if the size on disk ever matters.
 			if _, err := tx.Exec(`DELETE FROM audit WHERE seq <= ?`, int64(trim)); err != nil {
+				return ErrIO
+			}
+			// The file is asked about here, not before the transaction,
+			// because SQLite owns some file names beside the vault and by now
+			// has done what it does to them: it has deleted a rollback journal
+			// it found and written its own, which it deletes at commit. A
+			// file that still reads back as the rows is therefore not that
+			// journal under any name or link. That reasoning needs the
+			// rollback journal. A write-ahead log, which SQLite switches to
+			// when it finds one beside the vault, is first written at commit,
+			// after this.
+			var mode string
+			if err := tx.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil || !strings.EqualFold(mode, "delete") {
+				return ErrIO
+			}
+			if onFile == nil || !onFile() {
 				return ErrIO
 			}
 		}

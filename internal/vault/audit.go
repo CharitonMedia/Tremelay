@@ -247,6 +247,9 @@ func nextEvent(chain []auditEvent, action, vaultID, credID, credType, result str
 	})
 }
 
+// auditNow is the clock audit rows are stamped with. Tests hold it still.
+var auditNow = time.Now
+
 func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEvent, error) {
 	prev := make([]byte, 32)
 	seq := uint64(1)
@@ -262,7 +265,7 @@ func nextAudit(chain []auditEvent, vaultID string, partial auditEvent) (auditEve
 	ev := partial
 	ev.V = auditVersionForEvent(ev)
 	ev.Seq = seq
-	ev.Time = time.Now().UTC().Format(time.RFC3339Nano)
+	ev.Time = auditNow().UTC().Format(time.RFC3339Nano)
 	ev.VaultID = vaultID
 	ev.Prev = hex.EncodeToString(prev)
 	var sum []byte

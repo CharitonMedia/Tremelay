@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 )
 
 // ErrArchiveEmpty means the vault holds no more rows than the caller asked to
@@ -18,6 +20,15 @@ var ErrArchiveEmpty = errors.New("no audit rows to archive")
 // this vault's rows but do not start at row 1: an older file is missing, or
 // the front of one was removed.
 var ErrArchiveIncomplete = errors.New("archive files do not reach back to row 1")
+
+// ErrArchiveName refuses an archive file whose name SQLite could take for one
+// of its own files.
+var ErrArchiveName = fmt.Errorf("%w: the archive file's name cannot contain -journal, -wal or -shm", ErrInvalid)
+
+// ErrArchiveKept wraps the error of an archive call that failed and left its
+// file in place, because the call could not show that the vault still holds
+// the rows on it.
+var ErrArchiveKept = errors.New("the archive file was written and left in place: it may be the only copy of those rows; see docs/vault-lifecycle.md before deleting it")
 
 // archiveRetries bounds how often one archive call adopts a competing commit
 // and tries again. The window is longer than an ordinary command's, because
@@ -42,11 +53,13 @@ type AuditArchive struct {
 // the same transaction that deletes the archived rows, so the cut can be made
 // only with the DEK and is checked on every unlock, reload and verify.
 //
-// The file is written, flushed and read back before anything is deleted. It
-// is one JSON row per line, exactly as stored, and VerifyArchive checks it
-// without the vault. outPath must not exist and must not contain a symlink.
-// When the call fails the file is removed if the rows are still in the vault,
-// and left only when that cannot be established.
+// The file is written and flushed first, and read back inside the transaction
+// that deletes the rows: they leave only if the file is exactly those rows at
+// that moment. It is one JSON row per line, exactly as stored, and
+// VerifyArchive checks it without the vault. outPath must not exist, must not
+// contain a symlink, and must not be named like a file SQLite keeps beside a
+// database. When the call fails the file is removed if the rows are still in
+// the vault, and left only when that cannot be established.
 //
 // Detection counts, pending notices and suspension facts are derived from the
 // rows the vault holds, so after this call they reflect the rows that stay.
@@ -77,6 +90,11 @@ func (s *Session) ArchiveAudit(outPath string, keep int) (AuditArchive, error) {
 	if n == 0 {
 		return refuse(ErrArchiveEmpty)
 	}
+	// The name is judged as given, before the file system is asked anything
+	// about it.
+	if sidecarName(filepath.Base(outPath)) {
+		return refuse(ErrArchiveName)
+	}
 	out, err := cleanPath(outPath, true)
 	if err != nil {
 		return refuse(err)
@@ -84,71 +102,125 @@ func (s *Session) ArchiveAudit(outPath string, keep int) (AuditArchive, error) {
 	rows := s.audit[:n]
 	info := AuditArchive{FirstSeq: rows[0].Seq, LastSeq: rows[n-1].Seq, LastHash: rows[n-1].Hash, Rows: n}
 	cut := &auditBase{Seq: info.LastSeq, Hash: info.LastHash}
+	events, err := s.archiveRows(*cut)
+	if err != nil {
+		return AuditArchive{}, err
+	}
 	if err := writeArchive(out, rows); err != nil {
 		return refuse(err)
+	}
+	kept := func(err error) (AuditArchive, error) {
+		return AuditArchive{}, fmt.Errorf("%w; %w", err, ErrArchiveKept)
 	}
 	for try := 0; ; try++ {
 		if s.archiveAttempt != nil {
 			s.archiveAttempt()
 		}
-		events, err := s.archiveRows(*cut)
-		if err != nil {
-			_ = os.Remove(out)
-			return AuditArchive{}, err
-		}
 		tip := s.audit[len(s.audit)-1].Seq
-		err = s.commitBatchWrap(events, s.creds, s.agents, s.grants, false, nil, nil, nil, cut)
+		mine := events[len(events)-1]
+		err = s.commitBatchWrap(events, s.creds, s.agents, s.grants, false, nil, nil, nil, cut, func() bool { return archiveHolds(out, rows) })
 		if err == nil {
 			break
 		}
-		// The error alone does not say which side of the commit the vault is
-		// on, and the file's fate depends on exactly that. Ask the table.
-		gone, qerr := s.archivedRowsGone(*cut)
-		if qerr != nil {
-			// Unknown. The file may be the only copy of those rows; it stays.
-			return AuditArchive{}, err
-		}
-		if gone {
-			// The rows left the vault. Bring this session up to what is
-			// stored and see whose cut it was.
-			if aerr := s.adoptLocked(); aerr != nil {
-				return AuditArchive{}, aerr
-			}
-			if s.base != nil && *s.base == *cut {
-				// This transaction is durable and only a step after it
-				// failed. The file is the vault's archive.
+		// The error does not say which side of the commit the vault is on,
+		// and the file's fate depends on exactly that. Bring the session up
+		// to what is stored, then account for every row on file.
+		aerr := s.adoptLocked()
+		if aerr == nil {
+			// The adopted chain still holds the row this session last
+			// verified, and this call's archive row would come after that
+			// one. It is in the chain when this transaction committed. On a
+			// coarse clock another process's archive row can be the same row
+			// byte for byte, so the base is asked too: at or past this cut,
+			// every row on file has left the vault, whoever cut it.
+			if got, ok := rowAt(s.audit, mine.Seq); ok && got.Hash == mine.Hash && s.base != nil && s.base.Seq >= cut.Seq {
+				// Durable; only a step after the commit failed. The file is
+				// the archive of its rows, whatever was cut after it.
 				break
 			}
-			// Another archive took these rows and more, and has them on its
-			// own file. This one is a duplicate of part of that.
-			_ = os.Remove(out)
-			return AuditArchive{}, ErrStale
 		}
-		// Every row is still in the vault, so the file can go whatever
-		// happens next. If another writer got in first, a commit or an unlock
-		// denial behind the head, adopt its rows and cut at the same row: the
-		// rows on file are history it could not change.
-		if try < archiveRetries {
-			if aerr := s.adoptLocked(); aerr == nil && s.audit[len(s.audit)-1].Seq != tip && cutHolds(s.audit, *cut) {
-				continue
+		// A commit that retired the session says more than the refusal to
+		// adopt that follows from it.
+		cause := err
+		if aerr != nil && !errors.Is(err, ErrCorrupt) {
+			cause = aerr
+		}
+		// Rows at or before the base this session holds left in a cut made
+		// with the DEK, so an archive file has them. They are the rows on
+		// file: a base that moved was adopted with a chain that still holds
+		// the row this session last verified, and that row's hash covers
+		// every row before it. Every later row must still be in the audit
+		// table, exactly as it is on file. Otherwise this file may be the
+		// only copy of a row, and it stays.
+		live := rows
+		if s.base != nil && s.base.Seq >= info.FirstSeq {
+			live = rows[min(int(s.base.Seq-info.FirstSeq)+1, len(rows)):]
+		}
+		if !s.tableHolds(live) {
+			return kept(cause)
+		}
+		// The file is a spare. If another writer got in first, a commit or an
+		// unlock denial behind the head, cut at the same row again: the rows
+		// on file are history it could not change. That holds only while the
+		// chain still starts where the file does. After a smaller archive by
+		// someone else, cutting here would leave a file that overlaps theirs
+		// and reports rows this call did not remove.
+		moved := aerr == nil && s.audit[len(s.audit)-1].Seq != tip
+		if moved && try < archiveRetries && len(live) == len(rows) && cutHolds(s.audit, *cut) {
+			next, rerr := s.archiveRows(*cut)
+			if rerr != nil {
+				_ = os.Remove(out)
+				return AuditArchive{}, rerr
 			}
+			events = next
+			continue
 		}
 		_ = os.Remove(out)
-		return AuditArchive{}, err
+		if moved {
+			// A lost race, whatever the failed write called it.
+			return AuditArchive{}, ErrStale
+		}
+		return AuditArchive{}, cause
 	}
 	info.Kept = len(s.audit)
 	s.logf("audit_archive result=allowed")
 	return info, nil
 }
 
-// archivedRowsGone reports whether the rows through cut have left the audit
-// table, whoever removed them.
-func (s *Session) archivedRowsGone(cut auditBase) (bool, error) {
-	var first int64
-	if err := s.db.QueryRow(`SELECT COALESCE(MIN(seq), 0) FROM audit`).Scan(&first); err != nil || first < 0 {
-		return false, ErrIO
+// sidecarName reports whether SQLite could take a file called name for the
+// rollback journal, WAL or shared-memory file of a database. It names those
+// after the database file as it resolves it, which is not always the path a
+// session opened, and deletes or overwrites them when it likes. So the test
+// is on the name alone, in any directory, any letter case, and with anything
+// after the ending that a file system might drop. A name that merely contains
+// one of the endings is refused too.
+func sidecarName(name string) bool {
+	upper := strings.ToUpper(name)
+	return strings.Contains(upper, "-JOURNAL") || strings.Contains(upper, "-WAL") || strings.Contains(upper, "-SHM")
+}
+
+// tableHolds reports whether every one of rows is in the audit table exactly
+// as given. It reads the table, not the session's copy of it: rows deleted or
+// changed by hand do not move the vault's head, and the copy would not show
+// them.
+//
+// ponytail: reads the whole table once per failed attempt. A range query if
+// failures on a very large vault get slow.
+func (s *Session) tableHolds(rows []auditEvent) bool {
+	if len(rows) == 0 {
+		return true
 	}
-	return uint64(first) > cut.Seq, nil
+	stored, err := readAuditRows(s.db)
+	if err != nil {
+		return false
+	}
+	i := 0
+	for _, ev := range stored {
+		if i < len(rows) && ev == rows[i] {
+			i++
+		}
+	}
+	return i == len(rows)
 }
 
 // archiveCut returns how many rows from the front may leave: all but the
@@ -231,8 +303,9 @@ func (s *Session) archiveRows(cut auditBase) ([]auditEvent, error) {
 }
 
 // writeArchive creates path, owner-only, and writes rows to it one JSON
-// object per line. It returns only after the file is flushed and reads back
-// as the same rows: the vault's copy is deleted on the strength of this one.
+// object per line. It returns once the file is flushed. Whether it holds the
+// rows is archiveHolds's question, asked inside the transaction that deletes
+// the vault's copy.
 func writeArchive(path string, rows []auditEvent) (err error) {
 	f, err := openExclusiveOwnerOnly(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
@@ -257,17 +330,17 @@ func writeArchive(path string, rows []auditEvent) (err error) {
 	if w.Flush() != nil || f.Sync() != nil || f.Close() != nil {
 		return ErrIO
 	}
-	if err := syncDir(filepath.Dir(path)); err != nil {
-		return err
-	}
+	return syncDir(filepath.Dir(path))
+}
+
+// archiveHolds reports whether the file at path is exactly rows.
+//
+// ponytail: decodes the whole file while the vault's write lock is held, about
+// as long as the delete beside it. Compare a digest of the bytes written if
+// that ever holds other writers up.
+func archiveHolds(path string, rows []auditEvent) bool {
 	got, err := readArchive(path)
-	if err != nil {
-		return ErrIO
-	}
-	if !slices.Equal(got, rows) {
-		return ErrIO
-	}
-	return nil
+	return err == nil && slices.Equal(got, rows)
 }
 
 // readArchive decodes an archive file strictly: one row per line, each line

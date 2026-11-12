@@ -43,12 +43,14 @@ umask 077
 tremelay audit archive --path /canonical/vault.db --out /canonical/archives/audit-001.jsonl
 ```
 
-The command writes the oldest rows to the new file, reads the file back to
-check it, and only then removes those rows from the vault. It keeps the newest
-1000 rows; `--keep N` changes that. It prints one JSON line: the first and
-last sequence archived, the last row's hash, how many rows went, and how many
-the vault holds now. The output file must not exist, and its path must contain
-no symlink.
+The command writes the oldest rows to the new file. It removes them from the
+vault only if the file reads back as exactly those rows at the moment they are
+deleted. It keeps the newest 1000 rows; `--keep N` changes that. It prints one
+JSON line: the first and last sequence archived, the last row's hash, how many
+rows went, and how many the vault holds now. The output file must not exist,
+and its path must contain no symlink. Its name cannot contain `-journal`,
+`-wal` or `-shm`: SQLite keeps files with those endings beside a database and
+deletes them when it likes.
 
 The log is still one chain. The rows that stay keep their numbers, and the
 vault records, inside its encrypted part, which row its log now follows.
@@ -93,8 +95,12 @@ What to know before you run it:
   the first `seq` is 1, or no higher than the first row in the file, the
   vault still holds those rows and the file is a spare. If it is higher, the
   file is the only copy: keep it, and check it with `audit verify --archive`.
-- **Under a busy daemon the command can report a stale session.** It tried
-  five times and cut nothing. Run it again.
+  If the vault no longer opens at all, keep the file. The same check sorts
+  out a file left behind by a crash or an interrupted run, which leaves it
+  without saying anything.
+- **The command can report a stale session.** Other writers got in first
+  five times running, or another archive ran at the same moment. It cut
+  nothing and left no file. Run it again.
 - **Older builds refuse a vault once this command has run on it,** even if
   it refused. Upgrade only.
 - **The vault file does not get smaller.** The freed space is reused by new

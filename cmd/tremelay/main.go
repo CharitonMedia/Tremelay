@@ -626,8 +626,6 @@ func cmdAudit(args []string, getenv func(string) string, stdin io.Reader, stdout
 // archived, and that row is among the newest; see docs/vault-lifecycle.md.
 const auditArchiveKeep = 1000
 
-const errArchiveLeft = "the archive file was written and left in place: it may be the only copy of those rows; see docs/vault-lifecycle.md before deleting it"
-
 func cmdAuditArchive(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := newHumanFlagSet("audit archive")
 	path := fs.String("path", "", "vault file")
@@ -643,18 +641,13 @@ func cmdAuditArchive(args []string, getenv func(string) string, stdin io.Reader,
 	return withSession(*path, getenv, stdin, stderr, &vault.Redactor{}, func(session *vault.Session) error {
 		info, err := session.ArchiveAudit(*out, *keep)
 		if err != nil {
-			// A refusal wrote no file, and a failed commit that left the rows
-			// in the vault removed its own. A file still here is one the
-			// engine could not account for. ErrInvalid is the refusal of a
-			// name that was already taken, by a file that is not ours.
-			if !errors.Is(err, vault.ErrInvalid) {
-				if _, serr := os.Stat(*out); serr == nil {
-					fmt.Fprintln(stderr, errArchiveLeft)
-				}
-			}
 			return err
 		}
-		return json.NewEncoder(stdout).Encode(info)
+		if err := json.NewEncoder(stdout).Encode(info); err != nil {
+			// The rows are archived whether or not the report can be printed.
+			return fmt.Errorf("%w; %w", err, vault.ErrArchiveKept)
+		}
+		return nil
 	})
 }
 
